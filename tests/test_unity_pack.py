@@ -4675,7 +4675,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("unlowered C#", eng)
 
     def test_singleton_toggle_array_is_on(self):
-        """Other.instance.toggles[i].isOn → Toggle_set_isOn(Other_toggles[i], …)."""
+        """Other.instance.toggles[i].isOn → that instance's vector, bound once."""
         root = tempfile.mkdtemp(prefix="upack-toggle-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
@@ -4732,7 +4732,10 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "engine.cpp")) as f:
             eng = f.read()
         self.assertIn("static std::vector<int> CosmeticsMenu_toggles", eng)
-        self.assertIn("Toggle_set_isOn(CosmeticsMenu_toggles[0], (0))", eng)
+        self.assertIn("std::vector<int> &_CosmeticsMenu_toggles_of = "
+                      "CosmeticsMenu_toggles[CosmeticsMenu_Instance()];", eng)
+        self.assertIn("Toggle_set_isOn(_CosmeticsMenu_toggles_of[0], (0))",
+                      eng)
         self.assertNotIn("0.toggles", eng)
         self.assertNotIn("CosmeticsMenu.instance", eng)
 
@@ -14731,6 +14734,88 @@ class TestStaticFields(_ScriptPackMixin, unittest.TestCase):
 
 
 
+# Platformer's Concepts (Scripts)/FollowWaypoints.cs, verbatim.
+_FOLLOW_WAYPOINTS_CS = (
+    'using UnityEngine;\n'
+    '\n'
+    'public class FollowWaypoints : MonoBehaviour\n'
+    '{\n'
+    '\tpublic Transform trs;\n'
+    '\tpublic Transform waypointsParent;\n'
+    '\tpublic float moveSpeed;\n'
+    '\tpublic float rotateSpeed;\n'
+    '\tpublic int currWaypointIdx;\n'
+    '\tpublic bool isBacktracking;\n'
+    '\tpublic Transform[] waypoints = new Transform[0];\n'
+    '\tpublic FollowType followType;\n'
+    '\tTransform currWaypoint;\n'
+    '\n'
+    '\tvoid Start ()\n'
+    '\t{\n'
+    '\t\tcurrWaypoint = waypoints[currWaypointIdx];\n'
+    '\t\twaypointsParent.DetachChildren();\n'
+    '\t}\n'
+    '\n'
+    '\tvoid Update ()\n'
+    '\t{\n'
+    '\t\tif (moveSpeed != 0)\n'
+    '\t\t{\n'
+    '\t\t\tVector2 newPosition = Vector3.Lerp(trs.position, (Vector2) currWaypoint.position, moveSpeed * Time.deltaTime * (1f / Vector2.Distance(trs.position, (Vector2) currWaypoint.position)));\n'
+    '\t\t\tif (!float.IsNaN(newPosition.x))\n'
+    '\t\t\t\ttrs.position = newPosition;\n'
+    '\t\t}\n'
+    '\t\tif (rotateSpeed != 0)\n'
+    '\t\t\ttrs.rotation = Quaternion.Slerp(trs.rotation, currWaypoint.rotation, rotateSpeed * Time.deltaTime * (1f / Quaternion.Angle(trs.rotation, currWaypoint.rotation)));\n'
+    '\t\tif (((Vector2) trs.position == (Vector2) currWaypoint.position || moveSpeed == 0) && (trs.eulerAngles == currWaypoint.eulerAngles || rotateSpeed == 0))\n'
+    '\t\t\tOnReachedWaypoint ();\n'
+    '\t}\n'
+    '\t\n'
+    '\tvoid OnReachedWaypoint ()\n'
+    '\t{\n'
+    '\t\tif (isBacktracking)\n'
+    '\t\t\tcurrWaypointIdx --;\n'
+    '\t\telse\n'
+    '\t\t\tcurrWaypointIdx ++;\n'
+    '\t\tswitch (followType)\n'
+    '\t\t{\n'
+    '\t\t\tcase FollowType.Once:\n'
+    '\t\t\t\tif (currWaypointIdx == waypoints.Length)\n'
+    '\t\t\t\t\tcurrWaypointIdx = waypoints.Length - 1;\n'
+    '\t\t\t\telse if (currWaypointIdx == -1)\n'
+    '\t\t\t\t\tcurrWaypointIdx = 0;\n'
+    '\t\t\t\tbreak;\n'
+    '\t\t\tcase FollowType.Loop:\n'
+    '\t\t\t\tif (currWaypointIdx == waypoints.Length)\n'
+    '\t\t\t\t\tcurrWaypointIdx = 0;\n'
+    '\t\t\t\telse if (currWaypointIdx == -1)\n'
+    '\t\t\t\t\tcurrWaypointIdx = waypoints.Length - 1;\n'
+    '\t\t\t\tbreak;\n'
+    '\t\t\tcase FollowType.PingPong:\n'
+    '\t\t\t\tif (currWaypointIdx == waypoints.Length)\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tcurrWaypointIdx -= 2;\n'
+    '\t\t\t\t\tisBacktracking = !isBacktracking;\n'
+    '\t\t\t\t}\n'
+    '\t\t\t\telse if (currWaypointIdx == -1)\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tcurrWaypointIdx += 2;\n'
+    '\t\t\t\t\tisBacktracking = !isBacktracking;\n'
+    '\t\t\t\t}\n'
+    '\t\t\t\tbreak;\n'
+    '\t\t}\n'
+    '\t\tcurrWaypoint = waypoints[currWaypointIdx];\n'
+    '\t}\n'
+    '\n'
+    '\tpublic enum FollowType\n'
+    '\t{\n'
+    '\t\tOnce,\n'
+    '\t\tLoop,\n'
+    '\t\tPingPong\n'
+    '\t}\n'
+    '}\n'
+)
+
+
 class TestBox2DPhysicsBackend(unittest.TestCase):
     """2D physics is Box2D-Packed; OnCollisionEnter/Stay/Exit2D still come
     from unity_pack after the step. See box2d_unity.py in the Box2D-Packed
@@ -14934,15 +15019,375 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertGreater(y, -2.5)
 
     @needs_box2d
+    def test_collision2d_contact_normal_point_and_velocity(self):
+        """GetContact(0).normal points from the other collider to this one
+        and .point lies on the touching surface; a handler may forward to
+        another; Rigidbody2D.linearVelocity reads the body's velocity."""
+        root = self._project()
+        with open(os.path.join(root, "Assets", "Scripts", "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    public float ny;\n"
+                "    public float py;\n"
+                "    public int count;\n"
+                "    public float vy;\n"
+                "    Rigidbody2D rb;\n"
+                "    void Start() { rb = GetComponent<Rigidbody2D>(); }\n"
+                "    void Update() { vy = rb.linearVelocity.y; }\n"
+                "    void OnCollisionEnter2D(Collision2D coll) {\n"
+                "        ContactPoint2D c = coll.GetContact(0);\n"
+                "        ny = c.normal.y;\n"
+                "        py = c.point.y;\n"
+                "        count = coll.contactCount;\n"
+                "    }\n"
+                "    void OnCollisionStay2D(Collision2D coll) {\n"
+                "        OnCollisionEnter2D(coll);\n"
+                "    }\n"
+                "}\n")
+        d = tempfile.mkdtemp(prefix="upack-b2d-contact-")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        self.assertNotIn("CS8000", err.getvalue())
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include <stdio.h>\n"
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { float ny; float py; int count; float vy; } Ball;\n"
+                "extern Ball _Ball_inst_array[];\n"
+                "int main(void) {\n"
+                "  int i; float fall = 0.f;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 20; i = i + 1) engine_tick();\n"
+                "  fall = _Ball_inst_array[0].vy;\n"
+                "  for (i = 0; i < 280; i = i + 1) engine_tick();\n"
+                "  printf(\"%.3f %.3f %d %.3f %.3f\\n\", _Ball_inst_array[0].ny,\n"
+                "         _Ball_inst_array[0].py, _Ball_inst_array[0].count,\n"
+                "         fall, _Ball_inst_array[0].vy);\n"
+                "  return 0;\n"
+                "}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        ny, py, count, fall, vy = run.stdout.split()
+        self.assertAlmostEqual(float(ny), 1.0, delta=0.01)
+        self.assertAlmostEqual(float(py), -2.0, delta=0.05)
+        self.assertEqual(int(count), 1)
+        self.assertLess(float(fall), -2.0)
+        self.assertAlmostEqual(float(vy), 0.0, delta=0.05)
+
+    @needs_box2d
+    def test_capsule_collider2d_rests_on_its_bottom(self):
+        """CapsuleCollider2D: vertical 1x2 rests with its center 1 above the
+        ground; horizontal 1x1 (no longer than wide) is a circle of 0.5."""
+        for direction, size, want in (("0", "{x: 1, y: 2}", -1.0),
+                                      ("1", "{x: 1, y: 1}", -1.5)):
+            root = self._project()
+            path = os.path.join(root, "Assets", "Scenes", "S.unity")
+            with open(path) as f:
+                text = f.read()
+            text = text.replace(
+                "--- !u!58 &13\nCircleCollider2D:",
+                "--- !u!70 &13\nCapsuleCollider2D:").replace(
+                "  m_Radius: 0.5\n",
+                "  m_Size: %s\n  m_Direction: %s\n" % (size, direction))
+            with open(path, "w") as f:
+                f.write(text)
+            with open(os.path.join(root, "Assets", "Scripts", "Ball.cs"),
+                      "w") as f:
+                f.write("using UnityEngine;\n"
+                        "public class Ball : MonoBehaviour {\n"
+                        "    public int enters;\n    public int exits;\n}\n")
+            d = tempfile.mkdtemp(prefix="upack-b2d-capsule-")
+            with contextlib.redirect_stderr(io.StringIO()):
+                plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT,
+                                       force=True)
+                unity_pack.build_player_executable(
+                    d, plan.get("product_name") or "Player",
+                    box2d_root=_BOX2D_ROOT)
+            host = os.path.join(d, "host.c")
+            with open(host, "w") as f:
+                f.write(
+                    "#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float Time_deltaTime;\n"
+                    "extern float _Ball_pos[][2];\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    "  Time_deltaTime = 0.02f;\n"
+                    "  for (i = 0; i < 200; i = i + 1) engine_tick();\n"
+                    "  printf(\"%.4f\\n\", _Ball_pos[0][1]);\n"
+                    "  return 0;\n"
+                    "}\n")
+            exe = os.path.join(d, "host")
+            r = subprocess.run(
+                [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+                 os.path.join(d, "data.o"),
+                 os.path.join(d, "physics_box2d.o"),
+                 os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True)
+            self.assertAlmostEqual(float(run.stdout), want, delta=0.02,
+                                   msg="m_Direction %s" % direction)
+
+    @needs_box2d
+    def test_transform_field_local_scale_write(self):
+        """`trs.localScale = new Vector3(..)` on a Transform field sets the
+        referenced object's scale (not a RectTransform)."""
+        root = self._project()
+        with open(os.path.join(root, "Assets", "Scripts", "Ball.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Ball : MonoBehaviour {\n"
+                    "    public int enters;\n    public int exits;\n"
+                    "    public Transform trs;\n"
+                    "    void Update() {\n"
+                    "        trs.localScale = new Vector3(Mathf.Sign(-3f), 2, 1);\n"
+                    "    }\n}\n")
+        path = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(text.replace("  enters: 0\n", "  enters: 0\n"
+                                 "  trs: {fileID: 11}\n"))
+        d = tempfile.mkdtemp(prefix="upack-b2d-scale-")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        self.assertNotIn("CS8000", err.getvalue())
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float _Ball_scale_x[], _Ball_scale_y[];\n"
+                    "int main(void) {\n"
+                    "  engine_tick();\n"
+                    "  printf(\"%g %g\\n\", _Ball_scale_x[0], _Ball_scale_y[0]);\n"
+                    "  return 0;\n}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.stdout.split(), ["-1", "2"])
+
+    @needs_box2d
+    def test_waypoint_follower_carries_static_child_collider(self):
+        """FollowWaypoints (Platformer): Transform[] of plain Transforms,
+        DetachChildren, handle position/rotation, nested enum. The Ground
+        collider, a child of the mover, is where the ball comes to rest."""
+        root = self._project()
+        scripts = os.path.join(root, "Assets", "Scripts")
+        with open(os.path.join(scripts, "FollowWaypoints.cs"), "w") as f:
+            f.write(_FOLLOW_WAYPOINTS_CS)
+        with open(os.path.join(scripts, "FollowWaypoints.cs.meta"), "w") as f:
+            f.write("guid: b2df0110000000000000000000000a0a\n")
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Ball : MonoBehaviour {\n"
+                    "    public int enters;\n    public int exits;\n}\n")
+        path = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(path) as f:
+            text = f.read()
+        text = text.replace(
+            "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n",
+            "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n"
+            "  m_Father: {fileID: 21}\n")
+
+        def plain(go, xf, name, father, y):
+            return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_LocalPosition: {x: 0, y: %s, z: 0}\n"
+                    "  m_Father: {fileID: %d}\n" % (go, name, xf, xf, go, y,
+                                                     father))
+        text += (
+            "--- !u!1 &20\nGameObject:\n  m_Name: Mover\n"
+            "  m_Component:\n  - component: {fileID: 21}\n"
+            "  - component: {fileID: 22}\n"
+            "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "--- !u!114 &22\nMonoBehaviour:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: b2df0110000000000000000000000a0a}\n"
+            "  trs: {fileID: 21}\n  waypointsParent: {fileID: 31}\n"
+            "  moveSpeed: 5\n  rotateSpeed: 0\n  currWaypointIdx: 0\n"
+            "  isBacktracking: 0\n  waypoints:\n"
+            "  - {fileID: 41}\n  - {fileID: 51}\n  followType: 0\n"
+            + plain(30, 31, "Waypoints Parent", 21, 0)
+            + plain(40, 41, "Waypoint", 31, 0)
+            + plain(50, 51, "Waypoint (1)", 31, 1))
+        with open(path, "w") as f:
+            f.write(text)
+        d = tempfile.mkdtemp(prefix="upack-b2d-follow-")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        self.assertNotIn("CS8000", err.getvalue())
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float Time_deltaTime;\n"
+                    "extern float _Ball_pos[][2];\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    "  Time_deltaTime = 0.02f;\n"
+                    "  for (i = 0; i < 200; i = i + 1) engine_tick();\n"
+                    "  printf(\"%.4f\\n\", _Ball_pos[0][1]);\n"
+                    "  return 0;\n}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        # Ground rose 1 (to the second waypoint): top -1, ball center -0.5.
+        self.assertAlmostEqual(float(run.stdout), -0.5, delta=0.02)
+
+    @needs_box2d
     def test_box2d_injected_matches_standard(self):
         """Contact markers instead of event arrays: identical results."""
         self.assertEqual(self._run(inject=True), self._run(inject=False))
 
 
+class TestStrippedPrefabInstance(unittest.TestCase):
+    """A PrefabInstance the scene keeps a stripped Transform stub for (because
+    a scene object is parented under it) is placed like any other."""
+
+    def test_child_under_stripped_stub_is_placed(self):
+        d = tempfile.mkdtemp(prefix="upack-stripped-")
+        prefab = os.path.join(d, "Mover.prefab")
+        with open(prefab, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &100\nGameObject:\n  m_Name: Mover\n"
+                    "  m_Component:\n  - component: {fileID: 101}\n"
+                    "  - component: {fileID: 102}\n"
+                    "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "  m_Father: {fileID: 0}\n"
+                    "--- !u!61 &102\nBoxCollider2D:\n"
+                    "  m_GameObject: {fileID: 100}\n")
+        scene = (
+            "%YAML 1.1\n"
+            "--- !u!1001 &5\nPrefabInstance:\n  m_Modification:\n"
+            "    m_TransformParent: {fileID: 0}\n    m_Modifications:\n"
+            "    - target: {fileID: 101, guid: aa, type: 3}\n"
+            "      propertyPath: m_LocalPosition.x\n      value: 17\n"
+            "      objectReference: {fileID: 0}\n"
+            "  m_SourcePrefab: {fileID: 100100000, guid: aa, type: 3}\n"
+            "--- !u!4 &6 stripped\nTransform:\n"
+            "  m_CorrespondingSourceObject: {fileID: 101, guid: aa, type: 3}\n"
+            "  m_PrefabInstance: {fileID: 5}\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Child\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+            "  m_Father: {fileID: 6}\n"
+            "--- !u!61 &12\nBoxCollider2D:\n  m_GameObject: {fileID: 10}\n")
+        text = unity_pack._expand_unstripped_prefab_instances(
+            scene, {"aa": prefab})
+        self.assertNotIn("stripped", text)
+        objs, _l, _c, _h = unity_pack.parse_unity_yaml(text)
+        pos = {o["name"]: o["pos"][0] for o in objs}
+        self.assertEqual(pos, {"Mover": 17.0, "Child": 18.0})
+
+
+class TestProjectPhysicsSettings(unittest.TestCase):
+    """Physics2D / Physics gravity and Fixed Timestep come from ProjectSettings."""
+
+    def _root(self, time_manager):
+        root = tempfile.mkdtemp(prefix="upack-physset-")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        for name, body in (
+                ("Physics2DSettings.asset",
+                 "Physics2DSettings:\n  m_Gravity: {x: 1.5, y: -25}\n"),
+                ("DynamicsManager.asset",
+                 "PhysicsManager:\n  m_Gravity: {x: 0, y: -3, z: 2}\n"),
+                ("TimeManager.asset", time_manager)):
+            with open(os.path.join(ps, name), "w") as f:
+                f.write(body)
+        return root
+
+    def test_float_and_rational_timestep(self):
+        s = unity_pack.unity_physics_settings(
+            self._root("TimeManager:\n  Fixed Timestep: 0.0125\n"))
+        self.assertEqual(s["gravity2d"], (1.5, -25.0))
+        self.assertEqual(s["gravity3d"], (0.0, -3.0, 2.0))
+        self.assertEqual(s["fixed_dt"], 0.0125)
+        s = unity_pack.unity_physics_settings(self._root(
+            "TimeManager:\n  Fixed Timestep:\n    m_Count: 1411199\n"
+            "    m_Rate:\n      m_Denominator: 1\n"
+            "      m_Numerator: 141120000\n"))
+        self.assertAlmostEqual(s["fixed_dt"], 0.01, places=6)
+        self.assertEqual(
+            unity_pack.unity_physics_settings(tempfile.mkdtemp()),
+            {"gravity2d": (0.0, -9.81), "gravity3d": (0.0, -9.81, 0.0),
+             "fixed_dt": 0.02})
+
+    @needs_box2d
+    def test_packed_gravity_is_authored(self):
+        root = TestBox2DPhysicsBackend()._project()
+        shutil.copytree(
+            os.path.join(self._root("TimeManager:\n  Fixed Timestep: 0.01\n"),
+                         "ProjectSettings"),
+            os.path.join(root, "ProjectSettings"))
+        d = tempfile.mkdtemp(prefix="upack-physset-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("float Physics2D_gravity_x = 1.5f;", data)
+        self.assertIn("float Physics2D_gravity_y = -25.0f;", data)
+        self.assertIn("float Time_fixedDeltaTime = 0.01f;", data)
+
+
 class TestSceneManager(unittest.TestCase):
     """Every enabled build scene is packed and SceneManager swaps them."""
 
-    def _project(self, scripts, scenes):
+    @staticmethod
+    def _go_yaml(gi, go_name, guid, fields=()):
+        go, xf, mb = 3 * gi + 1, 3 * gi + 2, 3 * gi + 3
+        return [
+            "--- !u!1 &%d" % go, "GameObject:",
+            "  m_Name: %s" % go_name, "  m_IsActive: 1",
+            "  m_Component:",
+            "  - component: {fileID: %d}" % xf,
+            "  - component: {fileID: %d}" % mb,
+            "--- !u!4 &%d" % xf, "Transform:",
+            "  m_GameObject: {fileID: %d}" % go,
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}",
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}",
+            "  m_LocalScale: {x: 1, y: 1, z: 1}",
+            "  m_Father: {fileID: 0}",
+            "--- !u!114 &%d" % mb, "MonoBehaviour:",
+            "  m_GameObject: {fileID: %d}" % go,
+            "  m_Script: {fileID: 11500000, guid: %s, type: 3}" % guid,
+        ] + ["  %s: %s" % kv for kv in fields]
+
+    def _project(self, scripts, scenes, prefabs=None):
+        """*scenes* ``[(name, gos)]``: a go is ``(name, class)`` or
+        ``("prefab", prefab name, [(source fileID, path, value)])`` -- a
+        PrefabInstance of *prefabs* ``{name: (go name, class, fields)}``."""
         root = tempfile.mkdtemp(prefix="upack-scenes-")
         self.addCleanup(shutil.rmtree, root, True)
         for sub in ("Assets/Scripts", "Assets/Scenes", "ProjectSettings"):
@@ -14955,28 +15400,36 @@ class TestSceneManager(unittest.TestCase):
                 f.write(src)
             with open(path + ".meta", "w") as f:
                 f.write("guid: %s\n" % guids[cls])
+        prefab_guids = {}
+        for i, (pname, (go_name, cls, fields)) in enumerate(
+                sorted((prefabs or {}).items())):
+            prefab_guids[pname] = ("%02x" % (i + 0x51)) * 16
+            path = os.path.join(root, "Assets", pname + ".prefab")
+            with open(path, "w") as f:
+                f.write("\n".join(["%YAML 1.1"] + self._go_yaml(
+                    0, go_name, guids[cls], fields)) + "\n")
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % prefab_guids[pname])
         build = []
         for si, (sname, gos) in enumerate(scenes):
             out = ["%YAML 1.1"]
-            for gi, (go_name, cls) in enumerate(gos):
-                go, xf, mb = 3 * gi + 1, 3 * gi + 2, 3 * gi + 3
-                out += [
-                    "--- !u!1 &%d" % go, "GameObject:",
-                    "  m_Name: %s" % go_name, "  m_IsActive: 1",
-                    "  m_Component:",
-                    "  - component: {fileID: %d}" % xf,
-                    "  - component: {fileID: %d}" % mb,
-                    "--- !u!4 &%d" % xf, "Transform:",
-                    "  m_GameObject: {fileID: %d}" % go,
-                    "  m_LocalPosition: {x: 0, y: 0, z: 0}",
-                    "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}",
-                    "  m_LocalScale: {x: 1, y: 1, z: 1}",
-                    "  m_Father: {fileID: 0}",
-                    "--- !u!114 &%d" % mb, "MonoBehaviour:",
-                    "  m_GameObject: {fileID: %d}" % go,
-                    "  m_Script: {fileID: 11500000, guid: %s, type: 3}"
-                    % guids[cls],
-                ]
+            for gi, entry in enumerate(gos):
+                if entry[0] != "prefab":
+                    out += self._go_yaml(gi, entry[0], guids[entry[1]])
+                    continue
+                pg = prefab_guids[entry[1]]
+                out += ["--- !u!1001 &%d" % (3 * gi + 1), "PrefabInstance:",
+                        "  m_Modification:",
+                        "    m_TransformParent: {fileID: 0}",
+                        "    m_Modifications:"]
+                for src, prop, value in entry[2]:
+                    out += ["    - target: {fileID: %d, guid: %s, type: 3}"
+                            % (src, pg),
+                            "      propertyPath: %s" % prop,
+                            "      value: %s" % value,
+                            "      objectReference: {fileID: 0}"]
+                out += ["  m_SourcePrefab: {fileID: 100100000, guid: %s,"
+                        " type: 3}" % pg]
             path = os.path.join(root, "Assets", "Scenes", sname + ".unity")
             with open(path, "w") as f:
                 f.write("\n".join(out) + "\n")
@@ -14991,9 +15444,9 @@ class TestSceneManager(unittest.TestCase):
                     "  m_Scenes:\n" + "".join(build))
         return root
 
-    def _frames(self, scripts, scenes, n):
+    def _frames(self, scripts, scenes, n, prefabs=None):
         """Pack, build and tick `n` frames; return each frame's log lines."""
-        root = self._project(scripts, scenes)
+        root = self._project(scripts, scenes, prefabs)
         d = tempfile.mkdtemp(prefix="upack-scenes-out-")
         self.addCleanup(shutil.rmtree, d, True)
         with contextlib.redirect_stderr(io.StringIO()):
@@ -15174,6 +15627,191 @@ class TestSceneManager(unittest.TestCase):
             {"Single": single, "_Manager": manager, "User": user},
             [("Only", [("M", "_Manager"), ("U", "User")])], 2)
         self.assertEqual(frames, [["total 102"], ["total 205"]])
+
+    @needs_cc
+    def test_each_scene_prefab_instance_is_its_own_object(self):
+        single = (
+            "using UnityEngine;\n"
+            "public class Single<T> : MonoBehaviour where T : MonoBehaviour {\n"
+            "    public static T instance;\n"
+            "    public static T Instance {\n"
+            "        get {\n"
+            "            if (instance == null) instance = FindObjectOfType<T>();\n"
+            "            return instance;\n"
+            "        }\n"
+            "    }\n}\n")
+        mgr = (
+            "using UnityEngine;\n"
+            "public class Mgr : Single<Mgr> {\n"
+            "    public int label;\n"
+            "    public void Hello(int who) {"
+            " Debug.Log(\"mgr \" + label + \" \" + who); }\n}\n")
+        driver = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Driver%s : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Mgr.Instance.Hello(%d + ticks);\n"
+            "        if (ticks == 2) SceneManager.LoadScene(%d);\n"
+            "    }\n}\n")
+        frames = self._frames(
+            {"Single": single, "Mgr": mgr, "DriverA": driver % ("A", 0, 1),
+             "DriverB": driver % ("B", 10, 0)},
+            [("Menu", [("A", "DriverA"), ("prefab", "Game", [(3, "label", 1)])]),
+             ("Level", [("prefab", "Game", [(3, "label", 2)]),
+                        ("B", "DriverB")])],
+            6, prefabs={"Game": ("Manager", "Mgr", [("label", 7)])})
+        self.assertEqual(frames, [
+            ["mgr 1 1"], ["mgr 1 2"],
+            ["mgr 2 11"], ["mgr 2 12"],
+            ["mgr 1 1"], ["mgr 1 2"],
+        ])
+
+    @needs_cc
+    def test_scene_made_only_of_prefab_instances(self):
+        ticker = (
+            "using UnityEngine;\n"
+            "public class Ticker : MonoBehaviour {\n"
+            "    public int label;\n"
+            "    void Update() { Debug.Log(\"tick \" + label); }\n}\n")
+        frames = self._frames(
+            {"Ticker": ticker},
+            [("Only", [("prefab", "T", [(3, "label", 4)]),
+                       ("prefab", "T", [])])],
+            1, prefabs={"T": ("Ticker", "Ticker", [("label", 9)])})
+        self.assertEqual(frames, [["tick 4", "tick 9"]])
+
+    @needs_cc
+    def test_value_of_unpacked_scrollbar_and_slider_compiles(self):
+        user = (
+            "using UnityEngine;\nusing UnityEngine.UI;\n"
+            "public class User : MonoBehaviour {\n"
+            "    public Scrollbar bar;\n    public Slider slider;\n"
+            "    void Update() {\n"
+            "        if (bar.value > 2f) bar.value = 0f;\n"
+            "        if (slider.value > 2f) slider.value = 0f;\n"
+            "    }\n}\n")
+        root = self._project(
+            {"User": user}, [("A", [("U", "User")]), ("B", [])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("Scrollbar_get_value(", engine)
+        self.assertIn("Slider_get_value(", engine)
+        subprocess.run(
+            [_CC, "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            check=True, capture_output=True)
+
+    def test_editor_only_prefab_instance_is_not_packed(self):
+        mgr = ("using UnityEngine;\n"
+               "public class Mgr : MonoBehaviour { public int label; }\n")
+        root = self._project(
+            {"Mgr": mgr},
+            [("Menu", [("prefab", "Game", [(1, "m_TagString", "EditorOnly")])]),
+             ("Level", [("prefab", "Game", [(3, "label", 2)])])],
+            prefabs={"Game": ("Manager", "Mgr", [("label", 7)])})
+        with contextlib.redirect_stderr(io.StringIO()):
+            assets = unity_pack._asset_guid_map(root)
+            guids = unity_pack._guid_map(root, asset_guids=assets)
+            objs = unity_pack._load_prefab_objects_for_types(
+                root, {"Mgr"}, guids, assets,
+                unity_pack._mb_typename_to_script(root, guids),
+                scenes=unity_pack._unity_scenes_to_pack(
+                    root, asset_guids=assets))
+        self.assertEqual([(o["class"], o.get("scene")) for o in objs],
+                         [("Mgr", 1)])
+
+    def test_unowned_call_target_never_binds_across_scenes(self):
+        from tools import unity_pack_ui
+        plan = {"classes": {
+            "Mgr": {"n": 2, "instances": [{"scene": 1}, {"scene": 2}]},
+            "Loose": {"n": 1, "instances": [{}]},
+        }}
+        scenes = unity_pack_ui._class_instance_scenes(plan)
+        self.assertEqual(unity_pack_ui._unowned_target_inst(scenes, "Mgr", 2), 1)
+        self.assertIsNone(unity_pack_ui._unowned_target_inst(scenes, "Mgr", 0))
+        self.assertEqual(
+            unity_pack_ui._unowned_target_inst(scenes, "Loose", 0), 0)
+        button = {"scene": 0, "ui_button": {"onclick": [
+            {"method": "Go", "target_class": "Mgr", "target_go": "99"}]}}
+        objs = [button, {"class": "Mgr", "scene": 1, "mb_ids": []}]
+        unity_pack._alias_onclick_mb_file_ids(objs)
+        self.assertEqual(objs[1]["mb_ids"], [])
+
+    @needs_cc
+    def test_player_prefs_properties_pick_the_scene_to_load(self):
+        prefs_ext = (
+            "using UnityEngine;\n"
+            "namespace Ext {\n"
+            "public static class PrefsExt {\n"
+            "    public static bool GetBool (string key, bool d = false)\n"
+            "    {\n"
+            "        return PlayerPrefs.GetInt(key, d.GetHashCode()) == 1;\n"
+            "    }\n"
+            "    public static void SetBool (string key, bool value)\n"
+            "    {\n"
+            "        PlayerPrefs.SetInt(key, value.GetHashCode());\n"
+            "    }\n"
+            "}\n}\n")
+        gate = (
+            "using UnityEngine;\nusing Ext;\n"
+            "using UnityEngine.SceneManagement;\n"
+            "public class Gate : MonoBehaviour {\n"
+            "    public static string Target {\n"
+            "        get { return PlayerPrefs.GetString(\"target\"); }\n"
+            "        set { PlayerPrefs.SetString(\"target\", value); }\n"
+            "    }\n"
+            "    public static bool Done {\n"
+            "        get { return PrefsExt.GetBool(\"done\"); }\n"
+            "        set { PrefsExt.SetBool(\"done\", value); }\n"
+            "    }\n"
+            "    void Update() {\n"
+            "        Debug.Log(\"gate \" + Target);\n"
+            "        Done = true;\n"
+            "        SceneManager.LoadScene(Target);\n"
+            "    }\n}\n")
+        menu = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Menu : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Debug.Log(\"menu \" + ticks);\n"
+            "        if (ticks == 1) Begin(\"Level\");\n"
+            "    }\n"
+            "    public void Begin(string sceneName) {\n"
+            "        Gate.Target = sceneName;\n"
+            "        if (Gate.Done) Load(sceneName);\n"
+            "        else Load(\"Gate\");\n"
+            "    }\n"
+            "    public void Load(string s) { SceneManager.LoadScene(s); }\n"
+            "    public void Load(int s) { SceneManager.LoadScene(s); }\n"
+            "}\n")
+        level = ("using UnityEngine;\n"
+                 "public class Level : MonoBehaviour {\n"
+                 "    void Update() { Debug.Log(\"level\"); }\n}\n")
+        home = tempfile.mkdtemp(prefix="upack-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            frames = self._frames(
+                {"PrefsExt": prefs_ext, "Gate": gate, "Menu": menu,
+                 "Level": level},
+                [("Menu", [("M", "Menu")]), ("Gate", [("G", "Gate")]),
+                 ("Level", [("L", "Level")])], 3)
+        self.assertEqual(frames, [["menu 1"], ["gate Level"], ["level"]])
+        saved = []
+        for dp, _dn, fns in os.walk(home):
+            saved += [os.path.join(dp, fn) for fn in fns if fn == "prefs.crust"]
+        self.assertEqual(len(saved), 1)
+        with open(saved[0]) as f:
+            self.assertEqual(sorted(f.read().splitlines()),
+                             ["1\tdone\t1", "3\ttarget\tLevel"])
 
     def test_static_getter_inlining_leaves_input_manager_flags(self):
         root = self._project(

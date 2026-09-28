@@ -716,6 +716,42 @@ def player_identity(root):
     return company, product
 
 
+def unity_physics_settings(root):
+    """Authored Physics2D.gravity, Physics.gravity, Time.fixedDeltaTime.
+
+    Unity defaults (0,-9.81), (0,-9.81,0), 0.02 when a setting is absent.
+    Fixed Timestep is a float in older assets, a rational (m_Count ticks at
+    m_Numerator / m_Denominator Hz) in newer ones.
+    """
+    ps = os.path.join(root, "ProjectSettings")
+    num = r"\s*([-0-9.eE+]+)"
+
+    def asset(name):
+        path = os.path.join(ps, name)
+        return _read(path) if os.path.isfile(path) else ""
+
+    out = {"gravity2d": (0.0, -9.81), "gravity3d": (0.0, -9.81, 0.0),
+           "fixed_dt": 0.02}
+    m = re.search(r"m_Gravity:\s*\{x:%s,\s*y:%s\}" % (num, num),
+                  asset("Physics2DSettings.asset"))
+    if m:
+        out["gravity2d"] = (float(m.group(1)), float(m.group(2)))
+    m = re.search(r"m_Gravity:\s*\{x:%s,\s*y:%s,\s*z:%s\}" % (num, num, num),
+                  asset("DynamicsManager.asset"))
+    if m:
+        out["gravity3d"] = tuple(float(m.group(k)) for k in (1, 2, 3))
+    tm = asset("TimeManager.asset")
+    m = re.search(r"(?m)^\s*Fixed Timestep:%s\s*$" % num, tm)
+    r = re.search(r"Fixed Timestep:\s*\n\s*m_Count:%s\s*\n\s*m_Rate:\s*\n"
+                  r"\s*m_Denominator:%s\s*\n\s*m_Numerator:%s" % (num, num, num),
+                  tm)
+    if m:
+        out["fixed_dt"] = float(m.group(1))
+    elif r and float(r.group(3)) > 0:
+        out["fixed_dt"] = (float(r.group(1)) * float(r.group(2))
+                           / float(r.group(3)))
+    return out
+
 
 def _apply_camera_script_view_to_cameras(cameras, objects):
     """Match CameraScript.HandleViewSize orthographicSize on the main camera."""
@@ -2200,7 +2236,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     Also imports authored Camera (!u!20), SpriteRenderer (!u!212), Canvas
     (!u!223), uGUI Image / Button (builtin MB), RectTransform anchors/size,
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
-    CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
+    CircleCollider2D (!u!58), CapsuleCollider2D (!u!70), BoxCollider (!u!65),
+    SphereCollider (!u!135),
     AudioSource (!u!82), Animation (!u!111), Animator (!u!95),
     PhysicsMaterial2D / PhysicMaterial, and AnimationClip / AnimatorController
     assets. Does not invent any of those — missing components stay missing.
@@ -2230,7 +2267,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         km = re.search(
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
-            r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
+            r"Rigidbody|BoxCollider2D|CircleCollider2D|CapsuleCollider2D|"
+            r"BoxCollider|"
             r"SphereCollider|Animation|Animator|Canvas|AudioSource):",
             block)
         if km:
@@ -2253,6 +2291,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "BoxCollider2D"
         elif type_id == "58":
             kind = "CircleCollider2D"
+        elif type_id == "70":
+            kind = "CapsuleCollider2D"
         elif type_id == "65":
             kind = "BoxCollider"
         elif type_id == "135":
@@ -2409,6 +2449,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if fid == "0":
                 continue
             rec.setdefault("object_refs", {})[key] = fid
+        # Object ref arrays: name:\n  - {fileID: N} ... (0 = null slot).
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- \{fileID:\s*-?\d+"
+                r"[^}\n]*\}[ \t]*\n?)+)", block):
+            if not fm.group(1).startswith("m_"):
+                rec.setdefault("object_ref_arrays", {})[fm.group(1)] = \
+                    re.findall(r"fileID:\s*(-?\d+)", fm.group(2))
         if kind == "Light":
             inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
             col = re.search(
@@ -2642,15 +2689,19 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "vel_z": float(vel.group(3)) if vel else 0.0,
                 "material_guid": _parse_material_guid(block),
             }
-        if kind == "BoxCollider2D":
+        if kind in ("BoxCollider2D", "CapsuleCollider2D"):
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
             off = re.search(
                 r"m_Offset:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
             sz = re.search(
                 r"m_Size:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            # CapsuleCollider2D m_Direction: 0 Vertical, 1 Horizontal.
+            dirn = re.search(r"(?m)^\s+m_Direction:\s*(\d+)", block)
             rec["collider2d"] = {
-                "kind": "box",
+                "kind": "box" if kind == "BoxCollider2D" else (
+                    "capsule_h" if dirn and dirn.group(1) == "1"
+                    else "capsule_v"),
                 "enabled": int(en.group(1)) if en else 1,
                 "is_trigger": int(trig.group(1)) if trig else 0,
                 "offset_x": float(off.group(1)) if off else 0.0,
@@ -2783,6 +2834,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
         if gm:
             mbs_by_go.setdefault(gm.group(1), []).append(rec)
+    # A plain Transform a script field names (waypoints) stays a packed row.
+    mb_ref_ids = {fid for mbs in mbs_by_go.values() for rec in mbs
+                  for fid in list((rec.get("object_refs") or {}).values())
+                  + [f for arr in (rec.get("object_ref_arrays") or {}).values()
+                     for f in arr]}
 
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
@@ -2809,6 +2865,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         script = None
         fields = {}
         object_refs = {}
+        object_ref_arrays = {}
         mb_ids = []
         vec2_fields = {}
         vec3_fields = {}
@@ -2853,6 +2910,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 mb_ids.append(str(k.get("file_id")))
                 fields.update(k.get("fields") or {})
                 object_refs.update(k.get("object_refs") or {})
+                object_ref_arrays.update(k.get("object_ref_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
                 g = k.get("guid")
@@ -2900,7 +2958,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
-            if k.get("kind") in ("BoxCollider2D", "CircleCollider2D") and k.get(
+            if k.get("kind") in ("BoxCollider2D", "CircleCollider2D",
+                                 "CapsuleCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
@@ -2972,7 +3031,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             col2d["oy"] = float(col2d.get("offset_y", 0.0)) * sy
             col2d["cos_z"] = math.cos(rz)
             col2d["sin_z"] = math.sin(rz)
-            if col2d.get("kind") == "box":
+            if col2d.get("kind") != "circle":
                 col2d["hw"] = abs(float(col2d.get("size_x", 1.0))) * sx * 0.5
                 col2d["hh"] = abs(float(col2d.get("size_y", 1.0))) * sy * 0.5
             else:
@@ -3135,7 +3194,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if (script is None and sprite is None and not has_ui_draw
                 and not rb2d and not rb3d and cam is None and not col2d
                 and not col3d and not player and not canvas
-                and (not has_mb or ui_scaffold_mb)):
+                and (not has_mb or ui_scaffold_mb)
+                and not (rect is None and xf_id is not None
+                         and {str(xf_id), go_fid} & mb_ref_ids)):
             # Plain RectTransform parents (layout containers without a
             # MonoBehaviour) must stay so ContentSizeFitter /
             # AspectRatioFitter / layout groups can read parent size.
@@ -3224,6 +3285,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "active": active,
             "fields": fields,
             "object_refs": object_refs,
+            "object_ref_arrays": object_ref_arrays,
             "mb_ids": mb_ids,
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
@@ -3624,32 +3686,37 @@ def _alias_onclick_mb_file_ids(objects):
     instance of the annotated target class so ``_mb_index`` resolves the call.
     """
     by_class = {}
+    owned = set()
     for o in objects or []:
         by_class.setdefault(o.get("class"), []).append(o)
+        owned.update(str(m) for m in o.get("mb_ids") or [])
 
-    def _alias(calls):
+    def _alias(calls, scene):
         for c in calls or []:
             if c.get("method") == "SetActive":
                 continue
             cls = c.get("target_class")
             tid = str(c.get("target_go") or "")
-            if not cls or not tid or tid == "0":
+            if not cls or not tid or tid == "0" or tid in owned:
                 continue
-            for inst in by_class.get(cls) or []:
-                mbs = inst.setdefault("mb_ids", [])
-                if tid not in mbs:
-                    mbs.append(tid)
+            insts = by_class.get(cls) or []
+            same = [i for i in insts if int(i.get("scene") or 0) == scene]
+            unplaced = [i for i in insts if "scene" not in i]
+            for inst in same or unplaced:
+                inst.setdefault("mb_ids", []).append(tid)
+                owned.add(tid)
                 break
 
     for o in objects or []:
-        _alias((o.get("ui_button") or {}).get("onclick"))
-        _alias((o.get("ui_slider") or {}).get("on_value_changed"))
-        _alias((o.get("ui_scrollbar") or {}).get("on_value_changed"))
-        _alias((o.get("ui_toggle") or {}).get("on_value_changed"))
+        sc = int(o.get("scene") or 0)
+        _alias((o.get("ui_button") or {}).get("onclick"), sc)
+        _alias((o.get("ui_slider") or {}).get("on_value_changed"), sc)
+        _alias((o.get("ui_scrollbar") or {}).get("on_value_changed"), sc)
+        _alias((o.get("ui_toggle") or {}).get("on_value_changed"), sc)
         et = o.get("ui_eventtrigger")
         if et:
             for d in et.get("delegates") or []:
-                _alias(d.get("calls"))
+                _alias(d.get("calls"), sc)
 
 
 
@@ -4900,6 +4967,67 @@ def _resolve_go_field_refs(plan):
                 row.append(go)
             refs[(cname, f["name"])] = row
     plan["go_field_refs"] = refs
+    # Authored `T[]` refs: GO indices for handle types, instance indices for
+    # a packed class; an empty or unresolved slot is null (-1).
+    mb_inst = {}
+    for cname, cl in plan["classes"].items():
+        for k, o in enumerate(cl.get("instances") or []):
+            for fid in o.get("mb_ids") or []:
+                mb_inst[(cname, str(fid))] = k
+    seeds = {}
+    for cname, cl in plan["classes"].items():
+        for f in cl.get("ref_array_fields") or []:
+            elem = _array_elem_name(f.get("ty") or "")
+            rows = []
+            for o in cl.get("instances") or []:
+                row = []
+                for fid in (o.get("object_ref_arrays") or {}).get(
+                        f["name"]) or []:
+                    if elem in _GO_HANDLE_FIELD_TYPES:
+                        row.append(next((int(t[fid]) for t in (
+                            xf_to_go, go_by_id, comp_to_go) if fid in t), -1))
+                    else:
+                        row.append(mb_inst.get((elem, fid), -1))
+                rows.append(row)
+            if any(rows) and (elem in _GO_HANDLE_FIELD_TYPES
+                              or elem in plan["classes"]):
+                seeds.setdefault(cname, {})[f["name"]] = rows
+    plan["ref_array_seeds"] = seeds
+    _promote_handle_rot_classes(plan)
+
+
+def _promote_handle_rot_classes(plan):
+    """Rows a script's `Transform` handle reads / writes rotation through get
+    live rotation tables (seeded from their authored rotation)."""
+    go_cls = {int(o["go_index"]): cname
+              for cname, cl in plan["classes"].items()
+              for o in cl.get("instances") or []
+              if o.get("go_index") is not None}
+    live = set(plan.get("live_rot_classes") or [])
+    for cname, cl in plan["classes"].items():
+        try:
+            with open(cl.get("script_path") or "", encoding="utf-8",
+                      errors="replace") as f:
+                src = cs2cpp._blank(f.read())
+        except OSError:
+            continue
+        names = set(re.findall(r"(?<![\w.])Transform(?:\[\])?\s+(\w+)\s*[;=,)]",
+                               src))
+        used = {n for n in names if re.search(
+            r"(?<![\w.])%s\s*\.\s*(?:rotation|eulerAngles)\b" % re.escape(n),
+            src)}
+        if not used:
+            continue
+        plan["handle_rot"] = True
+        gos = set()
+        for f in cl.get("fields") or []:
+            if f.get("ty") == "Transform":
+                gos |= set((plan.get("go_field_refs") or {}).get(
+                    (cname, f["name"])) or [])
+        for rows in (plan["ref_array_seeds"].get(cname) or {}).values():
+            gos |= {g for r in rows for g in r}
+        live |= {go_cls[g] for g in gos if g in go_cls}
+    plan["live_rot_classes"] = sorted(live)
 
 
 def _rewrite_extensions_set_world_scale(text, cl, plan):
@@ -4984,7 +5112,129 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
             "(%s), (%s), (%s))" % (
                 idn, fname, idn, fname, sx, sy, sz))
         i = after
+    text = "".join(out)
+
+    # field.localScale = new Vector3(x, y, z): _engine_set_world_scale writes
+    # the target's local scale table (the name is SetWorldScale's).
+    def _local_scale(m):
+        parts = _split_call_args(m.group(2))
+        if len(parts) < 2:
+            return m.group(0)
+        fname = m.group(1)
+        return ("_engine_set_world_scale(_%s_%s_target_class[i], "
+                "(unsigned)_%s_%s_target_inst[i], (%s), (%s), (%s));" % (
+                    idn, fname, idn, fname, parts[0], parts[1],
+                    parts[2] if len(parts) > 2 else "1.f"))
+
+    return cs2cpp.code_sub(
+        r"(?<![.\w])(%s)\s*\.\s*localScale\s*=\s*new\s+Vector[23]\s*"
+        r"\((.*?)\)\s*;" % "|".join(re.escape(f) for f in transform_fields),
+        _local_scale, text, flags=re.DOTALL)
+
+
+def _uses_collision2d_contacts(analyses):
+    """Some OnCollision*2D handler reads `coll.GetContact(..)` /
+    `coll.contactCount`."""
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            for m in c.get("methods") or []:
+                arg = _collision2d_arg_name(m.get("args") or "")
+                if arg and re.search(
+                        r"(?<![\w.])%s\s*\.\s*(?:GetContact\s*\(|contactCount\b)"
+                        % re.escape(arg), m.get("body") or ""):
+                    return True
+    return False
+
+
+def _lower_collision2d_contacts(text, coll):
+    """`coll.GetContact(k)` / `coll.contactCount` on the handler's Collision2D."""
+    if not coll:
+        return text
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])%s\s*\.\s*GetContact\s*\(" % re.escape(coll),
+        "Collision2D_GetContact(%s, " % coll, text)
+    return cs2cpp.code_sub(
+        r"(?<![\w.])%s\s*\.\s*contactCount\b" % re.escape(coll),
+        "Collision2D_contactCount(%s)" % coll, text)
+
+
+def _rewrite_collision2d_handler_calls(text, cl, plan, coll):
+    """`OnCollisionEnter2D(coll)` from another OnCollision*2D handler of the
+    same class, passing on its own Collision2D."""
+    if not coll:
+        return text
+    idn = _c_ident(cl["name"])
+    methods = [m for _c, m in (plan.get("_methods_by") or {}).get(
+        cl["name"], [])] + list(cl.get("methods") or [])
+    names = {m["name"] for m in methods
+             if m.get("name") in _COLLISION2D_MSGS
+             and _collision2d_arg_name(m.get("args") or "")}
+    for name in sorted(names):
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\(\s*%s\s*\)"
+            % (re.escape(name), re.escape(coll)),
+            "%s_%s(i, %s)" % (idn, name, coll), text)
+    return text
+
+
+def _rewrite_vector2_ctor_normalized(text):
+    """Members of a ``Vector2_make(a, b)`` value: ``.normalized`` →
+    ``Vector2_normalized(..)``, then ``.x`` / ``.y`` → ``Vector2_x(..)``
+    (C cannot take a member of a call result in the crust subset)."""
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])Vector2_make\s*\(", text):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        _args, after = got
+        expr, end = text[m.start():after], after
+        norm = re.match(r"\s*\.\s*normalized\b", text[end:])
+        if norm:
+            expr, end = "Vector2_normalized(%s)" % expr, end + norm.end()
+        axis = re.match(r"\s*\.\s*([xy])\b", text[end:])
+        if axis:
+            expr, end = "Vector2_%s(%s)" % (axis.group(1), expr), \
+                end + axis.end()
+        if end == after:
+            continue
+        out.append(text[pos:m.start()])
+        out.append(expr)
+        pos = end
+    out.append(text[pos:])
     return "".join(out)
+
+
+_WORLD_POS_PROTO = ("static void _engine_world_pos(int class_id, unsigned inst,"
+                    " float *x, float *y, float *z, int depth);")
+
+
+def _rewrite_transform_field_position(text, cl, plan, site=None):
+    """``trs.position.x`` on an authored Transform field → the world position
+    of the object it references (a missing reference reads 0)."""
+    targets = plan.get("transform_field_targets") or {}
+    idn = _c_ident(cl["name"])
+    for f in cl.get("fields") or []:
+        fname = f.get("name")
+        if f.get("ty") != "Transform" or (cl["name"], fname) not in targets:
+            continue
+        pat = (r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*position\s*\.\s*([xyz])\b"
+               r"(?!\s*(?:=[^=]|\+=|-=|\*=|/=|\+\+|--))" % re.escape(fname))
+        if not re.search(pat, text):
+            continue
+        if site is not None:
+            site.setdefault("protos", set()).add(_WORLD_POS_PROTO)
+        text = cs2cpp.code_sub(
+            pat,
+            lambda m, fn=fname: (
+                "({ float _up_wx, _up_wy, _up_wz; "
+                "_engine_world_pos(_%s_%s_target_class[i], "
+                "(unsigned)_%s_%s_target_inst[i], "
+                "&_up_wx, &_up_wy, &_up_wz, 0); _up_w%s; })"
+                % (idn, fn, idn, fn, m.group(1))),
+            text)
+    return text
 
 
 def _class_id(plan, cname):
@@ -5456,6 +5706,14 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("transform.SetParent")
     if re.search(r"(?<![.\w])\w+\s*\.\s*SetParent\s*\(", scan):
         apis.add("transform.SetParent")
+    # DetachChildren is SetParent(null) per child; a Transform handle's
+    # position / rotation walks the same live hierarchy tables.
+    trs_names = set(re.findall(r"(?<![\w.])Transform\s+(\w+)\s*[;=,)]", scan))
+    if re.search(r"(?<![.\w])\w+\s*\.\s*DetachChildren\s*\(", scan) or any(
+            re.search(r"(?<![.\w])%s\s*\.\s*(?:position\b(?!\s*\.\s*[xyz]\b)"
+                      r"|rotation\b|eulerAngles\b)" % re.escape(n), scan)
+            for n in trs_names):
+        apis.add("transform.SetParent")
     if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*GetSiblingIndex\s*\(",
             scan):
@@ -5703,6 +5961,10 @@ def analyze_script(path, text=None, shallow=False):
             "methods": methods, "refs": refs,
             "properties": _property_names(bscan_m),
             "static_getters": cs2cpp.static_getter_exprs(
+                body_m, bscan_m,
+                [f["name"] for f in fields] + [mm["name"] for mm in methods]
+                + list(_property_names(bscan_m))),
+            "static_setters": cs2cpp.static_setter_stmts(
                 body_m, bscan_m,
                 [f["name"] for f in fields] + [mm["name"] for mm in methods]
                 + list(_property_names(bscan_m))),
@@ -6227,6 +6489,205 @@ def _collect_static_getters(analyses):
     return out
 
 
+def _collect_static_setters(analyses):
+    """``{class: {property: stmt}}`` from ``cs2cpp.static_setter_stmts``."""
+    out = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("static_setters"):
+                out.setdefault(c["name"], {}).update(c["static_setters"])
+    return out
+
+
+_STATIC_HELPERS = {}
+
+
+def _static_helper_methods():
+    """``{class: {method: (params, text, is_void)}}`` for the one-statement
+    static methods (``cs2cpp.static_method_exprs``) of the project's
+    ``static class``es -- helpers no scene names, so they are not analyzed."""
+    import tools.cpprust as cpprust
+    root = _TYPE_DECL_ROOT[0]
+    if not root:
+        return {}
+    got = _STATIC_HELPERS.get(root)
+    if got is not None:
+        return got
+    got, seen = {}, {}
+    head = re.compile(r"\bstatic\s+(?:partial\s+)?class\s+([A-Za-z_]\w*)[^{;]*\{")
+    field = re.compile(
+        r"(?m)^\s*(?:(?:public|private|protected|internal|static|readonly|"
+        r"const)\s+)+[\w.<>\[\],]+\s+(\w+)\s*[;=]")
+    for dp, _dn, fns in os.walk(os.path.join(root, "Assets")):
+        for fn in sorted(fns):
+            if not fn.endswith(".cs"):
+                continue
+            try:
+                with open(os.path.join(dp, fn), encoding="utf-8",
+                          errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if "static" not in text:
+                continue
+            bscan = cs2cpp._blank(text)
+            for m in head.finditer(bscan):
+                open_i = m.end() - 1
+                close = cpprust._match_brace(bscan, open_i)
+                if close is None:
+                    continue
+                body, bs = text[open_i + 1:close], bscan[open_i + 1:close]
+                cname = m.group(1)
+                seen[cname] = seen.get(cname, 0) + 1
+                meths = cs2cpp.static_method_exprs(body, bs, field.findall(bs))
+                if meths:
+                    got.setdefault(cname, {}).update(meths)
+    for cname, n in seen.items():
+        if n > 1:
+            got.pop(cname, None)
+    _STATIC_HELPERS[root] = got
+    return got
+
+
+_SIMPLE_ARG_RE = re.compile(
+    r'[A-Za-z_][\w.]*|"(?:[^"\\]|\\.)*"|-?(?:\d+\.?\d*|\.\d+)[fF]?')
+
+
+def _bind_params(text, params_str, args):
+    """*text* with each parameter of *params_str* replaced by its argument
+    from *args* (or its default), parenthesized; None when an argument is
+    missing or named, or a non-trivial argument would be evaluated twice."""
+    prms = cs2cpp.parse_params(params_str)
+    given = cs2cpp.split_call_args(args) if args.strip() else []
+    if len(given) > len(prms) or any(_NAMED_ARG_RE.match(g) for g in given):
+        return None
+    vals = []
+    for k, prm in enumerate(prms):
+        if k < len(given):
+            vals.append(given[k].strip())
+        elif prm.default is not None:
+            vals.append(prm.default.strip())
+        else:
+            return None
+    blank = cs2cpp._blank(text)
+    for prm, v in zip(prms, vals):
+        uses = len(re.findall(r"(?<![\w.])%s\b" % re.escape(prm.name), blank))
+        if uses > 1 and not _SIMPLE_ARG_RE.fullmatch(v):
+            return None
+    if not prms:
+        return text
+    for prm in prms:
+        hash_of = {"bool": "(%s ? 1 : 0)" % prm.name,
+                   "int": "(%s)" % prm.name}.get(prm.type)
+        if hash_of:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*GetHashCode\s*\(\s*\)" % re.escape(prm.name),
+                hash_of, text)
+    names = {p.name: "(%s)" % v for p, v in zip(prms, vals)}
+    return cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\b" % "|".join(re.escape(n) for n in names),
+        lambda m: names[m.group(1)], text)
+
+
+def _inline_static_helpers(text, plan):
+    """Calls of a one-statement static helper (``_static_helper_methods``)
+    become its body with the arguments bound: an expression in parentheses,
+    or -- for a ``void`` helper called as a statement -- the statement."""
+    classes = plan.get("classes") or {}
+    for cname, meths in sorted(_static_helper_methods().items()):
+        if cname in classes or cname not in text:
+            continue
+        for mname, (params, body, is_void) in sorted(meths.items()):
+            pat = re.compile(r"(?<![\w.])(?:\w+\s*\.\s*)*%s\s*\.\s*%s\s*\("
+                             % (re.escape(cname), re.escape(mname)))
+            out, pos = [], 0
+            while True:
+                m = pat.search(text, pos)
+                if not m:
+                    break
+                open_i = m.end() - 1
+                args, end = _match_call_args(text, open_i)
+                if end <= open_i:
+                    break
+                bound = _bind_params(body, params, args)
+                if bound is not None and is_void and not re.match(
+                        r"\s*;", text[end:]):
+                    bound = None
+                out.append(text[pos:m.start()])
+                if bound is None:
+                    out.append(text[m.start():end])
+                else:
+                    out.append(bound if is_void else "(%s)" % bound)
+                pos = end
+            out.append(text[pos:])
+            text = "".join(out)
+    return text
+
+
+def _inline_static_setters(text, cl, plan):
+    """``Type.Name = x;`` (or bare ``Name = x;`` inside *Type*) for an
+    inlinable static setter becomes the setter's statement on ``x``."""
+    for cname, props in (plan.get("static_setters") or {}).items():
+        for pname, stmt in props.items():
+            pats = [r"(?:[\w.]+\.)?%s\s*\.\s*%s" % (re.escape(cname),
+                                                   re.escape(pname))]
+            if cname == cl.get("name"):
+                pats.append(re.escape(pname))
+            for pat in pats:
+                def rep(m, stmt=stmt):
+                    bound = _bind_params(stmt, "object value", m.group(1))
+                    return m.group(0) if bound is None else bound + ";"
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])%s\s*=(?!=)\s*([^;]+);" % pat, rep, text)
+    return text
+
+
+_PLAYER_PREFS_DEFAULTS = {"GetString": '""', "GetInt": "0", "GetFloat": "0.f"}
+
+
+def _lower_player_prefs(text):
+    """UnityEngine.PlayerPrefs → the engine's persistent key/value store;
+    a missing default argument is Unity's ("" / 0 / 0f)."""
+    pat = re.compile(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?PlayerPrefs\s*\.\s*"
+                     r"(GetString|GetInt|GetFloat|SetString|SetInt|SetFloat|"
+                     r"HasKey|DeleteKey|DeleteAll|Save)\s*\(")
+    out, pos = [], 0
+    while True:
+        m = pat.search(text, pos)
+        if not m:
+            break
+        open_i = m.end() - 1
+        args, end = _match_call_args(text, open_i)
+        if end <= open_i:
+            break
+        args = _lower_player_prefs(args)
+        fn = m.group(1)
+        if fn in _PLAYER_PREFS_DEFAULTS and len(
+                cs2cpp.split_call_args(args) if args.strip() else []) == 1:
+            args = "%s, %s" % (args.strip(), _PLAYER_PREFS_DEFAULTS[fn])
+        out.append(text[pos:m.start()])
+        out.append("PlayerPrefs_%s(%s)" % (fn, args.strip()))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _uses_player_prefs(analyses):
+    """Whether a packed script -- or a static helper one names -- touches
+    PlayerPrefs."""
+    helpers = {c for c, ms in _static_helper_methods().items()
+               if any("PlayerPrefs" in t for _p, t, _v in ms.values())}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            text = c.get("file_text") or ""
+            if re.search(r"(?<![\w.])PlayerPrefs\s*\.", text):
+                return True
+            if any(re.search(r"(?<![\w.])%s\s*\." % re.escape(h), text)
+                   for h in helpers):
+                return True
+    return False
+
+
 def _inline_static_getters(text, cl, plan):
     """Reads of an inlinable static property (``Type.Name``, or bare ``Name``
     inside *Type*) become ``(expr)``. Assignments are left alone."""
@@ -6269,7 +6730,8 @@ def _lower_scene_manager(text, string_idents=(), scene_idents=()):
                 or re.fullmatch(r"\w+", a) is not None and a in strings
                 or re.search(r"\.\s*name\s*$|Scene_name\s*\(|\.\s*ToString\s*\(", a)
                 is not None
-                or re.search(r'"\s*\+|\+\s*"', a) is not None)
+                or re.search(r'"\s*\+|\+\s*"', a) is not None
+                or _c_expr_scalar_kind(a) == "s")
 
     def _calls(t, name_re, emit):
         out, pos = [], 0
@@ -6504,16 +6966,25 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 text)
         for f in ocl.get("ref_array_fields") or []:
             fname = f["name"]
-            text = cs2cpp.code_sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
-                % (re.escape(ocname), re.escape(fname)),
-                "%s_%s" % (oidn, fname),
-                text)
+            # cpprust lowers members of a vector name, not of `arr[i]`: the
+            # row's vector is bound to a reference, as instance lists are.
+            pat = (r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
+                   % (re.escape(ocname), re.escape(fname)))
+            alias = "_%s_%s_of" % (oidn, fname)
             if ocname == this:
-                text = cs2cpp.code_sub(
-                    r"(?<![\w.])%s\b" % re.escape(fname),
-                    "%s_%s" % (oidn, fname),
-                    text)
+                text = cs2cpp.code_sub(pat, fname, text)
+                pat, alias = (r"(?<![\w.])(?:this\s*\.\s*)?%s\b"
+                              % re.escape(fname)), fname
+                bind = "std::vector<int> &%s = %s_%s[i];" % (alias, oidn,
+                                                            fname)
+            else:
+                bind = "std::vector<int> &%s = %s_%s[%s];" % (
+                    alias, oidn, fname, inst)
+            if not re.search(pat, cs2cpp._blank(text)):
+                continue
+            text = cs2cpp.code_sub(pat + r"\s*\.\s*Length\b",
+                                   "(int)%s.size()" % alias, text)
+            text = bind + "\n" + cs2cpp.code_sub(pat, alias, text)
         # Other.Instance / Other.instance — including Other.Instance.unknownField
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
@@ -6759,7 +7230,7 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
              "GetComponentsInChildren is rewritten; bare GetComponents (no "
              "InChildren) stubs."),
             (r"(?<![\w._])[A-Z]\w*\.instances\b",
-             "Static array not lowered: `Cosmetic.instances.Length` / `[i]`."),
+             "Static `Type.instances` array not lowered."),
             (r"\w+\.gameObject\b",
              "Unity component handle still using `recv.gameObject`."),
             (r"\w+\.activeSelf\b",
@@ -6964,6 +7435,17 @@ def plan_layouts(objects, analyses, two_d=None):
         if any(o.get("rigidbody2d") or o.get("rigidbody")
                or o.get("anim_player") for o in insts):
             writes[cname] = True
+    # SetParent / DetachChildren / a Transform handle's position move the
+    # rows script fields name, and DetachChildren their children too.
+    if any("transform.SetParent" in (a.get("apis") or ()) for a in analyses):
+        refs = {str(f) for o in objects
+                for f in list((o.get("object_refs") or {}).values())
+                + [x for arr in (o.get("object_ref_arrays") or {}).values()
+                   for x in arr]}
+        for cname, insts in by_class.items():
+            if any({str(o.get("xf_id")), str(o.get("go_id")),
+                    str(o.get("father_id"))} & refs for o in insts):
+                writes[cname] = True
 
     # Live TRS consumers: TransformPoint / matrices / localPosition Vector3 fields.
     tp_classes = set()
@@ -7322,6 +7804,174 @@ def _emit_engine_anim_decls(
             p("extern const int _AnimSpriteKey_tex[%d];" % nsk)
             p("extern const float _AnimSpriteKey_hw[%d];" % nsk)
             p("extern const float _AnimSpriteKey_hh[%d];" % nsk)
+
+
+def _emit_engine_player_prefs(p, plan, want_log):
+    """emit_engine: UnityEngine.PlayerPrefs -- int / float / string values
+    by key, kept in ``prefs.crust`` under persistentDataPath (loaded on
+    first use, rewritten on every change)."""
+    if not plan.get("player_prefs"):
+        return
+    path = os.path.join(plan.get("persistent_data_path") or ".", "prefs.crust")
+    cap = 512
+    p("/* PlayerPrefs — persisted to persistentDataPath/prefs.crust */")
+    p("static const char _engine_pp_path[] = %s;" % _c_string(path))
+    p("static char _engine_pp_key[%d][128];" % cap)
+    p("static char _engine_pp_str[%d][256];" % cap)
+    p("static int _engine_pp_int[%d];" % cap)
+    p("static float _engine_pp_float[%d];" % cap)
+    p("static int _engine_pp_type[%d]; /* 1 int, 2 float, 3 string */" % cap)
+    p("static int _engine_pp_count;")
+    p("static int _engine_pp_loaded;")
+    p("static void _engine_pp_unescape(char *s) {")
+    p("    char *o = s;")
+    p("    while (*s) {")
+    p("        if (*s == '\\\\' && s[1]) {")
+    p("            s++;")
+    p("            *o++ = *s == 't' ? '\\t' : *s == 'n' ? '\\n' : *s;")
+    p("            s++;")
+    p("        } else {")
+    p("            *o++ = *s++;")
+    p("        }")
+    p("    }")
+    p("    *o = 0;")
+    p("}")
+    p("static void _engine_pp_put_escaped(FILE *f, const char *s) {")
+    p("    for (; *s; s++) {")
+    p("        if (*s == '\\t') fputs(\"\\\\t\", f);")
+    p("        else if (*s == '\\n') fputs(\"\\\\n\", f);")
+    p("        else if (*s == '\\\\') fputs(\"\\\\\\\\\", f);")
+    p("        else fputc(*s, f);")
+    p("    }")
+    p("}")
+    p("static void _engine_pp_load(void) {")
+    p("    FILE *f;")
+    p("    char line[512];")
+    p("    _engine_pp_loaded = 1;")
+    p("    f = fopen(_engine_pp_path, \"r\");")
+    p("    if (!f) return;")
+    p("    while (fgets(line, sizeof line, f) && _engine_pp_count < %d) {" % cap)
+    p("        char *key, *val, *nl;")
+    p("        int n = _engine_pp_count;")
+    p("        nl = strchr(line, '\\n');")
+    p("        if (nl) *nl = 0;")
+    p("        key = strchr(line, '\\t');")
+    p("        if (!key) continue;")
+    p("        *key++ = 0;")
+    p("        val = strchr(key, '\\t');")
+    p("        if (!val) continue;")
+    p("        *val++ = 0;")
+    p("        _engine_pp_unescape(key);")
+    p("        _engine_pp_unescape(val);")
+    p("        snprintf(_engine_pp_key[n], sizeof _engine_pp_key[0], \"%s\", key);")
+    p("        _engine_pp_type[n] = atoi(line);")
+    p("        if (_engine_pp_type[n] == 1) _engine_pp_int[n] = atoi(val);")
+    p("        else if (_engine_pp_type[n] == 2)"
+      " sscanf(val, \"%f\", &_engine_pp_float[n]);")
+    p("        else if (_engine_pp_type[n] == 3)")
+    p("            snprintf(_engine_pp_str[n], sizeof _engine_pp_str[0],"
+      " \"%s\", val);")
+    p("        else continue;")
+    p("        _engine_pp_count = n + 1;")
+    p("    }")
+    p("    fclose(f);")
+    p("}")
+    p("static void PlayerPrefs_Save(void) {")
+    p("    FILE *f;")
+    p("    int n;")
+    if want_log:
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("    {")
+        p("        char dir[1024];")
+        p("        char *slash;")
+        p("        snprintf(dir, sizeof dir, \"%s\", _engine_pp_path);")
+        p("        slash = strrchr(dir, '/');")
+        p("        if (slash) { *slash = 0; _engine_mkdir_p(dir); }")
+        p("    }")
+        p("#endif")
+    p("    f = fopen(_engine_pp_path, \"w\");")
+    p("    if (!f) return;")
+    p("    for (n = 0; n < _engine_pp_count; n = n + 1) {")
+    p("        if (!_engine_pp_type[n]) continue;")
+    p("        fprintf(f, \"%d\\t\", _engine_pp_type[n]);")
+    p("        _engine_pp_put_escaped(f, _engine_pp_key[n]);")
+    p("        fputc('\\t', f);")
+    p("        if (_engine_pp_type[n] == 1) fprintf(f, \"%d\", _engine_pp_int[n]);")
+    p("        else if (_engine_pp_type[n] == 2)"
+      " fprintf(f, \"%.9g\", (double)_engine_pp_float[n]);")
+    p("        else _engine_pp_put_escaped(f, _engine_pp_str[n]);")
+    p("        fputc('\\n', f);")
+    p("    }")
+    p("    fclose(f);")
+    p("}")
+    p("static int _engine_pp_find(const char *key) {")
+    p("    int n;")
+    p("    if (!_engine_pp_loaded) _engine_pp_load();")
+    p("    if (!key) return -1;")
+    p("    for (n = 0; n < _engine_pp_count; n = n + 1)")
+    p("        if (_engine_pp_type[n] && strcmp(_engine_pp_key[n], key) == 0)")
+    p("            return n;")
+    p("    return -1;")
+    p("}")
+    p("static int _engine_pp_slot(const char *key, int type) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    if (n < 0) {")
+    p("        for (n = 0; n < _engine_pp_count; n = n + 1)")
+    p("            if (!_engine_pp_type[n]) break;")
+    p("        if (n >= %d) return -1;" % cap)
+    p("        if (n == _engine_pp_count) _engine_pp_count = n + 1;")
+    p("        snprintf(_engine_pp_key[n], sizeof _engine_pp_key[0], \"%s\","
+      " key ? key : \"\");")
+    p("    }")
+    p("    _engine_pp_type[n] = type;")
+    p("    return n;")
+    p("}")
+    p("static int PlayerPrefs_HasKey(const char *key) {")
+    p("    return _engine_pp_find(key) >= 0;")
+    p("}")
+    p("static int PlayerPrefs_GetInt(const char *key, int d) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    return n >= 0 && _engine_pp_type[n] == 1 ? _engine_pp_int[n] : d;")
+    p("}")
+    p("static float PlayerPrefs_GetFloat(const char *key, float d) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    return n >= 0 && _engine_pp_type[n] == 2 ? _engine_pp_float[n] : d;")
+    p("}")
+    p("static const char *PlayerPrefs_GetString(const char *key, const char *d) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    return n >= 0 && _engine_pp_type[n] == 3 ? _engine_pp_str[n] : d;")
+    p("}")
+    p("static void PlayerPrefs_SetInt(const char *key, int v) {")
+    p("    int n = _engine_pp_slot(key, 1);")
+    p("    if (n < 0) return;")
+    p("    _engine_pp_int[n] = v;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_SetFloat(const char *key, float v) {")
+    p("    int n = _engine_pp_slot(key, 2);")
+    p("    if (n < 0) return;")
+    p("    _engine_pp_float[n] = v;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_SetString(const char *key, const char *v) {")
+    p("    int n = _engine_pp_slot(key, 3);")
+    p("    if (n < 0) return;")
+    p("    snprintf(_engine_pp_str[n], sizeof _engine_pp_str[0], \"%s\","
+      " v ? v : \"\");")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_DeleteKey(const char *key) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    if (n < 0) return;")
+    p("    _engine_pp_type[n] = 0;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_DeleteAll(void) {")
+    p("    if (!_engine_pp_loaded) _engine_pp_load();")
+    p("    _engine_pp_count = 0;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("")
 
 
 def _emit_engine_debug_log(p, plan, want_log):
@@ -9140,6 +9790,11 @@ def _emit_engine_ui_sliders(go_n, p, plan, ui_sliders, want_live_rt):
         p("    v = vmin + t * (vmax - vmin);")
         p("    _engine_ui_sl_set_value(si, v);")
         p("}")
+    else:
+        p("/* No Slider packed: every `slider.value` target is unknown. */")
+        p("static float Slider_get_value(int go) { (void)go; return 0.f; }")
+        p("static void Slider_set_value(int go, float v)"
+          " { (void)go; (void)v; }")
 
 
 def _emit_engine_ui_scrollbars(go_n, p, plan, ui_scrollbars, want_live_rt):
@@ -9370,6 +10025,13 @@ def _emit_engine_ui_scrollbars(go_n, p, plan, ui_scrollbars, want_live_rt):
         p("    if (rev) t = 1.f - t;")
         p("    _engine_ui_sb_set_value(si, t, 0);")
         p("}")
+    else:
+        p("/* No Scrollbar packed: every `scrollbar.value` target is"
+          " unknown. */")
+        p("static float Scrollbar_get_value(int go)"
+          " { (void)go; return 0.f; }")
+        p("static void Scrollbar_set_value(int go, float v)"
+          " { (void)go; (void)v; }")
 
 
 def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_live_rt):
@@ -10190,6 +10852,8 @@ def _emit_engine_scene_apply(lines, plan, class_ids):
 
     depth = max([len(d) for _k, _y, _r, a in groups for _t, _n, d in a] or [1])
     loop_vars = ", ".join(["i"] + [chr(ord("j") + k) for k in range(depth - 1)])
+    for cname in sorted(plan.get("ref_array_seeds") or {}):
+        p("static void _%s_seed_refs(unsigned i);" % _c_ident(cname))
     p("static void _engine_scene_snapshot(void) {")
     p("    int %s;" % loop_vars)
     for _kind, _key, rows, arrays in groups:
@@ -10221,6 +10885,8 @@ def _emit_engine_scene_apply(lines, plan, class_ids):
         p("        if (!(%s)) continue;" % own)
         for _ty, name, dims in arrays:
             _copy(name, "_engine_snap" + name, dims, "        ")
+        if kind == "class" and key in (plan.get("ref_array_seeds") or {}):
+            p("        _%s_seed_refs((unsigned)i);" % _c_ident(key))
         p("    }")
     p("}")
     p("static void _engine_scene_unload(int s) {")
@@ -11409,8 +12075,9 @@ def _emit_engine_static_collections(_emitted_coll, p, plan):
                 _list_elem_c_ty(elem, plan), idn, f["name"], cap))
             _emitted_coll = True
         for f in cl.get("ref_array_fields") or []:
-            p("static std::vector<int> %s_%s;" % (idn, f["name"]))
+            p("static std::vector<int> %s_%s[%d];" % (idn, f["name"], cap))
             _emitted_coll = True
+        _emit_ref_array_seed(p, plan, cname, cl, idn)
         for f in cl.get("dict_fields") or []:
             kv = _dict_kv_names(f.get("ty") or "")
             if not kv:
@@ -11928,6 +12595,112 @@ def _emit_engine_world_positions(
             p("    }")
             p("}")
             p("")
+    elif plan.get("transform_field_targets"):
+        p("/* No Transform parents: world position is the packed position. */")
+        p("static void _engine_world_pos(int class_id, unsigned inst,")
+        p("                             float *x, float *y, float *z,")
+        p("                             int depth) {")
+        p("    (void)depth;")
+        p("    *x = 0.f; *y = 0.f; *z = 0.f;")
+        p("    switch (class_id) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            idn = _c_ident(cname)
+            p("    case %d:" % cid)
+            p("        *x = %s_get_pos_x(inst);" % idn)
+            p("        *y = %s_get_pos_y(inst);" % idn)
+            if not cl.get("two_d"):
+                p("        *z = %s_get_pos_z(inst);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+
+
+def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
+    """emit_engine: world position / rotation through a Transform handle."""
+    go_n = max(1, len(plan.get("go_names") or []))
+    p("/* Transform.DetachChildren: SetParent(null) keeping world position. */")
+    p("static void Transform_DetachChildren(int go) {")
+    p("    int c;")
+    p("    if (go < 0) return;")
+    p("    for (c = 0; c < %d; c = c + 1)" % go_n)
+    p("        if (_engine_go_parent[c] == go) Transform_SetParent(c, -1, 1);")
+    p("}")
+    if want_vector2:
+        p("static Vector2 Transform_get_position2(int go) {")
+        p("    int c = -1;")
+        p("    unsigned n = 0u;")
+        p("    float x = 0.f, y = 0.f, z = 0.f;")
+        p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
+        p("    return Vector2_make(x, y);")
+        p("}")
+        p("/* position = Vector2: z is 0 (Vector2 → Vector3); local = world")
+        p("   minus the parent's world position (translation-only hierarchy). */")
+        p("static void Transform_set_position2(int go, Vector2 v) {")
+        p("    int c = -1;")
+        p("    unsigned n = 0u;")
+        p("    float px = 0.f, py = 0.f, pz = 0.f;")
+        p("    if (go < 0 || go >= %d) return;" % go_n)
+        p("    if (_engine_go_parent[go] >= 0")
+        p("        && _engine_go_xf(_engine_go_parent[go], &c, &n))")
+        p("        _engine_world_pos(c, n, &px, &py, &pz, 0);")
+        p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, 0.f - pz);")
+        p("}")
+    if not (want_live_rot and plan.get("handle_rot")):
+        p("")
+        return
+    rot = [_c_ident(c) for c in plan.get("live_rot_classes") or []
+           if c in plan["classes"] and _class_has_position(plan["classes"][c])]
+    # ponytail: rotation is the row's local rotation (the rotation setters
+    # already treat unparented ≈ world); compose parents if a rotated parent
+    # ever matters.
+    p("static Quaternion Transform_get_rotation(int go) {")
+    p("    Quaternion q;")
+    p("    int inst;")
+    p("    q.x = 0.f; q.y = 0.f; q.z = 0.f; q.w = 1.f;")
+    p("    if (go < 0 || go >= %d) return q;" % go_n)
+    for idn in rot:
+        p("    inst = _engine_go_%s[go];" % idn)
+        p("    if (inst >= 0) {")
+        p("        q.x = _%s_rot_x[inst]; q.y = _%s_rot_y[inst];" % (idn, idn))
+        p("        q.z = _%s_rot_z[inst]; q.w = _%s_rot_w[inst];" % (idn, idn))
+        p("        return q;")
+        p("    }")
+    p("    (void)inst;")
+    p("    return q;")
+    p("}")
+    p("static void Transform_set_rotation(int go, Quaternion q) {")
+    p("    int inst;")
+    p("    if (go < 0 || go >= %d) return;" % go_n)
+    for idn in rot:
+        p("    inst = _engine_go_%s[go];" % idn)
+        p("    if (inst >= 0) {")
+        p("        _engine_transform_set_quat(")
+        p("            &_{0}_rot_x[inst], &_{0}_rot_y[inst], &_{0}_rot_z[inst],"
+          .format(idn))
+        p("            &_{0}_rot_w[inst], &_{0}_rot_m00[inst], &_{0}_rot_m01[inst],"
+          .format(idn))
+        p("            &_{0}_rot_m10[inst], &_{0}_rot_m11[inst],".format(idn))
+        p("            q.x, q.y, q.z, q.w);")
+        p("        return;")
+        p("    }")
+    p("    (void)inst;")
+    p("}")
+    p("/* a.eulerAngles == b.eulerAngles: Unity Vector3 == (1e-5 epsilon). */")
+    p("static int Transform_eulerAngles_eq(int a, int b) {")
+    p("    Quaternion qa = Transform_get_rotation(a);")
+    p("    Quaternion qb = Transform_get_rotation(b);")
+    p("    float ax, ay, az, bx, by, bz;")
+    p("    _engine_quat_to_euler_deg(qa.x, qa.y, qa.z, qa.w, &ax, &ay, &az);")
+    p("    _engine_quat_to_euler_deg(qb.x, qb.y, qb.z, qb.w, &bx, &by, &bz);")
+    p("    ax = ax - bx; ay = ay - by; az = az - bz;")
+    p("    return ax * ax + ay * ay + az * az < 9.99999944e-11f;")
+    p("}")
+    p("")
 
 
 def _emit_engine_transform_point(class_ids, p, plan, tp_classes):
@@ -12133,19 +12906,83 @@ def _emit_engine_colliders_2d(
             p("static int _col2d_prev_b[%d];" % max_pairs)
             p("static int _col2d_prev_n;")
             p("")
-            p("static void _col2d_add_contact(int a, int b) {")
+            contacts = bool(plan.get("physics2d_contacts"))
+            if contacts:
+                p("/* Pair manifold: normal lo -> hi, up to two world points. */")
+                p("static float _col2d_contact_nx[%d];" % max_pairs)
+                p("static float _col2d_contact_ny[%d];" % max_pairs)
+                p("static int _col2d_contact_pn[%d];" % max_pairs)
+                p("static float _col2d_contact_px[%d];" % (2 * max_pairs))
+                p("static float _col2d_contact_py[%d];" % (2 * max_pairs))
+                p("/* Collider receiving the OnCollision*2D being sent. */")
+                p("static int _col2d_msg_self = -1;")
+            p("static int _col2d_add_contact(int a, int b) {")
             p("    int lo, hi, i;")
             p("    lo = (a < b) ? a : b;")
             p("    hi = (a < b) ? b : a;")
             p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
             p("        if (_col2d_contact_a[i] == lo && _col2d_contact_b[i] == hi)")
-            p("            return;")
-            p("    if (_col2d_contact_n >= %d) return;" % max_pairs)
+            p("            return i;")
+            p("    if (_col2d_contact_n >= %d) return -1;" % max_pairs)
             p("    _col2d_contact_a[_col2d_contact_n] = lo;")
             p("    _col2d_contact_b[_col2d_contact_n] = hi;")
+            if contacts:
+                p("    _col2d_contact_pn[_col2d_contact_n] = 0;")
             p("    _col2d_contact_n = _col2d_contact_n + 1;")
+            p("    return _col2d_contact_n - 1;")
             p("}")
             p("")
+            if contacts:
+                p("static void _col2d_set_manifold(int a, int b, float nx,")
+                p("    float ny, int n, float p0x, float p0y, float p1x,")
+                p("    float p1y) {")
+                p("    int k = _col2d_add_contact(a, b);")
+                p("    if (k < 0) return;")
+                p("    if (a > b) { nx = -nx; ny = -ny; }")
+                p("    _col2d_contact_nx[k] = nx;")
+                p("    _col2d_contact_ny[k] = ny;")
+                p("    _col2d_contact_pn[k] = n < 0 ? 0 : (n > 2 ? 2 : n);")
+                p("    _col2d_contact_px[2 * k] = p0x;")
+                p("    _col2d_contact_py[2 * k] = p0y;")
+                p("    _col2d_contact_px[2 * k + 1] = p1x;")
+                p("    _col2d_contact_py[2 * k + 1] = p1y;")
+                p("}")
+                p("static int _col2d_pair_index(int a, int b) {")
+                p("    int lo, hi, i;")
+                p("    lo = (a < b) ? a : b;")
+                p("    hi = (a < b) ? b : a;")
+                p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
+                p("        if (_col2d_contact_a[i] == lo"
+                  " && _col2d_contact_b[i] == hi)")
+                p("            return i;")
+                p("    return -1;")
+                p("}")
+                p("/* Collision2D.contactCount: 0 once the pair stopped"
+                  " touching (Exit). */")
+                p("static int Collision2D_contactCount(int coll) {")
+                p("    int k = _col2d_pair_index(_col2d_msg_self, coll);")
+                p("    return k < 0 ? 0 : _col2d_contact_pn[k];")
+                p("}")
+                p("/* ContactPoint2D.normal points from the other collider to"
+                  " this one. */")
+                p("static ContactPoint2D Collision2D_GetContact(int coll,"
+                  " int idx) {")
+                p("    ContactPoint2D c;")
+                p("    int k = _col2d_pair_index(_col2d_msg_self, coll);")
+                p("    float sgn;")
+                p("    c.normal = Vector2_make(0.f, 0.f);")
+                p("    c.point = Vector2_make(0.f, 0.f);")
+                p("    if (k < 0 || idx < 0 || idx >= _col2d_contact_pn[k])")
+                p("        return c;")
+                p("    sgn = (_col2d_msg_self == _col2d_contact_a[k])"
+                  " ? -1.f : 1.f;")
+                p("    c.normal = Vector2_make(sgn * _col2d_contact_nx[k],")
+                p("                            sgn * _col2d_contact_ny[k]);")
+                p("    c.point = Vector2_make(_col2d_contact_px[2 * k + idx],")
+                p("                           _col2d_contact_py[2 * k + idx]);")
+                p("    return c;")
+                p("}")
+                p("")
             p("static int _col2d_pair_in(int lo, int hi,")
             p("    const int *pa, const int *pb, int n) {")
             p("    int i;")
@@ -12170,6 +13007,8 @@ def _emit_engine_colliders_2d(
             p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
             p("    int oc = _Collider2D_owner_class[ci_self];")
             p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+            if contacts:
+                p("    _col2d_msg_self = ci_self;")
             p("    switch (oc) {")
             for cname in sorted(collision2d_handlers.keys()):
                 cid = class_ids.get(cname)
@@ -12231,6 +13070,19 @@ def _emit_engine_colliders_2d(
             p("    }")
             p("}")
             p("")
+    if plan.get("physics2d_contacts") and not (
+            want_col2d and col2d_list and want_collision2d_msgs):
+        p("/* No packed collision messages: no contact ever exists. */")
+        p("static int Collision2D_contactCount(int coll)"
+          " { (void)coll; return 0; }")
+        p("static ContactPoint2D Collision2D_GetContact(int coll, int k) {")
+        p("    ContactPoint2D c;")
+        p("    (void)coll; (void)k;")
+        p("    c.normal = Vector2_make(0.f, 0.f);")
+        p("    c.point = Vector2_make(0.f, 0.f);")
+        p("    return c;")
+        p("}")
+        p("")
 
 
 def _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d):
@@ -12453,6 +13305,17 @@ def _emit_engine_box2d_exports(
             p("    if (a < 0 || b < 0) return;")
         p("}")
         p("")
+        if plan.get("physics2d_contacts"):
+            p("void engine_col2d_manifold(int a, int b, float nx, float ny,")
+            p("    int n, float p0x, float p0y, float p1x, float p1y) {")
+            if want_collision2d_msgs and want_col2d and col2d_list:
+                p("    _col2d_set_manifold(a, b, nx, ny, n, p0x, p0y,"
+                  " p1x, p1y);")
+            else:
+                p("    (void)a; (void)b; (void)nx; (void)ny; (void)n;")
+                p("    (void)p0x; (void)p0y; (void)p1x; (void)p1y;")
+            p("}")
+            p("")
         if plan.get("physics2d_live"):
             p("/* Whether a body's GameObject is in the simulation (active, in a")
             p(" * loaded scene); the glue disables the bodies that are not. */")
@@ -13152,16 +14015,18 @@ def emit_engine(plan, analyses, used_apis):
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
     if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
-            or want_transform_matrix or want_quat_angle):
+            or want_transform_matrix or want_quat_angle
+            or _plan_needs_vector2(plan, used_apis)):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
             or want_set_parent or want_get_sibling
             or want_add_any or want_data_path or want_persistent_data_path
-            or want_file_io or soa or want_instantiate):
+            or want_file_io or soa or want_instantiate
+            or plan.get("player_prefs")):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
-            or want_app_open_url):
+            or want_app_open_url or plan.get("player_prefs")):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -13215,7 +14080,7 @@ def emit_engine(plan, analyses, used_apis):
             break
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
-            or want_app_open_url):
+            or want_app_open_url or plan.get("player_prefs")):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -13239,6 +14104,15 @@ def emit_engine(plan, analyses, used_apis):
     p("   group can find them. */")
     if _plan_needs_vector2(plan, used_apis):
         _emit_vector2_struct(p)
+    if plan.get("physics2d_contacts"):
+        p("/* UnityEngine.ContactPoint2D from Collision2D.GetContact. */")
+        p("typedef struct ContactPoint2D {")
+        p("    Vector2 normal;")
+        p("    Vector2 point;")
+        p("} ContactPoint2D;")
+        p("static ContactPoint2D Collision2D_GetContact(int coll, int k);")
+        p("static int Collision2D_contactCount(int coll);")
+        p("")
     if _plan_needs_vector2int(plan, used_apis):
         _emit_vector2int_struct(p)
     if want_rect:
@@ -13354,7 +14228,7 @@ def emit_engine(plan, analyses, used_apis):
     if want_col2d:
         nc = max(1, len(col2d_list))
         p("extern const int _Collider2D_count;")
-        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle */" % nc)
+        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h */" % nc)
         p("extern const int _Collider2D_is_trigger[%d];" % nc)
         p("extern const int _Collider2D_body_type[%d]; /* 0 dyn 1 kin 2 static */"
           % nc)
@@ -13520,6 +14394,26 @@ def emit_engine(plan, analyses, used_apis):
               % key)
             p("}")
             p("")
+        p("/* wasPressed/ReleasedThisFrame: key state latched once per"
+          " engine_tick. */")
+        for key in sorted(keyboard_keys):
+            p("static int _engine_kb_now_%s, _engine_kb_was_%s;"
+              % (key, key))
+            p("static int Keyboard_%sKey_wasPressedThisFrame(void) {" % key)
+            p("    return _engine_kb_now_%s && !_engine_kb_was_%s;"
+              % (key, key))
+            p("}")
+            p("static int Keyboard_%sKey_wasReleasedThisFrame(void) {" % key)
+            p("    return !_engine_kb_now_%s && _engine_kb_was_%s;"
+              % (key, key))
+            p("}")
+        p("static void _engine_keyboard_latch(void) {")
+        for key in sorted(keyboard_keys):
+            p("    _engine_kb_was_%s = _engine_kb_now_%s;" % (key, key))
+            p("    _engine_kb_now_%s = Keyboard_%sKey_isPressed();"
+              % (key, key))
+        p("}")
+        p("")
     if want_str_plus:
         # C# "" + 1 → "1"; C's ""+1 is pointer arithmetic (often prints garbage).
         # Ring of buffers: nested _str_plus_*(prev, x) must not snprintf into
@@ -13642,6 +14536,7 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
     _emit_engine_debug_log(p, plan, want_log)
+    _emit_engine_player_prefs(p, plan, want_log)
     if not want_data_path:
         p("const char *engine_data_path(void) { return \"\"; }")
         p("")
@@ -13847,6 +14742,24 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_live_rot and plan.get("handle_rot"):
+        p("/* UnityEngine.Quaternion value — a Transform handle's rotation. */")
+        p("typedef struct Quaternion {")
+        p("    float x; float y; float z; float w;")
+        p("} Quaternion;")
+        p("static Quaternion Quaternion_Slerp(Quaternion a, Quaternion b,")
+        p("                                   float t) {")
+        p("    Quaternion o;")
+        p("    _engine_quat_slerp(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, t,")
+        p("                       &o.x, &o.y, &o.z, &o.w);")
+        p("    return o;")
+        p("}")
+        p("static float Quaternion_Angle(Quaternion a, Quaternion b) {")
+        p("    return _engine_quat_angle(a.x, a.y, a.z, a.w,")
+        p("                              b.x, b.y, b.z, b.w);")
+        p("}")
+        p("")
+
     if want_live_rot:
         p("/* Quaternion.RotateTowards(from, to, maxDegreesDelta) — Unity. */")
         p("static void _engine_quat_rotate_towards(")
@@ -14023,6 +14936,9 @@ def emit_engine(plan, analyses, used_apis):
     want_set_parent = "transform.SetParent" in used_apis
     _emit_engine_world_positions(
             class_ids, p, plan, want_get_sibling, want_go_tables, want_set_parent)
+    if want_set_parent and want_go_tables:
+        _emit_engine_transform_handles(
+            p, plan, _plan_needs_vector2(plan, used_apis), want_live_rot)
 
     tp_classes = set(plan.get("transform_point_classes") or [])
     _emit_engine_transform_point(class_ids, p, plan, tp_classes)
@@ -14124,8 +15040,23 @@ def emit_engine(plan, analyses, used_apis):
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
     p("    if (_dt < 0.f) _dt = 0.f;")
+    seeded = sorted(plan.get("ref_array_seeds") or {})
+    if seeded:
+        p("    {")
+        p("        static int _engine_refs_seeded = 0;")
+        p("        unsigned _k;")
+        p("        if (!_engine_refs_seeded) {")
+        p("            _engine_refs_seeded = 1;")
+        for cname in seeded:
+            p("            for (_k = 0u; _k < %du; _k = _k + 1u) "
+              "_%s_seed_refs(_k);"
+              % (max(1, int(plan["classes"][cname]["n"])), _c_ident(cname)))
+        p("        }")
+        p("    }")
     if _multi_scene(plan):
         p("    _engine_scene_apply_pending();")
+    if want_keyboard:
+        p("    _engine_keyboard_latch();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
@@ -14589,7 +15520,7 @@ def _go_handle_receivers(text, cl, plan):
     return out
 
 
-def _rewrite_go_handle_members(text, cl, plan):
+def _rewrite_go_handle_members(text, cl, plan, site=None):
     """Component references as GameObject indices: `handleTrs.parent`, `.rect`.
 
     An authored `Transform` / `RectTransform` / uGUI field packs as the GO
@@ -14646,7 +15577,154 @@ def _rewrite_go_handle_members(text, cl, plan):
         text = cs2cpp.code_sub(
             pat + r"\s*\.\s*parent\b",
             lambda m, e=expr: "Transform_get_parent(%s)" % e, text)
+    trs = [(pat, expr) for pat, expr, ty in recvs if ty == "Transform"]
+    if trs:
+        text = _rewrite_transform_handle_trs(text, trs, site)
     return text
+
+
+_TRANSFORM_HANDLE_PROTOS = {
+    "Transform_get_position2": "static Vector2 Transform_get_position2(int go);",
+    "Transform_set_position2":
+        "static void Transform_set_position2(int go, Vector2 v);",
+    "Transform_DetachChildren": "static void Transform_DetachChildren(int go);",
+    "Transform_get_rotation": "static Quaternion Transform_get_rotation(int go);",
+    "Transform_set_rotation":
+        "static void Transform_set_rotation(int go, Quaternion q);",
+    "Transform_eulerAngles_eq":
+        "static int Transform_eulerAngles_eq(int a, int b);",
+}
+
+
+def _rewrite_transform_handle_trs(text, trs, site=None):
+    """World position / rotation through a `Transform` handle (a GO index).
+
+    C has a `Vector2` and a `Quaternion` but no `Vector3`, so `.position`
+    lowers where C# converts it to a Vector2 anyway: a `(Vector2)` cast, a
+    `Vector2.Distance` argument, a `Vector3.Lerp` stored in a `Vector2`
+    (z is dropped either way), a Vector2 assigned to it (z becomes 0).
+    `.eulerAngles` is lowered only as `a.eulerAngles == b.eulerAngles`.
+    """
+    alt = "(?:%s)" % "|".join(p for p, _e in trs)
+
+    def e(src):
+        return next((ex for p, ex in trs if re.fullmatch(p, src.strip())),
+                    src)
+
+    def sub(pat, fn, s):
+        return cs2cpp.code_sub(pat, fn, s)
+
+    text = sub(r"(%s)\s*\.\s*DetachChildren\s*\(\s*\)" % alt,
+               lambda m: "Transform_DetachChildren(%s)" % e(m.group(1)), text)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*(==|!=)\s*(%s)\s*\.\s*eulerAngles\b"
+               % (alt, alt),
+               lambda m: "%sTransform_eulerAngles_eq(%s, %s)" % (
+                   "!" if m.group(2) == "!=" else "", e(m.group(1)),
+                   e(m.group(3))), text)
+    text = sub(r"(%s)\s*\.\s*rotation\s*=(?!=)\s*([^;]+);" % alt,
+               lambda m: "Transform_set_rotation(%s, %s);" % (
+                   e(m.group(1)), m.group(2).strip()), text)
+    text = sub(r"(%s)\s*\.\s*rotation\b" % alt,
+               lambda m: "Transform_get_rotation(%s)" % e(m.group(1)), text)
+    text = sub(r"(?<![\w.])Quaternion\s*\.\s*(Slerp|Angle)\s*\(",
+               r"Quaternion_\1(", text)
+    text = sub(r"(%s)\s*\.\s*position\s*=(?!=)\s*([^;]+);" % alt,
+               lambda m: "Transform_set_position2(%s, %s);" % (
+                   e(m.group(1)), m.group(2).strip()), text)
+    text = sub(r"\(\s*Vector2\s*\)\s*(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
+               lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
+    # Implicit Vector3 → Vector2 inside calls whose result is a Vector2.
+    text = sub(r"(?<![\w.])Vector2\s*\.\s*Distance\s*\(", "Vector2_Distance(",
+               text)
+    text = sub(r"(?<![\w.])(Vector2\s+\w+\s*=\s*)Vector3\s*\.\s*Lerp\s*\(",
+               r"\1Vector2_Lerp(", text)
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])Vector2_(?:Distance|Lerp)\s*\(",
+                         cs2cpp._blank(text)):
+        got = _match_call_args(text, m.end() - 1)
+        if not got or m.start() < pos:
+            continue
+        args, after = got
+        args = sub(r"(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
+                   lambda a: "Transform_get_position2(%s)" % e(a.group(1)),
+                   args)
+        out += [text[pos:m.end()], args, ")"]
+        pos = after
+    text = "".join(out) + text[pos:]
+    text = _rewrite_vector2_eq(text, ("Transform_get_position2",))
+    if site is not None:
+        for fn, proto in _TRANSFORM_HANDLE_PROTOS.items():
+            if fn + "(" in text:
+                site.setdefault("protos", set()).add(proto)
+    return text
+
+
+def _rewrite_script_enums(text, file_text):
+    """`Kind.Member` / `Outer.Kind.Member` of an enum the script declares →
+    its integer value (the packed field holds the authored integer).
+
+    ponytail: enums declared in other scripts stay unlowered; an enum with a
+    non-literal member initializer is skipped whole.
+    """
+    for m in re.finditer(r"(?<![\w.])enum\s+(\w+)\s*(?::\s*[\w.]+\s*)?\{([^}]*)\}",
+                         cs2cpp._blank(file_text)):
+        vals, nxt = {}, 0
+        for part in m.group(2).split(","):
+            pm = re.fullmatch(r"\s*(\w+)\s*(?:=\s*(-?(?:0[xX][0-9a-fA-F]+|\d+))"
+                              r"\s*)?", part)
+            if pm is None:
+                vals = None if part.strip() else vals
+                if vals is None:
+                    break
+                continue
+            nxt = int(pm.group(2), 0) if pm.group(2) else nxt
+            vals[pm.group(1)] = nxt
+            nxt += 1
+        for name, v in (vals or {}).items():
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:\w+\s*\.\s*)*%s\s*\.\s*%s\b(?!\s*[.(])"
+                % (re.escape(m.group(1)), re.escape(name)), str(v), text)
+    return text
+
+
+def _rewrite_float_is_nan(text):
+    """`float.IsNaN(x)` → `((x) != (x))` (only NaN is unequal to itself)."""
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])(?:float|Single|System\s*\.\s*Single)"
+                         r"\s*\.\s*IsNaN\s*\(", cs2cpp._blank(text)):
+        got = _match_call_args(text, m.end() - 1)
+        if not got or m.start() < pos:
+            continue
+        out += [text[pos:m.start()], "((%s) != (%s))" % (got[0], got[0])]
+        pos = got[1]
+    return "".join(out) + text[pos:]
+
+
+def _rewrite_vector2_eq(text, fns):
+    """`f(a) == g(b)` on Vector2-valued calls → `Vector2_eq` (Unity's ==)."""
+    call = r"(?<![\w.])(?:%s)\s*\(" % "|".join(re.escape(f) for f in fns)
+    i = 0
+    while True:
+        m = re.compile(call).search(cs2cpp._blank(text), i)
+        if not m:
+            return text
+        i = m.end()
+        before = text[:m.start()].rstrip()
+        if before and before[-1] not in "(,!&|?:=;{}":
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        op = re.match(r"\s*(==|!=)\s*", text[got[1]:])
+        if not op:
+            continue
+        m2 = re.compile(call).match(text, got[1] + op.end())
+        got2 = m2 and _match_call_args(text, m2.end() - 1)
+        if not got2:
+            continue
+        text = "%s%sVector2_eq(%s, %s)%s" % (
+            text[:m.start()], "!" if op.group(1) == "!=" else "",
+            text[m.start():got[1]], text[m2.start():got2[1]], text[got2[1]:])
 
 
 def _rewrite_vector2_axis_scale(text):
@@ -15804,7 +16882,7 @@ def _plan_needs_vector2(plan, used_apis=None):
             or "rectTransform.sizeDelta" in used_apis
             or "Rect.PointToNormalized" in used_apis):
         return True
-    if plan and plan.get("live_rt"):
+    if plan and (plan.get("live_rt") or plan.get("physics2d_contacts")):
         return True
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2_fields"):
@@ -15840,6 +16918,26 @@ def _emit_vector2_struct(p):
     p("}")
     p("static float Vector2_x(Vector2 v) { return v.x; }")
     p("static float Vector2_y(Vector2 v) { return v.y; }")
+    p("static Vector2 Vector2_normalized(Vector2 v) {")
+    p("    float m = sqrtf(v.x * v.x + v.y * v.y);")
+    p("    if (m > 1e-5f) { v.x = v.x / m; v.y = v.y / m; }")
+    p("    else { v.x = 0.f; v.y = 0.f; }")
+    p("    return v;")
+    p("}")
+    p("static float Vector2_Distance(Vector2 a, Vector2 b) {")
+    p("    float dx = a.x - b.x, dy = a.y - b.y;")
+    p("    return sqrtf(dx * dx + dy * dy);")
+    p("}")
+    p("static Vector2 Vector2_Lerp(Vector2 a, Vector2 b, float t) {")
+    p("    if (t < 0.f) t = 0.f;")
+    p("    if (t > 1.f) t = 1.f;")
+    p("    return Vector2_make(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);")
+    p("}")
+    p("/* Unity ==: squared distance under kEpsilon (1e-5) squared. */")
+    p("static int Vector2_eq(Vector2 a, Vector2 b) {")
+    p("    float dx = a.x - b.x, dy = a.y - b.y;")
+    p("    return dx * dx + dy * dy < 9.99999944e-11f;")
+    p("}")
     p("")
 
 
@@ -15855,6 +16953,35 @@ def _emit_iref_struct(p):
     p("    int inst;")
     p("};")
     p("")
+
+
+def _emit_ref_array_seed(p, plan, cname, cl, idn):
+    """`_<Cls>_seed_refs(i)`: row i's ref arrays back to their authored refs."""
+    seeds = (plan.get("ref_array_seeds") or {}).get(cname)
+    if not seeds:
+        return
+    for fname, rows in sorted(seeds.items()):
+        flat, off = [], [0]
+        for r in rows:
+            flat += r
+            off.append(len(flat))
+        off += [len(flat)] * (max(1, int(cl.get("n") or 0)) + 1 - len(off))
+        p("static const int _%s_%s_init[%d] = { %s };" % (
+            idn, fname, max(1, len(flat)),
+            ", ".join(str(v) for v in flat) or "0"))
+        p("static const int _%s_%s_off[%d] = { %s };" % (
+            idn, fname, len(off), ", ".join(str(v) for v in off)))
+    p("static void _%s_seed_refs(unsigned i) {" % idn)
+    p("    int k;")
+    for fname in sorted(seeds):
+        p("    {")
+        p("        std::vector<int> &v = %s_%s[i];" % (idn, fname))
+        p("        v.clear();")
+        p("        for (k = _%s_%s_off[i]; k < _%s_%s_off[i + 1]; k = k + 1)"
+          % (idn, fname, idn, fname))
+        p("            v.push_back(_%s_%s_init[k]);" % (idn, fname))
+        p("    }")
+    p("}")
 
 
 def _emit_ref_vector_helpers(p, want_iref):
@@ -16191,7 +17318,26 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:[\w.]+\.)?InputManager\s*\.\s*InputDevice\s*\.\s*(\w+)\b",
         lambda m: _input_dev.get(m.group(1), "0"),
         text)
-    text = _inline_static_getters(text, cl, plan)
+    text = _inline_static_setters(text, cl, plan)
+    for _pass in range(3):
+        before = text
+        text = _inline_static_getters(text, cl, plan)
+        text = _inline_static_helpers(text, plan)
+        if text == before:
+            break
+    # Boolean.GetHashCode is 1 / 0 and Int32.GetHashCode the value itself
+    # (booleans are 1 / 0 by now unless inlined above).
+    for _pass in range(4):
+        text = cs2cpp.code_sub(
+            r"\(\s*(true|false|-?\d+)\s*\)(?=[\s)]*\.\s*GetHashCode\s*\()",
+            r"\1", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(true|false|-?\d+)\s*\.\s*GetHashCode\s*\(\s*\)",
+        lambda m: {"true": "1", "false": "0"}.get(m.group(1), m.group(1)),
+        text)
+    text = cs2cpp.code_sub(r"(?<![\w.])true\b", "1", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])false\b", "0", text)
+    text = _lower_player_prefs(text)
     if null_handle is not None:
         text = cs2cpp._lower_null_compares(text, null_handle)
     ddol = r"(?<![\w.])(?:(?:UnityEngine\s*\.\s*)?Object\s*\.\s*)?DontDestroyOnLoad\s*\(\s*"
@@ -16199,7 +17345,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         params = cs2cpp.parse_params((site or {}).get("args") or "")
         file_text = (site or {}).get("file_text") or ""
         strings = {prm.name for prm in params if prm.type in ("string", "String")}
-        strings |= set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
+        strings |= (set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
+                    - {prm.name for prm in params
+                       if prm.type not in ("string", "String")})
         scenes = {prm.name for prm in params if prm.type.split(".")[-1] == "Scene"}
         scenes |= set(re.findall(r"(?<![\w.])Scene\s+(\w+)\s*[;=]", text))
         text = _lower_scene_manager(text, strings, scenes)
@@ -16221,6 +17369,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text, _packed_class(cl),
         [_packed_class(o) for o in (plan.get("classes") or {}).values()],
         _packed_model(plan))
+    text = _rewrite_script_enums(text, (site or {}).get("file_text") or "")
+    text = _rewrite_float_is_nan(text)
     text = _rewrite_static_ref_arrays(text, cl, plan)
     text = _rewrite_mb_static_and_singleton(text, plan, cl)
     text = _rewrite_toggle_is_on(text)
@@ -16228,6 +17378,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_file_copy(text)
     text = _rewrite_file_text_streams(text, cl)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
+    text = _rewrite_transform_field_position(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
     text = _rewrite_transform_look_at(text, cl)
@@ -16236,7 +17387,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_quaternion_angle(text, cl)
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
-    text = _rewrite_go_handle_members(text, cl, plan)
+    text = _rewrite_go_handle_members(text, cl, plan, site)
     text = _rewrite_recttransform_apis(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
     text = _rewrite_transform_get_sibling_index(text, cl, plan)
@@ -16308,8 +17459,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = cs2cpp.code_sub(
-        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\.isPressed\b",
-        lambda m: "Keyboard_%sKey_isPressed()" % m.group(1),
+        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\."
+        r"(isPressed|wasPressedThisFrame|wasReleasedThisFrame)\b",
+        lambda m: "Keyboard_%sKey_%s()" % (m.group(1), m.group(2)),
         text)
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
@@ -16325,11 +17477,17 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Locals: `string x` / `const char *x` (after string→const char * rewrite).
     string_idents |= set(re.findall(
         r"\b(?:string|const char \*)\s+(\w+)\b", text))
+    string_idents |= {
+        prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
+        if prm.type in ("string", "String", "System.String")}
     text = _lower_string_concat(text, string_idents=string_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
     text = _wrap_log_collision2d_tostring(text, collision2d_param)
+    text = _lower_collision2d_contacts(text, collision2d_param)
+    text = _rewrite_collision2d_handler_calls(
+        text, cl, plan, collision2d_param)
     text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
     text = cs2cpp.lower_bindings(text, _UNITY_API_RECT)
     text = _rewrite_rect_members(text)
@@ -16438,6 +17596,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    text = _rewrite_vector2_ctor_normalized(text)
     # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
     def _fold_v2_axis_ctors(src, axis_fn, axis):
         out = []
@@ -16524,7 +17683,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if not str(kind).startswith("idx:"):
             continue
         other = kind.split(":", 1)[1]
-        if (other in _ADDABLE_BUILTINS or other in _PHYSICS_COMPONENTS):
+        if (other in _ADDABLE_BUILTINS or other in _PHYSICS_COMPONENTS
+                or other not in plan["classes"]):
             continue
         handle_fields[name] = _c_ident(other)
     text = cs2cpp.lower_packed_fields(
@@ -16661,17 +17821,18 @@ def emit_data(plan, used_apis=None):
         # Godot's physics ticks and gravity: pixels / s^2, y down.
         p("float Time_fixedDeltaTime = %sf;" % repr(float(godot["fixed_dt"])))
     else:
-        p("float Time_fixedDeltaTime = 0.02f;")
+        uphys = plan.get("unity_physics") or unity_physics_settings("")
+        p("float Time_fixedDeltaTime = %sf;" % repr(float(uphys["fixed_dt"])))
     if want_phys and godot:
         p("float Physics2D_gravity_x = %sf;" % repr(float(godot["gravity"][0])))
         p("float Physics2D_gravity_y = %sf;" % repr(float(godot["gravity"][1])))
     elif want_phys:
-        p("float Physics2D_gravity_x = 0.f;")
-        p("float Physics2D_gravity_y = -9.81f;")
+        for axis, v in zip("xy", uphys["gravity2d"]):
+            p("float Physics2D_gravity_%s = %sf;" % (axis, repr(float(v))))
     if want_phys3:
-        p("float Physics_gravity_x = 0.f;")
-        p("float Physics_gravity_y = -9.81f;")
-        p("float Physics_gravity_z = 0.f;")
+        g3 = uphys["gravity3d"] if not godot else (0.0, -9.81, 0.0)
+        for axis, v in zip("xyz", g3):
+            p("float Physics_gravity_%s = %sf;" % (axis, repr(float(v))))
     if want_ambient:
         # Unity default ambient-ish grey; host may override.
         p("float RenderSettings_ambient_r = 0.2f;")
@@ -17420,8 +18581,171 @@ def _script_guid_for_path(guids, script_path):
     return None
 
 
-def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map):
-    """Parse .prefab assets that author *type_names* MonoBehaviours."""
+_YAML_DOC_HEAD_RE = re.compile(r"(?m)^--- !u!(\d+) &(\d+)( stripped)?[^\n]*$")
+_PREFAB_MOD_RE = re.compile(
+    r"-\s*target:\s*\{fileID:\s*(\d+)[^}]*\}\s*\n\s*propertyPath:\s*(.*?)\s*\n"
+    r"\s*value:\s*(.*?)\s*\n\s*objectReference:\s*(\{[^}]*\})")
+_FILE_ID_MASK = 0x7FFFFFFFFFFFFFFF
+
+
+def _yaml_docs(text):
+    """``[(class_id, file_id, stripped, start, end)]`` of a Unity YAML file."""
+    heads = list(_YAML_DOC_HEAD_RE.finditer(text))
+    return [(h.group(1), int(h.group(2)), bool(h.group(3)), h.start(),
+             heads[k + 1].start() if k + 1 < len(heads) else len(text))
+            for k, h in enumerate(heads)]
+
+
+def _scene_prefab_instances(scene_text):
+    """The PrefabInstance docs of a (fileID-qualified) scene: ``{id,
+    prefab_guid, parent, mods, stripped}`` -- *mods* the property overrides
+    ``(source id, path, value, objectReference)``, *stripped* the scene
+    fileID of each source object the scene keeps a stripped stub for."""
+    insts, stripped = {}, {}
+    for cls, fid, is_stripped, a, b in _yaml_docs(scene_text):
+        doc = scene_text[a:b]
+        if is_stripped:
+            src = re.search(r"m_CorrespondingSourceObject:\s*\{fileID:\s*(\d+)",
+                            doc)
+            pi = re.search(r"m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", doc)
+            if src and pi:
+                stripped.setdefault(int(pi.group(1)), {})[
+                    int(src.group(1))] = fid
+            continue
+        if cls != "1001":
+            continue
+        g = _SOURCE_PREFAB_GUID_RE.search(doc)
+        if not g:
+            continue
+        parent = re.search(r"m_TransformParent:\s*\{fileID:\s*(\d+)\}", doc)
+        insts[fid] = {
+            "id": fid, "prefab_guid": g.group(1).lower(),
+            "parent": int(parent.group(1)) if parent else 0,
+            "mods": [(int(m.group(1)), m.group(2).strip("'\""), m.group(3),
+                      m.group(4)) for m in _PREFAB_MOD_RE.finditer(doc)],
+        }
+    for fid, inst in insts.items():
+        inst["stripped"] = stripped.get(fid, {})
+    return list(insts.values())
+
+
+def _set_yaml_property(doc, path, value):
+    """*doc* with the serialized property *path* (``name`` or ``a.b`` into
+    a flow mapping) set to *value*; unchanged for paths this does not model
+    (arrays, nested blocks)."""
+    if "Array" in path or not re.fullmatch(r"\w+(?:\.\w+)?", path):
+        return doc
+    top, _, sub = path.partition(".")
+    line = re.search(r"(?m)^  %s:[ \t]*(.*)$" % re.escape(top), doc)
+    if not line:
+        if sub:
+            return doc
+        body = doc.rstrip("\n")
+        return body + "\n  %s: %s" % (top, value) + doc[len(body):]
+    if not line.group(1).strip():
+        return doc
+    if not sub:
+        return doc[:line.start(1)] + value + doc[line.end(1):]
+    flow = line.group(1)
+    if not (flow.startswith("{") and flow.endswith("}")):
+        return doc
+    new = re.sub(r"(?<=[{,\s])%s:\s*[^,}]*" % re.escape(sub),
+                 "%s: %s" % (sub, value), flow, count=1)
+    return doc[:line.start(1)] + new + doc[line.end(1):]
+
+
+def _prefab_instance_text(prefab_text, inst):
+    """The prefab's YAML as the scene instance *inst* places it: local
+    fileIDs are the scene's stripped stubs where it has one, else Unity's
+    ``(instance ^ source) & mask``; property overrides applied; the root
+    Transform under the instance's ``m_TransformParent``."""
+    pid, strip = int(inst["id"]), inst.get("stripped") or {}
+
+    def new_id(x):
+        if x == 0:
+            return 0
+        got = strip.get(x)
+        return got if got is not None else (x ^ pid) & _FILE_ID_MASK
+
+    text = _LOCAL_FILE_ID_RE.sub(
+        lambda m: m.group(1) + str(new_id(int(m.group(2)))), prefab_text)
+    docs = {fid: (a, b) for _c, fid, _s, a, b in _yaml_docs(text)}
+    edits = {}
+    for src, path, value, objref in inst.get("mods") or []:
+        fid = new_id(src)
+        if fid not in docs:
+            continue
+        ref = re.match(r"\{fileID:\s*(\d+)", objref)
+        if ref and ref.group(1) != "0":
+            value = objref
+        a, b = docs[fid]
+        edits[fid] = _set_yaml_property(edits.get(fid, text[a:b]), path, value)
+    if inst.get("parent"):
+        for cls, fid, _s, a, b in _yaml_docs(text):
+            if cls in ("4", "224") and re.search(
+                    r"(?m)^  m_Father:\s*\{fileID:\s*0\}", text[a:b]):
+                edits[fid] = re.sub(
+                    r"(?m)^(  m_Father:\s*)\{fileID:\s*0\}",
+                    r"\g<1>{fileID: %d}" % inst["parent"],
+                    edits.get(fid, text[a:b]), count=1)
+    if not edits:
+        return text
+    out, pos = [], 0
+    for fid, (a, b) in sorted(docs.items(), key=lambda kv: kv[1][0]):
+        if fid in edits:
+            out.append(text[pos:a])
+            out.append(edits[fid])
+            pos = b
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _expand_unstripped_prefab_instances(scene_text, assets):
+    """*scene_text* with the placed objects of every PrefabInstance. A
+    stripped stub (kept when scene objects reference a prefab object, e.g.
+    children under its Transform) is replaced by the placed doc, which keeps
+    the stub's fileID. Instances with a stripped RectTransform are left to
+    `_append_prefab_instance_ui_objects` (onClick array overrides, components
+    added on the stripped GameObject)."""
+    extra, drop = [], set()
+    for inst in _scene_prefab_instances(scene_text):
+        ppath = (assets or {}).get(inst["prefab_guid"])
+        if not ppath or not ppath.lower().endswith(".prefab") \
+                or not os.path.isfile(ppath):
+            continue
+        raw = _read(ppath)
+        if any(cls == "224" and fid in inst["stripped"]
+               for cls, fid, _s, _a, _b in _yaml_docs(raw)):
+            continue
+        body = _prefab_instance_text(raw, inst)
+        first = _YAML_DOC_HEAD_RE.search(body)
+        if first:
+            extra.append(body[first.start():].rstrip("\n"))
+            placed = {fid for _c, fid, _s, _a, _b in _yaml_docs(body)}
+            drop |= placed & set(inst["stripped"].values())
+    if not extra:
+        return scene_text
+    if drop:
+        scene_text = _drop_yaml_docs(scene_text, drop)
+    return scene_text.rstrip("\n") + "\n" + "\n".join(extra) + "\n"
+
+
+def _drop_yaml_docs(text, file_ids):
+    """*text* without the stripped docs whose fileID is in *file_ids*."""
+    docs = _yaml_docs(text)
+    out = [text[:docs[0][3]] if docs else text]
+    out += [text[a:b] for _c, fid, s, a, b in docs
+            if not (s and fid in file_ids)]
+    return "".join(out)
+
+
+def _load_prefab_objects_for_types(root, type_names, guids, assets,
+                                   typename_map, scenes=()):
+    """Parse .prefab assets that author *type_names* MonoBehaviours.
+
+    A prefab a packed scene places (*scenes*, in build order) yields one copy
+    of its objects per PrefabInstance, tagged with that scene; one no scene
+    places is parsed once as it is."""
     if not type_names:
         return []
     want_guids = set()
@@ -17434,6 +18758,14 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
             want_guids.add(g.lower())
     if not want_guids:
         return []
+    placed = {}
+    for si, spath in enumerate(scenes):
+        stext = _scene_local_file_ids(_read(spath), si)
+        for inst in _scene_prefab_instances(stext):
+            ppath = (assets or {}).get(inst["prefab_guid"])
+            if ppath:
+                placed.setdefault(os.path.realpath(ppath), []).append(
+                    (si, inst))
     out = []
     prefabs = list(_walk_files(root, (".prefab",)))
     for pi, path in enumerate(prefabs):
@@ -17444,11 +18776,16 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
         if prefabs and ((pi + 1) % 25 == 0 or pi + 1 == len(prefabs)):
             _progress("  prefab %d/%d %s" % (
                 pi + 1, len(prefabs), os.path.basename(path)))
-        objs, _l, _c, _h = parse_unity_yaml(
-            raw, guid_to_script=guids, asset_guids=assets)
-        for o in objs:
-            if o.get("class") in type_names:
-                out.append(o)
+        copies = [(si, _prefab_instance_text(raw, inst))
+                  for si, inst in placed.get(os.path.realpath(path), [])]
+        for si, text in copies or [(None, raw)]:
+            objs, _l, _c, _h = parse_unity_yaml(
+                text, guid_to_script=guids, asset_guids=assets)
+            for o in objs:
+                if o.get("class") in type_names:
+                    if si is not None:
+                        o["scene"] = si
+                    out.append(o)
     return out
 
 
@@ -17485,7 +18822,8 @@ def _load_scenes_lights_cameras(root, assets):
         _progress("  scene %d/%d %s" % (
             si + 1, len(scenes), os.path.relpath(path, root)))
         objs, scene_lights, scene_cams, scene_hier = parse_unity_yaml(
-            _scene_local_file_ids(_read(path), si),
+            _expand_unstripped_prefab_instances(
+                _scene_local_file_ids(_read(path), si), assets),
             guid_to_script=guids, asset_guids=assets)
         for rec in objs + scene_lights + scene_cams + scene_hier:
             rec["scene"] = si
@@ -17624,7 +18962,8 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
     if missing:
         _progress("loading prefab components for %s" % ", ".join(missing))
         prefab_objs = _load_prefab_objects_for_types(
-            root, set(missing), guids, assets, typename_map)
+            root, set(missing), guids, assets, typename_map,
+            scenes=_unity_scenes_to_pack(root, asset_guids=assets))
         objects.extend(prefab_objs)
         _attach_sprite_textures(prefab_objs, assets)
         for t in missing:
@@ -17950,13 +19289,17 @@ def _csharp_field_site(analyses, class_idn, field):
     for a in analyses or []:
         path = a.get("path") or ""
         text = None
+        owner = None
         for c in a.get("classes") or []:
             cname = c.get("name") or ""
             if _c_ident(cname) != class_idn and cname != class_idn:
                 continue
+            owner = c
             if c.get("file_text") is not None:
                 text = c["file_text"]
             break
+        if owner is None:
+            continue
         if text is None and path and os.path.isfile(path):
             text = _read(path)
         if not text:
@@ -18144,20 +19487,26 @@ def _file_fingerprint_entry(path, root):
     return (rel, int(st.st_size), int(mtime_ns))
 
 
-def _fingerprint_entries(root):
-    """Sorted (relpath, size, mtime_ns) for packer + project inputs."""
+def _fingerprint_entries(root, box2d_root=None):
+    """Sorted (relpath, size, mtime_ns) for packer + project inputs.
+
+    Every module that shapes the output counts, the Box2D-Packed glue
+    generator included: an edit to any of them is a new pack.
+    """
     root = os.path.abspath(root)
     entries = []
     tools_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ("unity_pack.py", "cpprust.py"):
-        p = os.path.join(tools_dir, name)
-        if os.path.isfile(p):
-            try:
-                st = os.stat(p)
-            except OSError:
-                continue
-            mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
-            entries.append(("tools/%s" % name, int(st.st_size), int(mtime_ns)))
+    names = sorted(n for n in os.listdir(tools_dir)
+                   if n.startswith("unity_pack") and n.endswith(".py"))
+    for name in names + ["cs2cpp.py", "cpprust.py"]:
+        e = _file_fingerprint_entry(os.path.join(tools_dir, name), tools_dir)
+        if e:
+            entries.append(("tools/%s" % name,) + e[1:])
+    b2d = find_box2d_root(box2d_root)
+    if b2d:
+        e = _file_fingerprint_entry(os.path.join(b2d, "box2d_unity.py"), b2d)
+        if e:
+            entries.append(("box2d/box2d_unity.py",) + e[1:])
     ps = os.path.join(root, "ProjectSettings")
     if os.path.isdir(ps):
         for dirpath, _dns, names in os.walk(ps):
@@ -18201,13 +19550,14 @@ def _hash_fingerprint_entries(entries, soa=True, soa_vec4=False,
     return h.hexdigest()
 
 
-def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False):
+def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False,
+                        box2d_root=None):
     """(full, assets, scripts) fingerprints.
 
     *assets* covers tools, ProjectSettings, and non-``.cs`` Assets inputs.
     *scripts* covers ``Assets/**/*.cs`` only. *full* is the early-exit key.
     """
-    entries = _fingerprint_entries(root)
+    entries = _fingerprint_entries(root, box2d_root)
     script_entries = [e for e in entries if e[0].endswith(".cs")]
     asset_entries = [e for e in entries if not e[0].endswith(".cs")]
     full = _hash_fingerprint_entries(entries, soa=soa, soa_vec4=soa_vec4,
@@ -18443,7 +19793,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     _TYPE_DECL_ROOT[0] = os.path.abspath(root)
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
-        root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles)
+        root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles,
+        box2d_root=box2d_root)
     if not force:
         stamp = _read_stamp(outdir)
         if (stamp
@@ -18517,6 +19868,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan = plan_layouts(objects, analyses)
     if _godot.is_godot_project(root):
         plan["godot"] = _godot.physics_settings(root)
+    else:
+        plan["unity_physics"] = unity_physics_settings(root)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
     else:
@@ -18538,6 +19891,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["interfaces"] = _collect_interfaces(analyses)
     plan["scene_manager"] = "SceneManager" in used_apis
     plan["static_getters"] = _collect_static_getters(analyses)
+    plan["static_setters"] = _collect_static_setters(analyses)
+    plan["player_prefs"] = _uses_player_prefs(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
@@ -18579,6 +19934,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     for a in analyses:
         kb_keys |= set(a.get("keyboard_keys") or [])
     plan["keyboard_keys"] = sorted(kb_keys)
+    plan["physics2d_contacts"] = _uses_collision2d_contacts(analyses)
     company, product = player_identity(root)
     plan["company_name"] = company
     plan["product_name"] = product
@@ -18710,6 +20066,12 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
                       box2d_inject=bool(physics_inject)))
     if plan.get("box2d_physics"):
         b2u = _load_box2d_unity(box2d_root)
+        if plan.get("physics2d_contacts") and not hasattr(
+                b2u, "_with_contact_manifolds"):
+            raise PackError(
+                "Collision2D contacts (GetContact / contactCount) need a "
+                "Box2D-Packed checkout that reports manifolds; update %s"
+                % os.path.dirname(b2u.__file__))
         if plan.get("godot"):
             if "godot" not in getattr(b2u, "MODES", ()):
                 raise PackError(

@@ -52,10 +52,62 @@ float Camera_main_rect_h __attribute__((weak)) = 1.f;
 float engine_input_axis_Horizontal __attribute__((weak)) = 0.f;
 float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
 int engine_keyboard_connected __attribute__((weak)) = 0;
-int engine_keyboard_leftArrow __attribute__((weak)) = 0;
-int engine_keyboard_rightArrow __attribute__((weak)) = 0;
-int engine_keyboard_upArrow __attribute__((weak)) = 0;
-int engine_keyboard_downArrow __attribute__((weak)) = 0;
+/* Input System Keyboard.current.<name>Key -> GLFW key; weak so data.c's
+ * engine_keyboard_<name> (only the keys scripts read) wins. */
+#define UNITY_KEYS(X) \
+    X(a, GLFW_KEY_A) \
+    X(b, GLFW_KEY_B) \
+    X(c, GLFW_KEY_C) \
+    X(d, GLFW_KEY_D) \
+    X(e, GLFW_KEY_E) \
+    X(f, GLFW_KEY_F) \
+    X(g, GLFW_KEY_G) \
+    X(h, GLFW_KEY_H) \
+    X(i, GLFW_KEY_I) \
+    X(j, GLFW_KEY_J) \
+    X(k, GLFW_KEY_K) \
+    X(l, GLFW_KEY_L) \
+    X(m, GLFW_KEY_M) \
+    X(n, GLFW_KEY_N) \
+    X(o, GLFW_KEY_O) \
+    X(p, GLFW_KEY_P) \
+    X(q, GLFW_KEY_Q) \
+    X(r, GLFW_KEY_R) \
+    X(s, GLFW_KEY_S) \
+    X(t, GLFW_KEY_T) \
+    X(u, GLFW_KEY_U) \
+    X(v, GLFW_KEY_V) \
+    X(w, GLFW_KEY_W) \
+    X(x, GLFW_KEY_X) \
+    X(y, GLFW_KEY_Y) \
+    X(z, GLFW_KEY_Z) \
+    X(digit0, GLFW_KEY_0) \
+    X(digit1, GLFW_KEY_1) \
+    X(digit2, GLFW_KEY_2) \
+    X(digit3, GLFW_KEY_3) \
+    X(digit4, GLFW_KEY_4) \
+    X(digit5, GLFW_KEY_5) \
+    X(digit6, GLFW_KEY_6) \
+    X(digit7, GLFW_KEY_7) \
+    X(digit8, GLFW_KEY_8) \
+    X(digit9, GLFW_KEY_9) \
+    X(space, GLFW_KEY_SPACE) \
+    X(enter, GLFW_KEY_ENTER) \
+    X(escape, GLFW_KEY_ESCAPE) \
+    X(tab, GLFW_KEY_TAB) \
+    X(backspace, GLFW_KEY_BACKSPACE) \
+    X(leftShift, GLFW_KEY_LEFT_SHIFT) \
+    X(rightShift, GLFW_KEY_RIGHT_SHIFT) \
+    X(leftCtrl, GLFW_KEY_LEFT_CONTROL) \
+    X(rightCtrl, GLFW_KEY_RIGHT_CONTROL) \
+    X(leftAlt, GLFW_KEY_LEFT_ALT) \
+    X(rightAlt, GLFW_KEY_RIGHT_ALT) \
+    X(leftArrow, GLFW_KEY_LEFT) \
+    X(rightArrow, GLFW_KEY_RIGHT) \
+    X(upArrow, GLFW_KEY_UP) \
+    X(downArrow, GLFW_KEY_DOWN)
+#define UNITY_KEY_DECL(n, k) int engine_keyboard_##n __attribute__((weak)) = 0;
+UNITY_KEYS(UNITY_KEY_DECL)
 float engine_pointer_x __attribute__((weak)) = 0.f;
 float engine_pointer_y __attribute__((weak)) = 0.f;
 int engine_pointer_down __attribute__((weak)) = 0;
@@ -94,14 +146,9 @@ static void poll_input_axes(GLFWwindow *win)
 
     /* Input System Keyboard.current — only the named key, no WASD aliases. */
     engine_keyboard_connected = 1;
-    engine_keyboard_leftArrow =
-        glfwGetKey(win, GLFW_KEY_LEFT) == GLFW_PRESS;
-    engine_keyboard_rightArrow =
-        glfwGetKey(win, GLFW_KEY_RIGHT) == GLFW_PRESS;
-    engine_keyboard_upArrow =
-        glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS;
-    engine_keyboard_downArrow =
-        glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS;
+#define UNITY_KEY_SET(n, k) engine_keyboard_##n = glfwGetKey(win, k) == GLFW_PRESS;
+    UNITY_KEYS(UNITY_KEY_SET)
+#undef UNITY_KEY_SET
 
     /* uGUI Button — screen space, origin bottom-left (Unity).
      * glfwGetCursorPos is in window coordinates; map via window size, not

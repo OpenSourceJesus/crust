@@ -1949,11 +1949,7 @@ def _build_ui_buttons(plan, analyses=None):
         if gid and gi is not None:
             go_by_id.setdefault(gid, int(gi))
     mb_index = _mb_index(plan)
-    # class → first authored instance index (stripped MB fallback).
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
+    class_scenes = _class_instance_scenes(plan)
     buttons = []
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
@@ -1988,8 +1984,9 @@ def _build_ui_buttons(plan, analyses=None):
                 hit_mb = mb_index.get(tid)
                 if hit_mb:
                     cname, inst = hit_mb[0], int(hit_mb[1])
-                elif cname and cname in class_inst0:
-                    inst = int(class_inst0[cname])
+                elif cname:
+                    inst = _unowned_target_inst(
+                        class_scenes, cname, o.get("scene"))
                 if cname is None or inst is None:
                     continue
                 if not _mb_onclick_callable(analyses, cname, method, mode):
@@ -2070,10 +2067,7 @@ def _build_ui_sliders(plan, analyses=None):
         if xid is not None and fid is not None:
             handle_parent.setdefault(str(xid), str(fid))
     mb_index = _mb_index(plan)
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
+    class_scenes = _class_instance_scenes(plan)
     sliders = []
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
@@ -2110,8 +2104,9 @@ def _build_ui_sliders(plan, analyses=None):
                 hit_mb = mb_index.get(tid)
                 if hit_mb:
                     cname, inst = hit_mb[0], int(hit_mb[1])
-                elif cname and cname in class_inst0:
-                    inst = int(class_inst0[cname])
+                elif cname:
+                    inst = _unowned_target_inst(
+                        class_scenes, cname, o.get("scene"))
                 if cname is None or inst is None:
                     continue
                 if not _mb_onvaluechanged_callable(
@@ -2173,13 +2168,36 @@ def _ui_xf_go_maps(plan):
     return go_by_id, xf_to_go, handle_parent
 
 
-def _ui_mb_call_resolve(plan, analyses, calls, callable_fn):
+def _class_instance_scenes(plan):
+    """class → ``[(instance index, scene or None)]`` for binding persistent
+    calls whose target fileID no packed instance owns."""
+    out = {}
+    for cname, cl in (plan.get("classes") or {}).items():
+        insts = cl.get("instances") or []
+        out[cname] = [(i, o.get("scene")) for i, o in enumerate(insts)]
+        if not insts and int(cl.get("n") or 0) > 0:
+            out[cname] = [(0, None)]
+    return out
+
+
+def _unowned_target_inst(class_scenes, cname, scene):
+    """Instance of *cname* in the caller's *scene*, else one no scene places;
+    ``None`` when the only instances live in other scenes."""
+    insts = class_scenes.get(cname) or []
+    if scene is not None:
+        for i, s in insts:
+            if s is not None and int(s) == int(scene):
+                return i
+    for i, s in insts:
+        if s is None:
+            return i
+    return None
+
+
+def _ui_mb_call_resolve(plan, analyses, calls, callable_fn, scene=None):
     """Resolve persistent UnityEvent calls → mb dispatch entries."""
     mb_index = _mb_index(plan)
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
+    class_scenes = _class_instance_scenes(plan)
     out = []
     for c in calls or []:
         method = c.get("method") or ""
@@ -2190,8 +2208,8 @@ def _ui_mb_call_resolve(plan, analyses, calls, callable_fn):
         hit_mb = mb_index.get(tid)
         if hit_mb:
             cname, inst = hit_mb[0], int(hit_mb[1])
-        elif cname and cname in class_inst0:
-            inst = int(class_inst0[cname])
+        elif cname:
+            inst = _unowned_target_inst(class_scenes, cname, scene)
         if cname is None or inst is None:
             continue
         if not callable_fn(analyses, cname, method, mode):
@@ -2232,7 +2250,7 @@ def _build_ui_scrollbars(plan, analyses=None):
                 slide_go = self_go
             calls = _ui_mb_call_resolve(
                 plan, analyses, sb.get("on_value_changed"),
-                _mb_onvaluechanged_callable)
+                _mb_onvaluechanged_callable, scene=o.get("scene"))
             bars.append({
                 "go": self_go,
                 "slide_go": int(slide_go),
@@ -2322,7 +2340,7 @@ def _build_ui_toggles(plan, analyses=None):
                     graphic_go = xf_to_go.get(str(gid), -1)
             calls = _ui_mb_call_resolve(
                 plan, analyses, tg.get("on_value_changed"),
-                _mb_ontoggle_callable)
+                _mb_ontoggle_callable, scene=o.get("scene"))
             toggles.append({
                 "go": self_go,
                 "is_on": int(tg.get("is_on") or 0),
@@ -2340,10 +2358,7 @@ def _build_ui_eventtriggers(plan, analyses=None):
     """
     go_by_id, _xf, _hp = _ui_xf_go_maps(plan)
     mb_index = _mb_index(plan)
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
+    class_scenes = _class_instance_scenes(plan)
     # Slider go → ui_sliders index for set_value.
     sl_by_go = {}
     for i, sl in enumerate(plan.get("ui_sliders") or []):
@@ -2423,8 +2438,9 @@ def _build_ui_eventtriggers(plan, analyses=None):
                     hit_mb = mb_index.get(tid)
                     if hit_mb:
                         cname, inst = hit_mb[0], int(hit_mb[1])
-                    elif cname and cname in class_inst0:
-                        inst = int(class_inst0[cname])
+                    elif cname:
+                        inst = _unowned_target_inst(
+                            class_scenes, cname, o.get("scene"))
                     if cname is None or inst is None:
                         continue
                     if not _mb_eventtrigger_callable(

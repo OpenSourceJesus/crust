@@ -251,7 +251,7 @@ def _build_rigidbody_tables(plan):
 
 
 def _build_collider2d_tables(plan):
-    """Authored BoxCollider2D / CircleCollider2D → packed contact table."""
+    """Authored Box / Circle / CapsuleCollider2D → packed contact table."""
     cols = []
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
     # Map (class, inst) → rb2d index for dynamic flag.
@@ -268,7 +268,8 @@ def _build_collider2d_tables(plan):
             body = 2  # static (no RB)
             if rb_i is not None:
                 body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
-            kind = 0 if c.get("kind") == "box" else 1
+            kind = {"box": 0, "capsule_v": 2, "capsule_h": 3}.get(
+                c.get("kind"), 1)
             cols.append({
                 "name": o.get("name") or "obj",
                 "owner_class": cname,
@@ -527,6 +528,45 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
             r"new\s+Vector3\s*\((.*?)\)\s*;" % re.escape(fname),
             repl_new3, text, flags=re.S)
 
+    # Reads: rb.linearVelocity.x / rb.linearVelocity (a Vector2 / Vector3).
+    def _vel_read(gr, table, axis):
+        return ("({ int _up_rb = %s; _up_rb < 0 ? 0.f : %s_vel_%s[_up_rb]; })"
+                % (gr, table, axis))
+
+    for fields, table, axes, vec in (
+            (rb2d_fields, "_Rigidbody2D", "xy", "Vector2"),
+            (rb3d_fields, "_Rigidbody", "xyz", "Vector3")):
+        for fname in fields:
+            gr = "(int)%s_get_%s(i)" % (this_idn, fname)
+            if vec == "Vector2":
+                # rb.linearVelocity += v / -= v
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*"
+                    r"(?:linearVelocity|velocity)\s*([+-])=\s*([^;]+);"
+                    % re.escape(fname),
+                    lambda m, g=gr, t=table: (
+                        "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                        "Vector2 _up_d = (%s); "
+                        "%s_vel_x[_up_rb] %s= _up_d.x; "
+                        "%s_vel_y[_up_rb] %s= _up_d.y; } }" % (
+                            g, m.group(2).strip(), t, m.group(1), t,
+                            m.group(1))),
+                    text)
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*"
+                r"(?:linearVelocity|velocity)\s*\.\s*([%s])\b"
+                r"(?!\s*[-+*/]?=[^=])"
+                % (re.escape(fname), axes),
+                lambda m, g=gr, t=table: _vel_read(g, t, m.group(1)),
+                text)
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*"
+                r"(?:linearVelocity|velocity)\b"
+                r"(?!\s*(?:[-+*/]?=[^=]|\.))"
+                % re.escape(fname),
+                lambda m, g=gr, t=table, a=axes, v=vec: "%s_make(%s)" % (
+                    v, ", ".join(_vel_read(g, t, ax) for ax in a)),
+                text)
     return text
 
 

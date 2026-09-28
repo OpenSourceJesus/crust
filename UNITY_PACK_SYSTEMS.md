@@ -35,7 +35,8 @@ time C under both gcc and clang when both are on PATH (`--cc` to restrict).
 | `Input.GetButton("Jump")` | Host int `engine_input_button_Jump` |
 | `Input.GetKey("a")` | Host table `engine_input_key[256]` |
 | `Keyboard.current` | Non-NULL when `engine_keyboard_connected` |
-| `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>` |
+| `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>`; the GLFW hosts feed letters, digits, space, enter, escape, tab, backspace, shift / ctrl / alt, arrows |
+| `.wasPressedThisFrame` / `.wasReleasedThisFrame` | Key state latched once per `engine_tick` |
 
 Legacy Input Manager and Input System `Keyboard.current` (connected
 device + key state). Bare `Keyboard` needs `using UnityEngine.InputSystem;`
@@ -103,6 +104,9 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | Bare `instance = this` (singleton Awake) | ``T_instance = i`` (sets the same cache field ``T_Instance()`` reads) |
 | `T.Instance.Method(args)` (T's emitted instance method) | ``T_Method(T_Instance(), args)``; a null `Instance` is a `NullReferenceException` |
 | `T.staticField` (bool / number / string) | ``T_staticField`` (class statics are emitted before every class group) |
+| Static property with a one-statement getter / setter (`Intro.AlreadyDone`, `Intro.LoadSceneNameAtEnd = x`) | Getter inlined at reads, setter inlined at `T.P = x;` statements |
+| One-statement static method of a project `static class` (`PlayerPrefsExtensions.GetBool(key)`) | Inlined with its arguments bound (defaults filled); skipped when an argument with side effects would be evaluated twice |
+| `PlayerPrefs.Get/SetInt`, `Float`, `String`, `HasKey`, `DeleteKey`, `DeleteAll`, `Save` | Engine key/value store in `persistentDataPath/prefs.crust`, loaded on first use and rewritten on every change; Unity's defaults (`""` / 0) |
 | Overloaded `Method(args)` (same class or through `T.Instance`) | The overload whose parameters fit: string vs. non-string arguments, an int literal preferring `int`; a call two overloads fit equally stays unlowered |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 | `transform.Find(name)` / nested `"A/B"` | Child GO via **live** parent table (seeded from authored `m_Father`; updated by `SetParent`) → index or **-1** |
@@ -182,6 +186,9 @@ slot (intensity 1, white) into the light table.
 | `transform.parent` | Live `_engine_go_parent` (seeded `m_Father`) → parent GO index or **-1** |
 | `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T; appends as last sibling |
 | `transform.GetSiblingIndex` | Live `_engine_go_sib` (seeded GO order under parent; updated by `SetParent`) |
+| `trs.DetachChildren()` (Transform handle) | `SetParent(null)` on each child, world position kept |
+| `trs.position` (Transform handle) | World position through the live hierarchy, where C# makes it a `Vector2`: `(Vector2)` cast, `Vector2.Distance` argument, `Vector2 v = Vector3.Lerp(..)`; `trs.position = v2` sets world (z 0) |
+| `trs.rotation` / `Quaternion.Slerp` / `Quaternion.Angle` / `a.eulerAngles == b.eulerAngles` (handles) | `Quaternion` value on live rotation tables of every row the handle can name (local rotation, unparented ≈ world) |
 | `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
 | `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
 | `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |
@@ -376,11 +383,27 @@ unity_pack keeps the packed tables, the position accessors, and the
 1. Create Box2D bodies for new Rigidbody2D components: authored ones on the
    first step, `AddComponent<Rigidbody2D>` ones when they appear.
 2. Push what scripts changed: `linearVelocity`, `transform.position` (a
-   teleport), `gravityScale`, `linearDamping`, `Physics2D.gravity`.
+   teleport), `gravityScale`, `linearDamping`, `Physics2D.gravity`. A
+   collider without a Rigidbody2D whose Transform moved (a script, a moving
+   parent) is teleported to its new center, as Unity moves a static collider.
 3. `b2World_Step` with 4 substeps.
 4. Pull positions and velocities into the packed tables.
 5. Report touching pairs. unity_pack sends Enter / Stay / Exit by comparing with
    the previous step.
+
+When a script calls `Collision2D.GetContact(k)` or reads `contactCount`, the
+glue also reports each pair's manifold through `engine_col2d_manifold`
+(`_with_contact_manifolds` in `box2d_unity.py`). The normal and up to two
+world points are kept per pair. `GetContact` returns a `ContactPoint2D` whose
+`normal` points from the other collider toward the receiving one, as in
+Unity. A handler that calls another handler (`OnCollisionStay2D(coll)` →
+`OnCollisionEnter2D(coll)`) passes the same collision on. Reading
+`rb.linearVelocity` (or `.x` / `.y`) reads the packed body velocity.
+
+`Physics2D.gravity`, `Physics.gravity` and `Time.fixedDeltaTime` start at the
+project's `Physics2DSettings.asset` / `DynamicsManager.asset` `m_Gravity` and
+`TimeManager.asset` Fixed Timestep (a float, or the newer `m_Count` /
+`m_Rate` rational), with Unity's defaults when a file is missing.
 
 Box2D-Packed is found through `--box2d PATH`, `$BOX2D_PACKED_ROOT`, or a `box2d`
 checkout beside this repository. A project with 2D physics and no checkout is
@@ -406,6 +429,7 @@ The generated Makefile's `game` target links `physics_box2d.o` and
 | Rigidbody2D Dynamic / Kinematic / Static | dynamic / kinematic / static body |
 | Rigidbody2D mass | body mass |
 | BoxCollider2D, CircleCollider2D, offset, rotation | offset box, circle |
+| CapsuleCollider2D (size, `m_Direction`) | capsule; a circle when no longer than wide |
 | Collider2D without a Rigidbody2D | static body |
 | `m_IsTrigger` | sensor, no collision messages |
 | Friction, bounciness, combine modes | world friction and restitution callbacks with the same PhysicsMaterialCombine rules |
@@ -421,6 +445,7 @@ to it at runtime does not move it. `engine.c` stays in the crust subset: only
 |---------------|---------|
 | Authored `!u!61` BoxCollider2D | Size/offset → half-extents; a Box2D-Packed box |
 | Authored `!u!58` CircleCollider2D | Radius (× max scale); a Box2D-Packed circle |
+| Authored `!u!70` CapsuleCollider2D | Size → half-extents (× scale); a Box2D-Packed capsule along `m_Direction` |
 | Authored `!u!65` BoxCollider | Size/center → half-extents; contacts in `engine_physics_collide3d` |
 | Authored `!u!135` SphereCollider | Radius (× max scale); AABB contacts |
 | `m_IsTrigger: 1` | Parsed but skipped for solid resolution |
@@ -497,6 +522,16 @@ so it is in the same world units as `ScreenToWorldPoint` — the two compare,
 which is what the drag idiom `PointToNormalized(rect.GetWorldRect(),
 Camera.main.ScreenToWorldPoint(mouse))` needs. It is exact for UI the main
 orthographic camera draws (Screen Space – Camera / World Space).
+
+An instance `T[]` field (`public Transform[] waypoints`) is a vector per
+instance, seeded from the scene's `- {fileID: N}` list before the first
+Awake and again when its scene reloads: GO indices for Transform /
+GameObject / uGUI elements, instance indices for a packed class, `-1` for an
+empty slot. A GameObject with only a Transform, which the pack otherwise
+drops, stays a packed row when a script field or array names it. With
+`SetParent` / `DetachChildren` / handle `.position` in use, the classes of
+named rows and of their children keep writable positions. Enum members
+the script declares (`FollowType.Loop`) are their integer values.
 
 `Rect` packs as a C struct: `x` / `y` / `width` / `height` are fields in
 both languages, while `center`, `size`, `min` and `max` are C# properties
@@ -589,6 +624,26 @@ with `n << 56` before parsing (guid-qualified references are left alone).
 When `EditorBuildSettings.asset` is missing (tiny fixtures), every `.unity`
 under `Assets/` is used, sorted by path.
 
+A scene `PrefabInstance` is expanded in place into its prefab's objects. Its
+fileIDs, overrides and parent are handled the same way as for prefab-only
+components, described next. A stripped stub the scene keeps (for scene
+objects parented under the instance's Transform, say) is replaced by the
+placed object, which keeps the stub's fileID. An instance with a stripped
+RectTransform is left to the UI prefab-root path instead, which applies its
+onClick array overrides and components added on the stripped GameObject.
+
+Components that scripts need but no scene authors directly (singletons,
+`FindObjectOfType` targets, button targets) come from `.prefab` assets.
+Every `PrefabInstance` of such a prefab in a packed scene becomes its own
+copy in that scene. The copy uses the scene's stripped-stub fileIDs where
+the scene has them, and otherwise `(instance ^ source) & 0x7FFF…`. Scalar
+and flow-mapping property overrides are applied (array paths are not), and
+the root is parented under `m_TransformParent`. An instance tagged
+`EditorOnly` is dropped, as in a player build. A prefab that no packed
+scene places is loaded once with no scene. A button's stripped target
+binds to an instance in the button's own scene, or to that unplaced copy,
+and never to another scene's instance.
+
 With more than one scene (or one scene whose scripts use `SceneManager`)
 the engine carries a scene runtime (`_engine_scene_*`):
 
@@ -657,7 +712,8 @@ same project into the same outdir:
   `.cpp` is byte-identical (and the lowered `.c` exists). Other outputs use
   write-if-different so mtimes stay put for `gcc`.
 
-Fingerprint covers `tools/unity_pack.py`, `tools/cpprust.py`,
+Fingerprint covers `tools/unity_pack*.py`, `tools/cs2cpp.py`,
+`tools/cpprust.py`, Box2D-Packed's `box2d_unity.py`,
 `ProjectSettings/`, and authored `Assets/` extensions (`.cs`, scenes,
 prefabs, metas, common textures/audio, etc.). It does **not** walk
 `Library/PackageCache` — after a UPM-only change, pass `--force`.
