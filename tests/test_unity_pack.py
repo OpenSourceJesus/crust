@@ -38,6 +38,11 @@ import tools.unity_pack as unity_pack  # noqa: E402
 PROJECT = os.path.join(ROOT, "tests", "fixtures", "MiniScene")
 _CC = shutil.which("gcc") or shutil.which("cc")
 needs_cc = unittest.skipIf(_CC is None, "no C compiler")
+_BOX2D_ROOT = unity_pack.find_box2d_root()
+needs_box2d = unittest.skipUnless(
+    _BOX2D_ROOT is not None and _CC is not None,
+    "2D physics is Box2D-Packed: set BOX2D_PACKED_ROOT or clone "
+    "https://github.com/crustos/box2d beside this repository")
 
 
 class TestSceneImport(unittest.TestCase):
@@ -52,15 +57,533 @@ class TestSceneImport(unittest.TestCase):
 
     def test_godot_tscn(self):
         text = (
+            '[gd_scene format=3]\n\n'
             '[node name="Star" type="Node2D"]\n'
-            'script_class = "Star"\n'
             'position = Vector2(3, 4)\n'
-            'hp = 2\n'
         )
         objs = unity_pack.parse_godot_tscn(text)
         self.assertEqual(len(objs), 1)
         self.assertEqual(objs[0]["class"], "Star")
         self.assertEqual(objs[0]["pos"][0], 3.0)
+
+
+GODOT_PROJECT = os.path.join(ROOT, "tests", "fixtures", "GodotMini")
+
+
+class TestGodot(unittest.TestCase):
+    """Godot 4 projects: scenes and C# scripts (tools/godot_pack.py)."""
+
+    def setUp(self):
+        import tools.godot_pack as godot
+        self.godot = godot
+
+    def _copy(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        root = os.path.join(d, "GodotMini")
+        shutil.copytree(GODOT_PROJECT, root)
+        return root
+
+    @staticmethod
+    def _edit(path, old, new):
+        with open(path) as f:
+            text = f.read()
+        assert old in text, old
+        with open(path, "w") as f:
+            f.write(text.replace(old, new))
+
+    def test_resource_values(self):
+        secs = self.godot.parse_resource(
+            '[gd_scene format=3 uid="uid://x"]\n\n'
+            '[node name="A" type="Node2D" parent="." instance=ExtResource("2_c")]\n'
+            'position = Vector2(1.5, -2)\n'
+            'tags = PackedStringArray("a", "b")\n'
+            'meta = {\n"k": [1, 2.0, true],\n&"n": null\n}\n'
+            'metadata/_edit_lock_ = true\n'
+            'path = NodePath("../B")\n'
+            'note = "two\\nlines"\n')
+        node = secs[2]
+        self.assertEqual(node["tag"], "node")
+        self.assertEqual(node["attrs"]["instance"],
+                         self.godot.GdCall("ExtResource", ["2_c"]))
+        props = node["props"]
+        self.assertEqual(props["position"],
+                         self.godot.GdCall("Vector2", [1.5, -2]))
+        self.assertEqual(props["meta"], {"k": [1, 2.0, True], "n": None})
+        self.assertIs(props["metadata/_edit_lock_"], True)
+        self.assertEqual(props["note"], "two\nlines")
+        self.assertEqual(node["prop_lines"]["path"], 11)  # after the dict
+
+    def test_scene_tree_transforms_and_instances(self):
+        objs, _an, _l, _c, _h = unity_pack.load_project(GODOT_PROJECT)
+        by = {o["name"]: o for o in objs}
+        self.assertEqual([o["name"] for o in objs],
+                         ["Main", "Player", "Muzzle", "Tip", "CoinA", "CoinB"])
+        # Tip is 4 px along a Muzzle turned 90 degrees: y is down in Godot.
+        self.assertAlmostEqual(by["Tip"]["pos"][0], 110.0, places=3)
+        self.assertAlmostEqual(by["Tip"]["pos"][1], 54.0, places=3)
+        self.assertEqual(by["Tip"]["local_pos"], (4.0, 0.0, 0.0))
+        # Instanced scenes: the class is the script's, overrides apply.
+        self.assertEqual(by["CoinA"]["class"], "Coin")
+        self.assertEqual(by["CoinA"]["fields"], {})
+        self.assertEqual(by["CoinB"]["fields"], {"Value": 5})
+        self.assertEqual(by["Player"]["fields"], {"Speed": 120.0, "Hp": 5})
+        self.assertEqual(by["Muzzle"]["class"], "Muzzle")
+
+    def test_adapter_keeps_every_line(self):
+        path = os.path.join(GODOT_PROJECT, "scripts", "Player.cs")
+        with open(path) as f:
+            text = f.read()
+        out = self.godot.adapt_csharp(path, text, {"Player", "Coin"})
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertIn("class Player : MonoBehaviour", out)
+        self.assertNotIn("partial", out)
+        self.assertIn("public float Speed", out)
+        self.assertNotIn("get;", out)
+        self.assertIn("public void Update() { float delta = "
+                      "(float)Time.deltaTime;", out)
+        self.assertIn("transform.localPosition.x", out)
+        self.assertIn('System.Console.WriteLine("" + ("ready hp=") + (Hp))',
+                      out)
+
+    def test_vector_constants_are_godots(self):
+        src = ("using Godot;\npublic partial class M : Node2D {\n"
+               "  public override void _Ready() {\n"
+               "    Position = Position + Vector2.Up + Vector2.Zero;\n  }\n}\n")
+        out = self.godot.adapt_csharp("M.cs", src, {"M"})
+        self.assertIn("new Vector2(0, -1)", out)   # Godot's Up: y is down
+        self.assertIn("Vector2.zero", out)
+
+    def test_unpacked_api_is_refused_at_its_line(self):
+        root = self._copy()
+        self._edit(os.path.join(root, "scripts", "Player.cs"),
+                   "_ticks = _ticks + 1;",
+                   "_ticks = _ticks + 1; var m = GetNode<Node2D>(\"Muzzle\");")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.load_project(root)
+        self.assertIn("res://scripts/Player.cs(17,38): error CS8000: "
+                      "`GetNode` (Godot API) is not packed yet",
+                      str(cm.exception))
+
+    def test_a_member_the_script_declares_is_not_refused(self):
+        src = ("using Godot;\npublic partial class M : Node2D {\n"
+               "  public float Scale = 2f;\n"
+               "  public override void _Ready() { Scale = 3f; }\n}\n")
+        self.godot.adapt_csharp("M.cs", src, {"M"})  # no PackError
+
+    def test_gdscript_is_refused_at_the_scene_line(self):
+        root = self._copy()
+        with open(os.path.join(root, "scripts", "coin.gd"), "w") as f:
+            f.write("extends Node2D\n")
+        self._edit(os.path.join(root, "coin.tscn"),
+                   "res://scripts/Coin.cs", "res://scripts/coin.gd")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.load_project(root)
+        self.assertIn("res://coin.tscn:6: error: GDScript is not packed yet",
+                      str(cm.exception))
+
+    def test_edited_scene_is_not_unchanged(self):
+        # A Godot project has no Assets/: its fingerprint was empty.
+        root = self._copy()
+        before = unity_pack._input_fingerprint(root)
+        mp = os.path.join(root, "main.tscn")
+        with open(mp, "a") as f:
+            f.write("\n")
+        self.assertNotEqual(before, unity_pack._input_fingerprint(root))
+
+    def test_unity_diagnostics_keep_assets_paths(self):
+        unity_pack.load_project(GODOT_PROJECT)
+        unity_pack.load_project(PROJECT)
+        self.assertEqual(
+            unity_pack._assets_rel_path("/x/Assets/Scripts/A.cs"),
+            "Assets/Scripts/A.cs")
+
+    def _physics_project(self, body_extra="", shapes=None, script=None,
+                         settings=""):
+        """A Godot project: a RigidBody2D `Ball` over a StaticBody2D floor,
+        an Area2D, and two instances of crate.tscn."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "project.godot"), "w") as f:
+            f.write('config_version=5\n\n[application]\n\n'
+                    'run/main_scene="res://main.tscn"\n' + settings)
+        with open(os.path.join(d, "crate.tscn"), "w") as f:
+            f.write('[gd_scene format=3]\n\n'
+                    '[sub_resource type="RectangleShape2D" id="1"]\n'
+                    'size = Vector2(40, 40)\n\n'
+                    '[node name="Crate" type="RigidBody2D"]\n'
+                    'lock_rotation = true\n\n'
+                    '[node name="CollisionShape2D" type="CollisionShape2D" '
+                    'parent="."]\nshape = SubResource("1")\n')
+        ext = ""
+        if script:
+            with open(os.path.join(d, "Ball.cs"), "w") as f:
+                f.write(script)
+            ext = '[ext_resource type="Script" path="res://Ball.cs" id="9_s"]\n'
+        if shapes is None:
+            shapes = ('[node name="Shape" type="CollisionShape2D" '
+                      'parent="Ball"]\nposition = Vector2(0, 5)\n'
+                      'rotation = 1.5707963\nshape = SubResource("box")\n')
+        with open(os.path.join(d, "main.tscn"), "w") as f:
+            f.write(
+                '[gd_scene format=3]\n\n' + ext +
+                '[ext_resource type="PackedScene" path="res://crate.tscn" '
+                'id="2_c"]\n\n'
+                '[sub_resource type="RectangleShape2D" id="box"]\n'
+                'size = Vector2(30, 10)\n\n'
+                '[sub_resource type="CircleShape2D" id="circle"]\n'
+                'radius = 8.0\n\n'
+                '[sub_resource type="PhysicsMaterial" id="mat"]\n'
+                'friction = 0.4\nbounce = 0.25\nrough = true\n\n'
+                '[sub_resource type="PhysicsMaterial" id="pad"]\n'
+                'bounce = 0.3\nabsorbent = true\n\n'
+                '[node name="Main" type="Node2D"]\n\n'
+                '[node name="Ball" type="RigidBody2D" parent="."]\n'
+                'position = Vector2(100, 0)\n'
+                'physics_material_override = SubResource("mat")\n'
+                'lock_rotation = true\nmass = 2.0\nlinear_damp = 0.5\n'
+                + ('script = ExtResource("9_s")\n' if script else "")
+                + body_extra + '\n' + shapes + '\n'
+                '[node name="Floor" type="StaticBody2D" parent="."]\n'
+                'position = Vector2(0, 300)\n'
+                'physics_material_override = SubResource("pad")\n\n'
+                '[node name="CollisionShape2D" type="CollisionShape2D" '
+                'parent="Floor"]\nshape = SubResource("box")\n\n'
+                '[node name="Zone" type="Area2D" parent="."]\n\n'
+                '[node name="CollisionShape2D" type="CollisionShape2D" '
+                'parent="Zone"]\nshape = SubResource("circle")\n\n'
+                '[node name="C1" parent="." instance=ExtResource("2_c")]\n'
+                'position = Vector2(400, 260)\n\n'
+                '[node name="C2" parent="." instance=ExtResource("2_c")]\n'
+                'position = Vector2(400, 220)\n')
+        return d
+
+    def test_physics_bodies_take_their_shapes(self):
+        objs = unity_pack.load_project(self._physics_project())[0]
+        by = {o["name"]: o for o in objs}
+        # Shape nodes are components of their body, not objects.
+        self.assertEqual(sorted(by), ["Ball", "C1", "C2", "Floor", "Main",
+                                      "Zone"])
+        rb = by["Ball"]["rigidbody2d"]
+        self.assertEqual(rb["body_type"], 0)
+        self.assertEqual(rb["mass"], 2.0)
+        # linear_damp_mode combine: the body's plus the project's 0.1.
+        self.assertAlmostEqual(rb["linear_damping"], 0.6)
+        col = by["Ball"]["collider2d"]
+        self.assertEqual(col["kind"], "box")
+        # Turned 90 degrees, 5 px below the body origin: Box2D-Packed
+        # rotates (ox, oy) by the collider's angle back to (0, 5).
+        c, s_ = col["cos_z"], col["sin_z"]
+        self.assertAlmostEqual(c * col["ox"] - s_ * col["oy"], 0.0, places=4)
+        self.assertAlmostEqual(s_ * col["ox"] + c * col["oy"], 5.0, places=4)
+        self.assertAlmostEqual(s_, 1.0, places=5)
+        self.assertEqual((col["hw"], col["hh"]), (15.0, 5.0))
+        self.assertEqual((col["friction"], col["bounciness"]), (0.4, 0.25))
+        self.assertEqual((col["friction_combine"], col["bounce_combine"]),
+                         (1, 0))   # rough
+        floor = by["Floor"]
+        self.assertIsNone(floor["rigidbody2d"])   # static: a collider only
+        self.assertEqual(floor["collider2d"]["bounce_combine"], 1)  # absorbent
+        self.assertEqual(floor["collider2d"]["friction"], 1.0)  # its default
+        self.assertEqual(by["Zone"]["collider2d"]["is_trigger"], 1)
+        self.assertEqual(by["Zone"]["collider2d"]["hw"], 8.0)
+        # Instances of one scene are one class.
+        self.assertEqual({by["C1"]["class"], by["C2"]["class"]}, {"Crate"})
+        self.assertEqual(by["C1"]["rigidbody2d"]["linear_damping"], 0.1)
+
+    def test_project_physics_settings(self):
+        d = self._physics_project(settings=(
+            '\n[physics]\n\n2d/default_gravity=490.0\n'
+            '2d/default_gravity_vector=Vector2(1, 0)\n'
+            'common/physics_ticks_per_second=120\n'
+            '\n[godot_pack]\n\nlength_units_per_meter=32.0\n'))
+        st = self.godot.physics_settings(d)
+        self.assertEqual(st["gravity"], (490.0, 0.0))
+        self.assertAlmostEqual(st["fixed_dt"], 1.0 / 120)
+        self.assertEqual(st["length_units_per_meter"], 32.0)
+        self.assertEqual(self.godot.physics_settings(GODOT_PROJECT)["gravity"],
+                         (0.0, 980.0))   # Godot's default: 980 px/s^2, down
+
+    def test_physics_refusals_name_the_scene_line(self):
+        two = ('[node name="S1" type="CollisionShape2D" parent="Ball"]\n'
+               'shape = SubResource("box")\n\n'
+               '[node name="S2" type="CollisionShape2D" parent="Ball"]\n'
+               'shape = SubResource("circle")\n')
+        cases = [
+            (dict(shapes=two), "main.tscn:32: error: `Ball` has a second "
+             "CollisionShape2D"),
+            (dict(body_extra="collision_mask = 3\n"),
+             "main.tscn:28: error: collision_mask is not packed yet"),
+            (dict(shapes='[node name="S" type="CollisionShape2D" '
+                  'parent="Ball"]\nshape = SubResource("mat")\n'),
+             "main.tscn:30: error: `S` is a PhysicsMaterial; "
+             "RectangleShape2D and CircleShape2D are packed"),
+        ]
+        for kw, want in cases:
+            with self.assertRaises(unity_pack.PackError) as cm:
+                unity_pack.load_project(self._physics_project(**kw))
+            self.assertIn(want, str(cm.exception))
+        # A second shape that is disabled is not a second shape.
+        unity_pack.load_project(self._physics_project(
+            shapes=two.replace('shape = SubResource("circle")',
+                               'shape = SubResource("circle")\n'
+                               'disabled = true')))
+
+    def test_a_body_that_may_rotate_is_a_warning(self):
+        d = self._physics_project()
+        path = os.path.join(d, "main.tscn")
+        self._edit(path, 'lock_rotation = true\nmass', 'mass')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            unity_pack.load_project(d)
+        self.assertIn("main.tscn:22: warning: `Ball` is a RigidBody2D that "
+                      "may rotate", err.getvalue())
+
+    @needs_box2d
+    def test_a_body_falls_in_godot_units(self):
+        script = (
+            "using Godot;\n"
+            "public partial class Ball : RigidBody2D {\n"
+            "    private int _n;\n"
+            "    public override void _PhysicsProcess(double delta) {\n"
+            "        _n = _n + 1;\n"
+            "        if (_n == 31) { GD.Print(\"y=\", Position.Y); }\n"
+            "    }\n"
+            "}\n")
+        d = self._physics_project(script=script)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertEqual(plan["godot"]["gravity"], (0.0, 980.0))
+        with open(os.path.join(out, "data.c")) as f:
+            data = f.read()
+        self.assertIn("float Physics2D_gravity_y = 980.0f;", data)
+        self.assertIn("float Time_fixedDeltaTime = 0.016666666666666666f;",
+                      data)
+        with open(os.path.join(out, "physics_box2d.c")) as f:
+            glue = f.read()
+        self.assertIn("for godot_pack", glue)
+        self.assertIn("b2SetLengthUnitsPerMeter( 64.0f );", glue)
+        exe = unity_pack.build_player_executable(out, os.path.basename(d),
+                                                 box2d_root=_BOX2D_ROOT)
+        run = subprocess.run([exe], capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        y = float(run.stdout.split("y=")[1].split()[0])
+        # 30 steps of 1/60 s at 980 px/s^2, down, damped 0.6: about 122 px.
+        self.assertGreater(y, 110.0)
+        self.assertLess(y, 130.0)
+
+    # -- signals -----------------------------------------------------------
+
+    _PICKUP = (
+        "using Godot;\n"
+        "public partial class Pickup : Area2D {\n"
+        "    private int _seen;\n"
+        "    public override void _Ready() {\n"
+        "        BodyEntered += OnBody;\n"
+        "    }\n"
+        "    private void OnBody(Node2D body) {\n"
+        "        if (body is not Hero) { return; }\n"
+        "        if (body.IsInGroup(\"heroes\")) { _seen = _seen + 1; }\n"
+        "        GD.Print(\"taken by \", body.Name, \" seen=\", _seen);\n"
+        "        QueueFree();\n"
+        "    }\n"
+        "}\n")
+
+    def _signals_project(self, pickup=None, connections="", hero_extra=""):
+        """A Hero (RigidBody2D) falls through two instanced pickups (Area2D)
+        and a Watcher's area, onto a floor."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        files = {
+            "project.godot": 'config_version=5\n\n[application]\n\n'
+                             'run/main_scene="res://main.tscn"\n',
+            "Pickup.cs": pickup or self._PICKUP,
+            "Hero.cs": "using Godot;\npublic partial class Hero : "
+                       "RigidBody2D {\n}\n",
+            "Watcher.cs": (
+                "using Godot;\n"
+                "public partial class Watcher : Node2D {\n"
+                "    public void Saw(Node2D body) {\n"
+                "        GD.Print(\"watcher saw \", body.Name);\n"
+                "    }\n"
+                "}\n"),
+            "pickup.tscn": (
+                '[gd_scene format=3]\n\n'
+                '[ext_resource type="Script" path="res://Pickup.cs" id="1"]\n\n'
+                '[sub_resource type="CircleShape2D" id="c"]\nradius = 6.0\n\n'
+                '[node name="Pickup" type="Area2D"]\nscript = ExtResource("1")\n\n'
+                '[node name="CollisionShape2D" type="CollisionShape2D" '
+                'parent="."]\nshape = SubResource("c")\n'),
+            "main.tscn": (
+                '[gd_scene format=3]\n\n'
+                '[ext_resource type="Script" path="res://Hero.cs" id="1_h"]\n'
+                '[ext_resource type="Script" path="res://Watcher.cs" id="2_w"]\n'
+                '[ext_resource type="PackedScene" path="res://pickup.tscn" '
+                'id="3_p"]\n\n'
+                '[sub_resource type="CircleShape2D" id="ball"]\nradius = 8.0\n\n'
+                '[sub_resource type="RectangleShape2D" id="box"]\n'
+                'size = Vector2(200, 20)\n\n'
+                '[node name="Main" type="Node2D"]\n\n'
+                '[node name="Hero" type="RigidBody2D" parent="." '
+                'groups=["heroes"]]\nlock_rotation = true\n'
+                'script = ExtResource("1_h")\n' + hero_extra + '\n'
+                '[node name="CollisionShape2D" type="CollisionShape2D" '
+                'parent="Hero"]\nshape = SubResource("ball")\n\n'
+                '[node name="P1" parent="." instance=ExtResource("3_p")]\n'
+                'position = Vector2(0, 60)\n\n'
+                '[node name="P2" parent="." instance=ExtResource("3_p")]\n'
+                'position = Vector2(0, 120)\n\n'
+                '[node name="Watcher" type="Node2D" parent="."]\n'
+                'script = ExtResource("2_w")\n\n'
+                '[node name="Sensor" type="Area2D" parent="Watcher"]\n'
+                'position = Vector2(0, 90)\n\n'
+                '[node name="CollisionShape2D" type="CollisionShape2D" '
+                'parent="Watcher/Sensor"]\nshape = SubResource("box")\n\n'
+                '[node name="Floor" type="StaticBody2D" parent="."]\n'
+                'position = Vector2(0, 200)\n\n'
+                '[node name="CollisionShape2D" type="CollisionShape2D" '
+                'parent="Floor"]\nshape = SubResource("box")\n\n'
+                '[connection signal="body_entered" from="Watcher/Sensor" '
+                'to="Watcher" method="Saw"]\n' + connections),
+        }
+        for name, text in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+        return d
+
+    def test_signals_are_wired_from_scene_and_script(self):
+        objs = unity_pack.load_project(self._signals_project())[0]
+        by = {o["name"]: o for o in objs}
+        # `BodyEntered += OnBody;` in each instanced pickup's _Ready.
+        for n in ("P1", "P2"):
+            self.assertEqual(by[n]["godot_signals"], [{
+                "signal": "body_entered", "kind": 0, "other": "body",
+                "target": (0, n), "method": "OnBody"}])
+            self.assertEqual(by[n]["godot_handlers"], ["OnBody"])
+        # The scene's [connection]: a child's signal to its parent's method.
+        self.assertEqual(by["Sensor"]["godot_signals"][0]["target"],
+                         (0, "Watcher"))
+        self.assertEqual(by["Watcher"]["godot_handlers"], ["Saw"])
+        self.assertEqual(by["Hero"]["godot_groups"], ["heroes"])
+
+    def test_handler_parameter_lowering(self):
+        out = self.godot.adapt_csharp("Pickup.cs", self._PICKUP,
+                                      {"Pickup", "Hero"}, ["OnBody"])
+        self.assertEqual(out.count("\n"), self._PICKUP.count("\n"))
+        self.assertIn("public  void OnBody(int    body)", out)
+        self.assertIn('!GodotSignals.IsA(body, "Hero")', out)
+        self.assertIn('GodotSignals.InGroup(body, "heroes")', out)
+        self.assertIn("GodotSignals.NameOf(body)", out)
+        self.assertNotIn("BodyEntered", out)   # wiring, resolved at import
+
+    def test_handler_parameter_refusals(self):
+        cases = [
+            ("Destroy(body);", "`body` is the node a signal passes"),
+            ('if (body.Name == "Hero") { }', "`body.Name` compared"),
+            ("if (body is Hero h) { }", "`body is Hero <name>`"),
+        ]
+        for stmt, want in cases:
+            src = self._PICKUP.replace("QueueFree();", stmt)
+            with self.assertRaises(unity_pack.PackError) as cm:
+                self.godot.adapt_csharp("Pickup.cs", src, {"Pickup", "Hero"},
+                                        ["OnBody"])
+            self.assertIn("Pickup.cs(11,", str(cm.exception))
+            self.assertIn(want, str(cm.exception))
+
+    def test_script_wiring_rules(self):
+        late = self._PICKUP.replace(
+            "        BodyEntered += OnBody;\n    }\n",
+            "    }\n    public override void _Process(double d) { "
+            "BodyEntered += OnBody; }\n")
+        timer = self._PICKUP.replace("BodyEntered += OnBody;",
+                                     "Timeout += OnBody;")
+        lam = self._PICKUP.replace("BodyEntered += OnBody;",
+                                   "BodyEntered += (b) => { };")
+        for src, want in (
+                (late, "Pickup.cs(6,47): error CS8000: `BodyEntered +=` is "
+                 "packed as `BodyEntered += Method;` in _Ready or _EnterTree"),
+                (timer, "the Timeout signal is not packed yet"),
+                (lam, "`BodyEntered +=` is packed as")):
+            with self.assertRaises(unity_pack.PackError) as cm:
+                self.godot.script_signal_connections("Pickup.cs", src)
+            self.assertIn(want, str(cm.exception))
+        # A field of the script's own named like an event is its own.
+        own = self._PICKUP.replace("private int _seen;",
+                                   "private int Timeout;").replace(
+            "BodyEntered += OnBody;", "BodyEntered += OnBody; Timeout += 1;")
+        self.assertEqual(len(self.godot.script_signal_connections(
+            "Pickup.cs", own)), 1)
+
+    def test_connection_refusals_and_warnings(self):
+        cases = [
+            ('[connection signal="timeout" from="Hero" to="Watcher" '
+             'method="Saw"]\n', "the timeout signal is not packed yet"),
+            ('[connection signal="area_entered" from="Hero" to="Watcher" '
+             'method="Saw"]\n', "`Hero` is a RigidBody2D, which has no "
+             "area_entered signal packed"),
+            ('[connection signal="body_entered" from="Floor" to="Watcher" '
+             'method="Saw"]\n', "`Floor` is a StaticBody2D"),
+            ('[connection signal="body_exited" from="Watcher/Sensor" '
+             'to="Watcher" method="Gone"]\n',
+             "body_exited needs one method `Gone(Node body)`"),
+            ('[connection signal="body_exited" from="Watcher/Sensor" '
+             'to="Watcher" method="Saw" binds=[1]]\n',
+             "binds / unbinds are not packed yet"),
+        ]
+        for conn, want in cases:
+            with self.assertRaises(unity_pack.PackError) as cm:
+                unity_pack.load_project(self._signals_project(
+                    connections=conn))
+            self.assertIn(want, str(cm.exception))
+        # Godot sends a RigidBody2D's body_entered only when it monitors.
+        conn = ('[connection signal="body_entered" from="Hero" to="Watcher" '
+                'method="Saw"]\n')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            objs = unity_pack.load_project(self._signals_project(
+                connections=conn))[0]
+        self.assertIn("`Hero` does not report contacts", err.getvalue())
+        self.assertNotIn("godot_signals",
+                         {o["name"]: o for o in objs}["Hero"])
+        objs = unity_pack.load_project(self._signals_project(
+            connections=conn, hero_extra="contact_monitor = true\n"
+            "max_contacts_reported = 2\n"))[0]
+        self.assertEqual(len({o["name"]: o for o in objs}["Hero"]
+                             ["godot_signals"]), 1)
+
+    @needs_box2d
+    def test_signals_run(self):
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        d = self._signals_project()
+        unity_pack.pack(d, out, force=True, box2d_root=_BOX2D_ROOT)
+        exe = unity_pack.build_player_executable(out, os.path.basename(d),
+                                                 box2d_root=_BOX2D_ROOT)
+        run = subprocess.run([exe], capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        lines = run.stdout.splitlines()
+        # Two pickups taken in the order the Hero falls through them, each
+        # once; the Watcher's area (Sensor) reports to its parent.
+        self.assertEqual([l for l in lines if l.startswith(("taken", "watcher"))],
+                         ["taken by Hero seen=1", "watcher saw Hero",
+                          "taken by Hero seen=1"])
+
+    @needs_cc
+    def test_pack_and_run(self):
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(GODOT_PROJECT, out, force=True)
+        self.assertEqual(plan["classes"]["Coin"]["n"], 2)
+        exe = unity_pack.build_player_executable(out, "GodotMini")
+        run = subprocess.run([exe], capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # Hp and Speed come from the scene; 60 frames at 120 px/s.
+        self.assertEqual(run.stdout.splitlines()[:2],
+                         ["ready hp=5", "x=220"])
 
 
 class TestBuildSettingsAndActive(unittest.TestCase):
@@ -14207,11 +14730,6 @@ class TestStaticFields(_ScriptPackMixin, unittest.TestCase):
         # After 4 updates: bonus 16, count 5 + 4 * 2 = 13.
         self.assertEqual(self._total_after_four_updates(d), 29)
 
-_BOX2D_ROOT = unity_pack.find_box2d_root()
-needs_box2d = unittest.skipUnless(
-    _BOX2D_ROOT is not None and _CC is not None,
-    "2D physics is Box2D-Packed: set BOX2D_PACKED_ROOT or clone "
-    "https://github.com/crustos/box2d beside this repository")
 
 
 class TestBox2DPhysicsBackend(unittest.TestCase):
