@@ -383,7 +383,9 @@ unity_pack keeps the packed tables, the position accessors, and the
 1. Create Box2D bodies for new Rigidbody2D components: authored ones on the
    first step, `AddComponent<Rigidbody2D>` ones when they appear.
 2. Push what scripts changed: `linearVelocity`, `transform.position` (a
-   teleport), `gravityScale`, `linearDamping`, `Physics2D.gravity`.
+   teleport), `gravityScale`, `linearDamping`, `Physics2D.gravity`. A
+   collider without a Rigidbody2D whose Transform moved (a script, a moving
+   parent) is teleported to its new center, as Unity moves a static collider.
 3. `b2World_Step` with 4 substeps.
 4. Pull positions and velocities into the packed tables.
 5. Report touching pairs. unity_pack sends Enter / Stay / Exit by comparing with

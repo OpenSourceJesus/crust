@@ -14734,6 +14734,88 @@ class TestStaticFields(_ScriptPackMixin, unittest.TestCase):
 
 
 
+# Platformer's Concepts (Scripts)/FollowWaypoints.cs, verbatim.
+_FOLLOW_WAYPOINTS_CS = (
+    'using UnityEngine;\n'
+    '\n'
+    'public class FollowWaypoints : MonoBehaviour\n'
+    '{\n'
+    '\tpublic Transform trs;\n'
+    '\tpublic Transform waypointsParent;\n'
+    '\tpublic float moveSpeed;\n'
+    '\tpublic float rotateSpeed;\n'
+    '\tpublic int currWaypointIdx;\n'
+    '\tpublic bool isBacktracking;\n'
+    '\tpublic Transform[] waypoints = new Transform[0];\n'
+    '\tpublic FollowType followType;\n'
+    '\tTransform currWaypoint;\n'
+    '\n'
+    '\tvoid Start ()\n'
+    '\t{\n'
+    '\t\tcurrWaypoint = waypoints[currWaypointIdx];\n'
+    '\t\twaypointsParent.DetachChildren();\n'
+    '\t}\n'
+    '\n'
+    '\tvoid Update ()\n'
+    '\t{\n'
+    '\t\tif (moveSpeed != 0)\n'
+    '\t\t{\n'
+    '\t\t\tVector2 newPosition = Vector3.Lerp(trs.position, (Vector2) currWaypoint.position, moveSpeed * Time.deltaTime * (1f / Vector2.Distance(trs.position, (Vector2) currWaypoint.position)));\n'
+    '\t\t\tif (!float.IsNaN(newPosition.x))\n'
+    '\t\t\t\ttrs.position = newPosition;\n'
+    '\t\t}\n'
+    '\t\tif (rotateSpeed != 0)\n'
+    '\t\t\ttrs.rotation = Quaternion.Slerp(trs.rotation, currWaypoint.rotation, rotateSpeed * Time.deltaTime * (1f / Quaternion.Angle(trs.rotation, currWaypoint.rotation)));\n'
+    '\t\tif (((Vector2) trs.position == (Vector2) currWaypoint.position || moveSpeed == 0) && (trs.eulerAngles == currWaypoint.eulerAngles || rotateSpeed == 0))\n'
+    '\t\t\tOnReachedWaypoint ();\n'
+    '\t}\n'
+    '\t\n'
+    '\tvoid OnReachedWaypoint ()\n'
+    '\t{\n'
+    '\t\tif (isBacktracking)\n'
+    '\t\t\tcurrWaypointIdx --;\n'
+    '\t\telse\n'
+    '\t\t\tcurrWaypointIdx ++;\n'
+    '\t\tswitch (followType)\n'
+    '\t\t{\n'
+    '\t\t\tcase FollowType.Once:\n'
+    '\t\t\t\tif (currWaypointIdx == waypoints.Length)\n'
+    '\t\t\t\t\tcurrWaypointIdx = waypoints.Length - 1;\n'
+    '\t\t\t\telse if (currWaypointIdx == -1)\n'
+    '\t\t\t\t\tcurrWaypointIdx = 0;\n'
+    '\t\t\t\tbreak;\n'
+    '\t\t\tcase FollowType.Loop:\n'
+    '\t\t\t\tif (currWaypointIdx == waypoints.Length)\n'
+    '\t\t\t\t\tcurrWaypointIdx = 0;\n'
+    '\t\t\t\telse if (currWaypointIdx == -1)\n'
+    '\t\t\t\t\tcurrWaypointIdx = waypoints.Length - 1;\n'
+    '\t\t\t\tbreak;\n'
+    '\t\t\tcase FollowType.PingPong:\n'
+    '\t\t\t\tif (currWaypointIdx == waypoints.Length)\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tcurrWaypointIdx -= 2;\n'
+    '\t\t\t\t\tisBacktracking = !isBacktracking;\n'
+    '\t\t\t\t}\n'
+    '\t\t\t\telse if (currWaypointIdx == -1)\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tcurrWaypointIdx += 2;\n'
+    '\t\t\t\t\tisBacktracking = !isBacktracking;\n'
+    '\t\t\t\t}\n'
+    '\t\t\t\tbreak;\n'
+    '\t\t}\n'
+    '\t\tcurrWaypoint = waypoints[currWaypointIdx];\n'
+    '\t}\n'
+    '\n'
+    '\tpublic enum FollowType\n'
+    '\t{\n'
+    '\t\tOnce,\n'
+    '\t\tLoop,\n'
+    '\t\tPingPong\n'
+    '\t}\n'
+    '}\n'
+)
+
+
 class TestBox2DPhysicsBackend(unittest.TestCase):
     """2D physics is Box2D-Packed; OnCollisionEnter/Stay/Exit2D still come
     from unity_pack after the step. See box2d_unity.py in the Box2D-Packed
@@ -15102,6 +15184,83 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.stdout.split(), ["-1", "2"])
+
+    @needs_box2d
+    def test_waypoint_follower_carries_static_child_collider(self):
+        """FollowWaypoints (Platformer): Transform[] of plain Transforms,
+        DetachChildren, handle position/rotation, nested enum. The Ground
+        collider, a child of the mover, is where the ball comes to rest."""
+        root = self._project()
+        scripts = os.path.join(root, "Assets", "Scripts")
+        with open(os.path.join(scripts, "FollowWaypoints.cs"), "w") as f:
+            f.write(_FOLLOW_WAYPOINTS_CS)
+        with open(os.path.join(scripts, "FollowWaypoints.cs.meta"), "w") as f:
+            f.write("guid: b2df0110000000000000000000000a0a\n")
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Ball : MonoBehaviour {\n"
+                    "    public int enters;\n    public int exits;\n}\n")
+        path = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(path) as f:
+            text = f.read()
+        text = text.replace(
+            "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n",
+            "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n"
+            "  m_Father: {fileID: 21}\n")
+
+        def plain(go, xf, name, father, y):
+            return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_LocalPosition: {x: 0, y: %s, z: 0}\n"
+                    "  m_Father: {fileID: %d}\n" % (go, name, xf, xf, go, y,
+                                                     father))
+        text += (
+            "--- !u!1 &20\nGameObject:\n  m_Name: Mover\n"
+            "  m_Component:\n  - component: {fileID: 21}\n"
+            "  - component: {fileID: 22}\n"
+            "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "--- !u!114 &22\nMonoBehaviour:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: b2df0110000000000000000000000a0a}\n"
+            "  trs: {fileID: 21}\n  waypointsParent: {fileID: 31}\n"
+            "  moveSpeed: 5\n  rotateSpeed: 0\n  currWaypointIdx: 0\n"
+            "  isBacktracking: 0\n  waypoints:\n"
+            "  - {fileID: 41}\n  - {fileID: 51}\n  followType: 0\n"
+            + plain(30, 31, "Waypoints Parent", 21, 0)
+            + plain(40, 41, "Waypoint", 31, 0)
+            + plain(50, 51, "Waypoint (1)", 31, 1))
+        with open(path, "w") as f:
+            f.write(text)
+        d = tempfile.mkdtemp(prefix="upack-b2d-follow-")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        self.assertNotIn("CS8000", err.getvalue())
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float Time_deltaTime;\n"
+                    "extern float _Ball_pos[][2];\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    "  Time_deltaTime = 0.02f;\n"
+                    "  for (i = 0; i < 200; i = i + 1) engine_tick();\n"
+                    "  printf(\"%.4f\\n\", _Ball_pos[0][1]);\n"
+                    "  return 0;\n}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        # Ground rose 1 (to the second waypoint): top -1, ball center -0.5.
+        self.assertAlmostEqual(float(run.stdout), -0.5, delta=0.02)
 
     @needs_box2d
     def test_box2d_injected_matches_standard(self):
