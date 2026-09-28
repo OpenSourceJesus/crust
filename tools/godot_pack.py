@@ -321,6 +321,8 @@ def godot_fingerprint_paths(root):
 
 def godot_display_path(path):
     """`res://...` for a file in the project being packed."""
+    if path and path.startswith("res://"):
+        return path   # already shown as res:// (a diagnostic's second pass)
     root = GODOT_ROOT[0]
     if root and path:
         ap = os.path.abspath(path)
@@ -1509,8 +1511,11 @@ def adapt_csharp(path, text, project_types=(), handlers=()):
         if close is None:
             continue
         args = cs2cpp.split_call_args(text[m.end():close])
-        joined = " + ".join(['""'] + ["(%s)" % a.strip() for a in args
-                                      if a.strip()])
+        # Parentheses only where an argument needs them: a literal inside
+        # them, "(frame ", would be typed by counting its parentheses.
+        joined = " + ".join(['""'] + [
+            a.strip() if _SIMPLE_ARG.match(a.strip()) else "(%s)" % a.strip()
+            for a in args if a.strip()])
         edits.append((m.start(), close + 1,
                       "System.Console.WriteLine(%s)" % joined))
 
@@ -1600,6 +1605,10 @@ def _lower_signal_params(path, text, handler_params):
                         "`%s` is the node a signal passes: `is`, `IsInGroup` "
                         "and `Name` are packed, this use is not yet" % param)
     return _apply(text, edits)
+
+
+_SIMPLE_ARG = re.compile(
+    r'^(?:"(?:[^"\\\n]|\\.)*"|-?\d+(?:\.\d*)?[fF]?|[A-Za-z_][\w.]*)$')
 
 
 def _close_paren(scan, open_idx):
