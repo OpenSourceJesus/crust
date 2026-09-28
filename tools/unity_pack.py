@@ -2449,6 +2449,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if fid == "0":
                 continue
             rec.setdefault("object_refs", {})[key] = fid
+        # Object ref arrays: name:\n  - {fileID: N} ... (0 = null slot).
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- \{fileID:\s*-?\d+"
+                r"[^}\n]*\}[ \t]*\n?)+)", block):
+            if not fm.group(1).startswith("m_"):
+                rec.setdefault("object_ref_arrays", {})[fm.group(1)] = \
+                    re.findall(r"fileID:\s*(-?\d+)", fm.group(2))
         if kind == "Light":
             inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
             col = re.search(
@@ -2827,6 +2834,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
         if gm:
             mbs_by_go.setdefault(gm.group(1), []).append(rec)
+    # A plain Transform a script field names (waypoints) stays a packed row.
+    mb_ref_ids = {fid for mbs in mbs_by_go.values() for rec in mbs
+                  for fid in list((rec.get("object_refs") or {}).values())
+                  + [f for arr in (rec.get("object_ref_arrays") or {}).values()
+                     for f in arr]}
 
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
@@ -2853,6 +2865,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         script = None
         fields = {}
         object_refs = {}
+        object_ref_arrays = {}
         mb_ids = []
         vec2_fields = {}
         vec3_fields = {}
@@ -2897,6 +2910,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 mb_ids.append(str(k.get("file_id")))
                 fields.update(k.get("fields") or {})
                 object_refs.update(k.get("object_refs") or {})
+                object_ref_arrays.update(k.get("object_ref_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
                 g = k.get("guid")
@@ -3180,7 +3194,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if (script is None and sprite is None and not has_ui_draw
                 and not rb2d and not rb3d and cam is None and not col2d
                 and not col3d and not player and not canvas
-                and (not has_mb or ui_scaffold_mb)):
+                and (not has_mb or ui_scaffold_mb)
+                and not (rect is None and xf_id is not None
+                         and {str(xf_id), go_fid} & mb_ref_ids)):
             # Plain RectTransform parents (layout containers without a
             # MonoBehaviour) must stay so ContentSizeFitter /
             # AspectRatioFitter / layout groups can read parent size.
@@ -3269,6 +3285,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "active": active,
             "fields": fields,
             "object_refs": object_refs,
+            "object_ref_arrays": object_ref_arrays,
             "mb_ids": mb_ids,
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
@@ -4950,6 +4967,67 @@ def _resolve_go_field_refs(plan):
                 row.append(go)
             refs[(cname, f["name"])] = row
     plan["go_field_refs"] = refs
+    # Authored `T[]` refs: GO indices for handle types, instance indices for
+    # a packed class; an empty or unresolved slot is null (-1).
+    mb_inst = {}
+    for cname, cl in plan["classes"].items():
+        for k, o in enumerate(cl.get("instances") or []):
+            for fid in o.get("mb_ids") or []:
+                mb_inst[(cname, str(fid))] = k
+    seeds = {}
+    for cname, cl in plan["classes"].items():
+        for f in cl.get("ref_array_fields") or []:
+            elem = _array_elem_name(f.get("ty") or "")
+            rows = []
+            for o in cl.get("instances") or []:
+                row = []
+                for fid in (o.get("object_ref_arrays") or {}).get(
+                        f["name"]) or []:
+                    if elem in _GO_HANDLE_FIELD_TYPES:
+                        row.append(next((int(t[fid]) for t in (
+                            xf_to_go, go_by_id, comp_to_go) if fid in t), -1))
+                    else:
+                        row.append(mb_inst.get((elem, fid), -1))
+                rows.append(row)
+            if any(rows) and (elem in _GO_HANDLE_FIELD_TYPES
+                              or elem in plan["classes"]):
+                seeds.setdefault(cname, {})[f["name"]] = rows
+    plan["ref_array_seeds"] = seeds
+    _promote_handle_rot_classes(plan)
+
+
+def _promote_handle_rot_classes(plan):
+    """Rows a script's `Transform` handle reads / writes rotation through get
+    live rotation tables (seeded from their authored rotation)."""
+    go_cls = {int(o["go_index"]): cname
+              for cname, cl in plan["classes"].items()
+              for o in cl.get("instances") or []
+              if o.get("go_index") is not None}
+    live = set(plan.get("live_rot_classes") or [])
+    for cname, cl in plan["classes"].items():
+        try:
+            with open(cl.get("script_path") or "", encoding="utf-8",
+                      errors="replace") as f:
+                src = cs2cpp._blank(f.read())
+        except OSError:
+            continue
+        names = set(re.findall(r"(?<![\w.])Transform(?:\[\])?\s+(\w+)\s*[;=,)]",
+                               src))
+        used = {n for n in names if re.search(
+            r"(?<![\w.])%s\s*\.\s*(?:rotation|eulerAngles)\b" % re.escape(n),
+            src)}
+        if not used:
+            continue
+        plan["handle_rot"] = True
+        gos = set()
+        for f in cl.get("fields") or []:
+            if f.get("ty") == "Transform":
+                gos |= set((plan.get("go_field_refs") or {}).get(
+                    (cname, f["name"])) or [])
+        for rows in (plan["ref_array_seeds"].get(cname) or {}).values():
+            gos |= {g for r in rows for g in r}
+        live |= {go_cls[g] for g in gos if g in go_cls}
+    plan["live_rot_classes"] = sorted(live)
 
 
 def _rewrite_extensions_set_world_scale(text, cl, plan):
@@ -6880,16 +6958,25 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 text)
         for f in ocl.get("ref_array_fields") or []:
             fname = f["name"]
-            text = cs2cpp.code_sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
-                % (re.escape(ocname), re.escape(fname)),
-                "%s_%s" % (oidn, fname),
-                text)
+            # cpprust lowers members of a vector name, not of `arr[i]`: the
+            # row's vector is bound to a reference, as instance lists are.
+            pat = (r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
+                   % (re.escape(ocname), re.escape(fname)))
+            alias = "_%s_%s_of" % (oidn, fname)
             if ocname == this:
-                text = cs2cpp.code_sub(
-                    r"(?<![\w.])%s\b" % re.escape(fname),
-                    "%s_%s" % (oidn, fname),
-                    text)
+                text = cs2cpp.code_sub(pat, fname, text)
+                pat, alias = (r"(?<![\w.])(?:this\s*\.\s*)?%s\b"
+                              % re.escape(fname)), fname
+                bind = "std::vector<int> &%s = %s_%s[i];" % (alias, oidn,
+                                                            fname)
+            else:
+                bind = "std::vector<int> &%s = %s_%s[%s];" % (
+                    alias, oidn, fname, inst)
+            if not re.search(pat, cs2cpp._blank(text)):
+                continue
+            text = cs2cpp.code_sub(pat + r"\s*\.\s*Length\b",
+                                   "(int)%s.size()" % alias, text)
+            text = bind + "\n" + cs2cpp.code_sub(pat, alias, text)
         # Other.Instance / Other.instance — including Other.Instance.unknownField
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
@@ -10746,6 +10833,8 @@ def _emit_engine_scene_apply(lines, plan, class_ids):
 
     depth = max([len(d) for _k, _y, _r, a in groups for _t, _n, d in a] or [1])
     loop_vars = ", ".join(["i"] + [chr(ord("j") + k) for k in range(depth - 1)])
+    for cname in sorted(plan.get("ref_array_seeds") or {}):
+        p("static void _%s_seed_refs(unsigned i);" % _c_ident(cname))
     p("static void _engine_scene_snapshot(void) {")
     p("    int %s;" % loop_vars)
     for _kind, _key, rows, arrays in groups:
@@ -10777,6 +10866,8 @@ def _emit_engine_scene_apply(lines, plan, class_ids):
         p("        if (!(%s)) continue;" % own)
         for _ty, name, dims in arrays:
             _copy(name, "_engine_snap" + name, dims, "        ")
+        if kind == "class" and key in (plan.get("ref_array_seeds") or {}):
+            p("        _%s_seed_refs((unsigned)i);" % _c_ident(key))
         p("    }")
     p("}")
     p("static void _engine_scene_unload(int s) {")
@@ -11965,8 +12056,9 @@ def _emit_engine_static_collections(_emitted_coll, p, plan):
                 _list_elem_c_ty(elem, plan), idn, f["name"], cap))
             _emitted_coll = True
         for f in cl.get("ref_array_fields") or []:
-            p("static std::vector<int> %s_%s;" % (idn, f["name"]))
+            p("static std::vector<int> %s_%s[%d];" % (idn, f["name"], cap))
             _emitted_coll = True
+        _emit_ref_array_seed(p, plan, cname, cl, idn)
         for f in cl.get("dict_fields") or []:
             kv = _dict_kv_names(f.get("ty") or "")
             if not kv:
@@ -14825,6 +14917,19 @@ def emit_engine(plan, analyses, used_apis):
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
     p("    if (_dt < 0.f) _dt = 0.f;")
+    seeded = sorted(plan.get("ref_array_seeds") or {})
+    if seeded:
+        p("    {")
+        p("        static int _engine_refs_seeded = 0;")
+        p("        unsigned _k;")
+        p("        if (!_engine_refs_seeded) {")
+        p("            _engine_refs_seeded = 1;")
+        for cname in seeded:
+            p("            for (_k = 0u; _k < %du; _k = _k + 1u) "
+              "_%s_seed_refs(_k);"
+              % (max(1, int(plan["classes"][cname]["n"])), _c_ident(cname)))
+        p("        }")
+        p("    }")
     if _multi_scene(plan):
         p("    _engine_scene_apply_pending();")
     if want_keyboard:
@@ -16564,6 +16669,35 @@ def _emit_iref_struct(p):
     p("    int inst;")
     p("};")
     p("")
+
+
+def _emit_ref_array_seed(p, plan, cname, cl, idn):
+    """`_<Cls>_seed_refs(i)`: row i's ref arrays back to their authored refs."""
+    seeds = (plan.get("ref_array_seeds") or {}).get(cname)
+    if not seeds:
+        return
+    for fname, rows in sorted(seeds.items()):
+        flat, off = [], [0]
+        for r in rows:
+            flat += r
+            off.append(len(flat))
+        off += [len(flat)] * (max(1, int(cl.get("n") or 0)) + 1 - len(off))
+        p("static const int _%s_%s_init[%d] = { %s };" % (
+            idn, fname, max(1, len(flat)),
+            ", ".join(str(v) for v in flat) or "0"))
+        p("static const int _%s_%s_off[%d] = { %s };" % (
+            idn, fname, len(off), ", ".join(str(v) for v in off)))
+    p("static void _%s_seed_refs(unsigned i) {" % idn)
+    p("    int k;")
+    for fname in sorted(seeds):
+        p("    {")
+        p("        std::vector<int> &v = %s_%s[i];" % (idn, fname))
+        p("        v.clear();")
+        p("        for (k = _%s_%s_off[i]; k < _%s_%s_off[i + 1]; k = k + 1)"
+          % (idn, fname, idn, fname))
+        p("            v.push_back(_%s_%s_init[k]);" % (idn, fname))
+        p("    }")
+    p("}")
 
 
 def _emit_ref_vector_helpers(p, want_iref):

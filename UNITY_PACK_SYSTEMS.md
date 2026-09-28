@@ -518,6 +518,16 @@ which is what the drag idiom `PointToNormalized(rect.GetWorldRect(),
 Camera.main.ScreenToWorldPoint(mouse))` needs. It is exact for UI the main
 orthographic camera draws (Screen Space – Camera / World Space).
 
+An instance `T[]` field (`public Transform[] waypoints`) is a vector per
+instance, seeded from the scene's `- {fileID: N}` list before the first
+Awake and again when its scene reloads: GO indices for Transform /
+GameObject / uGUI elements, instance indices for a packed class, `-1` for an
+empty slot. A GameObject with only a Transform, which the pack otherwise
+drops, stays a packed row when a script field or array names it. With
+`SetParent` / `DetachChildren` / handle `.position` in use, the classes of
+named rows and of their children keep writable positions. Enum members
+the script declares (`FollowType.Loop`) are their integer values.
+
 `Rect` packs as a C struct: `x` / `y` / `width` / `height` are fields in
 both languages, while `center`, `size`, `min` and `max` are C# properties
 and become `Rect_center(r)` etc.; `rect.center = v` moves the rect through

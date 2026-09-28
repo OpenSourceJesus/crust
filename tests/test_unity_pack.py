@@ -4675,7 +4675,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("unlowered C#", eng)
 
     def test_singleton_toggle_array_is_on(self):
-        """Other.instance.toggles[i].isOn → Toggle_set_isOn(Other_toggles[i], …)."""
+        """Other.instance.toggles[i].isOn → that instance's vector, bound once."""
         root = tempfile.mkdtemp(prefix="upack-toggle-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
@@ -4732,7 +4732,10 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "engine.cpp")) as f:
             eng = f.read()
         self.assertIn("static std::vector<int> CosmeticsMenu_toggles", eng)
-        self.assertIn("Toggle_set_isOn(CosmeticsMenu_toggles[0], (0))", eng)
+        self.assertIn("std::vector<int> &_CosmeticsMenu_toggles_of = "
+                      "CosmeticsMenu_toggles[CosmeticsMenu_Instance()];", eng)
+        self.assertIn("Toggle_set_isOn(_CosmeticsMenu_toggles_of[0], (0))",
+                      eng)
         self.assertNotIn("0.toggles", eng)
         self.assertNotIn("CosmeticsMenu.instance", eng)
 
