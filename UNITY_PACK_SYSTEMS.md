@@ -186,6 +186,9 @@ slot (intensity 1, white) into the light table.
 | `transform.parent` | Live `_engine_go_parent` (seeded `m_Father`) → parent GO index or **-1** |
 | `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T; appends as last sibling |
 | `transform.GetSiblingIndex` | Live `_engine_go_sib` (seeded GO order under parent; updated by `SetParent`) |
+| `trs.DetachChildren()` (Transform handle) | `SetParent(null)` on each child, world position kept |
+| `trs.position` (Transform handle) | World position through the live hierarchy, where C# makes it a `Vector2`: `(Vector2)` cast, `Vector2.Distance` argument, `Vector2 v = Vector3.Lerp(..)`; `trs.position = v2` sets world (z 0) |
+| `trs.rotation` / `Quaternion.Slerp` / `Quaternion.Angle` / `a.eulerAngles == b.eulerAngles` (handles) | `Quaternion` value on live rotation tables of every row the handle can name (local rotation, unparented ≈ world) |
 | `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
 | `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
 | `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |

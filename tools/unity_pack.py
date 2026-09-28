@@ -5706,6 +5706,14 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("transform.SetParent")
     if re.search(r"(?<![.\w])\w+\s*\.\s*SetParent\s*\(", scan):
         apis.add("transform.SetParent")
+    # DetachChildren is SetParent(null) per child; a Transform handle's
+    # position / rotation walks the same live hierarchy tables.
+    trs_names = set(re.findall(r"(?<![\w.])Transform\s+(\w+)\s*[;=,)]", scan))
+    if re.search(r"(?<![.\w])\w+\s*\.\s*DetachChildren\s*\(", scan) or any(
+            re.search(r"(?<![.\w])%s\s*\.\s*(?:position\b(?!\s*\.\s*[xyz]\b)"
+                      r"|rotation\b|eulerAngles\b)" % re.escape(n), scan)
+            for n in trs_names):
+        apis.add("transform.SetParent")
     if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*GetSiblingIndex\s*\(",
             scan):
@@ -7427,6 +7435,17 @@ def plan_layouts(objects, analyses, two_d=None):
         if any(o.get("rigidbody2d") or o.get("rigidbody")
                or o.get("anim_player") for o in insts):
             writes[cname] = True
+    # SetParent / DetachChildren / a Transform handle's position move the
+    # rows script fields name, and DetachChildren their children too.
+    if any("transform.SetParent" in (a.get("apis") or ()) for a in analyses):
+        refs = {str(f) for o in objects
+                for f in list((o.get("object_refs") or {}).values())
+                + [x for arr in (o.get("object_ref_arrays") or {}).values()
+                   for x in arr]}
+        for cname, insts in by_class.items():
+            if any({str(o.get("xf_id")), str(o.get("go_id")),
+                    str(o.get("father_id"))} & refs for o in insts):
+                writes[cname] = True
 
     # Live TRS consumers: TransformPoint / matrices / localPosition Vector3 fields.
     tp_classes = set()
@@ -12601,6 +12620,89 @@ def _emit_engine_world_positions(
         p("")
 
 
+def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
+    """emit_engine: world position / rotation through a Transform handle."""
+    go_n = max(1, len(plan.get("go_names") or []))
+    p("/* Transform.DetachChildren: SetParent(null) keeping world position. */")
+    p("static void Transform_DetachChildren(int go) {")
+    p("    int c;")
+    p("    if (go < 0) return;")
+    p("    for (c = 0; c < %d; c = c + 1)" % go_n)
+    p("        if (_engine_go_parent[c] == go) Transform_SetParent(c, -1, 1);")
+    p("}")
+    if want_vector2:
+        p("static Vector2 Transform_get_position2(int go) {")
+        p("    int c = -1;")
+        p("    unsigned n = 0u;")
+        p("    float x = 0.f, y = 0.f, z = 0.f;")
+        p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
+        p("    return Vector2_make(x, y);")
+        p("}")
+        p("/* position = Vector2: z is 0 (Vector2 → Vector3); local = world")
+        p("   minus the parent's world position (translation-only hierarchy). */")
+        p("static void Transform_set_position2(int go, Vector2 v) {")
+        p("    int c = -1;")
+        p("    unsigned n = 0u;")
+        p("    float px = 0.f, py = 0.f, pz = 0.f;")
+        p("    if (go < 0 || go >= %d) return;" % go_n)
+        p("    if (_engine_go_parent[go] >= 0")
+        p("        && _engine_go_xf(_engine_go_parent[go], &c, &n))")
+        p("        _engine_world_pos(c, n, &px, &py, &pz, 0);")
+        p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, 0.f - pz);")
+        p("}")
+    if not (want_live_rot and plan.get("handle_rot")):
+        p("")
+        return
+    rot = [_c_ident(c) for c in plan.get("live_rot_classes") or []
+           if c in plan["classes"] and _class_has_position(plan["classes"][c])]
+    # ponytail: rotation is the row's local rotation (the rotation setters
+    # already treat unparented ≈ world); compose parents if a rotated parent
+    # ever matters.
+    p("static Quaternion Transform_get_rotation(int go) {")
+    p("    Quaternion q;")
+    p("    int inst;")
+    p("    q.x = 0.f; q.y = 0.f; q.z = 0.f; q.w = 1.f;")
+    p("    if (go < 0 || go >= %d) return q;" % go_n)
+    for idn in rot:
+        p("    inst = _engine_go_%s[go];" % idn)
+        p("    if (inst >= 0) {")
+        p("        q.x = _%s_rot_x[inst]; q.y = _%s_rot_y[inst];" % (idn, idn))
+        p("        q.z = _%s_rot_z[inst]; q.w = _%s_rot_w[inst];" % (idn, idn))
+        p("        return q;")
+        p("    }")
+    p("    (void)inst;")
+    p("    return q;")
+    p("}")
+    p("static void Transform_set_rotation(int go, Quaternion q) {")
+    p("    int inst;")
+    p("    if (go < 0 || go >= %d) return;" % go_n)
+    for idn in rot:
+        p("    inst = _engine_go_%s[go];" % idn)
+        p("    if (inst >= 0) {")
+        p("        _engine_transform_set_quat(")
+        p("            &_{0}_rot_x[inst], &_{0}_rot_y[inst], &_{0}_rot_z[inst],"
+          .format(idn))
+        p("            &_{0}_rot_w[inst], &_{0}_rot_m00[inst], &_{0}_rot_m01[inst],"
+          .format(idn))
+        p("            &_{0}_rot_m10[inst], &_{0}_rot_m11[inst],".format(idn))
+        p("            q.x, q.y, q.z, q.w);")
+        p("        return;")
+        p("    }")
+    p("    (void)inst;")
+    p("}")
+    p("/* a.eulerAngles == b.eulerAngles: Unity Vector3 == (1e-5 epsilon). */")
+    p("static int Transform_eulerAngles_eq(int a, int b) {")
+    p("    Quaternion qa = Transform_get_rotation(a);")
+    p("    Quaternion qb = Transform_get_rotation(b);")
+    p("    float ax, ay, az, bx, by, bz;")
+    p("    _engine_quat_to_euler_deg(qa.x, qa.y, qa.z, qa.w, &ax, &ay, &az);")
+    p("    _engine_quat_to_euler_deg(qb.x, qb.y, qb.z, qb.w, &bx, &by, &bz);")
+    p("    ax = ax - bx; ay = ay - by; az = az - bz;")
+    p("    return ax * ax + ay * ay + az * az < 9.99999944e-11f;")
+    p("}")
+    p("")
+
+
 def _emit_engine_transform_point(class_ids, p, plan, tp_classes):
     """emit_engine: Transform.TransformPoint."""
     if tp_classes:
@@ -14640,6 +14742,24 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_live_rot and plan.get("handle_rot"):
+        p("/* UnityEngine.Quaternion value — a Transform handle's rotation. */")
+        p("typedef struct Quaternion {")
+        p("    float x; float y; float z; float w;")
+        p("} Quaternion;")
+        p("static Quaternion Quaternion_Slerp(Quaternion a, Quaternion b,")
+        p("                                   float t) {")
+        p("    Quaternion o;")
+        p("    _engine_quat_slerp(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, t,")
+        p("                       &o.x, &o.y, &o.z, &o.w);")
+        p("    return o;")
+        p("}")
+        p("static float Quaternion_Angle(Quaternion a, Quaternion b) {")
+        p("    return _engine_quat_angle(a.x, a.y, a.z, a.w,")
+        p("                              b.x, b.y, b.z, b.w);")
+        p("}")
+        p("")
+
     if want_live_rot:
         p("/* Quaternion.RotateTowards(from, to, maxDegreesDelta) — Unity. */")
         p("static void _engine_quat_rotate_towards(")
@@ -14816,6 +14936,9 @@ def emit_engine(plan, analyses, used_apis):
     want_set_parent = "transform.SetParent" in used_apis
     _emit_engine_world_positions(
             class_ids, p, plan, want_get_sibling, want_go_tables, want_set_parent)
+    if want_set_parent and want_go_tables:
+        _emit_engine_transform_handles(
+            p, plan, _plan_needs_vector2(plan, used_apis), want_live_rot)
 
     tp_classes = set(plan.get("transform_point_classes") or [])
     _emit_engine_transform_point(class_ids, p, plan, tp_classes)
@@ -15397,7 +15520,7 @@ def _go_handle_receivers(text, cl, plan):
     return out
 
 
-def _rewrite_go_handle_members(text, cl, plan):
+def _rewrite_go_handle_members(text, cl, plan, site=None):
     """Component references as GameObject indices: `handleTrs.parent`, `.rect`.
 
     An authored `Transform` / `RectTransform` / uGUI field packs as the GO
@@ -15454,7 +15577,154 @@ def _rewrite_go_handle_members(text, cl, plan):
         text = cs2cpp.code_sub(
             pat + r"\s*\.\s*parent\b",
             lambda m, e=expr: "Transform_get_parent(%s)" % e, text)
+    trs = [(pat, expr) for pat, expr, ty in recvs if ty == "Transform"]
+    if trs:
+        text = _rewrite_transform_handle_trs(text, trs, site)
     return text
+
+
+_TRANSFORM_HANDLE_PROTOS = {
+    "Transform_get_position2": "static Vector2 Transform_get_position2(int go);",
+    "Transform_set_position2":
+        "static void Transform_set_position2(int go, Vector2 v);",
+    "Transform_DetachChildren": "static void Transform_DetachChildren(int go);",
+    "Transform_get_rotation": "static Quaternion Transform_get_rotation(int go);",
+    "Transform_set_rotation":
+        "static void Transform_set_rotation(int go, Quaternion q);",
+    "Transform_eulerAngles_eq":
+        "static int Transform_eulerAngles_eq(int a, int b);",
+}
+
+
+def _rewrite_transform_handle_trs(text, trs, site=None):
+    """World position / rotation through a `Transform` handle (a GO index).
+
+    C has a `Vector2` and a `Quaternion` but no `Vector3`, so `.position`
+    lowers where C# converts it to a Vector2 anyway: a `(Vector2)` cast, a
+    `Vector2.Distance` argument, a `Vector3.Lerp` stored in a `Vector2`
+    (z is dropped either way), a Vector2 assigned to it (z becomes 0).
+    `.eulerAngles` is lowered only as `a.eulerAngles == b.eulerAngles`.
+    """
+    alt = "(?:%s)" % "|".join(p for p, _e in trs)
+
+    def e(src):
+        return next((ex for p, ex in trs if re.fullmatch(p, src.strip())),
+                    src)
+
+    def sub(pat, fn, s):
+        return cs2cpp.code_sub(pat, fn, s)
+
+    text = sub(r"(%s)\s*\.\s*DetachChildren\s*\(\s*\)" % alt,
+               lambda m: "Transform_DetachChildren(%s)" % e(m.group(1)), text)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*(==|!=)\s*(%s)\s*\.\s*eulerAngles\b"
+               % (alt, alt),
+               lambda m: "%sTransform_eulerAngles_eq(%s, %s)" % (
+                   "!" if m.group(2) == "!=" else "", e(m.group(1)),
+                   e(m.group(3))), text)
+    text = sub(r"(%s)\s*\.\s*rotation\s*=(?!=)\s*([^;]+);" % alt,
+               lambda m: "Transform_set_rotation(%s, %s);" % (
+                   e(m.group(1)), m.group(2).strip()), text)
+    text = sub(r"(%s)\s*\.\s*rotation\b" % alt,
+               lambda m: "Transform_get_rotation(%s)" % e(m.group(1)), text)
+    text = sub(r"(?<![\w.])Quaternion\s*\.\s*(Slerp|Angle)\s*\(",
+               r"Quaternion_\1(", text)
+    text = sub(r"(%s)\s*\.\s*position\s*=(?!=)\s*([^;]+);" % alt,
+               lambda m: "Transform_set_position2(%s, %s);" % (
+                   e(m.group(1)), m.group(2).strip()), text)
+    text = sub(r"\(\s*Vector2\s*\)\s*(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
+               lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
+    # Implicit Vector3 → Vector2 inside calls whose result is a Vector2.
+    text = sub(r"(?<![\w.])Vector2\s*\.\s*Distance\s*\(", "Vector2_Distance(",
+               text)
+    text = sub(r"(?<![\w.])(Vector2\s+\w+\s*=\s*)Vector3\s*\.\s*Lerp\s*\(",
+               r"\1Vector2_Lerp(", text)
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])Vector2_(?:Distance|Lerp)\s*\(",
+                         cs2cpp._blank(text)):
+        got = _match_call_args(text, m.end() - 1)
+        if not got or m.start() < pos:
+            continue
+        args, after = got
+        args = sub(r"(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
+                   lambda a: "Transform_get_position2(%s)" % e(a.group(1)),
+                   args)
+        out += [text[pos:m.end()], args, ")"]
+        pos = after
+    text = "".join(out) + text[pos:]
+    text = _rewrite_vector2_eq(text, ("Transform_get_position2",))
+    if site is not None:
+        for fn, proto in _TRANSFORM_HANDLE_PROTOS.items():
+            if fn + "(" in text:
+                site.setdefault("protos", set()).add(proto)
+    return text
+
+
+def _rewrite_script_enums(text, file_text):
+    """`Kind.Member` / `Outer.Kind.Member` of an enum the script declares →
+    its integer value (the packed field holds the authored integer).
+
+    ponytail: enums declared in other scripts stay unlowered; an enum with a
+    non-literal member initializer is skipped whole.
+    """
+    for m in re.finditer(r"(?<![\w.])enum\s+(\w+)\s*(?::\s*[\w.]+\s*)?\{([^}]*)\}",
+                         cs2cpp._blank(file_text)):
+        vals, nxt = {}, 0
+        for part in m.group(2).split(","):
+            pm = re.fullmatch(r"\s*(\w+)\s*(?:=\s*(-?(?:0[xX][0-9a-fA-F]+|\d+))"
+                              r"\s*)?", part)
+            if pm is None:
+                vals = None if part.strip() else vals
+                if vals is None:
+                    break
+                continue
+            nxt = int(pm.group(2), 0) if pm.group(2) else nxt
+            vals[pm.group(1)] = nxt
+            nxt += 1
+        for name, v in (vals or {}).items():
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:\w+\s*\.\s*)*%s\s*\.\s*%s\b(?!\s*[.(])"
+                % (re.escape(m.group(1)), re.escape(name)), str(v), text)
+    return text
+
+
+def _rewrite_float_is_nan(text):
+    """`float.IsNaN(x)` → `((x) != (x))` (only NaN is unequal to itself)."""
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])(?:float|Single|System\s*\.\s*Single)"
+                         r"\s*\.\s*IsNaN\s*\(", cs2cpp._blank(text)):
+        got = _match_call_args(text, m.end() - 1)
+        if not got or m.start() < pos:
+            continue
+        out += [text[pos:m.start()], "((%s) != (%s))" % (got[0], got[0])]
+        pos = got[1]
+    return "".join(out) + text[pos:]
+
+
+def _rewrite_vector2_eq(text, fns):
+    """`f(a) == g(b)` on Vector2-valued calls → `Vector2_eq` (Unity's ==)."""
+    call = r"(?<![\w.])(?:%s)\s*\(" % "|".join(re.escape(f) for f in fns)
+    i = 0
+    while True:
+        m = re.compile(call).search(cs2cpp._blank(text), i)
+        if not m:
+            return text
+        i = m.end()
+        before = text[:m.start()].rstrip()
+        if before and before[-1] not in "(,!&|?:=;{}":
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        op = re.match(r"\s*(==|!=)\s*", text[got[1]:])
+        if not op:
+            continue
+        m2 = re.compile(call).match(text, got[1] + op.end())
+        got2 = m2 and _match_call_args(text, m2.end() - 1)
+        if not got2:
+            continue
+        text = "%s%sVector2_eq(%s, %s)%s" % (
+            text[:m.start()], "!" if op.group(1) == "!=" else "",
+            text[m.start():got[1]], text[m2.start():got2[1]], text[got2[1]:])
 
 
 def _rewrite_vector2_axis_scale(text):
@@ -16654,6 +16924,20 @@ def _emit_vector2_struct(p):
     p("    else { v.x = 0.f; v.y = 0.f; }")
     p("    return v;")
     p("}")
+    p("static float Vector2_Distance(Vector2 a, Vector2 b) {")
+    p("    float dx = a.x - b.x, dy = a.y - b.y;")
+    p("    return sqrtf(dx * dx + dy * dy);")
+    p("}")
+    p("static Vector2 Vector2_Lerp(Vector2 a, Vector2 b, float t) {")
+    p("    if (t < 0.f) t = 0.f;")
+    p("    if (t > 1.f) t = 1.f;")
+    p("    return Vector2_make(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);")
+    p("}")
+    p("/* Unity ==: squared distance under kEpsilon (1e-5) squared. */")
+    p("static int Vector2_eq(Vector2 a, Vector2 b) {")
+    p("    float dx = a.x - b.x, dy = a.y - b.y;")
+    p("    return dx * dx + dy * dy < 9.99999944e-11f;")
+    p("}")
     p("")
 
 
@@ -17085,6 +17369,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text, _packed_class(cl),
         [_packed_class(o) for o in (plan.get("classes") or {}).values()],
         _packed_model(plan))
+    text = _rewrite_script_enums(text, (site or {}).get("file_text") or "")
+    text = _rewrite_float_is_nan(text)
     text = _rewrite_static_ref_arrays(text, cl, plan)
     text = _rewrite_mb_static_and_singleton(text, plan, cl)
     text = _rewrite_toggle_is_on(text)
@@ -17101,7 +17387,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_quaternion_angle(text, cl)
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
-    text = _rewrite_go_handle_members(text, cl, plan)
+    text = _rewrite_go_handle_members(text, cl, plan, site)
     text = _rewrite_recttransform_apis(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
     text = _rewrite_transform_get_sibling_index(text, cl, plan)
