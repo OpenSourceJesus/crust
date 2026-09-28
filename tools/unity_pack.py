@@ -17263,7 +17263,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if not str(kind).startswith("idx:"):
             continue
         other = kind.split(":", 1)[1]
-        if (other in _ADDABLE_BUILTINS or other in _PHYSICS_COMPONENTS):
+        if (other in _ADDABLE_BUILTINS or other in _PHYSICS_COMPONENTS
+                or other not in plan["classes"]):
             continue
         handle_fields[name] = _c_ident(other)
     text = cs2cpp.lower_packed_fields(
