@@ -185,8 +185,16 @@ glfw3` succeeds — `gles2_window.c` with `UNITY_PACK_GLES2=1`, for hardware
 without ES 3.1 — otherwise the generated headless `main.c` (tick + print
 draw count).
 
-Godot: pass a directory containing `.tscn`. Blender: a JSON dump
-(`blender_pack.json`) — same packed C, different importer.
+Godot 4: `python3 tools/godot_pack.py <project>` (or unity_pack.py on the
+directory holding `project.godot`; see [GODOT_PACK.md](GODOT_PACK.md)).
+Blender: a JSON dump (`blender_pack.json`) — same packed C, different
+importer.
+
+## Godot
+
+Godot 4 projects are packed by the same back end, through
+`tools/godot_pack.py` — scenes, C# node scripts, and 2D physics on
+Box2D-Packed's Godot mode. See [GODOT_PACK.md](GODOT_PACK.md).
 
 ## Display: OpenGL ES 3.1 (and GLES2)
 
@@ -296,6 +304,7 @@ only the ones above them in this list:
 | `unity_pack_anim.py` | AnimationClip / AnimatorController parsing, keyframes, animation tables |
 | `unity_pack_audio.py` | AudioSource tables and API rewrites |
 | `unity_pack_build.py` | Makefile and player executable, including the Box2D-Packed glue |
+| `godot_pack.py` | Godot 4 ([GODOT_PACK.md](GODOT_PACK.md)): the text resource reader, scenes, instancing and resources, bodies and shapes for Box2D-Packed, C# node scripts read as the subset; its own CLI |
 | `unity_pack.py` | scene import, script analysis and lowering, `emit_engine`, `emit_data`, `pack`, CLI |
 
 The split was checked by importing the old and new code side by side: every
