@@ -18279,6 +18279,45 @@ def _prefab_instance_text(prefab_text, inst):
     return "".join(out)
 
 
+def _expand_unstripped_prefab_instances(scene_text, assets):
+    """*scene_text* with the placed objects of every PrefabInstance. A
+    stripped stub (kept when scene objects reference a prefab object, e.g.
+    children under its Transform) is replaced by the placed doc, which keeps
+    the stub's fileID. Instances with a stripped RectTransform are left to
+    `_append_prefab_instance_ui_objects` (onClick array overrides, components
+    added on the stripped GameObject)."""
+    extra, drop = [], set()
+    for inst in _scene_prefab_instances(scene_text):
+        ppath = (assets or {}).get(inst["prefab_guid"])
+        if not ppath or not ppath.lower().endswith(".prefab") \
+                or not os.path.isfile(ppath):
+            continue
+        raw = _read(ppath)
+        if any(cls == "224" and fid in inst["stripped"]
+               for cls, fid, _s, _a, _b in _yaml_docs(raw)):
+            continue
+        body = _prefab_instance_text(raw, inst)
+        first = _YAML_DOC_HEAD_RE.search(body)
+        if first:
+            extra.append(body[first.start():].rstrip("\n"))
+            placed = {fid for _c, fid, _s, _a, _b in _yaml_docs(body)}
+            drop |= placed & set(inst["stripped"].values())
+    if not extra:
+        return scene_text
+    if drop:
+        scene_text = _drop_yaml_docs(scene_text, drop)
+    return scene_text.rstrip("\n") + "\n" + "\n".join(extra) + "\n"
+
+
+def _drop_yaml_docs(text, file_ids):
+    """*text* without the stripped docs whose fileID is in *file_ids*."""
+    docs = _yaml_docs(text)
+    out = [text[:docs[0][3]] if docs else text]
+    out += [text[a:b] for _c, fid, s, a, b in docs
+            if not (s and fid in file_ids)]
+    return "".join(out)
+
+
 def _load_prefab_objects_for_types(root, type_names, guids, assets,
                                    typename_map, scenes=()):
     """Parse .prefab assets that author *type_names* MonoBehaviours.
@@ -18362,7 +18401,8 @@ def _load_scenes_lights_cameras(root, assets):
         _progress("  scene %d/%d %s" % (
             si + 1, len(scenes), os.path.relpath(path, root)))
         objs, scene_lights, scene_cams, scene_hier = parse_unity_yaml(
-            _scene_local_file_ids(_read(path), si),
+            _expand_unstripped_prefab_instances(
+                _scene_local_file_ids(_read(path), si), assets),
             guid_to_script=guids, asset_guids=assets)
         for rec in objs + scene_lights + scene_cams + scene_hier:
             rec["scene"] = si

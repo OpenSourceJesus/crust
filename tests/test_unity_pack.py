@@ -15106,6 +15106,49 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertEqual(self._run(inject=True), self._run(inject=False))
 
 
+class TestStrippedPrefabInstance(unittest.TestCase):
+    """A PrefabInstance the scene keeps a stripped Transform stub for (because
+    a scene object is parented under it) is placed like any other."""
+
+    def test_child_under_stripped_stub_is_placed(self):
+        d = tempfile.mkdtemp(prefix="upack-stripped-")
+        prefab = os.path.join(d, "Mover.prefab")
+        with open(prefab, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &100\nGameObject:\n  m_Name: Mover\n"
+                    "  m_Component:\n  - component: {fileID: 101}\n"
+                    "  - component: {fileID: 102}\n"
+                    "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "  m_Father: {fileID: 0}\n"
+                    "--- !u!61 &102\nBoxCollider2D:\n"
+                    "  m_GameObject: {fileID: 100}\n")
+        scene = (
+            "%YAML 1.1\n"
+            "--- !u!1001 &5\nPrefabInstance:\n  m_Modification:\n"
+            "    m_TransformParent: {fileID: 0}\n    m_Modifications:\n"
+            "    - target: {fileID: 101, guid: aa, type: 3}\n"
+            "      propertyPath: m_LocalPosition.x\n      value: 17\n"
+            "      objectReference: {fileID: 0}\n"
+            "  m_SourcePrefab: {fileID: 100100000, guid: aa, type: 3}\n"
+            "--- !u!4 &6 stripped\nTransform:\n"
+            "  m_CorrespondingSourceObject: {fileID: 101, guid: aa, type: 3}\n"
+            "  m_PrefabInstance: {fileID: 5}\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Child\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+            "  m_Father: {fileID: 6}\n"
+            "--- !u!61 &12\nBoxCollider2D:\n  m_GameObject: {fileID: 10}\n")
+        text = unity_pack._expand_unstripped_prefab_instances(
+            scene, {"aa": prefab})
+        self.assertNotIn("stripped", text)
+        objs, _l, _c, _h = unity_pack.parse_unity_yaml(text)
+        pos = {o["name"]: o["pos"][0] for o in objs}
+        self.assertEqual(pos, {"Mover": 17.0, "Child": 18.0})
+
+
 class TestProjectPhysicsSettings(unittest.TestCase):
     """Physics2D / Physics gravity and Fixed Timestep come from ProjectSettings."""
 
@@ -15462,6 +15505,20 @@ class TestSceneManager(unittest.TestCase):
             ["mgr 2 11"], ["mgr 2 12"],
             ["mgr 1 1"], ["mgr 1 2"],
         ])
+
+    @needs_cc
+    def test_scene_made_only_of_prefab_instances(self):
+        ticker = (
+            "using UnityEngine;\n"
+            "public class Ticker : MonoBehaviour {\n"
+            "    public int label;\n"
+            "    void Update() { Debug.Log(\"tick \" + label); }\n}\n")
+        frames = self._frames(
+            {"Ticker": ticker},
+            [("Only", [("prefab", "T", [(3, "label", 4)]),
+                       ("prefab", "T", [])])],
+            1, prefabs={"T": ("Ticker", "Ticker", [("label", 9)])})
+        self.assertEqual(frames, [["tick 4", "tick 9"]])
 
     @needs_cc
     def test_value_of_unpacked_scrollbar_and_slider_compiles(self):

@@ -609,6 +609,14 @@ with `n << 56` before parsing (guid-qualified references are left alone).
 When `EditorBuildSettings.asset` is missing (tiny fixtures), every `.unity`
 under `Assets/` is used, sorted by path.
 
+A scene `PrefabInstance` is expanded in place into its prefab's objects. Its
+fileIDs, overrides and parent are handled the same way as for prefab-only
+components, described next. A stripped stub the scene keeps (for scene
+objects parented under the instance's Transform, say) is replaced by the
+placed object, which keeps the stub's fileID. An instance with a stripped
+RectTransform is left to the UI prefab-root path instead, which applies its
+onClick array overrides and components added on the stripped GameObject.
+
 Components that scripts need but no scene authors directly (singletons,
 `FindObjectOfType` targets, button targets) come from `.prefab` assets.
 Every `PrefabInstance` of such a prefab in a packed scene becomes its own
