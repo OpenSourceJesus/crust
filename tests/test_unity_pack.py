@@ -143,8 +143,7 @@ class TestGodot(unittest.TestCase):
         self.assertIn("public void Update() { float delta = "
                       "(float)Time.deltaTime;", out)
         self.assertIn("transform.localPosition.x", out)
-        self.assertIn('System.Console.WriteLine("" + ("ready hp=") + (Hp))',
-                      out)
+        self.assertIn('System.Console.WriteLine("" + "ready hp=" + Hp)', out)
 
     def test_vector_constants_are_godots(self):
         src = ("using Godot;\npublic partial class M : Node2D {\n"
