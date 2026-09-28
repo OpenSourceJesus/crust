@@ -48,6 +48,7 @@ from tools.unity_pack_ui import *  # noqa: E402,F401,F403
 from tools.unity_pack_anim import *  # noqa: E402,F401,F403
 from tools.unity_pack_audio import *  # noqa: E402,F401,F403
 from tools.unity_pack_build import *  # noqa: E402,F401,F403
+import tools.godot_pack as _godot  # noqa: E402
 
 # C# helpers that moved to cs2cpp; the old names stay for callers and tests.
 _c_string = cs2cpp.c_string
@@ -67,7 +68,10 @@ _blank_method_bodies = cs2cpp.blank_method_bodies
 
 
 def _assets_rel_path(path):
-    """Unity-style path: `Assets/...` when under an Assets tree."""
+    """Unity-style path: `Assets/...` when under an Assets tree; `res://...`
+    in a Godot project."""
+    if _godot.GODOT_ROOT[0] and path:
+        return _godot.godot_display_path(path)
     norm = path.replace("\\", "/")
     i = norm.find("/Assets/")
     if i >= 0:
@@ -3846,40 +3850,9 @@ def _append_prefab_instance_ui_objects(
                 stub["rec"]["father_id"] = father_id
 
 
-def parse_godot_tscn(text):
-    """Godot .tscn nodes with a script class name and exported numbers."""
-    objects = []
-    chunks = re.split(r"(?m)^\[node ", text)
-    for chunk in chunks[1:]:
-        hm = re.match(r'name="([^"]+)"', chunk)
-        if not hm:
-            continue
-        name = hm.group(1)
-        pos = (0.0, 0.0, 0.0)
-        pm = re.search(
-            r"position\s*=\s*Vector[23]\(\s*([^,\)]+),\s*([^,\)]+)"
-            r"(?:,\s*([^)]+))?\)", chunk)
-        if pm:
-            pos = (float(pm.group(1)), float(pm.group(2)),
-                   float(pm.group(3) or 0.0))
-        fields = {}
-        class_name = name
-        sm = re.search(r"(?m)^script_class\s*=\s*\"([^\"]+)\"", chunk)
-        if sm:
-            class_name = sm.group(1)
-        for fm in re.finditer(r"(?m)^(\w+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$",
-                              chunk):
-            key = fm.group(1)
-            if key in ("position",):
-                continue
-            val = fm.group(2)
-            fields[key] = float(val) if "." in val else int(val)
-        objects.append({
-            "name": name, "pos": pos, "fields": fields,
-            "script": None, "class": class_name,
-            "sprite": None,
-        })
-    return objects
+def parse_godot_tscn(text, path=None):
+    """Objects of one Godot .tscn: `godot_pack.parse_tscn`."""
+    return _godot.parse_tscn(text, path)
 
 
 def parse_blender_json(text):
@@ -12116,7 +12089,7 @@ def _emit_engine_transform_matrices(class_ids, matrix_classes, p, plan):
 
 def _emit_engine_colliders_2d(
         class_ids, col2d_list, collision2d_handlers, p, plan, want_col2d,
-        want_collision2d_msgs, want_go_tables):
+        want_collision2d_msgs, want_go_tables, want_destroy=False):
     """emit_engine: Collider2D centers and OnCollision*2D messages (physics is Box2D-Packed)."""
     if want_col2d and col2d_list:
         p("/* Authored BoxCollider2D / CircleCollider2D — centers for Box2D-Packed */")
@@ -12181,6 +12154,18 @@ def _emit_engine_colliders_2d(
             p("    return 0;")
             p("}")
             p("")
+            godot_signals = bool(plan.get("godot_signals"))
+            if godot_signals:
+                def _guard(call):
+                    if not want_go_tables:
+                        return [call]
+                    return ["_engine_in_script = 1;",
+                            "if (setjmp(_engine_script_jmp) == 0)",
+                            "    " + call,
+                            "_engine_in_script = 0;"]
+                _godot.emit_signal_dispatch(
+                    p, plan, col2d_list, _c_ident,
+                    bool(want_destroy and plan.get("go_names")), _guard)
             p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
             p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
             p("    int oc = _Collider2D_owner_class[ci_self];")
@@ -12212,6 +12197,8 @@ def _emit_engine_colliders_2d(
                 p("        break;")
             p("    default: break;")
             p("    }")
+            if godot_signals:
+                p("    if (kind != 1) _godot_signal(ci_self, ci_other, kind);")
             p("}")
             p("")
             p("static void engine_physics_collide2d_messages(void) {")
@@ -13902,7 +13889,8 @@ def emit_engine(plan, analyses, used_apis):
             msgs[m["name"]] = arg
         if msgs:
             collision2d_handlers[cname] = msgs
-    want_collision2d_msgs = bool(collision2d_handlers) and want_col2d
+    want_collision2d_msgs = (bool(collision2d_handlers)
+                             or bool(plan.get("godot_signals"))) and want_col2d
 
     if want_collision2d_msgs:
         p("/* Collision2D.ToString — Unity object type name. */")
@@ -14024,6 +14012,8 @@ def emit_engine(plan, analyses, used_apis):
             if c.get("properties"):
                 class_properties.setdefault(c["name"], set()).update(
                     c["properties"])
+    if plan.get("godot_signals"):
+        _godot.emit_signal_decls(p)
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
@@ -14078,7 +14068,7 @@ def emit_engine(plan, analyses, used_apis):
 
     _emit_engine_colliders_2d(
             class_ids, col2d_list, collision2d_handlers, p, plan, want_col2d,
-            want_collision2d_msgs, want_go_tables)
+            want_collision2d_msgs, want_go_tables, want_destroy)
     _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d)
 
     # 2D physics is Box2D-Packed (box2d_unity.py in the Box2D-Packed repo).
@@ -16027,6 +16017,10 @@ def _rewrite_file_text_streams(text, cl):
 
 #: The packed model's string knowledge does not depend on the plan.
 _PACKED_STRINGS = cs2cpp.packed_model(False)
+# godot_pack's string calls (the name of the node a signal passes). No Unity
+# script can spell them, so a Unity pack is unchanged.
+_PACKED_STRINGS.string_calls = (_PACKED_STRINGS.string_calls
+                                + _godot.STRING_CALLS)
 
 
 def _lower_string_concat(text, string_idents=None):
@@ -16287,6 +16281,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"\b%s\b(?=\s+\w)" % re.escape(cname), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = cs2cpp.lower_bindings(text, _UNITY_API_CORE)
+    if plan.get("godot"):
+        # The node a Godot signal passes (godot_pack.BINDINGS).
+        text = cs2cpp.lower_bindings(text, _godot.BINDINGS)
     # Layout is bake-time; authored ForceUpdateCanvases is intentionally a no-op.
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.)?Canvas\s*\.\s*ForceUpdateCanvases\s*\(\s*\)\s*;?",
@@ -16659,8 +16656,16 @@ def emit_data(plan, used_apis=None):
     p("float Time_deltaTime = 0.0166667f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
-    p("float Time_fixedDeltaTime = 0.02f;")
-    if want_phys:
+    godot = plan.get("godot")
+    if godot:
+        # Godot's physics ticks and gravity: pixels / s^2, y down.
+        p("float Time_fixedDeltaTime = %sf;" % repr(float(godot["fixed_dt"])))
+    else:
+        p("float Time_fixedDeltaTime = 0.02f;")
+    if want_phys and godot:
+        p("float Physics2D_gravity_x = %sf;" % repr(float(godot["gravity"][0])))
+        p("float Physics2D_gravity_y = %sf;" % repr(float(godot["gravity"][1])))
+    elif want_phys:
         p("float Physics2D_gravity_x = 0.f;")
         p("float Physics2D_gravity_y = -9.81f;")
     if want_phys3:
@@ -17460,7 +17465,15 @@ def _load_scenes_lights_cameras(root, assets):
     """Parse scenes / tscn / blender JSON → objects, lights, cameras, hierarchy.
 
     Does not analyze scripts or load prefab extras. Sprite pixels are attached.
+    A Godot project's scenes come from tools/godot_pack.py.
     """
+    _godot.GODOT_ROOT[0] = None
+    if _godot.is_godot_project(root):
+        objects, scene_names = _godot.load_godot_scenes(root)
+        _load_scenes_lights_cameras.scenes = scene_names
+        _load_scenes_lights_cameras.ui_layout = _godot.godot_screen_size(root)
+        _progress("scene objects=%d" % len(objects))
+        return objects, [], [], []
     guids = _guid_map(root, asset_guids=assets)
     objects = []
     lights = []
@@ -17481,8 +17494,6 @@ def _load_scenes_lights_cameras(root, assets):
         cameras.extend(scene_cams)
         hierarchy.extend(scene_hier)
     _load_scenes_lights_cameras.scenes = _scene_list(root, scenes)
-    for path in _walk_files(root, (".tscn",)):
-        objects.extend(parse_godot_tscn(_read(path)))
     for path in _walk_files(root, (".json",)):
         if os.path.basename(path) == "blender_pack.json":
             objects.extend(parse_blender_json(_read(path)))
@@ -17490,7 +17501,7 @@ def _load_scenes_lights_cameras(root, assets):
     if not objects:
         raise PackError(
             "no scene objects found under %s "
-            "(looked for .unity / .tscn / blender_pack.json)" % root)
+            "(looked for .unity / blender_pack.json, or a Godot project.godot / .tscn)" % root)
     _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
         len(objects), len(lights), len(cameras), len(hierarchy)))
     _apply_camera_script_view_to_cameras(cameras, objects)
@@ -17556,6 +17567,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     *objects* is extended in place with prefab instances. Returns analyses.
     """
+    if _godot.is_godot_project(root):
+        return _godot.analyze_scripts(root, objects, analyze_script)
+    _godot.GODOT_ROOT[0] = None
     guids = _guid_map(root, asset_guids=assets)
     typename_map = _mb_typename_to_script(root, guids)
     scene_scripts = set()
@@ -18159,6 +18173,17 @@ def _fingerprint_entries(root):
             e = _file_fingerprint_entry(path, root)
             if e:
                 entries.append(e)
+    elif _godot.is_godot_project(root):
+        # No Assets/: without these a Godot project's fingerprint was empty,
+        # and an edited scene or script was taken for "unchanged".
+        gp = os.path.join(tools_dir, "godot_pack.py")
+        e = _file_fingerprint_entry(gp, os.path.dirname(tools_dir))
+        if e:
+            entries.append(e)
+        for path in _godot.godot_fingerprint_paths(root):
+            e = _file_fingerprint_entry(path, root)
+            if e:
+                entries.append(e)
     entries.sort()
     return entries
 
@@ -18490,6 +18515,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
             "definition for 'main'")
     _progress("planning layouts (%d objects)" % len(objects))
     plan = plan_layouts(objects, analyses)
+    if _godot.is_godot_project(root):
+        plan["godot"] = _godot.physics_settings(root)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
     else:
@@ -18575,6 +18602,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["ui_layout_height"] = max(1, int(ulh))
     _seed_camera_script_view(plan, objects)
     go_names, go_comps = _build_go_tables(plan)
+    if plan.get("godot"):
+        plan["godot_signals"] = _godot.resolve_signals(plan)
     ui_gc = set()
     for a in analyses:
         ui_gc |= set(a.get("getcomponent_types") or [])
@@ -18680,8 +18709,17 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
         emit_makefile(outdir, box2d=bool(plan.get("box2d_physics")),
                       box2d_inject=bool(physics_inject)))
     if plan.get("box2d_physics"):
-        _load_box2d_unity(box2d_root).emit_glue(
-            outdir, plan, inject=bool(physics_inject))
+        b2u = _load_box2d_unity(box2d_root)
+        if plan.get("godot"):
+            if "godot" not in getattr(b2u, "MODES", ()):
+                raise PackError(
+                    "this Box2D-Packed checkout (%s) has no Godot mode; "
+                    "update it" % os.path.dirname(b2u.__file__))
+            b2u.emit_glue(
+                outdir, plan, inject=bool(physics_inject), mode="godot",
+                length_units_per_meter=plan["godot"]["length_units_per_meter"])
+        else:
+            b2u.emit_glue(outdir, plan, inject=bool(physics_inject))
     else:
         for stale in ("physics_box2d.c", "box2d_inject.json"):
             if os.path.exists(os.path.join(outdir, stale)):
