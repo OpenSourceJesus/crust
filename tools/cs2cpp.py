@@ -1309,8 +1309,7 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
 
     known_types = set(known_types)
     if rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+"):
-        return found("C# array locals / fields left after rewrite: "
-                     "`Renderer[] renderers`.")
+        return found("C# array local or field left after rewrite.")
     if rec(r"\w+\s*<\s*\w+\s*>\s*\("):
         return found("Leftover generics not rewritten to C helpers.")
     if "=>" in body:
@@ -1322,15 +1321,12 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
                      "etc.).")
     ctors = "|".join(re.escape(c) for c in value_ctors) or r"(?!)"
     if rec(r"(?<![\w.])(?!(?:%s)\b)[A-Z][a-zA-Z0-9]*\s*\(" % ctors):
-        return found("Bare C# instance/static method call not rewritten: "
-                     "`End()` (no `_`). Allow value-type ctors kept as "
-                     "`Vector2Int(` / `Color(`.")
+        return found("C# method call nothing lowered.")
     if rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[A-Z][a-zA-Z0-9]*\s*\("):
-        return found("Unlowered static call: `EventManager.AddEvent(...)` "
-                     "(Pascal Type.Method). Not `P_equipped.push_back` "
-                     "(underscored C ident).")
+        return found("Static method call (`Type.Method(`) nothing lowered.")
     if rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b"):
-        return found("Unlowered static field: `Vector3.zero` / `Random.value`.")
+        return found("Static field or property (`Type.member`) nothing "
+                     "lowered.")
     # A member of a call's result -- unless the call is the model's
     # instance accessor, `Other_AT(idx).field`: C, the struct in its slot.
     at_suffix = None
@@ -1350,16 +1346,15 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
                                    % re.escape(at_suffix), body[:max(j, 0)]):
             continue
         seen.append(raw[cm.start():cm.end()])
-        return found("Chained call/property on a call result: "
-                     "`AudioManager_Instance().MakeSoundEffect`.")
+        return found("Member of a call's result (`f(..).member`) nothing "
+                     "lowered.")
     # A local of a reference type -- not one of the engine's own C types.
     for tm in re.finditer(
             r"(?<![\w.])[A-Z]\w*(?:\s*\.\s*[A-Z]\w*)*\s+[a-z_]\w*\s*=", body):
         if re.match(r"[A-Z]\w*", tm.group(0)).group(0) in known_types:
             continue
         seen.append(raw[tm.start():tm.end()])
-        return found("C# typed local of a reference type: "
-                     "`SoundEffect soundEffect =`.")
+        return found("Local of a C# reference type.")
     # Member access that is neither the C++ subset's container API nor a
     # field of a local of an engine type (`Matrix4x4 l2w; l2w.m00`).
     engine_locals = set(re.findall(

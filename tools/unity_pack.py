@@ -7135,7 +7135,7 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
              "GetComponentsInChildren is rewritten; bare GetComponents (no "
              "InChildren) stubs."),
             (r"(?<![\w._])[A-Z]\w*\.instances\b",
-             "Static array not lowered: `Cosmetic.instances.Length` / `[i]`."),
+             "Static `Type.instances` array not lowered."),
             (r"\w+\.gameObject\b",
              "Unity component handle still using `recv.gameObject`."),
             (r"\w+\.activeSelf\b",
