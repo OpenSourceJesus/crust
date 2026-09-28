@@ -509,7 +509,8 @@ _PACKED_STRING_CALLS = ("Application_dataPath()",
                         "Application_persistentDataPath()",
                         "Application_productName()",
                         "StreamReader_ReadLine(",
-                        "Scene_name(", "Scene_path(")
+                        "Scene_name(", "Scene_path(",
+                        "PlayerPrefs_GetString(")
 
 
 def packed_model(has_objects, byte_arrays=False, elem_type=None):
@@ -3973,49 +3974,143 @@ def properties_as_methods(body, bscan, body_abs=0):
     return out
 
 
-def static_getter_exprs(body, bscan, member_names=()):
-    """``{Name: expr}`` for static get-only properties whose getter is one
-    ``return expr;`` (or ``=> expr``) naming none of *member_names* (the
-    declaring type's own members), so a read can be replaced by the
-    expression anywhere: ``static Scene Current { get { return
-    SceneManager.GetActiveScene(); } }``."""
+_ACCESSOR_RE = re.compile(
+    r"\s*(?:(?:public|private|protected|internal)\s+)*(get|set)\s*"
+    r"(?:\{\s*(return\s+)?(.+?)\s*;\s*\}|=>\s*(.+?)\s*;)", re.S)
+
+
+def _static_property_accessors(body, bscan, member_names):
+    """``(getters, setters)`` of static properties whose accessors are one
+    statement naming none of *member_names* (the declaring type's own
+    members) nor the property: a getter ``{Name: expr}`` from ``return
+    expr;`` / ``=> expr``, a setter ``{Name: stmt}`` (in terms of
+    ``value``) from ``{ stmt; }`` / ``=> stmt``."""
     import tools.cpprust as cpprust
     own = set(member_names)
-    out = {}
+    getters, setters = {}, {}
     head = re.compile(
         r"(?m)^[ \t]*(?:public|private|protected|internal)?[ \t]*static[ \t]+"
         r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*(\{|=>)")
+
+    def usable(text, name, extra=()):
+        if not text or ";" in text or "{" in text:
+            return False
+        idents = set(re.findall(r"(?<![\w.])([A-Za-z_]\w*)", _blank(text)))
+        return not (idents - set(extra)) & (own | {name})
+
     for m in head.finditer(bscan):
         name = m.group(2)
         if m.group(1) in ("class", "struct", "enum", "interface"):
             continue
         if m.group(3) == "=>":
             end = bscan.find(";", m.end())
-            if end < 0:
-                continue
-            expr = body[m.end():end].strip()
+            if end >= 0:
+                expr = body[m.end():end].strip()
+                if usable(expr, name):
+                    getters[name] = expr
+            continue
+        open_i = m.end() - 1
+        close = cpprust._match_brace(bscan, open_i)
+        if close is None:
+            continue
+        inner = bscan[open_i + 1:close]
+        pos, found = 0, {}
+        while pos < len(inner) and inner[pos:].strip():
+            am = _ACCESSOR_RE.match(inner, pos)
+            if not am or am.group(1) in found:
+                found = None
+                break
+            g = 3 if am.group(3) is not None else 4
+            text = body[open_i + 1 + am.start(g):open_i + 1 + am.end(g)].strip()
+            if am.group(1) == "get" and g == 3 and not am.group(2):
+                text = None
+            if am.group(1) == "set" and am.group(2):
+                text = None
+            found[am.group(1)] = text
+            pos = am.end()
+        if not found:
+            continue
+        if usable(found.get("get"), name):
+            getters[name] = found["get"]
+        if usable(found.get("set"), name, ("value",)):
+            setters[name] = found["set"]
+    return getters, setters
+
+
+def static_getter_exprs(body, bscan, member_names=()):
+    """``{Name: expr}`` for static properties whose getter is one ``return
+    expr;`` (or ``=> expr``) naming none of *member_names*, so a read can be
+    replaced by the expression anywhere: ``static Scene Current { get {
+    return SceneManager.GetActiveScene(); } }``."""
+    return _static_property_accessors(body, bscan, member_names)[0]
+
+
+def static_setter_stmts(body, bscan, member_names=()):
+    """``{Name: stmt}`` for static properties whose setter is one statement
+    (in terms of ``value``) naming none of *member_names*, so ``Type.Name =
+    x;`` can be replaced by the statement with ``value`` bound to ``x``."""
+    return _static_property_accessors(body, bscan, member_names)[1]
+
+
+def static_method_exprs(body, bscan, member_names=()):
+    """``{Name: (params, text, is_void)}`` for static methods declared once
+    whose body is one ``return expr;`` / ``=> expr`` (or, for ``void``, one
+    statement), naming none of *member_names* nor another static method of
+    the type, so a call can be replaced by the body with its parameters
+    bound: ``static bool GetBool(string key, bool d = false) { return
+    PlayerPrefs.GetInt(key, d.GetHashCode()) == 1; }``."""
+    import tools.cpprust as cpprust
+    head = re.compile(
+        r"(?m)^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)?static"
+        r"[ \t]+([\w.<>\[\],]+)[ \t]+(\w+)[ \t]*\(")
+    decls = []
+    for m in head.finditer(bscan):
+        if m.group(1) in ("class", "struct", "enum", "interface"):
+            continue
+        open_p = m.end() - 1
+        depth, j = 0, open_p
+        while j < len(bscan):
+            if bscan[j] == "(":
+                depth += 1
+            elif bscan[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(bscan):
+            continue
+        rest = re.match(r"\s*(\{|=>)", bscan[j + 1:])
+        if not rest:
+            continue
+        decls.append((m.group(1), m.group(2), body[open_p + 1:j],
+                      j + 1 + rest.end() - 1, rest.group(1)))
+    names = [d[1] for d in decls]
+    own = set(member_names) | set(names)
+    out = {}
+    for ret, name, params, at, kind in decls:
+        if names.count(name) != 1:
+            continue
+        if kind == "=>":
+            end = bscan.find(";", at)
+            text = body[at + 2:end].strip() if end >= 0 else ""
         else:
-            open_i = m.end() - 1
-            close = cpprust._match_brace(bscan, open_i)
+            close = cpprust._match_brace(bscan, at)
             if close is None:
                 continue
-            inner = bscan[open_i + 1:close]
-            if re.search(r"\bset\b", inner):
+            sm = re.fullmatch(r"\s*(return\s+)?(.+?)\s*;\s*",
+                              bscan[at + 1:close], re.S)
+            if not sm or bool(sm.group(1)) == (ret == "void"):
                 continue
-            gm = re.fullmatch(
-                r"\s*get\s*(?:\{\s*return\s+(.+?)\s*;\s*\}|=>\s*(.+?)\s*;)\s*",
-                inner, re.S)
-            if not gm:
-                continue
-            g0 = open_i + 1 + gm.start(1 if gm.group(1) is not None else 2)
-            g1 = open_i + 1 + gm.end(1 if gm.group(1) is not None else 2)
-            expr = body[g0:g1].strip()
-        if not expr or ";" in expr or "{" in expr:
+            text = body[at + 1 + sm.start(2):at + 1 + sm.end(2)].strip()
+        if not text or ";" in text or "{" in text:
             continue
-        idents = set(re.findall(r"(?<![\w.])([A-Za-z_]\w*)", _blank(expr)))
-        if idents & (own | {name}):
+        prms = parse_params(params)
+        if any(p.modifier for p in prms):
             continue
-        out[name] = expr
+        idents = set(re.findall(r"(?<![\w.])([A-Za-z_]\w*)", _blank(text)))
+        if idents & own:
+            continue
+        out[name] = (params, text, ret == "void")
     return out
 
 

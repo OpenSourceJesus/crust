@@ -103,6 +103,9 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | Bare `instance = this` (singleton Awake) | ``T_instance = i`` (sets the same cache field ``T_Instance()`` reads) |
 | `T.Instance.Method(args)` (T's emitted instance method) | ``T_Method(T_Instance(), args)``; a null `Instance` is a `NullReferenceException` |
 | `T.staticField` (bool / number / string) | ``T_staticField`` (class statics are emitted before every class group) |
+| Static property with a one-statement getter / setter (`Intro.AlreadyDone`, `Intro.LoadSceneNameAtEnd = x`) | Getter inlined at reads, setter inlined at `T.P = x;` statements |
+| One-statement static method of a project `static class` (`PlayerPrefsExtensions.GetBool(key)`) | Inlined with its arguments bound (defaults filled); skipped when an argument with side effects would be evaluated twice |
+| `PlayerPrefs.Get/SetInt`, `Float`, `String`, `HasKey`, `DeleteKey`, `DeleteAll`, `Save` | Engine key/value store in `persistentDataPath/prefs.crust`, loaded on first use and rewritten on every change; Unity's defaults (`""` / 0) |
 | Overloaded `Method(args)` (same class or through `T.Instance`) | The overload whose parameters fit: string vs. non-string arguments, an int literal preferring `int`; a call two overloads fit equally stays unlowered |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 | `transform.Find(name)` / nested `"A/B"` | Child GO via **live** parent table (seeded from authored `m_Father`; updated by `SetParent`) → index or **-1** |

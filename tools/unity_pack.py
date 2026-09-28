@@ -5706,6 +5706,10 @@ def analyze_script(path, text=None, shallow=False):
                 body_m, bscan_m,
                 [f["name"] for f in fields] + [mm["name"] for mm in methods]
                 + list(_property_names(bscan_m))),
+            "static_setters": cs2cpp.static_setter_stmts(
+                body_m, bscan_m,
+                [f["name"] for f in fields] + [mm["name"] for mm in methods]
+                + list(_property_names(bscan_m))),
             "bases": bases,
             "path": path,
             "file_text": text,
@@ -6227,6 +6231,205 @@ def _collect_static_getters(analyses):
     return out
 
 
+def _collect_static_setters(analyses):
+    """``{class: {property: stmt}}`` from ``cs2cpp.static_setter_stmts``."""
+    out = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("static_setters"):
+                out.setdefault(c["name"], {}).update(c["static_setters"])
+    return out
+
+
+_STATIC_HELPERS = {}
+
+
+def _static_helper_methods():
+    """``{class: {method: (params, text, is_void)}}`` for the one-statement
+    static methods (``cs2cpp.static_method_exprs``) of the project's
+    ``static class``es -- helpers no scene names, so they are not analyzed."""
+    import tools.cpprust as cpprust
+    root = _TYPE_DECL_ROOT[0]
+    if not root:
+        return {}
+    got = _STATIC_HELPERS.get(root)
+    if got is not None:
+        return got
+    got, seen = {}, {}
+    head = re.compile(r"\bstatic\s+(?:partial\s+)?class\s+([A-Za-z_]\w*)[^{;]*\{")
+    field = re.compile(
+        r"(?m)^\s*(?:(?:public|private|protected|internal|static|readonly|"
+        r"const)\s+)+[\w.<>\[\],]+\s+(\w+)\s*[;=]")
+    for dp, _dn, fns in os.walk(os.path.join(root, "Assets")):
+        for fn in sorted(fns):
+            if not fn.endswith(".cs"):
+                continue
+            try:
+                with open(os.path.join(dp, fn), encoding="utf-8",
+                          errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if "static" not in text:
+                continue
+            bscan = cs2cpp._blank(text)
+            for m in head.finditer(bscan):
+                open_i = m.end() - 1
+                close = cpprust._match_brace(bscan, open_i)
+                if close is None:
+                    continue
+                body, bs = text[open_i + 1:close], bscan[open_i + 1:close]
+                cname = m.group(1)
+                seen[cname] = seen.get(cname, 0) + 1
+                meths = cs2cpp.static_method_exprs(body, bs, field.findall(bs))
+                if meths:
+                    got.setdefault(cname, {}).update(meths)
+    for cname, n in seen.items():
+        if n > 1:
+            got.pop(cname, None)
+    _STATIC_HELPERS[root] = got
+    return got
+
+
+_SIMPLE_ARG_RE = re.compile(
+    r'[A-Za-z_][\w.]*|"(?:[^"\\]|\\.)*"|-?(?:\d+\.?\d*|\.\d+)[fF]?')
+
+
+def _bind_params(text, params_str, args):
+    """*text* with each parameter of *params_str* replaced by its argument
+    from *args* (or its default), parenthesized; None when an argument is
+    missing or named, or a non-trivial argument would be evaluated twice."""
+    prms = cs2cpp.parse_params(params_str)
+    given = cs2cpp.split_call_args(args) if args.strip() else []
+    if len(given) > len(prms) or any(_NAMED_ARG_RE.match(g) for g in given):
+        return None
+    vals = []
+    for k, prm in enumerate(prms):
+        if k < len(given):
+            vals.append(given[k].strip())
+        elif prm.default is not None:
+            vals.append(prm.default.strip())
+        else:
+            return None
+    blank = cs2cpp._blank(text)
+    for prm, v in zip(prms, vals):
+        uses = len(re.findall(r"(?<![\w.])%s\b" % re.escape(prm.name), blank))
+        if uses > 1 and not _SIMPLE_ARG_RE.fullmatch(v):
+            return None
+    if not prms:
+        return text
+    for prm in prms:
+        hash_of = {"bool": "(%s ? 1 : 0)" % prm.name,
+                   "int": "(%s)" % prm.name}.get(prm.type)
+        if hash_of:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*GetHashCode\s*\(\s*\)" % re.escape(prm.name),
+                hash_of, text)
+    names = {p.name: "(%s)" % v for p, v in zip(prms, vals)}
+    return cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\b" % "|".join(re.escape(n) for n in names),
+        lambda m: names[m.group(1)], text)
+
+
+def _inline_static_helpers(text, plan):
+    """Calls of a one-statement static helper (``_static_helper_methods``)
+    become its body with the arguments bound: an expression in parentheses,
+    or -- for a ``void`` helper called as a statement -- the statement."""
+    classes = plan.get("classes") or {}
+    for cname, meths in sorted(_static_helper_methods().items()):
+        if cname in classes or cname not in text:
+            continue
+        for mname, (params, body, is_void) in sorted(meths.items()):
+            pat = re.compile(r"(?<![\w.])(?:\w+\s*\.\s*)*%s\s*\.\s*%s\s*\("
+                             % (re.escape(cname), re.escape(mname)))
+            out, pos = [], 0
+            while True:
+                m = pat.search(text, pos)
+                if not m:
+                    break
+                open_i = m.end() - 1
+                args, end = _match_call_args(text, open_i)
+                if end <= open_i:
+                    break
+                bound = _bind_params(body, params, args)
+                if bound is not None and is_void and not re.match(
+                        r"\s*;", text[end:]):
+                    bound = None
+                out.append(text[pos:m.start()])
+                if bound is None:
+                    out.append(text[m.start():end])
+                else:
+                    out.append(bound if is_void else "(%s)" % bound)
+                pos = end
+            out.append(text[pos:])
+            text = "".join(out)
+    return text
+
+
+def _inline_static_setters(text, cl, plan):
+    """``Type.Name = x;`` (or bare ``Name = x;`` inside *Type*) for an
+    inlinable static setter becomes the setter's statement on ``x``."""
+    for cname, props in (plan.get("static_setters") or {}).items():
+        for pname, stmt in props.items():
+            pats = [r"(?:[\w.]+\.)?%s\s*\.\s*%s" % (re.escape(cname),
+                                                   re.escape(pname))]
+            if cname == cl.get("name"):
+                pats.append(re.escape(pname))
+            for pat in pats:
+                def rep(m, stmt=stmt):
+                    bound = _bind_params(stmt, "object value", m.group(1))
+                    return m.group(0) if bound is None else bound + ";"
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])%s\s*=(?!=)\s*([^;]+);" % pat, rep, text)
+    return text
+
+
+_PLAYER_PREFS_DEFAULTS = {"GetString": '""', "GetInt": "0", "GetFloat": "0.f"}
+
+
+def _lower_player_prefs(text):
+    """UnityEngine.PlayerPrefs → the engine's persistent key/value store;
+    a missing default argument is Unity's ("" / 0 / 0f)."""
+    pat = re.compile(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?PlayerPrefs\s*\.\s*"
+                     r"(GetString|GetInt|GetFloat|SetString|SetInt|SetFloat|"
+                     r"HasKey|DeleteKey|DeleteAll|Save)\s*\(")
+    out, pos = [], 0
+    while True:
+        m = pat.search(text, pos)
+        if not m:
+            break
+        open_i = m.end() - 1
+        args, end = _match_call_args(text, open_i)
+        if end <= open_i:
+            break
+        args = _lower_player_prefs(args)
+        fn = m.group(1)
+        if fn in _PLAYER_PREFS_DEFAULTS and len(
+                cs2cpp.split_call_args(args) if args.strip() else []) == 1:
+            args = "%s, %s" % (args.strip(), _PLAYER_PREFS_DEFAULTS[fn])
+        out.append(text[pos:m.start()])
+        out.append("PlayerPrefs_%s(%s)" % (fn, args.strip()))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _uses_player_prefs(analyses):
+    """Whether a packed script -- or a static helper one names -- touches
+    PlayerPrefs."""
+    helpers = {c for c, ms in _static_helper_methods().items()
+               if any("PlayerPrefs" in t for _p, t, _v in ms.values())}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            text = c.get("file_text") or ""
+            if re.search(r"(?<![\w.])PlayerPrefs\s*\.", text):
+                return True
+            if any(re.search(r"(?<![\w.])%s\s*\." % re.escape(h), text)
+                   for h in helpers):
+                return True
+    return False
+
+
 def _inline_static_getters(text, cl, plan):
     """Reads of an inlinable static property (``Type.Name``, or bare ``Name``
     inside *Type*) become ``(expr)``. Assignments are left alone."""
@@ -6269,7 +6472,8 @@ def _lower_scene_manager(text, string_idents=(), scene_idents=()):
                 or re.fullmatch(r"\w+", a) is not None and a in strings
                 or re.search(r"\.\s*name\s*$|Scene_name\s*\(|\.\s*ToString\s*\(", a)
                 is not None
-                or re.search(r'"\s*\+|\+\s*"', a) is not None)
+                or re.search(r'"\s*\+|\+\s*"', a) is not None
+                or _c_expr_scalar_kind(a) == "s")
 
     def _calls(t, name_re, emit):
         out, pos = [], 0
@@ -7322,6 +7526,174 @@ def _emit_engine_anim_decls(
             p("extern const int _AnimSpriteKey_tex[%d];" % nsk)
             p("extern const float _AnimSpriteKey_hw[%d];" % nsk)
             p("extern const float _AnimSpriteKey_hh[%d];" % nsk)
+
+
+def _emit_engine_player_prefs(p, plan, want_log):
+    """emit_engine: UnityEngine.PlayerPrefs -- int / float / string values
+    by key, kept in ``prefs.crust`` under persistentDataPath (loaded on
+    first use, rewritten on every change)."""
+    if not plan.get("player_prefs"):
+        return
+    path = os.path.join(plan.get("persistent_data_path") or ".", "prefs.crust")
+    cap = 512
+    p("/* PlayerPrefs — persisted to persistentDataPath/prefs.crust */")
+    p("static const char _engine_pp_path[] = %s;" % _c_string(path))
+    p("static char _engine_pp_key[%d][128];" % cap)
+    p("static char _engine_pp_str[%d][256];" % cap)
+    p("static int _engine_pp_int[%d];" % cap)
+    p("static float _engine_pp_float[%d];" % cap)
+    p("static int _engine_pp_type[%d]; /* 1 int, 2 float, 3 string */" % cap)
+    p("static int _engine_pp_count;")
+    p("static int _engine_pp_loaded;")
+    p("static void _engine_pp_unescape(char *s) {")
+    p("    char *o = s;")
+    p("    while (*s) {")
+    p("        if (*s == '\\\\' && s[1]) {")
+    p("            s++;")
+    p("            *o++ = *s == 't' ? '\\t' : *s == 'n' ? '\\n' : *s;")
+    p("            s++;")
+    p("        } else {")
+    p("            *o++ = *s++;")
+    p("        }")
+    p("    }")
+    p("    *o = 0;")
+    p("}")
+    p("static void _engine_pp_put_escaped(FILE *f, const char *s) {")
+    p("    for (; *s; s++) {")
+    p("        if (*s == '\\t') fputs(\"\\\\t\", f);")
+    p("        else if (*s == '\\n') fputs(\"\\\\n\", f);")
+    p("        else if (*s == '\\\\') fputs(\"\\\\\\\\\", f);")
+    p("        else fputc(*s, f);")
+    p("    }")
+    p("}")
+    p("static void _engine_pp_load(void) {")
+    p("    FILE *f;")
+    p("    char line[512];")
+    p("    _engine_pp_loaded = 1;")
+    p("    f = fopen(_engine_pp_path, \"r\");")
+    p("    if (!f) return;")
+    p("    while (fgets(line, sizeof line, f) && _engine_pp_count < %d) {" % cap)
+    p("        char *key, *val, *nl;")
+    p("        int n = _engine_pp_count;")
+    p("        nl = strchr(line, '\\n');")
+    p("        if (nl) *nl = 0;")
+    p("        key = strchr(line, '\\t');")
+    p("        if (!key) continue;")
+    p("        *key++ = 0;")
+    p("        val = strchr(key, '\\t');")
+    p("        if (!val) continue;")
+    p("        *val++ = 0;")
+    p("        _engine_pp_unescape(key);")
+    p("        _engine_pp_unescape(val);")
+    p("        snprintf(_engine_pp_key[n], sizeof _engine_pp_key[0], \"%s\", key);")
+    p("        _engine_pp_type[n] = atoi(line);")
+    p("        if (_engine_pp_type[n] == 1) _engine_pp_int[n] = atoi(val);")
+    p("        else if (_engine_pp_type[n] == 2)"
+      " sscanf(val, \"%f\", &_engine_pp_float[n]);")
+    p("        else if (_engine_pp_type[n] == 3)")
+    p("            snprintf(_engine_pp_str[n], sizeof _engine_pp_str[0],"
+      " \"%s\", val);")
+    p("        else continue;")
+    p("        _engine_pp_count = n + 1;")
+    p("    }")
+    p("    fclose(f);")
+    p("}")
+    p("static void PlayerPrefs_Save(void) {")
+    p("    FILE *f;")
+    p("    int n;")
+    if want_log:
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("    {")
+        p("        char dir[1024];")
+        p("        char *slash;")
+        p("        snprintf(dir, sizeof dir, \"%s\", _engine_pp_path);")
+        p("        slash = strrchr(dir, '/');")
+        p("        if (slash) { *slash = 0; _engine_mkdir_p(dir); }")
+        p("    }")
+        p("#endif")
+    p("    f = fopen(_engine_pp_path, \"w\");")
+    p("    if (!f) return;")
+    p("    for (n = 0; n < _engine_pp_count; n = n + 1) {")
+    p("        if (!_engine_pp_type[n]) continue;")
+    p("        fprintf(f, \"%d\\t\", _engine_pp_type[n]);")
+    p("        _engine_pp_put_escaped(f, _engine_pp_key[n]);")
+    p("        fputc('\\t', f);")
+    p("        if (_engine_pp_type[n] == 1) fprintf(f, \"%d\", _engine_pp_int[n]);")
+    p("        else if (_engine_pp_type[n] == 2)"
+      " fprintf(f, \"%.9g\", (double)_engine_pp_float[n]);")
+    p("        else _engine_pp_put_escaped(f, _engine_pp_str[n]);")
+    p("        fputc('\\n', f);")
+    p("    }")
+    p("    fclose(f);")
+    p("}")
+    p("static int _engine_pp_find(const char *key) {")
+    p("    int n;")
+    p("    if (!_engine_pp_loaded) _engine_pp_load();")
+    p("    if (!key) return -1;")
+    p("    for (n = 0; n < _engine_pp_count; n = n + 1)")
+    p("        if (_engine_pp_type[n] && strcmp(_engine_pp_key[n], key) == 0)")
+    p("            return n;")
+    p("    return -1;")
+    p("}")
+    p("static int _engine_pp_slot(const char *key, int type) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    if (n < 0) {")
+    p("        for (n = 0; n < _engine_pp_count; n = n + 1)")
+    p("            if (!_engine_pp_type[n]) break;")
+    p("        if (n >= %d) return -1;" % cap)
+    p("        if (n == _engine_pp_count) _engine_pp_count = n + 1;")
+    p("        snprintf(_engine_pp_key[n], sizeof _engine_pp_key[0], \"%s\","
+      " key ? key : \"\");")
+    p("    }")
+    p("    _engine_pp_type[n] = type;")
+    p("    return n;")
+    p("}")
+    p("static int PlayerPrefs_HasKey(const char *key) {")
+    p("    return _engine_pp_find(key) >= 0;")
+    p("}")
+    p("static int PlayerPrefs_GetInt(const char *key, int d) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    return n >= 0 && _engine_pp_type[n] == 1 ? _engine_pp_int[n] : d;")
+    p("}")
+    p("static float PlayerPrefs_GetFloat(const char *key, float d) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    return n >= 0 && _engine_pp_type[n] == 2 ? _engine_pp_float[n] : d;")
+    p("}")
+    p("static const char *PlayerPrefs_GetString(const char *key, const char *d) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    return n >= 0 && _engine_pp_type[n] == 3 ? _engine_pp_str[n] : d;")
+    p("}")
+    p("static void PlayerPrefs_SetInt(const char *key, int v) {")
+    p("    int n = _engine_pp_slot(key, 1);")
+    p("    if (n < 0) return;")
+    p("    _engine_pp_int[n] = v;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_SetFloat(const char *key, float v) {")
+    p("    int n = _engine_pp_slot(key, 2);")
+    p("    if (n < 0) return;")
+    p("    _engine_pp_float[n] = v;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_SetString(const char *key, const char *v) {")
+    p("    int n = _engine_pp_slot(key, 3);")
+    p("    if (n < 0) return;")
+    p("    snprintf(_engine_pp_str[n], sizeof _engine_pp_str[0], \"%s\","
+      " v ? v : \"\");")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_DeleteKey(const char *key) {")
+    p("    int n = _engine_pp_find(key);")
+    p("    if (n < 0) return;")
+    p("    _engine_pp_type[n] = 0;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("static void PlayerPrefs_DeleteAll(void) {")
+    p("    if (!_engine_pp_loaded) _engine_pp_load();")
+    p("    _engine_pp_count = 0;")
+    p("    PlayerPrefs_Save();")
+    p("}")
+    p("")
 
 
 def _emit_engine_debug_log(p, plan, want_log):
@@ -13157,11 +13529,12 @@ def emit_engine(plan, analyses, used_apis):
     if (want_input or want_log or want_find or want_transform_find
             or want_set_parent or want_get_sibling
             or want_add_any or want_data_path or want_persistent_data_path
-            or want_file_io or soa or want_instantiate):
+            or want_file_io or soa or want_instantiate
+            or plan.get("player_prefs")):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
-            or want_app_open_url):
+            or want_app_open_url or plan.get("player_prefs")):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -13215,7 +13588,7 @@ def emit_engine(plan, analyses, used_apis):
             break
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
-            or want_app_open_url):
+            or want_app_open_url or plan.get("player_prefs")):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -13642,6 +14015,7 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
     _emit_engine_debug_log(p, plan, want_log)
+    _emit_engine_player_prefs(p, plan, want_log)
     if not want_data_path:
         p("const char *engine_data_path(void) { return \"\"; }")
         p("")
@@ -16191,7 +16565,26 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:[\w.]+\.)?InputManager\s*\.\s*InputDevice\s*\.\s*(\w+)\b",
         lambda m: _input_dev.get(m.group(1), "0"),
         text)
-    text = _inline_static_getters(text, cl, plan)
+    text = _inline_static_setters(text, cl, plan)
+    for _pass in range(3):
+        before = text
+        text = _inline_static_getters(text, cl, plan)
+        text = _inline_static_helpers(text, plan)
+        if text == before:
+            break
+    # Boolean.GetHashCode is 1 / 0 and Int32.GetHashCode the value itself
+    # (booleans are 1 / 0 by now unless inlined above).
+    for _pass in range(4):
+        text = cs2cpp.code_sub(
+            r"\(\s*(true|false|-?\d+)\s*\)(?=[\s)]*\.\s*GetHashCode\s*\()",
+            r"\1", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(true|false|-?\d+)\s*\.\s*GetHashCode\s*\(\s*\)",
+        lambda m: {"true": "1", "false": "0"}.get(m.group(1), m.group(1)),
+        text)
+    text = cs2cpp.code_sub(r"(?<![\w.])true\b", "1", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])false\b", "0", text)
+    text = _lower_player_prefs(text)
     if null_handle is not None:
         text = cs2cpp._lower_null_compares(text, null_handle)
     ddol = r"(?<![\w.])(?:(?:UnityEngine\s*\.\s*)?Object\s*\.\s*)?DontDestroyOnLoad\s*\(\s*"
@@ -16199,7 +16592,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         params = cs2cpp.parse_params((site or {}).get("args") or "")
         file_text = (site or {}).get("file_text") or ""
         strings = {prm.name for prm in params if prm.type in ("string", "String")}
-        strings |= set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
+        strings |= (set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
+                    - {prm.name for prm in params
+                       if prm.type not in ("string", "String")})
         scenes = {prm.name for prm in params if prm.type.split(".")[-1] == "Scene"}
         scenes |= set(re.findall(r"(?<![\w.])Scene\s+(\w+)\s*[;=]", text))
         text = _lower_scene_manager(text, strings, scenes)
@@ -16325,6 +16720,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Locals: `string x` / `const char *x` (after string→const char * rewrite).
     string_idents |= set(re.findall(
         r"\b(?:string|const char \*)\s+(\w+)\b", text))
+    string_idents |= {
+        prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
+        if prm.type in ("string", "String", "System.String")}
     text = _lower_string_concat(text, string_idents=string_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
@@ -18538,6 +18936,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["interfaces"] = _collect_interfaces(analyses)
     plan["scene_manager"] = "SceneManager" in used_apis
     plan["static_getters"] = _collect_static_getters(analyses)
+    plan["static_setters"] = _collect_static_setters(analyses)
+    plan["player_prefs"] = _uses_player_prefs(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
