@@ -1,0 +1,26 @@
+[gd_scene load_steps=4 format=3 uid="uid://bmainscene001"]
+
+[ext_resource type="Script" path="res://scripts/Player.cs" id="1_player"]
+[ext_resource type="PackedScene" uid="uid://bcoinscene0001" path="res://coin.tscn" id="2_coin"]
+
+[node name="Main" type="Node2D"]
+
+[node name="Player" type="Node2D" parent="."]
+position = Vector2(100, 50)
+script = ExtResource("1_player")
+Speed = 120.0
+Hp = 5
+
+[node name="Muzzle" type="Node2D" parent="Player"]
+position = Vector2(10, 0)
+rotation = 1.5708
+
+[node name="Tip" type="Node2D" parent="Player/Muzzle"]
+position = Vector2(4, 0)
+
+[node name="CoinA" parent="." instance=ExtResource("2_coin")]
+position = Vector2(200, 80)
+
+[node name="CoinB" parent="." instance=ExtResource("2_coin")]
+position = Vector2(260, 80)
+Value = 5
