@@ -14934,6 +14934,74 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertGreater(y, -2.5)
 
     @needs_box2d
+    def test_collision2d_contact_normal_point_and_velocity(self):
+        """GetContact(0).normal points from the other collider to this one
+        and .point lies on the touching surface; a handler may forward to
+        another; Rigidbody2D.linearVelocity reads the body's velocity."""
+        root = self._project()
+        with open(os.path.join(root, "Assets", "Scripts", "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    public float ny;\n"
+                "    public float py;\n"
+                "    public int count;\n"
+                "    public float vy;\n"
+                "    Rigidbody2D rb;\n"
+                "    void Start() { rb = GetComponent<Rigidbody2D>(); }\n"
+                "    void Update() { vy = rb.linearVelocity.y; }\n"
+                "    void OnCollisionEnter2D(Collision2D coll) {\n"
+                "        ContactPoint2D c = coll.GetContact(0);\n"
+                "        ny = c.normal.y;\n"
+                "        py = c.point.y;\n"
+                "        count = coll.contactCount;\n"
+                "    }\n"
+                "    void OnCollisionStay2D(Collision2D coll) {\n"
+                "        OnCollisionEnter2D(coll);\n"
+                "    }\n"
+                "}\n")
+        d = tempfile.mkdtemp(prefix="upack-b2d-contact-")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        self.assertNotIn("CS8000", err.getvalue())
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include <stdio.h>\n"
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { float ny; float py; int count; float vy; } Ball;\n"
+                "extern Ball _Ball_inst_array[];\n"
+                "int main(void) {\n"
+                "  int i; float fall = 0.f;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 20; i = i + 1) engine_tick();\n"
+                "  fall = _Ball_inst_array[0].vy;\n"
+                "  for (i = 0; i < 280; i = i + 1) engine_tick();\n"
+                "  printf(\"%.3f %.3f %d %.3f %.3f\\n\", _Ball_inst_array[0].ny,\n"
+                "         _Ball_inst_array[0].py, _Ball_inst_array[0].count,\n"
+                "         fall, _Ball_inst_array[0].vy);\n"
+                "  return 0;\n"
+                "}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        ny, py, count, fall, vy = run.stdout.split()
+        self.assertAlmostEqual(float(ny), 1.0, delta=0.01)
+        self.assertAlmostEqual(float(py), -2.0, delta=0.05)
+        self.assertEqual(int(count), 1)
+        self.assertLess(float(fall), -2.0)
+        self.assertAlmostEqual(float(vy), 0.0, delta=0.05)
+
+    @needs_box2d
     def test_capsule_collider2d_rests_on_its_bottom(self):
         """CapsuleCollider2D: vertical 1x2 rests with its center 1 above the
         ground; horizontal 1x1 (no longer than wide) is a circle of 0.5."""

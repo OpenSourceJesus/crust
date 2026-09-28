@@ -386,6 +386,15 @@ unity_pack keeps the packed tables, the position accessors, and the
 5. Report touching pairs. unity_pack sends Enter / Stay / Exit by comparing with
    the previous step.
 
+When a script calls `Collision2D.GetContact(k)` or reads `contactCount`, the
+glue also reports each pair's manifold through `engine_col2d_manifold`
+(`_with_contact_manifolds` in `box2d_unity.py`). The normal and up to two
+world points are kept per pair. `GetContact` returns a `ContactPoint2D` whose
+`normal` points from the other collider toward the receiving one, as in
+Unity. A handler that calls another handler (`OnCollisionStay2D(coll)` →
+`OnCollisionEnter2D(coll)`) passes the same collision on. Reading
+`rb.linearVelocity` (or `.x` / `.y`) reads the packed body velocity.
+
 `Physics2D.gravity`, `Physics.gravity` and `Time.fixedDeltaTime` start at the
 project's `Physics2DSettings.asset` / `DynamicsManager.asset` `m_Gravity` and
 `TimeManager.asset` Fixed Timestep (a float, or the newer `m_Count` /

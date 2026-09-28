@@ -5054,6 +5054,80 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
         _local_scale, text, flags=re.DOTALL)
 
 
+def _uses_collision2d_contacts(analyses):
+    """Some OnCollision*2D handler reads `coll.GetContact(..)` /
+    `coll.contactCount`."""
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            for m in c.get("methods") or []:
+                arg = _collision2d_arg_name(m.get("args") or "")
+                if arg and re.search(
+                        r"(?<![\w.])%s\s*\.\s*(?:GetContact\s*\(|contactCount\b)"
+                        % re.escape(arg), m.get("body") or ""):
+                    return True
+    return False
+
+
+def _lower_collision2d_contacts(text, coll):
+    """`coll.GetContact(k)` / `coll.contactCount` on the handler's Collision2D."""
+    if not coll:
+        return text
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])%s\s*\.\s*GetContact\s*\(" % re.escape(coll),
+        "Collision2D_GetContact(%s, " % coll, text)
+    return cs2cpp.code_sub(
+        r"(?<![\w.])%s\s*\.\s*contactCount\b" % re.escape(coll),
+        "Collision2D_contactCount(%s)" % coll, text)
+
+
+def _rewrite_collision2d_handler_calls(text, cl, plan, coll):
+    """`OnCollisionEnter2D(coll)` from another OnCollision*2D handler of the
+    same class, passing on its own Collision2D."""
+    if not coll:
+        return text
+    idn = _c_ident(cl["name"])
+    methods = [m for _c, m in (plan.get("_methods_by") or {}).get(
+        cl["name"], [])] + list(cl.get("methods") or [])
+    names = {m["name"] for m in methods
+             if m.get("name") in _COLLISION2D_MSGS
+             and _collision2d_arg_name(m.get("args") or "")}
+    for name in sorted(names):
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\(\s*%s\s*\)"
+            % (re.escape(name), re.escape(coll)),
+            "%s_%s(i, %s)" % (idn, name, coll), text)
+    return text
+
+
+def _rewrite_vector2_ctor_normalized(text):
+    """Members of a ``Vector2_make(a, b)`` value: ``.normalized`` →
+    ``Vector2_normalized(..)``, then ``.x`` / ``.y`` → ``Vector2_x(..)``
+    (C cannot take a member of a call result in the crust subset)."""
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])Vector2_make\s*\(", text):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        _args, after = got
+        expr, end = text[m.start():after], after
+        norm = re.match(r"\s*\.\s*normalized\b", text[end:])
+        if norm:
+            expr, end = "Vector2_normalized(%s)" % expr, end + norm.end()
+        axis = re.match(r"\s*\.\s*([xy])\b", text[end:])
+        if axis:
+            expr, end = "Vector2_%s(%s)" % (axis.group(1), expr), \
+                end + axis.end()
+        if end == after:
+            continue
+        out.append(text[pos:m.start()])
+        out.append(expr)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
 _WORLD_POS_PROTO = ("static void _engine_world_pos(int class_id, unsigned inst,"
                     " float *x, float *y, float *z, int depth);")
 
@@ -12638,19 +12712,83 @@ def _emit_engine_colliders_2d(
             p("static int _col2d_prev_b[%d];" % max_pairs)
             p("static int _col2d_prev_n;")
             p("")
-            p("static void _col2d_add_contact(int a, int b) {")
+            contacts = bool(plan.get("physics2d_contacts"))
+            if contacts:
+                p("/* Pair manifold: normal lo -> hi, up to two world points. */")
+                p("static float _col2d_contact_nx[%d];" % max_pairs)
+                p("static float _col2d_contact_ny[%d];" % max_pairs)
+                p("static int _col2d_contact_pn[%d];" % max_pairs)
+                p("static float _col2d_contact_px[%d];" % (2 * max_pairs))
+                p("static float _col2d_contact_py[%d];" % (2 * max_pairs))
+                p("/* Collider receiving the OnCollision*2D being sent. */")
+                p("static int _col2d_msg_self = -1;")
+            p("static int _col2d_add_contact(int a, int b) {")
             p("    int lo, hi, i;")
             p("    lo = (a < b) ? a : b;")
             p("    hi = (a < b) ? b : a;")
             p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
             p("        if (_col2d_contact_a[i] == lo && _col2d_contact_b[i] == hi)")
-            p("            return;")
-            p("    if (_col2d_contact_n >= %d) return;" % max_pairs)
+            p("            return i;")
+            p("    if (_col2d_contact_n >= %d) return -1;" % max_pairs)
             p("    _col2d_contact_a[_col2d_contact_n] = lo;")
             p("    _col2d_contact_b[_col2d_contact_n] = hi;")
+            if contacts:
+                p("    _col2d_contact_pn[_col2d_contact_n] = 0;")
             p("    _col2d_contact_n = _col2d_contact_n + 1;")
+            p("    return _col2d_contact_n - 1;")
             p("}")
             p("")
+            if contacts:
+                p("static void _col2d_set_manifold(int a, int b, float nx,")
+                p("    float ny, int n, float p0x, float p0y, float p1x,")
+                p("    float p1y) {")
+                p("    int k = _col2d_add_contact(a, b);")
+                p("    if (k < 0) return;")
+                p("    if (a > b) { nx = -nx; ny = -ny; }")
+                p("    _col2d_contact_nx[k] = nx;")
+                p("    _col2d_contact_ny[k] = ny;")
+                p("    _col2d_contact_pn[k] = n < 0 ? 0 : (n > 2 ? 2 : n);")
+                p("    _col2d_contact_px[2 * k] = p0x;")
+                p("    _col2d_contact_py[2 * k] = p0y;")
+                p("    _col2d_contact_px[2 * k + 1] = p1x;")
+                p("    _col2d_contact_py[2 * k + 1] = p1y;")
+                p("}")
+                p("static int _col2d_pair_index(int a, int b) {")
+                p("    int lo, hi, i;")
+                p("    lo = (a < b) ? a : b;")
+                p("    hi = (a < b) ? b : a;")
+                p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
+                p("        if (_col2d_contact_a[i] == lo"
+                  " && _col2d_contact_b[i] == hi)")
+                p("            return i;")
+                p("    return -1;")
+                p("}")
+                p("/* Collision2D.contactCount: 0 once the pair stopped"
+                  " touching (Exit). */")
+                p("static int Collision2D_contactCount(int coll) {")
+                p("    int k = _col2d_pair_index(_col2d_msg_self, coll);")
+                p("    return k < 0 ? 0 : _col2d_contact_pn[k];")
+                p("}")
+                p("/* ContactPoint2D.normal points from the other collider to"
+                  " this one. */")
+                p("static ContactPoint2D Collision2D_GetContact(int coll,"
+                  " int idx) {")
+                p("    ContactPoint2D c;")
+                p("    int k = _col2d_pair_index(_col2d_msg_self, coll);")
+                p("    float sgn;")
+                p("    c.normal = Vector2_make(0.f, 0.f);")
+                p("    c.point = Vector2_make(0.f, 0.f);")
+                p("    if (k < 0 || idx < 0 || idx >= _col2d_contact_pn[k])")
+                p("        return c;")
+                p("    sgn = (_col2d_msg_self == _col2d_contact_a[k])"
+                  " ? -1.f : 1.f;")
+                p("    c.normal = Vector2_make(sgn * _col2d_contact_nx[k],")
+                p("                            sgn * _col2d_contact_ny[k]);")
+                p("    c.point = Vector2_make(_col2d_contact_px[2 * k + idx],")
+                p("                           _col2d_contact_py[2 * k + idx]);")
+                p("    return c;")
+                p("}")
+                p("")
             p("static int _col2d_pair_in(int lo, int hi,")
             p("    const int *pa, const int *pb, int n) {")
             p("    int i;")
@@ -12675,6 +12813,8 @@ def _emit_engine_colliders_2d(
             p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
             p("    int oc = _Collider2D_owner_class[ci_self];")
             p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+            if contacts:
+                p("    _col2d_msg_self = ci_self;")
             p("    switch (oc) {")
             for cname in sorted(collision2d_handlers.keys()):
                 cid = class_ids.get(cname)
@@ -12736,6 +12876,19 @@ def _emit_engine_colliders_2d(
             p("    }")
             p("}")
             p("")
+    if plan.get("physics2d_contacts") and not (
+            want_col2d and col2d_list and want_collision2d_msgs):
+        p("/* No packed collision messages: no contact ever exists. */")
+        p("static int Collision2D_contactCount(int coll)"
+          " { (void)coll; return 0; }")
+        p("static ContactPoint2D Collision2D_GetContact(int coll, int k) {")
+        p("    ContactPoint2D c;")
+        p("    (void)coll; (void)k;")
+        p("    c.normal = Vector2_make(0.f, 0.f);")
+        p("    c.point = Vector2_make(0.f, 0.f);")
+        p("    return c;")
+        p("}")
+        p("")
 
 
 def _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d):
@@ -12958,6 +13111,17 @@ def _emit_engine_box2d_exports(
             p("    if (a < 0 || b < 0) return;")
         p("}")
         p("")
+        if plan.get("physics2d_contacts"):
+            p("void engine_col2d_manifold(int a, int b, float nx, float ny,")
+            p("    int n, float p0x, float p0y, float p1x, float p1y) {")
+            if want_collision2d_msgs and want_col2d and col2d_list:
+                p("    _col2d_set_manifold(a, b, nx, ny, n, p0x, p0y,"
+                  " p1x, p1y);")
+            else:
+                p("    (void)a; (void)b; (void)nx; (void)ny; (void)n;")
+                p("    (void)p0x; (void)p0y; (void)p1x; (void)p1y;")
+            p("}")
+            p("")
         if plan.get("physics2d_live"):
             p("/* Whether a body's GameObject is in the simulation (active, in a")
             p(" * loaded scene); the glue disables the bodies that are not. */")
@@ -13657,7 +13821,8 @@ def emit_engine(plan, analyses, used_apis):
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
     if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
-            or want_transform_matrix or want_quat_angle):
+            or want_transform_matrix or want_quat_angle
+            or _plan_needs_vector2(plan, used_apis)):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
             or want_set_parent or want_get_sibling
@@ -13745,6 +13910,15 @@ def emit_engine(plan, analyses, used_apis):
     p("   group can find them. */")
     if _plan_needs_vector2(plan, used_apis):
         _emit_vector2_struct(p)
+    if plan.get("physics2d_contacts"):
+        p("/* UnityEngine.ContactPoint2D from Collision2D.GetContact. */")
+        p("typedef struct ContactPoint2D {")
+        p("    Vector2 normal;")
+        p("    Vector2 point;")
+        p("} ContactPoint2D;")
+        p("static ContactPoint2D Collision2D_GetContact(int coll, int k);")
+        p("static int Collision2D_contactCount(int coll);")
+        p("")
     if _plan_needs_vector2int(plan, used_apis):
         _emit_vector2int_struct(p)
     if want_rect:
@@ -16333,7 +16507,7 @@ def _plan_needs_vector2(plan, used_apis=None):
             or "rectTransform.sizeDelta" in used_apis
             or "Rect.PointToNormalized" in used_apis):
         return True
-    if plan and plan.get("live_rt"):
+    if plan and (plan.get("live_rt") or plan.get("physics2d_contacts")):
         return True
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2_fields"):
@@ -16369,6 +16543,12 @@ def _emit_vector2_struct(p):
     p("}")
     p("static float Vector2_x(Vector2 v) { return v.x; }")
     p("static float Vector2_y(Vector2 v) { return v.y; }")
+    p("static Vector2 Vector2_normalized(Vector2 v) {")
+    p("    float m = sqrtf(v.x * v.x + v.y * v.y);")
+    p("    if (m > 1e-5f) { v.x = v.x / m; v.y = v.y / m; }")
+    p("    else { v.x = 0.f; v.y = 0.f; }")
+    p("    return v;")
+    p("}")
     p("")
 
 
@@ -16885,6 +17065,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
     text = _wrap_log_collision2d_tostring(text, collision2d_param)
+    text = _lower_collision2d_contacts(text, collision2d_param)
+    text = _rewrite_collision2d_handler_calls(
+        text, cl, plan, collision2d_param)
     text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
     text = cs2cpp.lower_bindings(text, _UNITY_API_RECT)
     text = _rewrite_rect_members(text)
@@ -16993,6 +17176,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    text = _rewrite_vector2_ctor_normalized(text)
     # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
     def _fold_v2_axis_ctors(src, axis_fn, axis):
         out = []
@@ -19281,6 +19465,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     for a in analyses:
         kb_keys |= set(a.get("keyboard_keys") or [])
     plan["keyboard_keys"] = sorted(kb_keys)
+    plan["physics2d_contacts"] = _uses_collision2d_contacts(analyses)
     company, product = player_identity(root)
     plan["company_name"] = company
     plan["product_name"] = product
@@ -19412,6 +19597,12 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
                       box2d_inject=bool(physics_inject)))
     if plan.get("box2d_physics"):
         b2u = _load_box2d_unity(box2d_root)
+        if plan.get("physics2d_contacts") and not hasattr(
+                b2u, "_with_contact_manifolds"):
+            raise PackError(
+                "Collision2D contacts (GetContact / contactCount) need a "
+                "Box2D-Packed checkout that reports manifolds; update %s"
+                % os.path.dirname(b2u.__file__))
         if plan.get("godot"):
             if "godot" not in getattr(b2u, "MODES", ()):
                 raise PackError(
