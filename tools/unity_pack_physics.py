@@ -251,7 +251,7 @@ def _build_rigidbody_tables(plan):
 
 
 def _build_collider2d_tables(plan):
-    """Authored BoxCollider2D / CircleCollider2D → packed contact table."""
+    """Authored Box / Circle / CapsuleCollider2D → packed contact table."""
     cols = []
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
     # Map (class, inst) → rb2d index for dynamic flag.
@@ -268,7 +268,8 @@ def _build_collider2d_tables(plan):
             body = 2  # static (no RB)
             if rb_i is not None:
                 body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
-            kind = 0 if c.get("kind") == "box" else 1
+            kind = {"box": 0, "capsule_v": 2, "capsule_h": 3}.get(
+                c.get("kind"), 1)
             cols.append({
                 "name": o.get("name") or "obj",
                 "owner_class": cname,

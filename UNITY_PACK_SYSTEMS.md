@@ -415,6 +415,7 @@ The generated Makefile's `game` target links `physics_box2d.o` and
 | Rigidbody2D Dynamic / Kinematic / Static | dynamic / kinematic / static body |
 | Rigidbody2D mass | body mass |
 | BoxCollider2D, CircleCollider2D, offset, rotation | offset box, circle |
+| CapsuleCollider2D (size, `m_Direction`) | capsule; a circle when no longer than wide |
 | Collider2D without a Rigidbody2D | static body |
 | `m_IsTrigger` | sensor, no collision messages |
 | Friction, bounciness, combine modes | world friction and restitution callbacks with the same PhysicsMaterialCombine rules |
@@ -430,6 +431,7 @@ to it at runtime does not move it. `engine.c` stays in the crust subset: only
 |---------------|---------|
 | Authored `!u!61` BoxCollider2D | Size/offset → half-extents; a Box2D-Packed box |
 | Authored `!u!58` CircleCollider2D | Radius (× max scale); a Box2D-Packed circle |
+| Authored `!u!70` CapsuleCollider2D | Size → half-extents (× scale); a Box2D-Packed capsule along `m_Direction` |
 | Authored `!u!65` BoxCollider | Size/center → half-extents; contacts in `engine_physics_collide3d` |
 | Authored `!u!135` SphereCollider | Radius (× max scale); AABB contacts |
 | `m_IsTrigger: 1` | Parsed but skipped for solid resolution |

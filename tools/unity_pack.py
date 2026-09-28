@@ -2236,7 +2236,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     Also imports authored Camera (!u!20), SpriteRenderer (!u!212), Canvas
     (!u!223), uGUI Image / Button (builtin MB), RectTransform anchors/size,
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
-    CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
+    CircleCollider2D (!u!58), CapsuleCollider2D (!u!70), BoxCollider (!u!65),
+    SphereCollider (!u!135),
     AudioSource (!u!82), Animation (!u!111), Animator (!u!95),
     PhysicsMaterial2D / PhysicMaterial, and AnimationClip / AnimatorController
     assets. Does not invent any of those — missing components stay missing.
@@ -2266,7 +2267,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         km = re.search(
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
-            r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
+            r"Rigidbody|BoxCollider2D|CircleCollider2D|CapsuleCollider2D|"
+            r"BoxCollider|"
             r"SphereCollider|Animation|Animator|Canvas|AudioSource):",
             block)
         if km:
@@ -2289,6 +2291,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "BoxCollider2D"
         elif type_id == "58":
             kind = "CircleCollider2D"
+        elif type_id == "70":
+            kind = "CapsuleCollider2D"
         elif type_id == "65":
             kind = "BoxCollider"
         elif type_id == "135":
@@ -2678,15 +2682,19 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "vel_z": float(vel.group(3)) if vel else 0.0,
                 "material_guid": _parse_material_guid(block),
             }
-        if kind == "BoxCollider2D":
+        if kind in ("BoxCollider2D", "CapsuleCollider2D"):
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
             off = re.search(
                 r"m_Offset:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
             sz = re.search(
                 r"m_Size:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            # CapsuleCollider2D m_Direction: 0 Vertical, 1 Horizontal.
+            dirn = re.search(r"(?m)^\s+m_Direction:\s*(\d+)", block)
             rec["collider2d"] = {
-                "kind": "box",
+                "kind": "box" if kind == "BoxCollider2D" else (
+                    "capsule_h" if dirn and dirn.group(1) == "1"
+                    else "capsule_v"),
                 "enabled": int(en.group(1)) if en else 1,
                 "is_trigger": int(trig.group(1)) if trig else 0,
                 "offset_x": float(off.group(1)) if off else 0.0,
@@ -2936,7 +2944,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
-            if k.get("kind") in ("BoxCollider2D", "CircleCollider2D") and k.get(
+            if k.get("kind") in ("BoxCollider2D", "CircleCollider2D",
+                                 "CapsuleCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
@@ -3008,7 +3017,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             col2d["oy"] = float(col2d.get("offset_y", 0.0)) * sy
             col2d["cos_z"] = math.cos(rz)
             col2d["sin_z"] = math.sin(rz)
-            if col2d.get("kind") == "box":
+            if col2d.get("kind") != "circle":
                 col2d["hw"] = abs(float(col2d.get("size_x", 1.0))) * sx * 0.5
                 col2d["hh"] = abs(float(col2d.get("size_y", 1.0))) * sy * 0.5
             else:
@@ -13780,7 +13789,7 @@ def emit_engine(plan, analyses, used_apis):
     if want_col2d:
         nc = max(1, len(col2d_list))
         p("extern const int _Collider2D_count;")
-        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle */" % nc)
+        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h */" % nc)
         p("extern const int _Collider2D_is_trigger[%d];" % nc)
         p("extern const int _Collider2D_body_type[%d]; /* 0 dyn 1 kin 2 static */"
           % nc)

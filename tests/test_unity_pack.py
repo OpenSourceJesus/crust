@@ -14934,6 +14934,61 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertGreater(y, -2.5)
 
     @needs_box2d
+    def test_capsule_collider2d_rests_on_its_bottom(self):
+        """CapsuleCollider2D: vertical 1x2 rests with its center 1 above the
+        ground; horizontal 1x1 (no longer than wide) is a circle of 0.5."""
+        for direction, size, want in (("0", "{x: 1, y: 2}", -1.0),
+                                      ("1", "{x: 1, y: 1}", -1.5)):
+            root = self._project()
+            path = os.path.join(root, "Assets", "Scenes", "S.unity")
+            with open(path) as f:
+                text = f.read()
+            text = text.replace(
+                "--- !u!58 &13\nCircleCollider2D:",
+                "--- !u!70 &13\nCapsuleCollider2D:").replace(
+                "  m_Radius: 0.5\n",
+                "  m_Size: %s\n  m_Direction: %s\n" % (size, direction))
+            with open(path, "w") as f:
+                f.write(text)
+            with open(os.path.join(root, "Assets", "Scripts", "Ball.cs"),
+                      "w") as f:
+                f.write("using UnityEngine;\n"
+                        "public class Ball : MonoBehaviour {\n"
+                        "    public int enters;\n    public int exits;\n}\n")
+            d = tempfile.mkdtemp(prefix="upack-b2d-capsule-")
+            with contextlib.redirect_stderr(io.StringIO()):
+                plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT,
+                                       force=True)
+                unity_pack.build_player_executable(
+                    d, plan.get("product_name") or "Player",
+                    box2d_root=_BOX2D_ROOT)
+            host = os.path.join(d, "host.c")
+            with open(host, "w") as f:
+                f.write(
+                    "#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float Time_deltaTime;\n"
+                    "extern float _Ball_pos[][2];\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    "  Time_deltaTime = 0.02f;\n"
+                    "  for (i = 0; i < 200; i = i + 1) engine_tick();\n"
+                    "  printf(\"%.4f\\n\", _Ball_pos[0][1]);\n"
+                    "  return 0;\n"
+                    "}\n")
+            exe = os.path.join(d, "host")
+            r = subprocess.run(
+                [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+                 os.path.join(d, "data.o"),
+                 os.path.join(d, "physics_box2d.o"),
+                 os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True)
+            self.assertAlmostEqual(float(run.stdout), want, delta=0.02,
+                                   msg="m_Direction %s" % direction)
+
+    @needs_box2d
     def test_box2d_injected_matches_standard(self):
         """Contact markers instead of event arrays: identical results."""
         self.assertEqual(self._run(inject=True), self._run(inject=False))
