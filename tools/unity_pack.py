@@ -5034,7 +5034,55 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
             "(%s), (%s), (%s))" % (
                 idn, fname, idn, fname, sx, sy, sz))
         i = after
-    return "".join(out)
+    text = "".join(out)
+
+    # field.localScale = new Vector3(x, y, z): _engine_set_world_scale writes
+    # the target's local scale table (the name is SetWorldScale's).
+    def _local_scale(m):
+        parts = _split_call_args(m.group(2))
+        if len(parts) < 2:
+            return m.group(0)
+        fname = m.group(1)
+        return ("_engine_set_world_scale(_%s_%s_target_class[i], "
+                "(unsigned)_%s_%s_target_inst[i], (%s), (%s), (%s));" % (
+                    idn, fname, idn, fname, parts[0], parts[1],
+                    parts[2] if len(parts) > 2 else "1.f"))
+
+    return cs2cpp.code_sub(
+        r"(?<![.\w])(%s)\s*\.\s*localScale\s*=\s*new\s+Vector[23]\s*"
+        r"\((.*?)\)\s*;" % "|".join(re.escape(f) for f in transform_fields),
+        _local_scale, text, flags=re.DOTALL)
+
+
+_WORLD_POS_PROTO = ("static void _engine_world_pos(int class_id, unsigned inst,"
+                    " float *x, float *y, float *z, int depth);")
+
+
+def _rewrite_transform_field_position(text, cl, plan, site=None):
+    """``trs.position.x`` on an authored Transform field → the world position
+    of the object it references (a missing reference reads 0)."""
+    targets = plan.get("transform_field_targets") or {}
+    idn = _c_ident(cl["name"])
+    for f in cl.get("fields") or []:
+        fname = f.get("name")
+        if f.get("ty") != "Transform" or (cl["name"], fname) not in targets:
+            continue
+        pat = (r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*position\s*\.\s*([xyz])\b"
+               r"(?!\s*(?:=[^=]|\+=|-=|\*=|/=|\+\+|--))" % re.escape(fname))
+        if not re.search(pat, text):
+            continue
+        if site is not None:
+            site.setdefault("protos", set()).add(_WORLD_POS_PROTO)
+        text = cs2cpp.code_sub(
+            pat,
+            lambda m, fn=fname: (
+                "({ float _up_wx, _up_wy, _up_wz; "
+                "_engine_world_pos(_%s_%s_target_class[i], "
+                "(unsigned)_%s_%s_target_inst[i], "
+                "&_up_wx, &_up_wy, &_up_wz, 0); _up_w%s; })"
+                % (idn, fn, idn, fn, m.group(1))),
+            text)
+    return text
 
 
 def _class_id(plan, cname):
@@ -12362,6 +12410,29 @@ def _emit_engine_world_positions(
             p("    }")
             p("}")
             p("")
+    elif plan.get("transform_field_targets"):
+        p("/* No Transform parents: world position is the packed position. */")
+        p("static void _engine_world_pos(int class_id, unsigned inst,")
+        p("                             float *x, float *y, float *z,")
+        p("                             int depth) {")
+        p("    (void)depth;")
+        p("    *x = 0.f; *y = 0.f; *z = 0.f;")
+        p("    switch (class_id) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            idn = _c_ident(cname)
+            p("    case %d:" % cid)
+            p("        *x = %s_get_pos_x(inst);" % idn)
+            p("        *y = %s_get_pos_y(inst);" % idn)
+            if not cl.get("two_d"):
+                p("        *z = %s_get_pos_z(inst);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
 
 
 def _emit_engine_transform_point(class_ids, p, plan, tp_classes):
@@ -16707,6 +16778,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_file_copy(text)
     text = _rewrite_file_text_streams(text, cl)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
+    text = _rewrite_transform_field_position(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
     text = _rewrite_transform_look_at(text, cl)

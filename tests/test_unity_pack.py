@@ -14989,6 +14989,50 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
                                    msg="m_Direction %s" % direction)
 
     @needs_box2d
+    def test_transform_field_local_scale_write(self):
+        """`trs.localScale = new Vector3(..)` on a Transform field sets the
+        referenced object's scale (not a RectTransform)."""
+        root = self._project()
+        with open(os.path.join(root, "Assets", "Scripts", "Ball.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Ball : MonoBehaviour {\n"
+                    "    public int enters;\n    public int exits;\n"
+                    "    public Transform trs;\n"
+                    "    void Update() {\n"
+                    "        trs.localScale = new Vector3(Mathf.Sign(-3f), 2, 1);\n"
+                    "    }\n}\n")
+        path = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(text.replace("  enters: 0\n", "  enters: 0\n"
+                                 "  trs: {fileID: 11}\n"))
+        d = tempfile.mkdtemp(prefix="upack-b2d-scale-")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        self.assertNotIn("CS8000", err.getvalue())
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float _Ball_scale_x[], _Ball_scale_y[];\n"
+                    "int main(void) {\n"
+                    "  engine_tick();\n"
+                    "  printf(\"%g %g\\n\", _Ball_scale_x[0], _Ball_scale_y[0]);\n"
+                    "  return 0;\n}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.stdout.split(), ["-1", "2"])
+
+    @needs_box2d
     def test_box2d_injected_matches_standard(self):
         """Contact markers instead of event arrays: identical results."""
         self.assertEqual(self._run(inject=True), self._run(inject=False))
