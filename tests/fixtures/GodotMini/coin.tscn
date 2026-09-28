@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://bcoinscene0001"]
+
+[ext_resource type="Script" path="res://scripts/Coin.cs" id="1_coin"]
+
+[node name="Coin" type="Node2D"]
+script = ExtResource("1_coin")
