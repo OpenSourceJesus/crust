@@ -592,6 +592,18 @@ with `n << 56` before parsing (guid-qualified references are left alone).
 When `EditorBuildSettings.asset` is missing (tiny fixtures), every `.unity`
 under `Assets/` is used, sorted by path.
 
+Components that scripts need but no scene authors directly (singletons,
+`FindObjectOfType` targets, button targets) come from `.prefab` assets.
+Every `PrefabInstance` of such a prefab in a packed scene becomes its own
+copy in that scene. The copy uses the scene's stripped-stub fileIDs where
+the scene has them, and otherwise `(instance ^ source) & 0x7FFF…`. Scalar
+and flow-mapping property overrides are applied (array paths are not), and
+the root is parented under `m_TransformParent`. An instance tagged
+`EditorOnly` is dropped, as in a player build. A prefab that no packed
+scene places is loaded once with no scene. A button's stripped target
+binds to an instance in the button's own scene, or to that unplaced copy,
+and never to another scene's instance.
+
 With more than one scene (or one scene whose scripts use `SceneManager`)
 the engine carries a scene runtime (`_engine_scene_*`):
 

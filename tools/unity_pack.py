@@ -3624,32 +3624,37 @@ def _alias_onclick_mb_file_ids(objects):
     instance of the annotated target class so ``_mb_index`` resolves the call.
     """
     by_class = {}
+    owned = set()
     for o in objects or []:
         by_class.setdefault(o.get("class"), []).append(o)
+        owned.update(str(m) for m in o.get("mb_ids") or [])
 
-    def _alias(calls):
+    def _alias(calls, scene):
         for c in calls or []:
             if c.get("method") == "SetActive":
                 continue
             cls = c.get("target_class")
             tid = str(c.get("target_go") or "")
-            if not cls or not tid or tid == "0":
+            if not cls or not tid or tid == "0" or tid in owned:
                 continue
-            for inst in by_class.get(cls) or []:
-                mbs = inst.setdefault("mb_ids", [])
-                if tid not in mbs:
-                    mbs.append(tid)
+            insts = by_class.get(cls) or []
+            same = [i for i in insts if int(i.get("scene") or 0) == scene]
+            unplaced = [i for i in insts if "scene" not in i]
+            for inst in same or unplaced:
+                inst.setdefault("mb_ids", []).append(tid)
+                owned.add(tid)
                 break
 
     for o in objects or []:
-        _alias((o.get("ui_button") or {}).get("onclick"))
-        _alias((o.get("ui_slider") or {}).get("on_value_changed"))
-        _alias((o.get("ui_scrollbar") or {}).get("on_value_changed"))
-        _alias((o.get("ui_toggle") or {}).get("on_value_changed"))
+        sc = int(o.get("scene") or 0)
+        _alias((o.get("ui_button") or {}).get("onclick"), sc)
+        _alias((o.get("ui_slider") or {}).get("on_value_changed"), sc)
+        _alias((o.get("ui_scrollbar") or {}).get("on_value_changed"), sc)
+        _alias((o.get("ui_toggle") or {}).get("on_value_changed"), sc)
         et = o.get("ui_eventtrigger")
         if et:
             for d in et.get("delegates") or []:
-                _alias(d.get("calls"))
+                _alias(d.get("calls"), sc)
 
 
 
@@ -9512,6 +9517,11 @@ def _emit_engine_ui_sliders(go_n, p, plan, ui_sliders, want_live_rt):
         p("    v = vmin + t * (vmax - vmin);")
         p("    _engine_ui_sl_set_value(si, v);")
         p("}")
+    else:
+        p("/* No Slider packed: every `slider.value` target is unknown. */")
+        p("static float Slider_get_value(int go) { (void)go; return 0.f; }")
+        p("static void Slider_set_value(int go, float v)"
+          " { (void)go; (void)v; }")
 
 
 def _emit_engine_ui_scrollbars(go_n, p, plan, ui_scrollbars, want_live_rt):
@@ -9742,6 +9752,13 @@ def _emit_engine_ui_scrollbars(go_n, p, plan, ui_scrollbars, want_live_rt):
         p("    if (rev) t = 1.f - t;")
         p("    _engine_ui_sb_set_value(si, t, 0);")
         p("}")
+    else:
+        p("/* No Scrollbar packed: every `scrollbar.value` target is"
+          " unknown. */")
+        p("static float Scrollbar_get_value(int go)"
+          " { (void)go; return 0.f; }")
+        p("static void Scrollbar_set_value(int go, float v)"
+          " { (void)go; (void)v; }")
 
 
 def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_live_rt):
@@ -17818,8 +17835,132 @@ def _script_guid_for_path(guids, script_path):
     return None
 
 
-def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map):
-    """Parse .prefab assets that author *type_names* MonoBehaviours."""
+_YAML_DOC_HEAD_RE = re.compile(r"(?m)^--- !u!(\d+) &(\d+)( stripped)?[^\n]*$")
+_PREFAB_MOD_RE = re.compile(
+    r"-\s*target:\s*\{fileID:\s*(\d+)[^}]*\}\s*\n\s*propertyPath:\s*(.*?)\s*\n"
+    r"\s*value:\s*(.*?)\s*\n\s*objectReference:\s*(\{[^}]*\})")
+_FILE_ID_MASK = 0x7FFFFFFFFFFFFFFF
+
+
+def _yaml_docs(text):
+    """``[(class_id, file_id, stripped, start, end)]`` of a Unity YAML file."""
+    heads = list(_YAML_DOC_HEAD_RE.finditer(text))
+    return [(h.group(1), int(h.group(2)), bool(h.group(3)), h.start(),
+             heads[k + 1].start() if k + 1 < len(heads) else len(text))
+            for k, h in enumerate(heads)]
+
+
+def _scene_prefab_instances(scene_text):
+    """The PrefabInstance docs of a (fileID-qualified) scene: ``{id,
+    prefab_guid, parent, mods, stripped}`` -- *mods* the property overrides
+    ``(source id, path, value, objectReference)``, *stripped* the scene
+    fileID of each source object the scene keeps a stripped stub for."""
+    insts, stripped = {}, {}
+    for cls, fid, is_stripped, a, b in _yaml_docs(scene_text):
+        doc = scene_text[a:b]
+        if is_stripped:
+            src = re.search(r"m_CorrespondingSourceObject:\s*\{fileID:\s*(\d+)",
+                            doc)
+            pi = re.search(r"m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", doc)
+            if src and pi:
+                stripped.setdefault(int(pi.group(1)), {})[
+                    int(src.group(1))] = fid
+            continue
+        if cls != "1001":
+            continue
+        g = _SOURCE_PREFAB_GUID_RE.search(doc)
+        if not g:
+            continue
+        parent = re.search(r"m_TransformParent:\s*\{fileID:\s*(\d+)\}", doc)
+        insts[fid] = {
+            "id": fid, "prefab_guid": g.group(1).lower(),
+            "parent": int(parent.group(1)) if parent else 0,
+            "mods": [(int(m.group(1)), m.group(2).strip("'\""), m.group(3),
+                      m.group(4)) for m in _PREFAB_MOD_RE.finditer(doc)],
+        }
+    for fid, inst in insts.items():
+        inst["stripped"] = stripped.get(fid, {})
+    return list(insts.values())
+
+
+def _set_yaml_property(doc, path, value):
+    """*doc* with the serialized property *path* (``name`` or ``a.b`` into
+    a flow mapping) set to *value*; unchanged for paths this does not model
+    (arrays, nested blocks)."""
+    if "Array" in path or not re.fullmatch(r"\w+(?:\.\w+)?", path):
+        return doc
+    top, _, sub = path.partition(".")
+    line = re.search(r"(?m)^  %s:[ \t]*(.*)$" % re.escape(top), doc)
+    if not line:
+        if sub:
+            return doc
+        body = doc.rstrip("\n")
+        return body + "\n  %s: %s" % (top, value) + doc[len(body):]
+    if not line.group(1).strip():
+        return doc
+    if not sub:
+        return doc[:line.start(1)] + value + doc[line.end(1):]
+    flow = line.group(1)
+    if not (flow.startswith("{") and flow.endswith("}")):
+        return doc
+    new = re.sub(r"(?<=[{,\s])%s:\s*[^,}]*" % re.escape(sub),
+                 "%s: %s" % (sub, value), flow, count=1)
+    return doc[:line.start(1)] + new + doc[line.end(1):]
+
+
+def _prefab_instance_text(prefab_text, inst):
+    """The prefab's YAML as the scene instance *inst* places it: local
+    fileIDs are the scene's stripped stubs where it has one, else Unity's
+    ``(instance ^ source) & mask``; property overrides applied; the root
+    Transform under the instance's ``m_TransformParent``."""
+    pid, strip = int(inst["id"]), inst.get("stripped") or {}
+
+    def new_id(x):
+        if x == 0:
+            return 0
+        got = strip.get(x)
+        return got if got is not None else (x ^ pid) & _FILE_ID_MASK
+
+    text = _LOCAL_FILE_ID_RE.sub(
+        lambda m: m.group(1) + str(new_id(int(m.group(2)))), prefab_text)
+    docs = {fid: (a, b) for _c, fid, _s, a, b in _yaml_docs(text)}
+    edits = {}
+    for src, path, value, objref in inst.get("mods") or []:
+        fid = new_id(src)
+        if fid not in docs:
+            continue
+        ref = re.match(r"\{fileID:\s*(\d+)", objref)
+        if ref and ref.group(1) != "0":
+            value = objref
+        a, b = docs[fid]
+        edits[fid] = _set_yaml_property(edits.get(fid, text[a:b]), path, value)
+    if inst.get("parent"):
+        for cls, fid, _s, a, b in _yaml_docs(text):
+            if cls in ("4", "224") and re.search(
+                    r"(?m)^  m_Father:\s*\{fileID:\s*0\}", text[a:b]):
+                edits[fid] = re.sub(
+                    r"(?m)^(  m_Father:\s*)\{fileID:\s*0\}",
+                    r"\g<1>{fileID: %d}" % inst["parent"],
+                    edits.get(fid, text[a:b]), count=1)
+    if not edits:
+        return text
+    out, pos = [], 0
+    for fid, (a, b) in sorted(docs.items(), key=lambda kv: kv[1][0]):
+        if fid in edits:
+            out.append(text[pos:a])
+            out.append(edits[fid])
+            pos = b
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _load_prefab_objects_for_types(root, type_names, guids, assets,
+                                   typename_map, scenes=()):
+    """Parse .prefab assets that author *type_names* MonoBehaviours.
+
+    A prefab a packed scene places (*scenes*, in build order) yields one copy
+    of its objects per PrefabInstance, tagged with that scene; one no scene
+    places is parsed once as it is."""
     if not type_names:
         return []
     want_guids = set()
@@ -17832,6 +17973,14 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
             want_guids.add(g.lower())
     if not want_guids:
         return []
+    placed = {}
+    for si, spath in enumerate(scenes):
+        stext = _scene_local_file_ids(_read(spath), si)
+        for inst in _scene_prefab_instances(stext):
+            ppath = (assets or {}).get(inst["prefab_guid"])
+            if ppath:
+                placed.setdefault(os.path.realpath(ppath), []).append(
+                    (si, inst))
     out = []
     prefabs = list(_walk_files(root, (".prefab",)))
     for pi, path in enumerate(prefabs):
@@ -17842,11 +17991,16 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
         if prefabs and ((pi + 1) % 25 == 0 or pi + 1 == len(prefabs)):
             _progress("  prefab %d/%d %s" % (
                 pi + 1, len(prefabs), os.path.basename(path)))
-        objs, _l, _c, _h = parse_unity_yaml(
-            raw, guid_to_script=guids, asset_guids=assets)
-        for o in objs:
-            if o.get("class") in type_names:
-                out.append(o)
+        copies = [(si, _prefab_instance_text(raw, inst))
+                  for si, inst in placed.get(os.path.realpath(path), [])]
+        for si, text in copies or [(None, raw)]:
+            objs, _l, _c, _h = parse_unity_yaml(
+                text, guid_to_script=guids, asset_guids=assets)
+            for o in objs:
+                if o.get("class") in type_names:
+                    if si is not None:
+                        o["scene"] = si
+                    out.append(o)
     return out
 
 
@@ -18022,7 +18176,8 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
     if missing:
         _progress("loading prefab components for %s" % ", ".join(missing))
         prefab_objs = _load_prefab_objects_for_types(
-            root, set(missing), guids, assets, typename_map)
+            root, set(missing), guids, assets, typename_map,
+            scenes=_unity_scenes_to_pack(root, asset_guids=assets))
         objects.extend(prefab_objs)
         _attach_sprite_textures(prefab_objs, assets)
         for t in missing:
@@ -18348,13 +18503,17 @@ def _csharp_field_site(analyses, class_idn, field):
     for a in analyses or []:
         path = a.get("path") or ""
         text = None
+        owner = None
         for c in a.get("classes") or []:
             cname = c.get("name") or ""
             if _c_ident(cname) != class_idn and cname != class_idn:
                 continue
+            owner = c
             if c.get("file_text") is not None:
                 text = c["file_text"]
             break
+        if owner is None:
+            continue
         if text is None and path and os.path.isfile(path):
             text = _read(path)
         if not text:

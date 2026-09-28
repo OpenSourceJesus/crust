@@ -14942,7 +14942,30 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
 class TestSceneManager(unittest.TestCase):
     """Every enabled build scene is packed and SceneManager swaps them."""
 
-    def _project(self, scripts, scenes):
+    @staticmethod
+    def _go_yaml(gi, go_name, guid, fields=()):
+        go, xf, mb = 3 * gi + 1, 3 * gi + 2, 3 * gi + 3
+        return [
+            "--- !u!1 &%d" % go, "GameObject:",
+            "  m_Name: %s" % go_name, "  m_IsActive: 1",
+            "  m_Component:",
+            "  - component: {fileID: %d}" % xf,
+            "  - component: {fileID: %d}" % mb,
+            "--- !u!4 &%d" % xf, "Transform:",
+            "  m_GameObject: {fileID: %d}" % go,
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}",
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}",
+            "  m_LocalScale: {x: 1, y: 1, z: 1}",
+            "  m_Father: {fileID: 0}",
+            "--- !u!114 &%d" % mb, "MonoBehaviour:",
+            "  m_GameObject: {fileID: %d}" % go,
+            "  m_Script: {fileID: 11500000, guid: %s, type: 3}" % guid,
+        ] + ["  %s: %s" % kv for kv in fields]
+
+    def _project(self, scripts, scenes, prefabs=None):
+        """*scenes* ``[(name, gos)]``: a go is ``(name, class)`` or
+        ``("prefab", prefab name, [(source fileID, path, value)])`` -- a
+        PrefabInstance of *prefabs* ``{name: (go name, class, fields)}``."""
         root = tempfile.mkdtemp(prefix="upack-scenes-")
         self.addCleanup(shutil.rmtree, root, True)
         for sub in ("Assets/Scripts", "Assets/Scenes", "ProjectSettings"):
@@ -14955,28 +14978,36 @@ class TestSceneManager(unittest.TestCase):
                 f.write(src)
             with open(path + ".meta", "w") as f:
                 f.write("guid: %s\n" % guids[cls])
+        prefab_guids = {}
+        for i, (pname, (go_name, cls, fields)) in enumerate(
+                sorted((prefabs or {}).items())):
+            prefab_guids[pname] = ("%02x" % (i + 0x51)) * 16
+            path = os.path.join(root, "Assets", pname + ".prefab")
+            with open(path, "w") as f:
+                f.write("\n".join(["%YAML 1.1"] + self._go_yaml(
+                    0, go_name, guids[cls], fields)) + "\n")
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % prefab_guids[pname])
         build = []
         for si, (sname, gos) in enumerate(scenes):
             out = ["%YAML 1.1"]
-            for gi, (go_name, cls) in enumerate(gos):
-                go, xf, mb = 3 * gi + 1, 3 * gi + 2, 3 * gi + 3
-                out += [
-                    "--- !u!1 &%d" % go, "GameObject:",
-                    "  m_Name: %s" % go_name, "  m_IsActive: 1",
-                    "  m_Component:",
-                    "  - component: {fileID: %d}" % xf,
-                    "  - component: {fileID: %d}" % mb,
-                    "--- !u!4 &%d" % xf, "Transform:",
-                    "  m_GameObject: {fileID: %d}" % go,
-                    "  m_LocalPosition: {x: 0, y: 0, z: 0}",
-                    "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}",
-                    "  m_LocalScale: {x: 1, y: 1, z: 1}",
-                    "  m_Father: {fileID: 0}",
-                    "--- !u!114 &%d" % mb, "MonoBehaviour:",
-                    "  m_GameObject: {fileID: %d}" % go,
-                    "  m_Script: {fileID: 11500000, guid: %s, type: 3}"
-                    % guids[cls],
-                ]
+            for gi, entry in enumerate(gos):
+                if entry[0] != "prefab":
+                    out += self._go_yaml(gi, entry[0], guids[entry[1]])
+                    continue
+                pg = prefab_guids[entry[1]]
+                out += ["--- !u!1001 &%d" % (3 * gi + 1), "PrefabInstance:",
+                        "  m_Modification:",
+                        "    m_TransformParent: {fileID: 0}",
+                        "    m_Modifications:"]
+                for src, prop, value in entry[2]:
+                    out += ["    - target: {fileID: %d, guid: %s, type: 3}"
+                            % (src, pg),
+                            "      propertyPath: %s" % prop,
+                            "      value: %s" % value,
+                            "      objectReference: {fileID: 0}"]
+                out += ["  m_SourcePrefab: {fileID: 100100000, guid: %s,"
+                        " type: 3}" % pg]
             path = os.path.join(root, "Assets", "Scenes", sname + ".unity")
             with open(path, "w") as f:
                 f.write("\n".join(out) + "\n")
@@ -14991,9 +15022,9 @@ class TestSceneManager(unittest.TestCase):
                     "  m_Scenes:\n" + "".join(build))
         return root
 
-    def _frames(self, scripts, scenes, n):
+    def _frames(self, scripts, scenes, n, prefabs=None):
         """Pack, build and tick `n` frames; return each frame's log lines."""
-        root = self._project(scripts, scenes)
+        root = self._project(scripts, scenes, prefabs)
         d = tempfile.mkdtemp(prefix="upack-scenes-out-")
         self.addCleanup(shutil.rmtree, d, True)
         with contextlib.redirect_stderr(io.StringIO()):
@@ -15174,6 +15205,177 @@ class TestSceneManager(unittest.TestCase):
             {"Single": single, "_Manager": manager, "User": user},
             [("Only", [("M", "_Manager"), ("U", "User")])], 2)
         self.assertEqual(frames, [["total 102"], ["total 205"]])
+
+    @needs_cc
+    def test_each_scene_prefab_instance_is_its_own_object(self):
+        single = (
+            "using UnityEngine;\n"
+            "public class Single<T> : MonoBehaviour where T : MonoBehaviour {\n"
+            "    public static T instance;\n"
+            "    public static T Instance {\n"
+            "        get {\n"
+            "            if (instance == null) instance = FindObjectOfType<T>();\n"
+            "            return instance;\n"
+            "        }\n"
+            "    }\n}\n")
+        mgr = (
+            "using UnityEngine;\n"
+            "public class Mgr : Single<Mgr> {\n"
+            "    public int label;\n"
+            "    public void Hello(int who) {"
+            " Debug.Log(\"mgr \" + label + \" \" + who); }\n}\n")
+        driver = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Driver%s : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Mgr.Instance.Hello(%d + ticks);\n"
+            "        if (ticks == 2) SceneManager.LoadScene(%d);\n"
+            "    }\n}\n")
+        frames = self._frames(
+            {"Single": single, "Mgr": mgr, "DriverA": driver % ("A", 0, 1),
+             "DriverB": driver % ("B", 10, 0)},
+            [("Menu", [("A", "DriverA"), ("prefab", "Game", [(3, "label", 1)])]),
+             ("Level", [("prefab", "Game", [(3, "label", 2)]),
+                        ("B", "DriverB")])],
+            6, prefabs={"Game": ("Manager", "Mgr", [("label", 7)])})
+        self.assertEqual(frames, [
+            ["mgr 1 1"], ["mgr 1 2"],
+            ["mgr 2 11"], ["mgr 2 12"],
+            ["mgr 1 1"], ["mgr 1 2"],
+        ])
+
+    @needs_cc
+    def test_value_of_unpacked_scrollbar_and_slider_compiles(self):
+        user = (
+            "using UnityEngine;\nusing UnityEngine.UI;\n"
+            "public class User : MonoBehaviour {\n"
+            "    public Scrollbar bar;\n    public Slider slider;\n"
+            "    void Update() {\n"
+            "        if (bar.value > 2f) bar.value = 0f;\n"
+            "        if (slider.value > 2f) slider.value = 0f;\n"
+            "    }\n}\n")
+        root = self._project(
+            {"User": user}, [("A", [("U", "User")]), ("B", [])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("Scrollbar_get_value(", engine)
+        self.assertIn("Slider_get_value(", engine)
+        subprocess.run(
+            [_CC, "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            check=True, capture_output=True)
+
+    def test_editor_only_prefab_instance_is_not_packed(self):
+        mgr = ("using UnityEngine;\n"
+               "public class Mgr : MonoBehaviour { public int label; }\n")
+        root = self._project(
+            {"Mgr": mgr},
+            [("Menu", [("prefab", "Game", [(1, "m_TagString", "EditorOnly")])]),
+             ("Level", [("prefab", "Game", [(3, "label", 2)])])],
+            prefabs={"Game": ("Manager", "Mgr", [("label", 7)])})
+        with contextlib.redirect_stderr(io.StringIO()):
+            assets = unity_pack._asset_guid_map(root)
+            guids = unity_pack._guid_map(root, asset_guids=assets)
+            objs = unity_pack._load_prefab_objects_for_types(
+                root, {"Mgr"}, guids, assets,
+                unity_pack._mb_typename_to_script(root, guids),
+                scenes=unity_pack._unity_scenes_to_pack(
+                    root, asset_guids=assets))
+        self.assertEqual([(o["class"], o.get("scene")) for o in objs],
+                         [("Mgr", 1)])
+
+    def test_unowned_call_target_never_binds_across_scenes(self):
+        from tools import unity_pack_ui
+        plan = {"classes": {
+            "Mgr": {"n": 2, "instances": [{"scene": 1}, {"scene": 2}]},
+            "Loose": {"n": 1, "instances": [{}]},
+        }}
+        scenes = unity_pack_ui._class_instance_scenes(plan)
+        self.assertEqual(unity_pack_ui._unowned_target_inst(scenes, "Mgr", 2), 1)
+        self.assertIsNone(unity_pack_ui._unowned_target_inst(scenes, "Mgr", 0))
+        self.assertEqual(
+            unity_pack_ui._unowned_target_inst(scenes, "Loose", 0), 0)
+        button = {"scene": 0, "ui_button": {"onclick": [
+            {"method": "Go", "target_class": "Mgr", "target_go": "99"}]}}
+        objs = [button, {"class": "Mgr", "scene": 1, "mb_ids": []}]
+        unity_pack._alias_onclick_mb_file_ids(objs)
+        self.assertEqual(objs[1]["mb_ids"], [])
+
+    @needs_cc
+    def test_player_prefs_properties_pick_the_scene_to_load(self):
+        prefs_ext = (
+            "using UnityEngine;\n"
+            "namespace Ext {\n"
+            "public static class PrefsExt {\n"
+            "    public static bool GetBool (string key, bool d = false)\n"
+            "    {\n"
+            "        return PlayerPrefs.GetInt(key, d.GetHashCode()) == 1;\n"
+            "    }\n"
+            "    public static void SetBool (string key, bool value)\n"
+            "    {\n"
+            "        PlayerPrefs.SetInt(key, value.GetHashCode());\n"
+            "    }\n"
+            "}\n}\n")
+        gate = (
+            "using UnityEngine;\nusing Ext;\n"
+            "using UnityEngine.SceneManagement;\n"
+            "public class Gate : MonoBehaviour {\n"
+            "    public static string Target {\n"
+            "        get { return PlayerPrefs.GetString(\"target\"); }\n"
+            "        set { PlayerPrefs.SetString(\"target\", value); }\n"
+            "    }\n"
+            "    public static bool Done {\n"
+            "        get { return PrefsExt.GetBool(\"done\"); }\n"
+            "        set { PrefsExt.SetBool(\"done\", value); }\n"
+            "    }\n"
+            "    void Update() {\n"
+            "        Debug.Log(\"gate \" + Target);\n"
+            "        Done = true;\n"
+            "        SceneManager.LoadScene(Target);\n"
+            "    }\n}\n")
+        menu = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Menu : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Debug.Log(\"menu \" + ticks);\n"
+            "        if (ticks == 1) Begin(\"Level\");\n"
+            "    }\n"
+            "    public void Begin(string sceneName) {\n"
+            "        Gate.Target = sceneName;\n"
+            "        if (Gate.Done) Load(sceneName);\n"
+            "        else Load(\"Gate\");\n"
+            "    }\n"
+            "    public void Load(string s) { SceneManager.LoadScene(s); }\n"
+            "    public void Load(int s) { SceneManager.LoadScene(s); }\n"
+            "}\n")
+        level = ("using UnityEngine;\n"
+                 "public class Level : MonoBehaviour {\n"
+                 "    void Update() { Debug.Log(\"level\"); }\n}\n")
+        home = tempfile.mkdtemp(prefix="upack-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            frames = self._frames(
+                {"PrefsExt": prefs_ext, "Gate": gate, "Menu": menu,
+                 "Level": level},
+                [("Menu", [("M", "Menu")]), ("Gate", [("G", "Gate")]),
+                 ("Level", [("L", "Level")])], 3)
+        self.assertEqual(frames, [["menu 1"], ["gate Level"], ["level"]])
+        saved = []
+        for dp, _dn, fns in os.walk(home):
+            saved += [os.path.join(dp, fn) for fn in fns if fn == "prefs.crust"]
+        self.assertEqual(len(saved), 1)
+        with open(saved[0]) as f:
+            self.assertEqual(sorted(f.read().splitlines()),
+                             ["1\tdone\t1", "3\ttarget\tLevel"])
 
     def test_static_getter_inlining_leaves_input_manager_flags(self):
         root = self._project(
