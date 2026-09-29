@@ -1973,6 +1973,34 @@ class TestStubDiagnostics(unittest.TestCase):
                       cm.exception.message)
 
 
+class TestRuntimeApis(unittest.TestCase):
+    """tools/unity_pack_runtime.py: Mathf, Random, Parse, Path, bools as
+    C# prints them, and `new string[n]` -- packed, built and run."""
+
+    def _run(self, body, fields=""):
+        return TestOwnedStrings._run(self, body, fields)
+
+    @needs_coost
+    def test_mathf_random_parse(self):
+        out = self._run(
+            "        Random.InitState(7);\n"
+            "        int r = Random.Range(3, 4);\n"
+            "        int n;\n"
+            "        bool ok = int.TryParse(\"12\", out n);\n"
+            "        Debug.Log(Mathf.Sqrt(9f) + \",\" + Mathf.RoundToInt(2.5f) + \",\""
+            " + r + \",\" + n + \",\" + ok + \",\" + float.Parse(\"0.25\"));\n")
+        self.assertEqual(out[0], "3,2,3,12,True,0.25")
+
+    @needs_coost
+    def test_path_and_string_arrays(self):
+        out = self._run(
+            "        string[] a = new string[] { \"x\", \"y\" };\n"
+            "        string p = Path.Combine(\"d\", a[1] + \".txt\");\n"
+            "        Debug.Log(p + \",\" + Path.GetExtension(p) + \",\""
+            " + (a.Length > 1 ? \"two\" : \"one\"));\n")
+        self.assertEqual(out[0], "d/y.txt,.txt,two")
+
+
 class TestSpawnLifecycle(unittest.TestCase):
     """An instantiated object gets Awake at once and Start before its first
     Update, each once -- they ran once per class, at the first tick, for the
@@ -5100,7 +5128,7 @@ class TestSystems(unittest.TestCase):
             "\n"
             "public class LogAverageFPS : MonoBehaviour {\n"
             "    void Update() {\n"
-            "        File.ReadAllText(\"a.txt\");\n"
+            "        File.Move(\"a.txt\", \"b.txt\");\n"
             "    }\n"
             "}\n"
         )
@@ -5110,45 +5138,49 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(
             cm.exception.message,
             "Assets/Scripts/LogAverageFPS.cs(6,14): error CS0117: 'File' "
-            "does not contain a definition for 'ReadAllText'")
+            "does not contain a definition for 'Move'")
         # FQN binds without using; still CS0117 for unsupported members.
         fqn = src.replace("using System.IO;\n", "").replace(
-            "File.ReadAllText", "System.IO.File.ReadAllText")
+            "File.Move", "System.IO.File.Move")
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.analyze_script(path, fqn)
         self.assertIn("CS0117", cm.exception.message)
-        self.assertIn("ReadAllText", cm.exception.message)
+        self.assertIn("Move", cm.exception.message)
         # Supported WriteAllText / AppendAllText / WriteAllBytes /
-        # ReadAllBytes / Exists / Delete / CreateText / OpenText / Copy.
+        # ReadAllBytes / Exists / Delete / CreateText / OpenText / Copy, and
+        # ReadAllText / ReadAllLines (tools/unity_pack_runtime.py).
+        for ok in ('ReadAllText("a.txt")', 'ReadAllLines("a.txt")'):
+            unity_pack.analyze_script(
+                path, src.replace('Move("a.txt", "b.txt")', ok))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "WriteAllText(\"a.txt\", \"x\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "AppendAllText(\"a.txt\", \"x\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "WriteAllBytes(\"a.bin\", new byte[] { 1 })"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "ReadAllBytes(\"a.bin\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "Exists(\"a.txt\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "Delete(\"a.txt\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "CreateText(\"a.txt\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "OpenText(\"a.txt\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "Copy(\"a.txt\", \"b.txt\")"))
         unity_pack.analyze_script(
-            path, src.replace("ReadAllText(\"a.txt\")",
+            path, src.replace("Move(\"a.txt\", \"b.txt\")",
                               "Copy(\"a.txt\", \"b.txt\", true)"))
 
     def test_filestream_write_not_file_cs0117(self):
