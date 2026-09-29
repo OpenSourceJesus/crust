@@ -2316,6 +2316,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if kind == "GameObject":
             act = re.search(r"(?m)^\s+m_IsActive:\s*(\d+)\s*$", block)
             rec["active"] = int(act.group(1)) if act else 1
+            lay = re.search(r"(?m)^\s+m_Layer:\s*(\d+)\s*$", block)
+            rec["layer"] = int(lay.group(1)) if lay else 0
         tag = re.search(r"(?m)^\s+m_TagString:\s*(.+)$", block)
         if tag:
             rec["tag"] = tag.group(1).strip()
@@ -2423,6 +2425,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 continue
             val = fm.group(2)
             rec["fields"][key] = float(val) if "." in val else int(val)
+        # A LayerMask field: `ground: {serializedVersion: 2, m_Bits: 256}`.
+        for fm in re.finditer(r"(?m)^\s{2}(\w+):\s*\{serializedVersion:\s*\d+,"
+                              r"\s*m_Bits:\s*(\d+)\s*\}", block):
+            if not fm.group(1).startswith("m_"):
+                rec["fields"][fm.group(1)] = int(fm.group(2)) & 0xFFFFFFFF
         # Every plain scalar as its text too: a `string` field's value
         # (`label: hello`, `'two words'`). Kept apart from `fields`, which
         # holds numbers -- "007" is not 7 -- and read only for fields the
@@ -3124,6 +3131,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                              if k.get("file_id") is not None],
                 "active": active,
                 "tag": go.get("tag") or "Untagged",
+                "layer": int(go.get("layer") or 0),
                 "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
@@ -4201,6 +4209,31 @@ def _build_go_tags(plan, go_names):
             continue
         tags[gi] = h.get("tag") or "Untagged"
     return tags
+
+
+def _build_go_layers(plan, go_names):
+    """Authored ``m_Layer`` per go_names index (0, Default, when none)."""
+    layers = [0] * len(go_names or [])
+    for h in plan.get("scene_hierarchy") or []:
+        gi = h.get("go_index")
+        if gi is None or gi < 0 or gi >= len(layers):
+            continue
+        layers[gi] = int(h.get("layer") or 0)
+    return layers
+
+
+def _collider2d_layers(plan, col2d_list):
+    """Each Collider2D's layer: its GameObject's."""
+    gl = plan.get("go_layers") or []
+    out = []
+    for c in col2d_list:
+        insts = (plan["classes"].get(c.get("owner_class")) or {}).get(
+            "instances") or []
+        k = c.get("owner_inst")
+        gi = insts[k].get("go_index") if isinstance(k, int) and \
+            0 <= k < len(insts) else None
+        out.append(gl[gi] if isinstance(gi, int) and 0 <= gi < len(gl) else 0)
+    return out
 
 
 def _build_go_scene(plan, go_names):
@@ -5754,8 +5787,8 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("GameObject.SetActive")
     # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
     # read for its GameObject.
-    if re.search(r"\bPhysics2D\s*\.\s*(?:Raycast|OverlapCircle|OverlapPoint)\s*\(",
-                 scan):
+    if re.search(r"\bPhysics2D\s*\.\s*(?:Raycast|OverlapCircle|OverlapPoint)(?:All)?"
+                 r"\s*\(", scan):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
@@ -14816,33 +14849,76 @@ def emit_engine(plan, analyses, used_apis):
         p("/* Physics2D.Raycast / OverlapCircle / OverlapPoint: Box2D-Packed")
         p("   queries (physics_box2d.c); a collider index, -1 for none. */")
         p("int engine_box2d_raycast(float ox, float oy, float dx, float dy,")
-        p("    float distance, float *out);")
-        p("int engine_box2d_overlap_circle(float x, float y, float radius);")
-        p("int engine_box2d_overlap_point(float x, float y);")
-        p("typedef struct RaycastHit2D {")
+        p("    float distance, unsigned int mask, float *out);")
+        p("int engine_box2d_raycast_all(float ox, float oy, float dx, float dy,")
+        p("    float distance, unsigned int mask, float *out, int *colliders, int max);")
+        p("int engine_box2d_overlap_circle(float x, float y, float radius,")
+        p("    unsigned int mask);")
+        p("int engine_box2d_overlap_circle_all(float x, float y, float radius,")
+        p("    unsigned int mask, int *colliders, int max);")
+        p("int engine_box2d_overlap_point(float x, float y, unsigned int mask);")
+        # A C++ struct, not a C typedef: cpprust then places the
+        # std::vector<RaycastHit2D> of RaycastAll after it.
+        p("struct RaycastHit2D {")
         p("    int collider;")
         p("    Vector2 point;")
         p("    Vector2 normal;")
         p("    float distance;")
         p("    float fraction;")
-        p("} RaycastHit2D;")
-        p("static RaycastHit2D Physics2D_Raycast(Vector2 o, Vector2 d, float dist) {")
+        p("};")
+        p("static RaycastHit2D Physics2D_Raycast(Vector2 o, Vector2 d, float dist,")
+        p("    int mask) {")
         p("    RaycastHit2D h;")
         p("    float out[6];")
         p("    int k;")
         p("    for (k = 0; k < 6; k = k + 1) out[k] = 0.f;")
-        p("    h.collider = engine_box2d_raycast(o.x, o.y, d.x, d.y, dist, out);")
+        p("    h.collider = engine_box2d_raycast(o.x, o.y, d.x, d.y, dist,")
+        p("        (unsigned int)mask, out);")
         p("    h.point = Vector2_make(out[0], out[1]);")
         p("    h.normal = Vector2_make(out[2], out[3]);")
         p("    h.fraction = out[4];")
         p("    h.distance = out[5];")
         p("    return h;")
         p("}")
-        p("static int Physics2D_OverlapCircle(Vector2 c, float r) {")
-        p("    return engine_box2d_overlap_circle(c.x, c.y, r);")
+        p("static int Physics2D_OverlapCircle(Vector2 c, float r, int mask) {")
+        p("    return engine_box2d_overlap_circle(c.x, c.y, r, (unsigned int)mask);")
         p("}")
-        p("static int Physics2D_OverlapPoint(Vector2 q) {")
-        p("    return engine_box2d_overlap_point(q.x, q.y);")
+        p("static int Physics2D_OverlapPoint(Vector2 q, int mask) {")
+        p("    return engine_box2d_overlap_point(q.x, q.y, (unsigned int)mask);")
+        p("}")
+        ncol = max(1, len(plan.get("collider2d") or []))
+        p("/* RaycastAll (nearest first), OverlapCircleAll / OverlapPointAll. */")
+        p("static std::vector<RaycastHit2D> Physics2D_RaycastAll(Vector2 o, Vector2 d,")
+        p("    float dist, int mask) {")
+        p("    std::vector<RaycastHit2D> v;")
+        p("    float out[%d];" % (6 * ncol))
+        p("    int cols[%d];" % ncol)
+        p("    int n, k;")
+        p("    n = engine_box2d_raycast_all(o.x, o.y, d.x, d.y, dist,")
+        p("        (unsigned int)mask, out, cols, %d);" % ncol)
+        p("    for (k = 0; k < n; k = k + 1) {")
+        p("        RaycastHit2D h;")
+        p("        h.collider = cols[k];")
+        p("        h.point = Vector2_make(out[6 * k], out[6 * k + 1]);")
+        p("        h.normal = Vector2_make(out[6 * k + 2], out[6 * k + 3]);")
+        p("        h.fraction = out[6 * k + 4];")
+        p("        h.distance = out[6 * k + 5];")
+        p("        v.push_back(h);")
+        p("    }")
+        p("    return v;")
+        p("}")
+        p("static std::vector<int> Physics2D_OverlapCircleAll(Vector2 c, float r,")
+        p("    int mask) {")
+        p("    std::vector<int> v;")
+        p("    int cols[%d];" % ncol)
+        p("    int n, k;")
+        p("    n = engine_box2d_overlap_circle_all(c.x, c.y, r, (unsigned int)mask,")
+        p("        cols, %d);" % ncol)
+        p("    for (k = 0; k < n; k = k + 1) {")
+        p("        int ci = cols[k];")
+        p("        v.push_back(ci);")
+        p("    }")
+        p("    return v;")
         p("}")
         p("")
     if plan.get("physics2d_contacts"):
@@ -14977,6 +15053,7 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const int _Collider2D_count;")
         p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h */" % nc)
         p("extern const int _Collider2D_is_trigger[%d];" % nc)
+        p("extern const int _Collider2D_layer[%d];" % nc)
         p("extern const int _Collider2D_body_type[%d]; /* 0 dyn 1 kin 2 static */"
           % nc)
         p("extern const int _Collider2D_owner_class[%d];" % nc)
@@ -17818,6 +17895,8 @@ def _collection_elem_c_ty(elem, plan=None):
         return "std::string"
     if elem in _UNITY_INT_VECTOR_TYPES:
         return elem
+    if elem == "RaycastHit2D":
+        return "RaycastHit2D"     # Physics2D.RaycastAll's, the engine's struct
     # MonoBehaviour / component / GameObject handles are packed indices.
     return "int"
 
@@ -19422,7 +19501,8 @@ def _lower_physics2d_queries(text):
     for _pass in range(64):
         scan = cs2cpp._blank(text)
         m = re.search(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
-                      r"(Raycast|OverlapCircle|OverlapPoint)\s*\(", scan)
+                      r"(RaycastAll|Raycast|OverlapCircleAll|OverlapCircle|"
+                      r"OverlapPointAll|OverlapPoint)\s*\(", scan)
         if not m:
             break
         op = m.end() - 1
@@ -19431,18 +19511,33 @@ def _lower_physics2d_queries(text):
             break
         args = [a.strip() for a in cs2cpp.split_call_args(text[op + 1:cp])]
         which = m.group(1)
-        if which == "Raycast" and len(args) >= 2:
-            rep = "Physics2D_Raycast(%s, %s, %s)" % (
-                _query_vec2(args[0]), _query_vec2(args[1]),
-                args[2] if len(args) > 2 else "1e30f")
-        elif which == "OverlapCircle" and len(args) >= 2:
-            rep = "Physics2D_OverlapCircle(%s, %s)" % (_query_vec2(args[0]),
-                                                      args[1])
+        # Physics2D.DefaultRaycastLayers: every layer but "Ignore Raycast"
+        dmask = "(~4)"
+
+        def mask_at(k):
+            return "(int)(%s)" % args[k] if len(args) > k else dmask
+        if which in ("Raycast", "RaycastAll") and len(args) >= 2:
+            rep = "Physics2D_%s(%s, %s, %s, %s)" % (
+                which, _query_vec2(args[0]), _query_vec2(args[1]),
+                args[2] if len(args) > 2 else "1e30f", mask_at(3))
+        elif which in ("OverlapCircle", "OverlapCircleAll") and len(args) >= 2:
+            rep = "Physics2D_%s(%s, %s, %s)" % (which, _query_vec2(args[0]),
+                                                args[1], mask_at(2))
         elif which == "OverlapPoint" and len(args) >= 1:
-            rep = "Physics2D_OverlapPoint(%s)" % _query_vec2(args[0])
+            rep = "Physics2D_OverlapPoint(%s, %s)" % (_query_vec2(args[0]),
+                                                     mask_at(1))
+        elif which == "OverlapPointAll" and len(args) >= 1:
+            rep = "Physics2D_OverlapCircleAll(%s, 0.f, %s)" % (
+                _query_vec2(args[0]), mask_at(1))
         else:
             break
         text = text[:m.start()] + rep + text[cp + 1:]
+    scan = cs2cpp._blank(text)
+    # the *All results' lists (tools/unity_pack_physics.desugar_layers)
+    for n in set(re.findall(r"(?<![\w.])List\s*<\s*(?:RaycastHit2D|Collider2D)\s*>"
+                            r"\s+(\w+)\s*=\s*Physics2D_", scan)):
+        text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*Count\b" % re.escape(n),
+                               "((int)%s.size())" % n, text)
     scan = cs2cpp._blank(text)
     hits = set(re.findall(r"(?<![\w.])RaycastHit2D\s+(\w+)\s*[=;]", scan))
     cols = set(re.findall(r"(?<![\w.])Collider2D\s+(\w+)\s*=", scan))
@@ -19455,6 +19550,16 @@ def _lower_physics2d_queries(text):
                                "(%s.collider < 0)" % h, text)
         text = cs2cpp.code_sub(r"((?<![\w.])(?:if|while)\s*\(\s*)%s(\s*\))" % q,
                                lambda m, h=h: "%s%s.collider >= 0%s" % (
+                                   m.group(1), h, m.group(2)), text)
+        # as a bool elsewhere: `hit ? a : b`, `hit && ..`, `.. || hit`,
+        # `bool b = hit;`
+        text = cs2cpp.code_sub(r"(?<![\w.])%s(?=\s*(?:\?(?!\?)|&&|\|\|))" % q,
+                               "(%s.collider >= 0)" % h, text)
+        text = cs2cpp.code_sub(r"(?<=&&|\|\|)(\s*)%s(?![\w.\[])" % q,
+                               lambda m, h=h: "%s(%s.collider >= 0)" % (m.group(1), h),
+                               text)
+        text = cs2cpp.code_sub(r"(\bbool\s+\w+\s*=\s*)%s(\s*;)" % q,
+                               lambda m, h=h: "%s(%s.collider >= 0)%s" % (
                                    m.group(1), h, m.group(2)), text)
         text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*transform\b" % q,
                                "%s.collider.gameObject" % h, text)
@@ -21070,6 +21175,9 @@ def emit_data(plan, used_apis=None):
         p("const int _Collider2D_count = %d;" % n)
         p("const int _Collider2D_kind[%d] = { %s };" % (
             n, ", ".join(str(int(c["kind"])) for c in col2d_list)))
+        p("const int _Collider2D_layer[%d] = { %s };" % (
+            max(1, len(col2d_list)), ", ".join(
+                str(v) for v in _collider2d_layers(plan, col2d_list)) or "0"))
         p("const int _Collider2D_is_trigger[%d] = { %s };" % (
             n, ", ".join(str(int(c["is_trigger"])) for c in col2d_list)))
         p("const int _Collider2D_body_type[%d] = { %s };" % (
@@ -22873,9 +22981,14 @@ def pack(root, outdir, *args, **kwargs):
     # Stack / Queue / HashSet, as the List the packer lowers
     # (tools/unity_pack_collections.py).
     import tools.unity_pack_collections as _coll
+    import tools.unity_pack_physics as _phys
+    _layer_names = _phys.read_layer_names(root)
+    _common.SOURCE_LAYER_NAMES.clear()
+    _common.SOURCE_LAYER_NAMES.update(_layer_names)
     _n = [0]
     for fp in sorted(files):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
+        t = _phys.desugar_layers(t, _layer_names)
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
@@ -23101,6 +23214,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["go_active"] = _build_go_active(plan, go_names)
     plan["go_tags"] = _build_go_tags(plan, go_names)
+    plan["go_layers"] = _build_go_layers(plan, go_names)
     plan["scenes"] = list(
         getattr(_load_scenes_lights_cameras, "scenes", None) or [])
     plan["go_scene"] = _build_go_scene(plan, go_names)

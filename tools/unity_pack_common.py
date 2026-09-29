@@ -219,6 +219,10 @@ SOURCE_OVERLAY = {}
 #: without them). Set by pack().
 SOURCE_API_HINTS = set()
 
+#: The project's layer names ({index: name}), read by pack() from
+#: ProjectSettings/TagManager.asset.
+SOURCE_LAYER_NAMES = {}
+
 
 def _read(path):
     if path in SOURCE_OVERLAY:

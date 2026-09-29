@@ -647,6 +647,8 @@ BOX2D_BALL = (
     "    }\n"
     "}\n")
 BOX2D_EXPECT = ["b2d_q:Ground,7,1,-2", "b2d_q:Ground,none",
+                "b2d_q:mask Ground,none,Ground", "b2d_q:all 3 Ball,Zone,Ground",
+                "b2d_q:circle 1 Ball",
                 "b2d_status:falling", "b2d_rb:1,2,2,0,True",
                 "b2d_status:hit-1",
                 "b2d_trig:enter Ball Player", "b2d_trig:exit Ball",
@@ -704,7 +706,23 @@ BOX2D_PROBE = (
     "        Collider2D far = Physics2D.OverlapCircle(new Vector2(100f, 100f), 1f);\n"
     "        Debug.Log(\"b2d_q:\" + (inside != null ? inside.name : \"null\") + \",\""
     " + (far == null ? \"none\" : far.name));\n"
+    "        RaycastHit2D g = Physics2D.Raycast(transform.position, Vector2.down, 20f,"
+    " LayerMask.GetMask(\"Ground\"));\n"
+    "        RaycastHit2D ng = Physics2D.Raycast(transform.position, Vector2.down, 20f,"
+    " ~LayerMask.GetMask(\"Ground\"));\n"
+    "        RaycastHit2D fm = Physics2D.Raycast(transform.position, Vector2.down, 20f,"
+    " groundMask.value);\n"
+    "        Debug.Log(\"b2d_q:mask \" + (g ? g.collider.name : \"none\") + \",\""
+    " + (ng ? ng.collider.name : \"none\") + \",\" + (fm ? fm.collider.name : \"none\"));\n"
+    "        RaycastHit2D[] hits = Physics2D.RaycastAll(new Vector2(0f, 10f), Vector2.down, 30f);\n"
+    "        string names = \"\";\n"
+    "        foreach (RaycastHit2D h in hits) names += (names.Length > 0 ? \",\" : \"\")"
+    " + h.collider.gameObject.name;\n"
+    "        Debug.Log(\"b2d_q:all \" + hits.Length + \" \" + names);\n"
+    "        Collider2D[] near = Physics2D.OverlapCircleAll(new Vector2(0f, 2f), 0.1f);\n"
+    "        foreach (Collider2D c in near) Debug.Log(\"b2d_q:circle \" + near.Length + \" \" + c.name);\n"
     "    }\n"
+    "    public LayerMask groundMask;\n"
     "}\n")
 
 #: A trigger zone the ball falls through on its way to the ground: static,
@@ -910,7 +928,14 @@ def box2d_project(root):
         "  - component: {fileID: 42}\n"
         "--- !u!4 &41\nTransform:\n  m_GameObject: {fileID: 40}\n"
         "  m_LocalPosition: {x: 5, y: 5, z: 0}\n"
-        + _mb(42, 40, "feat0000000000000000000000000014"))
+        + _mb(42, 40, "feat0000000000000000000000000014").rstrip("\n")
+        + "\n  groundMask: {serializedVersion: 2, m_Bits: 256}\n")
+    scene = scene.replace("  m_Name: Ground\n", "  m_Name: Ground\n  m_Layer: 8\n", 1)
+    _write(os.path.join(root, "ProjectSettings", "TagManager.asset"),
+           "%YAML 1.1\n--- !u!78 &1\nTagManager:\n  tags: []\n  layers:\n"
+           + "".join("  - %s\n" % n for n in (
+               ["Default", "TransparentFX", "Ignore Raycast", "", "Water", "UI",
+                "", "", "Ground"] + [""] * 23)))
     _write(os.path.join(root, "Assets", "Scenes", "S.unity"), scene)
     return BOX2D_EXPECT
 
@@ -932,8 +957,9 @@ def _asan_player(out):
     return exe
 
 
-def run_project(kind, make, tmp, verbose, asan=False):
-    """Pack, build and run one project; returns (ok, report lines)."""
+def run_project(kind, make, tmp, verbose, asan=False, inject=False):
+    """Pack, build and run one project; returns (ok, report lines).
+    `inject`: Box2D-Packed's --physics-inject build."""
     root = os.path.join(tmp, "feat_" + kind)
     out = os.path.join(tmp, kind + "-out")
     expect = make(root)
@@ -941,7 +967,8 @@ def run_project(kind, make, tmp, verbose, asan=False):
     t0 = time.time()
     try:
         with contextlib.redirect_stderr(err):
-            plan = unity_pack.pack(root, out, force=True)
+            plan = unity_pack.pack(root, out, force=True,
+                                   **({"physics_inject": True} if inject else {}))
             exe = unity_pack.build_player_executable(
                 out, plan.get("product_name") or "Player")
             if asan:
@@ -1002,19 +1029,22 @@ def main(argv):
         return 2
     # The project directory names the player binary, so none is named after
     # a directory a pack writes (`box2d/` holds the physics glue).
+    # box2d-inject: the Box2D project again, through --physics-inject
+    # (Box2D-Packed with the glue's event code injected), same lines.
     projects = [("unity", unity_project), ("godot", godot_project),
-                ("box2d", box2d_project)]
+                ("box2d", box2d_project), ("box2d-inject", box2d_project)]
     tmp = tempfile.mkdtemp(prefix="upack-features-")
     all_ok = True
     for kind, make in projects:
         if only and kind not in only:
             continue
-        if kind == "box2d" and unity_pack.find_box2d_root() is None:
+        if kind.startswith("box2d") and unity_pack.find_box2d_root() is None:
             print("box2d: skipped (no Box2D-Packed checkout: "
                   "BOX2D_PACKED_ROOT, or ../box2d)")
             continue
         ok, report = run_project(kind, make, tmp, verbose,
-                                 asan=asan and kind != "box2d")
+                                 asan=asan and not kind.startswith("box2d"),
+                                 inject=kind == "box2d-inject")
         all_ok = all_ok and ok
         print("\n".join(report))
     if keep:

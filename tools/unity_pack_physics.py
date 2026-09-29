@@ -604,3 +604,77 @@ def _load_box2d_unity(box2d_root=None):
         sys.path.insert(0, root)
     import box2d_unity
     return box2d_unity
+
+
+
+# ---------------------------------------------------------------------------
+# Layers: LayerMask, and the *All queries' arrays, at the source level
+# ---------------------------------------------------------------------------
+
+#: Unity's built-in layer names, where a project's TagManager has none.
+_BUILTIN_LAYERS = {0: "Default", 1: "TransparentFX", 2: "Ignore Raycast",
+                   4: "Water", 5: "UI"}
+
+
+def read_layer_names(root):
+    """ProjectSettings/TagManager.asset `layers:` -> {index: name}."""
+    names = dict(_BUILTIN_LAYERS)
+    path = os.path.join(root or "", "ProjectSettings", "TagManager.asset")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return names
+    m = re.search(r"(?m)^  layers:\s*\n((?:  - .*\n?)+)", text)
+    if not m:
+        return names
+    for k, line in enumerate(m.group(1).splitlines()[:32]):
+        nm = line[4:].strip()
+        if nm:
+            names[k] = nm
+    return names
+
+
+def desugar_layers(text, layer_names):
+    """LayerMask as the int it is: `LayerMask` declarations are `int`,
+    `mask.value` is `mask`, and `LayerMask.GetMask("A", ..)` /
+    `NameToLayer("A")` are constants from the project's layer names (an
+    unknown name is -1 / no bit, as in Unity). The `*All` queries' arrays --
+    `RaycastHit2D[] hits = Physics2D.RaycastAll(..)` -- are lists, so
+    `foreach` and `hits[i]` are the list's; `.Length` is `.Count`."""
+    import tools.cs2cpp as cs2cpp
+    if "LayerMask" not in text and "All(" not in text:
+        return text
+    by_name = {v: k for k, v in layer_names.items()}
+
+    def lits(args):
+        return re.findall(r'"((?:[^"\\]|\\.)*)"', args)
+    text = re.sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?LayerMask\s*\.\s*GetMask\s*\(([^()]*)\)",
+        lambda m: str(sum(1 << by_name[n] for n in set(lits(m.group(1)))
+                          if n in by_name)), text)
+    text = re.sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?LayerMask\s*\.\s*NameToLayer\s*\(\s*"
+        r'"((?:[^"\\]|\\.)*)"\s*\)',
+        lambda m: str(by_name.get(m.group(1), -1)), text)
+    scan = cs2cpp._blank(text)
+    masks = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?LayerMask\s+(\w+)",
+                           scan))
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?LayerMask(?=\s+\w)",
+                           "int", text)
+    for n in sorted(masks):
+        text = cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*value\b" % re.escape(n),
+                               lambda m: m.group(1), text)
+    arrays = set()
+    for m in re.finditer(r"(?<![\w.])(RaycastHit2D|Collider2D)\s*\[\s*\]\s+(\w+)"
+                         r"(?=\s*=\s*(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
+                         r"\w+All\s*\()", cs2cpp._blank(text)):
+        arrays.add(m.group(2))
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(RaycastHit2D|Collider2D)\s*\[\s*\](\s+\w+\s*=\s*"
+        r"(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*\w+All\s*\()",
+        lambda m: "List<%s>%s" % (m.group(1), m.group(2)), text)
+    for n in sorted(arrays):
+        text = cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*Length\b" % re.escape(n),
+                               lambda m: "%s.Count" % m.group(1), text)
+    return text
