@@ -2199,6 +2199,62 @@ class TestRuntimeApis(unittest.TestCase):
         self.assertEqual(out[0], "12,3,6,36")
 
     @needs_coost
+    def test_linked_list(self):
+        out = self._run(
+            "        var ll = new System.Collections.Generic.LinkedList<int>();\n"
+            "        ll.AddLast(2); ll.AddLast(3); ll.AddFirst(1);\n"
+            "        ll.RemoveLast();\n"
+            "        Debug.Log(ll.First.Value + \",\" + ll.Last.Value + \",\" + ll.Count);\n")
+        self.assertEqual(out[0], "1,2,2")
+
+    @needs_coost
+    def test_coroutines(self):
+        # IEnumerator methods had nothing to lower them: StartCoroutine
+        # stubbed its caller. State machines now, resumed after Update.
+        co = ("using UnityEngine;\nusing System.Collections;\n"
+              "public class Co : MonoBehaviour {\n"
+              "    int frames;\n"
+              "    void Start() { StartCoroutine(Count(2)); StartCoroutine(nameof(Stopped)); }\n"
+              "    void Update() { frames++; if (frames == 1) StopCoroutine(\"Stopped\"); }\n"
+              "    IEnumerator Count(int n) {\n"
+              "        for (int k = 0; k < n; k++) { Debug.Log(\"c\" + k + \"@\" + frames);"
+              " yield return null; }\n"
+              "        Debug.Log(\"done@\" + frames);\n"
+              "    }\n"
+              "    IEnumerator Stopped() { Debug.Log(\"s0\"); yield return null;"
+              " Debug.Log(\"s1\"); }\n"
+              "}\n")
+        root = os.path.join(tempfile.mkdtemp(prefix="upack-co-"), "p")
+        os.makedirs(os.path.join(root, "Assets", "Scripts"))
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scripts", "Co.cs"), "w") as f:
+            f.write(co)
+        with open(os.path.join(root, "Assets", "Scripts", "Co.cs.meta"), "w") as f:
+            f.write("guid: c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\n")
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &1\nGameObject:\n  m_Name: Co\n"
+                    "  m_Component:\n  - component: {fileID: 2}\n"
+                    "  - component: {fileID: 3}\n"
+                    "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, "
+                    "guid: c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0}\n")
+        d = tempfile.mkdtemp(prefix="upack-co-out-")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            plan = unity_pack.pack(root, d)
+            exe = unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player")
+        self.assertNotIn("CS8000", err.getvalue())
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, cwd=d, timeout=60)
+        lines = [l for l in run.stdout.splitlines()
+                 if re.match(r"^(c\d|done|s\d)", l)]
+        self.assertEqual(lines, ["c0@0", "s0", "c1@2", "done@3"])
+
+    @needs_coost
     def test_get_type_typeof_nameof(self):
         out = self._run(
             "        Debug.Log(GetType().Name + \",\" + typeof(Player).Name + \",\""
