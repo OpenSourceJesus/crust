@@ -711,6 +711,7 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
             or any(e.startswith(pre) for pre in prefixes)
             or (re.match(r"^\w+$", e) and e in string_idents)
             or _is_string_table_entry(e, string_idents)
+            or re.match(r"^[\w\[\]().]*\.\s*c_str\s*\(\s*\)$", e)
             or (re.match(r"^(\w+)\s*\(", e)
                 and re.match(r"^(\w+)", e).group(1) in string_idents
                 and _is_one_call(e))):
@@ -988,6 +989,25 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
                 # chain had to *start* with a literal or an engine call, so
                 # `s = s + "x"` was left as pointer arithmetic.
                 wm = re.match(r"\w+", text[i:])
+                cs = re.match(r"\w+\s*\.\s*c_str\s*\(\s*\)", text[i:])
+                if cs and (i == 0 or not (text[i - 1].isalnum()
+                                          or text[i - 1] in "_.>")):
+                    # `sb.c_str()`: a fastring's text is a string.
+                    left_end = i + cs.end()
+                    left = text[i:left_end]
+                    k = left_end
+                    while k < len(text) and text[k] in " \t":
+                        k += 1
+                    if k < len(text) and text[k] == "+" and \
+                            text[k + 1:k + 2] not in ("=", "+"):
+                        rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
+                        rhs = text[rhs_start:rhs_end].strip()
+                        kind = scalar_kind(rhs, model, names, int_idents)
+                        out.append("%s_%s(%s, (%s))" % (helper, kind, left,
+                                                        rhs))
+                        i = rhs_end
+                        changed = True
+                        continue
                 if wm and wm.group(0) in names:
                     left_end = i + len(wm.group(0))
                     if text[left_end:left_end + 1] == "(":

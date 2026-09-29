@@ -5875,6 +5875,12 @@ def analyze_script(path, text=None, shallow=False):
             r"productName)\s*\+",
             scan):
         apis.add("string.+")
+    # StringBuilder appends formatted values from the scratch slots, and
+    # JsonUtility's text is built the same way.
+    if re.search(r"\bStringBuilder\b|\bJsonUtility\b", scan):
+        apis.add("string.+")
+    if re.search(r"\bJsonUtility\s*\.\s*FromJsonOverwrite\b", scan):
+        apis.add("JsonUtility.FromJsonOverwrite")
     # The runtime table's APIs are helpers emitted with the string ones.
     if runtime.API_RE.search(scan):
         apis.add("string.+")
@@ -7677,7 +7683,12 @@ def plan_layouts(objects, analyses, two_d=None):
                 # No scene/seed values → C# width (not phantom [0] → 1 bit).
                 # Seeds from `framesLeft = FRAME_CNT` widen counters correctly.
                 # A write that is not a literal bounds nothing: C# width.
-                if not vals or _int_field_writes_unbounded(
+                # JsonUtility.FromJsonOverwrite writes any serialized field
+                # a value no literal bounds.
+                json_writes = any(
+                    "JsonUtility.FromJsonOverwrite" in (a.get("apis") or ())
+                    for a in analyses)
+                if not vals or json_writes or _int_field_writes_unbounded(
                         fname, script_methods,
                         [mm for a in analyses for c in a.get("classes") or []
                          for mm in c.get("methods") or []]):
@@ -17860,6 +17871,36 @@ def _lower_string_arrays(text, used=None):
     return text, names
 
 
+def _format_bool_literals(text):
+    """`"x" + true` is "xTrue" in C#, and `Debug.Log(false)` prints
+    "False": a bool literal next to a binary `+` (only legal beside a
+    string) or as a log call's whole argument, as its C# text. Before the
+    pipeline turns `true` into 1."""
+    scan = cs2cpp._blank(text)
+    log = re.compile(r"(?:Debug\s*\.\s*Log|print|Console\s*\.\s*WriteLine)"
+                     r"\s*\(\s*$")
+    out, last = [], 0
+    for m in re.finditer(r"(?<![\w.])(true|false)(?![\w])", scan):
+        k0, k1 = m.start(), m.end()
+        # Parentheses around the literal are the operand's own.
+        while k0 > 0 and scan[k0 - 1] == "(" and k1 < len(scan) \
+                and scan[k1] == ")" and not re.search(r"[\w\]]\s*$",
+                                                     scan[:k0 - 1]):
+            k0, k1 = k0 - 1, k1 + 1
+        before = scan[:k0].rstrip()
+        after = scan[k1:].lstrip()
+        prev_plus = before.endswith("+") and not before.endswith("++")
+        next_plus = after.startswith("+") and not after.startswith(("++", "+="))
+        in_log = bool(log.search(before)) and after.startswith(")")
+        if not (prev_plus or next_plus or in_log):
+            continue
+        out.append(text[last:m.start()])
+        out.append('"%s"' % m.group(1).capitalize())
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _bool_names(cl, body, site):
     """Names holding a bool in this method: `bool` locals and parameters,
     and the class's bool fields -- by their C# name and, once lowered, their
@@ -17923,6 +17964,275 @@ def _format_bools(text, names, calls):
         last = end
     out.append(text[last:])
     return "".join(out)
+
+
+_SB_TYPE = r"(?:System\s*\.\s*Text\s*\.\s*)?StringBuilder"
+
+
+def _lower_string_builders(text):
+    """A `StringBuilder` local, as a coost `fastring` it appends to in place.
+
+        var sb = new StringBuilder();         ->  fastring sb;
+        StringBuilder sb = new ("init");      ->  fastring sb; sb.append_cstr(..)
+        sb.Append(x);                         ->  sb.append_cstr("" + (x));
+        sb.AppendLine(x);                     ->  .. + "\n"
+        sb.AppendFormat("{0}", a);            ->  sb.append_cstr(string.Format(..))
+        sb.Append(a).Append(b);               ->  one statement per call
+        sb.Clear();  sb.Replace(a, b);        ->  sb.clear();  sb.replace_cstr(..)
+        sb.ToString()  sb.Length              ->  sb.c_str()  ((int)sb.size())
+
+    `"" + (x)` is the typed concatenation's: an int, float, bool or char
+    formats as it would anywhere else, and the append copies only it. A
+    builder passed to a method or kept in a field is not lowered, and the
+    method is reported. The rewrite adds no line.
+    """
+    scan = cs2cpp._blank(text)
+    decl = re.compile(
+        r"(?<![\w.])(?:var|%s)\s+(\w+)\s*=\s*new\s+%s\s*\(" % (_SB_TYPE,
+                                                                _SB_TYPE))
+    names = set()
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        m = decl.search(scan)
+        if not m:
+            break
+        op = m.end() - 1
+        cl_ = _match_close(scan, op, "(", ")")
+        if cl_ is None:
+            break
+        semi = cl_ + 1
+        while semi < len(scan) and scan[semi] in " \t":
+            semi += 1
+        if semi >= len(scan) or scan[semi] != ";":
+            break
+        name = m.group(1)
+        names.add(name)
+        arg = text[op + 1:cl_].strip()
+        init = ""
+        args = cs2cpp.split_call_args(arg) if arg else []
+        if args and not re.match(r"^\d+$", args[0].strip()):
+            init = ' %s.append_cstr("" + (%s));' % (name, args[0].strip())
+        text = text[:m.start()] + "fastring %s;%s" % (name, init) \
+            + text[semi + 1:]
+    if not names:
+        return text
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+
+    def call_text(name, meth, args):
+        if meth == "Append" and len(args) == 1:
+            return '%s.append_cstr("" + (%s))' % (name, args[0])
+        if meth == "AppendLine" and not args:
+            return "%s.append_char('\\n')" % name
+        if meth == "AppendLine" and len(args) == 1:
+            return '%s.append_cstr("" + (%s) + "\\n")' % (name, args[0])
+        if meth == "AppendFormat" and args:
+            return "%s.append_cstr(string.Format(%s))" % (
+                name, ", ".join(args))
+        if meth == "Clear" and not args:
+            return "%s.clear()" % name
+        if meth == "Replace" and len(args) == 2:
+            return "%s.replace_cstr(%s, %s, 0)" % (name, args[0], args[1])
+        return None
+
+    # Statements: `sb.M(..).M(..)..;` -- each call its own statement.
+    stmt = re.compile(r"(?<![\w.])(%s)\s*\.\s*(Append|AppendLine|AppendFormat|"
+                      r"Clear|Replace)\s*\(" % alt)
+    start = 0
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        m = stmt.search(scan, start)
+        if not m:
+            break
+        name = m.group(1)
+        calls, k, ok = [], m.start() + len(name), True
+        while True:
+            cm = re.match(r"\s*\.\s*(\w+)\s*\(", scan[k:])
+            if not cm:
+                break
+            op = k + cm.end() - 1
+            cl_ = _match_close(scan, op, "(", ")")
+            if cl_ is None:
+                ok = False
+                break
+            inner = text[op + 1:cl_]
+            args = [a.strip() for a in cs2cpp.split_call_args(inner)] \
+                if inner.strip() else []
+            ct = call_text(name, cm.group(1), args)
+            if ct is None:
+                ok = False
+                break
+            calls.append(ct)
+            k = cl_ + 1
+        end = re.match(r"\s*;", scan[k:])
+        if not ok or not calls or not end:
+            start = m.end()
+            continue
+        # In braces: the statement may be a loop's or an `if`'s body.
+        joined = "; ".join(calls) + ";"
+        if len(calls) > 1:
+            joined = "{ %s }" % joined
+        text = text[:m.start()] + joined + text[k + end.end():]
+        start = m.start() + 1
+    text = cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*ToString\s*\(\s*\)" % alt,
+                           lambda m: "%s.c_str()" % m.group(1), text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*Length\b" % alt,
+                           lambda m: "((int)%s.size())" % m.group(1), text)
+    return text
+
+
+_JSON_INT_TYPES = ("int", "short", "ushort", "byte", "sbyte", "uint")
+
+
+def _json_fields(cl):
+    """What JsonUtility writes for a packed class, in declaration order:
+    [(name, kind, [member, ..])], kind "int" / "float" / "bool" / "string" /
+    "vec". None when a serialized field is one this cannot write (a
+    reference, a collection) -- the call is then left for the stub check
+    rather than written without it."""
+    members = {m[0] for m in cl.get("members") or ()}
+    strings = {f["name"] for f in cl.get("string_fields") or []}
+    out = []
+    for f in cl.get("fields") or []:
+        if f.get("static") or f.get("const") or not f.get("serialized"):
+            continue
+        ty, name = f.get("ty"), f["name"]
+        if ty in _JSON_INT_TYPES and name in members:
+            out.append((name, "int", [name]))
+        elif ty in ("float", "double") and name in members:
+            out.append((name, "float", [name]))
+        elif ty == "bool" and name in members:
+            out.append((name, "bool", [name]))
+        elif ty == "string" and name in strings:
+            out.append((name, "string", [name]))
+        elif ty in ("Vector2", "Vector3"):
+            comps = ["x", "y"] + (["z"] if ty == "Vector3" else [])
+            ms = ["%s_%s" % (name, c) for c in comps]
+            if not all(m in members for m in ms):
+                return None
+            out.append((name, "vec", ms))
+        else:
+            return None
+    return out
+
+
+def _json_class_c(cname, cl, what):
+    """C for `_<Cls>_ToJson(i, pretty)` / `_<Cls>_FromJsonOverwrite(json,
+    i)`: (prototypes, definitions)."""
+    idn = _c_ident(cname)
+    fields = _json_fields(cl) or []
+    protos, defs = [], []
+    if "to" in what:
+        protos.append("static const char *_%s_ToJson(unsigned i, int pretty);"
+                      % idn)
+        b = ["static const char *_%s_ToJson(unsigned i, int pretty) {" % idn,
+             "    fastring t;", "    t.append_char('{');"]
+        for n, (name, kind, ms) in enumerate(fields):
+            b.append('    _cs_json_key(&t, "%s", %d, pretty, 1);'
+                     % (name, 1 if n == 0 else 0))
+            if kind == "vec":
+                b.append("    t.append_char('{');")
+                for c, m in enumerate(ms):
+                    b.append('    _cs_json_key(&t, "%s", %d, pretty, 2);'
+                             % (m[-1], 1 if c == 0 else 0))
+                    b.append("    _cs_json_float(&t, (float)%s_get_%s(i));"
+                             % (idn, m))
+                b.append("    _cs_json_close(&t, pretty, 1);")
+            elif kind == "string":
+                b.append("    _cs_json_str(&t, %s_%s[i].c_str());"
+                         % (idn, name))
+            else:
+                b.append("    _cs_json_%s(&t, (%s)%s_get_%s(i));" % (
+                    kind, "float" if kind == "float" else "int", idn, name))
+        b.append("    if (%d) _cs_json_close(&t, pretty, 0);" % len(fields))
+        b.append("    else t.append_char('}');")
+        b.append("    return _engine_str_keep(t.data(), t.size());")
+        b.append("}")
+        defs.append("\n".join(b))
+    if "from" in what:
+        protos.append("static void _%s_FromJsonOverwrite(const char *json, "
+                      "unsigned i);" % idn)
+        b = ["static void _%s_FromJsonOverwrite(const char *json, "
+             "unsigned i) {" % idn,
+             "    const char *v;",
+             "    const char *w;",
+             '    v = _cs_json_find(json, "");']
+        for name, kind, ms in fields:
+            b.append('    v = _cs_json_find(json, "%s");' % name)
+            if kind == "vec":
+                b.append("    if (v && *v == '{') {")
+                for m in ms:
+                    b.append('        w = _cs_json_find(v, "%s");' % m[-1])
+                    b.append("        if (w) %s_set_%s(i, _cs_json_read_float(w));"
+                             % (idn, m))
+                b.append("    }")
+            elif kind == "string":
+                b.append("    if (v) %s_%s[i].assign_cstr(_cs_json_read_str(v));"
+                         % (idn, name))
+            else:
+                b.append("    if (v) %s_set_%s(i, _cs_json_read_%s(v));"
+                         % (idn, name, kind))
+        b.append("    (void)w;")
+        b.append("}")
+        defs.append("\n".join(b))
+    return "\n".join(protos), "\n\n".join(defs)
+
+
+def _lower_json_utility(text, cl, plan, site):
+    """`JsonUtility.ToJson(obj[, pretty])` and `FromJsonOverwrite(json,
+    obj)` on a packed object -- `this`, or a handle field, local or
+    parameter -- as that class's generated functions (`_json_class_c`)."""
+    classes = plan.get("classes") or {}
+    holds = {"i": cl["name"], "this": cl["name"]}
+    for name, _ty, _bits, kind in cl.get("members") or ():
+        if str(kind).startswith("idx:"):
+            holds[name] = kind.split(":", 1)[1]
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in classes:
+            holds[prm.name] = prm.type
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[=;]",
+                         cs2cpp._blank(text)):
+        if m.group(1) in classes:
+            holds[m.group(2)] = m.group(1)
+    pat = re.compile(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?JsonUtility\s*\.\s*"
+                     r"(ToJson|FromJsonOverwrite)\s*\(")
+    want = plan.setdefault("_json_classes", {})
+    used = plan.setdefault("_cs_str_used", set())
+    start = 0
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        m = pat.search(scan, start)
+        if not m:
+            break
+        op = m.end() - 1
+        cl_ = _match_close(scan, op, "(", ")")
+        if cl_ is None:
+            break
+        args = [a.strip() for a in cs2cpp.split_call_args(text[op + 1:cl_])]
+        which = m.group(1)
+        obj = args[0] if which == "ToJson" else (args[1] if len(args) == 2
+                                                  else None)
+        other = holds.get(obj or "")
+        ok = (other is not None and _json_fields(classes[other]) is not None
+              and ((which == "ToJson" and len(args) in (1, 2))
+                   or (which == "FromJsonOverwrite" and len(args) == 2)))
+        if not ok:
+            start = m.end()
+            continue
+        oidn = _c_ident(other)
+        idx = "i" if obj in ("i", "this") else obj
+        if which == "ToJson":
+            want.setdefault(other, set()).add("to")
+            used.add("_cs_json_w")
+            plan.setdefault("_json_string_fns", set()).add("_%s_ToJson" % oidn)
+            rep = "_%s_ToJson(%s, %s)" % (oidn, idx,
+                                          args[1] if len(args) == 2 else "0")
+        else:
+            want.setdefault(other, set()).add("from")
+            used.add("_cs_json_r")
+            rep = "_%s_FromJsonOverwrite(%s, %s)" % (oidn, args[0], idx)
+        text = text[:m.start()] + rep + text[cl_ + 1:]
+        start = m.start() + len(rep)
+    return text
 
 
 def _lower_string_formats(text, cl, plan, site):
@@ -18777,6 +19087,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
+    # Before `true` becomes 1: a builder's Append(true) and a bool literal
+    # in a concatenation print as C# prints them.
+    text = _lower_string_builders(text)
+    text = _format_bool_literals(text)
     text = _rewrite_csharp_float_literals(text)
     text = re.sub(r"(?<![\w.])true\b", "1", text)
     text = re.sub(r"(?<![\w.])false\b", "0", text)
@@ -18796,6 +19110,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         cs2cpp.split_call_args,
         lambda e: cs2cpp.scalar_kind(e, _PACKED_STRINGS, set(), _early_ints),
         _match_close)
+    text = _lower_json_utility(text, cl, plan, site)
     # `x == null` / `x != null` against the packed null (-1). This was part of
     # cs2cpp.lower_body, which the inline rewrites above replaced; the null
     # comparisons were lost with it and reached C as an undeclared `null`.
@@ -19003,6 +19318,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     string_idents |= _string_store_names(plan)
     # `string[]` locals: an element is a string (`parts[i]`).
     string_idents |= string_arrays
+    string_idents |= plan.get("_json_string_fns") or set()
     int_idents = _int_idents(cl, plan, body, site)
     # String members first: their helpers are then operands the typed
     # concatenation and Debug.Log can classify.
@@ -21580,6 +21896,16 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
             and "#include <math.h>" not in engine:
         k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
         engine = engine[:k] + "#include <math.h>\n" + engine[k:]
+    json_protos, json_defs = [], []
+    for jc, what in sorted((plan.pop("_json_classes", None) or {}).items()):
+        pr, df = _json_class_c(jc, plan["classes"][jc], what)
+        json_protos.append(pr)
+        json_defs.append(df)
+    plan.pop("_json_string_fns", None)
+    if json_protos:
+        helpers_c += "\n".join(json_protos) + "\n"
+        engine = engine.rstrip("\n") + "\n\n/* JsonUtility, per class */\n" \
+            + "\n\n".join(json_defs) + "\n"
     if _CS_STRING_HELPER_MARKER in engine:
         engine = engine.replace(_CS_STRING_HELPER_MARKER + "\n", helpers_c, 1)
     # C# string locals are coost fastrings (`_own_string_locals`). Only an

@@ -192,6 +192,20 @@ UNITY_CHECKS = [
      'Debug.Log("strarray_new:" + a.Length);\n',
      "", ["strarray_new:x--z,3,pq7,v", "strarray_new:1"]),
 
+    ("builder",
+     'var sb = new System.Text.StringBuilder();\n'
+     'for (int k = 0; k < 3; k++) sb.Append(k).Append(",");\n'
+     'sb.Append(true).Append(\'!\').Append(1.5f);\n'
+     'StringBuilder t = new StringBuilder("init");\n'
+     't.AppendLine(); t.AppendLine("x"); t.AppendFormat("{0}-{1}", hp, "y");\n'
+     'Debug.Log("builder:" + sb.ToString() + "|" + sb.Length);\n'
+     't.Replace("\\n", "/");\n'
+     'Debug.Log("builder:" + t.ToString());\n'
+     'sb.Clear();\n'
+     'Debug.Log("builder:" + sb.Length);\n',
+     "", ["builder:0,1,2,True!1.5|14", "builder:init/x/7-y",
+          "builder:0"]),
+
     ("self_assign",
      'string a = "x";\n'
      'string b = a;\n'
@@ -326,6 +340,33 @@ UNITY_LIFE_SCRIPT = (
     "}\n")
 UNITY_LIFE_EXPECT = ["life:123"] * 4
 
+#: JsonUtility on a packed object: every serialized field kind, a private
+#: field left out, pretty printing, and an overwrite that skips an unknown
+#: key holding nested values.
+UNITY_SAVE_SCRIPT = (
+    "using UnityEngine;\n"
+    "public class Save : MonoBehaviour {\n"
+    "    public int hp = 3;\n"
+    "    public float speed = 1.5f;\n"
+    "    public bool alive = true;\n"
+    "    public string title = \"a\\\"b\";\n"
+    "    public Vector2 v;\n"
+    "    private int secret = 9;\n"
+    "    void Start() {\n"
+    "        Debug.Log(\"json:\" + JsonUtility.ToJson(this));\n"
+    "        Debug.Log(\"json:\" + JsonUtility.ToJson(this, true).Replace(\"\\n\", \"|\"));\n"
+    "        JsonUtility.FromJsonOverwrite(\"{\\\"hp\\\": 42, \\\"extra\\\": [1, {\\\"a\\\": 2}],\"\n"
+    "            + \" \\\"title\\\": \\\"n\\\\u00e9w\\\", \\\"v\\\": {\\\"x\\\": 1.5, \\\"y\\\": -2}}\", this);\n"
+    "        Debug.Log(\"json:\" + JsonUtility.ToJson(this) + secret);\n"
+    "    }\n"
+    "}\n")
+UNITY_SAVE_EXPECT = [
+    'json:{"hp":3,"speed":1.5,"alive":true,"title":"a\\"b","v":{"x":0.0,"y":0.0}}',
+    'json:{|    "hp": 3,|    "speed": 1.5,|    "alive": true,|    "title": "a\\"b",'
+    '|    "v": {|        "x": 0.0,|        "y": 0.0|    }|}',
+    'json:{"hp":42,"speed":1.5,"alive":true,"title":"n\u00e9w","v":{"x":1.5,"y":-2.0}}9',
+]
+
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (
     "using UnityEngine;\n"
@@ -355,6 +396,12 @@ GODOT_CHECKS = [
      'Title = Title + "!";\n'
      'GD.Print("g_field_scene:", Title);\n',
      "", ["g_field_scene:hero", "g_field_scene:hero!"]),
+
+    ("g_builder",
+     'var sb = new System.Text.StringBuilder();\n'
+     'sb.Append(Hp).Append("/").Append(Title);\n'
+     'GD.Print("g_builder:", sb.ToString());\n',
+     "", ["g_builder:5/hero!"]),
 
     ("g_members",
      'string s = "  Godot  ";\n'
@@ -407,6 +454,7 @@ def _write(path, text):
 
 def unity_project(root):
     player = ["using UnityEngine;\n", "using System.IO;\n",
+              "using System.Text;\n",
               "public class Player : MonoBehaviour {\n",
               "    public int hp;\n",
               "    public Tag tag;\n"]
@@ -430,6 +478,9 @@ def unity_project(root):
     _write(os.path.join(scripts, "Shot.cs"), UNITY_SHOT_SCRIPT)
     _write(os.path.join(scripts, "Shot.cs.meta"),
            "guid: feat0000000000000000000000000004\n")
+    _write(os.path.join(scripts, "Save.cs"), UNITY_SAVE_SCRIPT)
+    _write(os.path.join(scripts, "Save.cs.meta"),
+           "guid: feat0000000000000000000000000006\n")
     _write(os.path.join(scripts, "Life.cs"), UNITY_LIFE_SCRIPT)
     _write(os.path.join(scripts, "Life.cs.meta"),
            "guid: feat0000000000000000000000000005\n")
@@ -441,6 +492,8 @@ def unity_project(root):
              _go(1, "Player", [3]),
              _mb(3, 1, "feat0000000000000000000000000001",
                  "  hp: 7\n  tag: {fileID: %d}\n" % (tags[0][1] + 2))]
+    scene.append(_go(80, "Save", [82]))
+    scene.append(_mb(82, 80, "feat0000000000000000000000000006"))
     scene.append(_go(70, "Life", [72]))
     scene.append(_mb(72, 70, "feat0000000000000000000000000005"))
     scene.append(_go(60, "Shot", [62]))
@@ -453,7 +506,8 @@ def unity_project(root):
     expect = []
     for _n, _b, _m, e in UNITY_CHECKS:
         expect += e
-    return expect + UNITY_TAG_EXPECT + UNITY_SHOT_EXPECT + UNITY_LIFE_EXPECT
+    return (expect + UNITY_TAG_EXPECT + UNITY_SHOT_EXPECT + UNITY_LIFE_EXPECT
+            + UNITY_SAVE_EXPECT)
 
 
 def godot_project(root):
