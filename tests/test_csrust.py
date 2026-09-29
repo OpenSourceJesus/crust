@@ -1702,9 +1702,12 @@ class TestLowerBody(unittest.TestCase):
     def test_packed_string_locals(self):
         # `lower_local_types`: unity_pack runs it after its Unity rewrites,
         # which read some declarations as C# wrote them.
+        # The packed model declares a marker, which unity_pack's last pass
+        # turns into owned storage (a coost fastring) -- not `const char *`,
+        # which pointed into scratch buffers later concatenations reused.
         self.assertEqual(
             cs2cpp.lower_local_types('string p = "string s";', self.PACKED),
-            'const char * p = "string s";')
+            '%s p = "string s";' % cs2cpp.PACKED_STRING_LOCAL)
         self.assertEqual(
             cs2cpp.lower_local_types("string p = q;", cs2cpp.OWNED),
             "string p = q;")

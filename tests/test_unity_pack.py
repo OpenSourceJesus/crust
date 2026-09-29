@@ -43,6 +43,11 @@ needs_box2d = unittest.skipUnless(
     _BOX2D_ROOT is not None and _CC is not None,
     "2D physics is Box2D-Packed: set BOX2D_PACKED_ROOT or clone "
     "https://github.com/crustos/box2d beside this repository")
+_COOST_ROOT = unity_pack.find_coost_root()
+needs_coost = unittest.skipUnless(
+    _COOST_ROOT is not None and _CC is not None,
+    "C# string locals are coost fastrings: set COOST_ROOT or clone "
+    "https://github.com/crustos/coost beside this repository")
 
 
 class TestSceneImport(unittest.TestCase):
@@ -1966,6 +1971,137 @@ class TestStubDiagnostics(unittest.TestCase):
                                 strict=True)
         self.assertIn("error CS8000: `Menu.Start` is not lowered yet",
                       cm.exception.message)
+
+
+class TestOwnedStrings(unittest.TestCase):
+    """C# `string` locals own their bytes: each is a coost `fastring`.
+
+    Strings in the packed engine are `const char *`, and a concatenation's
+    result lives in a ring of scratch buffers that later concatenations
+    reuse. A local kept one of those pointers, so `string saved = "a" + hp;`
+    printed whatever the ninth concatenation after it had written -- and a
+    result longer than a 512-byte slot was cut short. A local now copies
+    into a fastring of its own, and the scratch slots grow to fit.
+    """
+
+    def _run(self, body, fields=""):
+        """Pack MiniScene with `body` as Player.Start, build and run it;
+        the player's log, one line per `Debug.Log`."""
+        root = os.path.join(tempfile.mkdtemp(prefix="upack-str-"), "p")
+        shutil.copytree(PROJECT, root)
+        with open(os.path.join(root, "Assets", "Scripts", "Player.cs"),
+                  "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Player : MonoBehaviour {\n"
+                    "    public int hp;\n"
+                    "    public float speed;\n" + fields +
+                    "    public void Start() {\n" + body + "    }\n"
+                    "}\n")
+        d = tempfile.mkdtemp(prefix="upack-str-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("stubs") or [], [])
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
+                             capture_output=True, text=True, cwd=d,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            self.engine = f.read()
+        self.plan = plan
+        return [l for l in run.stdout.splitlines() if not l.startswith("ticks=")]
+
+    @needs_coost
+    def test_a_kept_string_survives_later_concatenations(self):
+        out = self._run(
+            "        string saved = \"saved-\" + hp;\n"
+            "        for (int k = 0; k < 20; k++) {\n"
+            "            string t = \"tmp-\" + k;\n"
+            "        }\n"
+            "        Debug.Log(saved);\n")
+        self.assertEqual(out[0], "saved-7")
+        self.assertIn("fastring saved;", self.engine)
+        self.assertEqual(self.plan.get("coost_root"), _COOST_ROOT)
+
+    @needs_coost
+    def test_a_long_string_is_not_cut_short(self):
+        out = self._run(
+            "        string big = \"\";\n"
+            "        for (int k = 0; k < 400; k++) {\n"
+            "            big = big + \"abc\";\n"
+            "        }\n"
+            "        Debug.Log(big);\n")
+        self.assertEqual(out[0], "abc" * 400)
+
+    @needs_coost
+    def test_append_and_integer_formatting(self):
+        # An integer printed through `%g` came out `1e+06`.
+        out = self._run(
+            "        string s = \"n=\";\n"
+            "        s += 1000000;\n"
+            "        s += \"!\";\n"
+            "        Debug.Log(s);\n"
+            "        Debug.Log(\"hp=\" + hp);\n"
+            "        Debug.Log(hp);\n")
+        self.assertEqual(out[:3], ["n=1000000!", "hp=7", "7"])
+
+    @needs_coost
+    def test_a_long_is_not_cut_to_an_int(self):
+        # The int formatters take an `int`; a `long` keeps the float path.
+        out = self._run(
+            "        long big = 5000000000;\n"
+            "        Debug.Log(\"big=\" + big);\n")
+        self.assertNotEqual(out[0], "big=705032704")
+
+    @needs_coost
+    def test_reassigning_from_itself(self):
+        out = self._run(
+            "        string a = \"x\";\n"
+            "        string b = a;\n"
+            "        a = a + a;\n"
+            "        a = b + a + b;\n"
+            "        Debug.Log(a);\n"
+            "        Debug.Log(b);\n")
+        self.assertEqual(out[:2], ["xxxx", "x"])
+
+    def test_a_project_without_string_locals_needs_no_coost(self):
+        # coost is an optional checkout: nothing changes for a project
+        # that does not use it, even with no checkout to be found.
+        real = unity_pack.find_coost_root
+        import tools.unity_pack_common as common
+        unity_pack.find_coost_root = common.find_coost_root = lambda *a: None
+        try:
+            d = tempfile.mkdtemp(prefix="upack-nocoost-")
+            with contextlib.redirect_stderr(io.StringIO()):
+                plan = unity_pack.pack(PROJECT, d)
+            self.assertIsNone(plan.get("coost_root"))
+            with open(os.path.join(d, "engine.cpp")) as f:
+                self.assertNotIn("fastring", f.read())
+        finally:
+            unity_pack.find_coost_root = common.find_coost_root = real
+
+    def test_a_missing_checkout_is_an_error_naming_the_option(self):
+        import tools.unity_pack_common as common
+        real = common.find_coost_root
+        common.find_coost_root = lambda *a: None
+        try:
+            with self.assertRaises(unity_pack.PackError) as cm:
+                common.require_coost_root()
+        finally:
+            common.find_coost_root = real
+        self.assertIn("--coost PATH", cm.exception.message)
+        self.assertIn("COOST_ROOT", cm.exception.message)
+
+    def test_upstream_coost_is_refused(self):
+        # idealvin/coost has a fastring.h too, in C++ cpprust refuses.
+        fake = tempfile.mkdtemp(prefix="upstream-coost-")
+        os.makedirs(os.path.join(fake, "include", "co"))
+        with open(os.path.join(fake, "include", "co", "fastring.h"), "w") as f:
+            f.write("class fastring : public fast::stream { };\n")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.require_coost_root(fake)
+        self.assertIn("not the crust edition", cm.exception.message)
 
 
 class TestPackedFields(unittest.TestCase):
@@ -5332,7 +5468,9 @@ class TestSystems(unittest.TestCase):
         self.assertIn("File_Copy(", start)
         self.assertIn("File_Copy(", start)
         # 2-arg → overwrite 0; true → 1; false → 0
-        self.assertRegex(start, r"File_Copy\([^)]+,\s*0\s*\)")
+        # The path arguments may be calls themselves (a string local is
+        # read as `fastring_c_str(&src)`), so match to the statement's end.
+        self.assertRegex(start, r"File_Copy\(.*,\s*0\s*\);")
         self.assertIn(", 1)", start)
         if not _CC:
             return
@@ -7131,7 +7269,10 @@ class TestSystems(unittest.TestCase):
         plan = unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("_engine_str_buf[8]", eng)
+        # Enough scratch slots for sibling concatenations (the ring was
+        # two, then eight fixed 512-byte ones; now sixteen that grow).
+        self.assertIn("_engine_str_buf[16]", eng)
+        self.assertIn("_engine_str_slot(", eng)
         pp = plan.get("persistent_data_path") or ""
         self.assertTrue(pp, "expected baked persistentDataPath")
         want_file = os.path.join(pp, "AverageFPS.txt")
