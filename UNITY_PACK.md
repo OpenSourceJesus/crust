@@ -429,7 +429,7 @@ compiler.) The checkout's files are part of the pack's input fingerprint.
 `TestOwnedStrings` packs, builds and runs each case, and so does
 `tools/unity_pack_features.py` (below).
 
-## Runtime: `Mathf`, `Random`, `Parse`, `Path`, `Directory`, `File` reads
+## Runtime: `Mathf`, `Random`, `Parse`, `Path`, `Directory`, `File` reads, `StringBuilder`, `JsonUtility`
 
 Common .NET and Unity static APIs are one table,
 `tools/unity_pack_runtime.py`: each C# spelling maps to an engine helper,
@@ -469,6 +469,31 @@ next to a binary `+` can only be in a concatenation, so a bool variable,
 field, or helper result there becomes `(b ? "True" : "False")`. A
 conditional takes its branches' type in a concatenation, so
 `"x" + (ok ? "in" : "out")` is a string, not a float.
+
+**`StringBuilder`.** A `StringBuilder` local is a coost `fastring` it
+appends to in place: `Append(x)` formats `x` as a concatenation would (an
+int, float, bool or char as C# prints it) and copies only that. `AppendLine`,
+`AppendFormat` (through the format lowering), `Clear`, `Replace`,
+`ToString`, `Length` and chained statements (`sb.Append(a).Append(b);`, one
+statement per call, in braces) are lowered; a builder passed to a method or
+kept in a field is not, and the method is reported.
+
+**`JsonUtility`.** `JsonUtility.ToJson(obj)`, `ToJson(obj, pretty)` and
+`FromJsonOverwrite(json, obj)` on a packed object -- `this`, or a handle
+field, local or parameter of another class -- are functions generated per
+class at pack time (`_Player_ToJson(i, pretty)`), over the fields Unity
+serializes (public, or `[SerializeField]`), in declaration order: `int`,
+`float`, `bool`, `string`, `Vector2`, `Vector3`. The text is Unity's: a
+float always has a point (`2.0`) and is the shortest that reads back as
+the same float, strings are escaped, pretty output indents four spaces.
+`FromJsonOverwrite` sets the fields the JSON has and leaves the rest, skips
+keys it does not know (nested values included), reads `\uXXXX` as UTF-8,
+and a document that is not an object is .NET's `ArgumentException`. When a
+project calls it, integer fields keep their full C# width: the packer
+narrows a field to what its authored values need, and a value read from
+JSON is not one it can see. A class with a serialized field of another
+type (a reference, a collection) is not lowered, and the method is
+reported rather than writing JSON without it.
 
 **`new string[n]`**, `new string[] { .. }`, `new[] { .. }` and `{ .. }`
 make a `string[]` of that size (C#'s nulls read as ""), then write each
