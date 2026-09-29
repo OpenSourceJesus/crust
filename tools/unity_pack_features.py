@@ -646,10 +646,12 @@ BOX2D_BALL = (
     "        if (enters == 1) Debug.Log(\"b2d_status:\" + status);\n"
     "    }\n"
     "}\n")
-BOX2D_EXPECT = ["b2d_status:falling", "b2d_rb:1,2,2,0,True",
+BOX2D_EXPECT = ["b2d_q:Ground,7,1,-2", "b2d_q:Ground,none",
+                "b2d_status:falling", "b2d_rb:1,2,2,0,True",
                 "b2d_status:hit-1",
                 "b2d_trig:enter Ball Player", "b2d_trig:exit Ball",
-                "b2d_rb:up", "b2d_rb:moved 5,2"]
+                "b2d_rb:up", "b2d_rb:moved 5,2", "b2d_rot:30,30",
+                "b2d_rot:spinning,turned"]
 
 #: Rigidbody2D's script API on another dynamic body: mass, gravityScale,
 #: drag, bodyType / isKinematic, AddForce (Force and Impulse), position and
@@ -677,6 +679,31 @@ BOX2D_KICK = (
     "        if (ticks == 20) rb.MovePosition(new Vector2(5f, 2f));\n"
     "        if (ticks == 21) Debug.Log(\"b2d_rb:moved \" + Mathf.RoundToInt(rb.position.x)"
     " + \",\" + Mathf.RoundToInt(rb.position.y));\n"
+    "        if (ticks == 22) { rb.velocity = Vector2.zero; rb.angularVelocity = 0f; rb.rotation = 30f; }\n"
+    "        if (ticks == 23) Debug.Log(\"b2d_rot:\" + Mathf.RoundToInt(rb.rotation)"
+    " + \",\" + Mathf.RoundToInt(transform.eulerAngles.z));\n"
+    "        if (ticks == 24) rb.AddTorque(0.05f, ForceMode2D.Impulse);\n"
+    "        if (ticks == 30) Debug.Log(\"b2d_rot:\" + (rb.angularVelocity > 1f ? \"spinning\" : \"still\")"
+    " + \",\" + (rb.rotation > 31f ? \"turned\" : \"not\"));\n"
+    "        if (ticks == 31) { rb.freezeRotation = true; rb.angularVelocity = 0f; }\n"
+    "    }\n"
+    "}\n")
+
+#: Physics2D queries from Start, before the first physics step: a ray from
+#: (5, 5) straight down hits the ground's top (y -2) 7 units away; a point
+#: inside the ground overlaps it, a circle far away nothing.
+BOX2D_PROBE = (
+    "using UnityEngine;\n"
+    "public class Probe : MonoBehaviour {\n"
+    "    void Start() {\n"
+    "        RaycastHit2D hit = Physics2D.Raycast(transform.position, Vector2.down, 20f);\n"
+    "        if (hit) Debug.Log(\"b2d_q:\" + hit.collider.gameObject.name + \",\""
+    " + Mathf.RoundToInt(hit.distance) + \",\" + Mathf.RoundToInt(hit.normal.y)"
+    " + \",\" + Mathf.RoundToInt(hit.point.y));\n"
+    "        Collider2D inside = Physics2D.OverlapPoint(new Vector2(3f, -2.5f));\n"
+    "        Collider2D far = Physics2D.OverlapCircle(new Vector2(100f, 100f), 1f);\n"
+    "        Debug.Log(\"b2d_q:\" + (inside != null ? inside.name : \"null\") + \",\""
+    " + (far == null ? \"none\" : far.name));\n"
     "    }\n"
     "}\n")
 
@@ -845,6 +872,9 @@ def box2d_project(root):
         "  m_Enabled: 1\n  m_IsTrigger: 0\n"
         "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
         + _mb(14, 10, "feat0000000000000000000000000003", "  enters: 0\n"))
+    _write(os.path.join(scripts, "Probe.cs"), BOX2D_PROBE)
+    _write(os.path.join(scripts, "Probe.cs.meta"),
+           "guid: feat0000000000000000000000000014\n")
     _write(os.path.join(scripts, "Kick.cs"), BOX2D_KICK)
     _write(os.path.join(scripts, "Kick.cs.meta"),
            "guid: feat0000000000000000000000000013\n")
@@ -874,7 +904,13 @@ def box2d_project(root):
         "--- !u!58 &33\nCircleCollider2D:\n  m_GameObject: {fileID: 30}\n"
         "  m_Enabled: 1\n  m_IsTrigger: 0\n"
         "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.25\n"
-        + _mb(34, 30, "feat0000000000000000000000000013"))
+        + _mb(34, 30, "feat0000000000000000000000000013")
+        + "--- !u!1 &40\nGameObject:\n  m_Name: Probe\n"
+        "  m_Component:\n  - component: {fileID: 41}\n"
+        "  - component: {fileID: 42}\n"
+        "--- !u!4 &41\nTransform:\n  m_GameObject: {fileID: 40}\n"
+        "  m_LocalPosition: {x: 5, y: 5, z: 0}\n"
+        + _mb(42, 40, "feat0000000000000000000000000014"))
     _write(os.path.join(root, "Assets", "Scenes", "S.unity"), scene)
     return BOX2D_EXPECT
 

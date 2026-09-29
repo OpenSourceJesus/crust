@@ -230,6 +230,8 @@ def _build_rigidbody_tables(plan):
                     "linear_damping": float(r2.get("linear_damping") or 0.0),
                     "vel_x": float(r2.get("vel_x") or 0.0),
                     "vel_y": float(r2.get("vel_y") or 0.0),
+                    "freeze_rot": bool(r2.get("freeze_rot")),
+                    "ang_vel": float(r2.get("ang_vel") or 0.0),
                 })
             r3 = o.get("rigidbody")
             if r3:

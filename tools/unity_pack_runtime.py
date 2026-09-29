@@ -669,6 +669,17 @@ _h("_cs_require_nonempty", "void",
    "        abort();\n"
    "    }\n}")
 
+# -- transform.eulerAngles.z of a live rotation ----------------------------------
+
+_h("_cs_euler_z", "float",
+   "/* A rotation about z (quaternion z, w) in degrees, [0, 360) as Unity's\n"
+   "   eulerAngles reports it. */\n"
+   "static float _cs_euler_z(float qz, float qw) {\n"
+   "    float d = (float)(2.0 * atan2((double)qz, (double)qw) * 57.29577951308232);\n"
+   "    while (d < 0.f) d = d + 360.f;\n"
+   "    while (d >= 360.f) d = d - 360.f;\n"
+   "    return d;\n}", math=True)
+
 # -- LinkedList ends -----------------------------------------------------------
 
 _h("_cs_ll_first", "int",

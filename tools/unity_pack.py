@@ -2669,7 +2669,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 vel = re.search(
                     r"m_Velocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}",
                     block)
+            cons = re.search(r"(?m)^\s+m_Constraints:\s*(\d+)", block)
+            av = re.search(r"(?m)^\s+m_AngularVelocity:\s*([0-9.eE+-]+)", block)
             rec["rigidbody2d"] = {
+                # RigidbodyConstraints2D.FreezeRotation is 4
+                "freeze_rot": bool(int(cons.group(1)) & 4) if cons else False,
+                "ang_vel": float(av.group(1)) if av else 0.0,
                 "body_type": int(bt.group(1)) if bt else 0,
                 "mass": float(mass.group(1)) if mass else 1.0,
                 "gravity_scale": float(gs.group(1)) if gs else 1.0,
@@ -5746,6 +5751,13 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("transform.SetParent")
     if re.search(r"(?<![\w.])(?:this\s*\.\s*)?gameObject\s*\.\s*SetActive\s*\(",
                  scan):
+        apis.add("GameObject.SetActive")
+    # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
+    # read for its GameObject.
+    if re.search(r"\bPhysics2D\s*\.\s*(?:Raycast|OverlapCircle|OverlapPoint)\s*\(",
+                 scan):
+        apis.add("Physics2D.query")
+        apis.add("Vector2")
         apis.add("GameObject.SetActive")
     # A collision / trigger handler reads the other's GameObject from them.
     if re.search(r"\bOn(?:Trigger|Collision)(?:Enter|Stay|Exit)2D\s*\(", scan):
@@ -13738,7 +13750,9 @@ def _lower_rb2d_api(text, cl, plan, site):
                            lambda m: "0" if m.group(1) == "Force" else "1", text)
     props = {"mass": "mass", "gravityScale": "gravityScale", "drag": "drag",
              "linearDamping": "drag", "bodyType": "bodyType",
-             "isKinematic": "isKinematic"}
+             "isKinematic": "isKinematic", "rotation": "rotation",
+             "angularVelocity": "angularVelocity",
+             "freezeRotation": "freezeRotation"}
     for pat, rx in recvs.items():
         def force(m, rx=rx):
             args = [a.strip() for a in cs2cpp.split_call_args(m.group(1))]
@@ -13747,6 +13761,26 @@ def _lower_rb2d_api(text, cl, plan, site):
                     "_cs_f.y, %s); }" % (args[0], rx, mode))
         text = cs2cpp.code_sub(pat + r"\s*\.\s*AddForce\s*\(((?:[^;])*)\)\s*;",
                                force, text)
+
+        # velocity = any Vector2 expression (`Vector2.zero`, a local, a sum);
+        # `new Vector2(..)` and `.SetX(..)` keep their own rewrite
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*(?:linearVelocity|velocity)\s*=(?!=)\s*"
+            r"(?!new\s+Vector2\b)(?![\w.]*\.\s*(?:linearVelocity|velocity)\s*\.\s*Set)"
+            r"([^;]+);",
+            lambda m, rx=rx: "{ Vector2 _cs_v = (%s); Rigidbody2D_set_velocity(%s, "
+                             "_cs_v.x, _cs_v.y); }" % (m.group(1).strip(), rx), text)
+
+        def torque(m, rx=rx):
+            args = [a.strip() for a in cs2cpp.split_call_args(m.group(1))]
+            return "Rigidbody2D_AddTorque(%s, %s, %s);" % (
+                rx, args[0], args[1] if len(args) > 1 else "0")
+        text = cs2cpp.code_sub(pat + r"\s*\.\s*AddTorque\s*\(((?:[^;])*)\)\s*;",
+                               torque, text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*MoveRotation\s*\(((?:[^;])*)\)\s*;",
+            lambda m, rx=rx: "Rigidbody2D_set_rotation(%s, %s);" % (
+                rx, m.group(1).strip()), text)
         text = cs2cpp.code_sub(
             pat + r"\s*\.\s*(?:MovePosition\s*\(((?:[^;])*)\)|position\s*=(?!=)"
             r"((?:[^;])*))\s*;",
@@ -13773,7 +13807,7 @@ def _lower_rb2d_api(text, cl, plan, site):
     return text
 
 
-def _emit_rb2d_api(p):
+def _emit_rb2d_api(p, plan=None):
     """Rigidbody2D's script API over the packed tables, which Box2D-Packed
     reads before each step (velocity, the owner's position as a teleport,
     gravity scale, damping; mass and body type when they change). An `rb`
@@ -13793,6 +13827,11 @@ def _emit_rb2d_api(p):
     p("        : (Time_fixedDeltaTime > 1e-8f ? Time_fixedDeltaTime : 0.02f) / m;")
     p("    _Rigidbody2D_vel_x[rb] = _Rigidbody2D_vel_x[rb] + fx * k;")
     p("    _Rigidbody2D_vel_y[rb] = _Rigidbody2D_vel_y[rb] + fy * k;")
+    p("}")
+    p("static void Rigidbody2D_set_velocity(int rb, float x, float y) {")
+    p("    if (!_rb2d_ok(rb)) return;")
+    p("    _Rigidbody2D_vel_x[rb] = x;")
+    p("    _Rigidbody2D_vel_y[rb] = y;")
     p("}")
     p("static float Rigidbody2D_position_x(int rb) {")
     p("    float x = 0.f, y = 0.f;")
@@ -13822,6 +13861,52 @@ def _emit_rb2d_api(p):
     p("}")
     p("static void Rigidbody2D_set_isKinematic(int rb, int v) {")
     p("    Rigidbody2D_set_bodyType(rb, v ? 1 : 0);")
+    p("}")
+    # Rotation, in Unity's degrees; the tables and Box2D in radians. With no
+    # body turning (every one frozen or static) it reads 0 and writes nothing.
+    rot = bool((plan or {}).get("physics2d_rotation"))
+    if rot:
+        p("float engine_rb2d_get_rot(int rb);")
+        p("void engine_rb2d_set_rot(int rb, float a);")
+    p("static float Rigidbody2D_get_rotation(int rb) {")
+    p("    return %s;" % ("_rb2d_ok(rb) ? engine_rb2d_get_rot(rb) * 57.2957795f : 0.f"
+                          if rot else "(void)rb, 0.f"))
+    p("}")
+    p("static void Rigidbody2D_set_rotation(int rb, float deg) {")
+    if rot:
+        p("    if (_rb2d_ok(rb)) engine_rb2d_set_rot(rb, deg * 0.0174532925f);")
+    else:
+        p("    (void)rb; (void)deg;")
+    p("}")
+    p("static float Rigidbody2D_get_angularVelocity(int rb) {")
+    p("    return %s;" % ("_rb2d_ok(rb) ? _Rigidbody2D_ang_vel[rb] * 57.2957795f : 0.f"
+                          if rot else "(void)rb, 0.f"))
+    p("}")
+    p("static void Rigidbody2D_set_angularVelocity(int rb, float deg) {")
+    if rot:
+        p("    if (_rb2d_ok(rb)) _Rigidbody2D_ang_vel[rb] = deg * 0.0174532925f;")
+    else:
+        p("    (void)rb; (void)deg;")
+    p("}")
+    p("static int Rigidbody2D_get_freezeRotation(int rb) {")
+    p("    return %s;" % ("_rb2d_ok(rb) ? _Rigidbody2D_freeze_rot[rb] : 1"
+                          if rot else "(void)rb, 1"))
+    p("}")
+    p("static void Rigidbody2D_set_freezeRotation(int rb, int v) {")
+    if rot:
+        p("    if (_rb2d_ok(rb)) _Rigidbody2D_freeze_rot[rb] = v ? 1 : 0;")
+    else:
+        p("    (void)rb; (void)v;")
+    p("}")
+    p("/* ForceMode2D.Force: a torque over the next step; Impulse: an angular")
+    p("   impulse. Box2D-Packed applies them (it knows the inertia). */")
+    p("static void Rigidbody2D_AddTorque(int rb, float t, int mode) {")
+    if rot:
+        p("    if (!_rb2d_ok(rb) || _Rigidbody2D_body_type[rb] != 0) return;")
+        p("    if (mode == 1) _Rigidbody2D_ang_imp[rb] = _Rigidbody2D_ang_imp[rb] + t;")
+        p("    else _Rigidbody2D_torque[rb] = _Rigidbody2D_torque[rb] + t;")
+    else:
+        p("    (void)rb; (void)t; (void)mode;")
     p("}")
     p("")
 
@@ -13867,6 +13952,45 @@ def _emit_engine_box2d_exports(
         p("    }")
         p("}")
         p("")
+        if plan.get("physics2d_rotation"):
+            # A Rigidbody2D's angle (radians) is its owner's rotation about z.
+            p("float engine_rb2d_get_rot(int rb) {")
+            p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
+            p("    switch (_Rigidbody2D_owner_class[rb]) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                if cname not in set(plan.get("live_rot_classes") or []):
+                    continue
+                idn = _c_ident(cname)
+                p("    case %d: return 2.f * atan2f(_%s_rot_z[oi], _%s_rot_w[oi]);"
+                  % (cid, idn, idn))
+            p("    default: break;")
+            p("    }")
+            p("    (void)oi;")
+            p("    return 0.f;")
+            p("}")
+            p("")
+            p("void engine_rb2d_set_rot(int rb, float a) {")
+            p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
+            p("    float s = sinf(a * 0.5f), c = cosf(a * 0.5f);")
+            p("    switch (_Rigidbody2D_owner_class[rb]) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                if cname not in set(plan.get("live_rot_classes") or []):
+                    continue
+                idn = _c_ident(cname)
+                p("    case %d:" % cid)
+                p("        _engine_transform_set_quat(&_{0}_rot_x[oi], &_{0}_rot_y[oi],"
+                  .format(idn))
+                p("            &_{0}_rot_z[oi], &_{0}_rot_w[oi], &_{0}_rot_m00[oi],"
+                  .format(idn))
+                p("            &_{0}_rot_m01[oi], &_{0}_rot_m10[oi], &_{0}_rot_m11[oi],"
+                  .format(idn))
+                p("            0.f, 0.f, s, c);")
+                p("        break;")
+            p("    default: break;")
+            p("    }")
+            p("    (void)oi; (void)s; (void)c;")
+            p("}")
+            p("")
         p("void engine_col2d_center(int ci, float *x, float *y) {")
         if want_col2d and col2d_list:
             p("    _col2d_center(ci, x, y);")
@@ -14687,6 +14811,40 @@ def emit_engine(plan, analyses, used_apis):
     p("   group can find them. */")
     if _plan_needs_vector2(plan, used_apis):
         _emit_vector2_struct(p)
+    if "Physics2D.query" in used_apis and plan.get("rigidbody2d") is not None:
+        plan["physics2d_queries"] = True
+        p("/* Physics2D.Raycast / OverlapCircle / OverlapPoint: Box2D-Packed")
+        p("   queries (physics_box2d.c); a collider index, -1 for none. */")
+        p("int engine_box2d_raycast(float ox, float oy, float dx, float dy,")
+        p("    float distance, float *out);")
+        p("int engine_box2d_overlap_circle(float x, float y, float radius);")
+        p("int engine_box2d_overlap_point(float x, float y);")
+        p("typedef struct RaycastHit2D {")
+        p("    int collider;")
+        p("    Vector2 point;")
+        p("    Vector2 normal;")
+        p("    float distance;")
+        p("    float fraction;")
+        p("} RaycastHit2D;")
+        p("static RaycastHit2D Physics2D_Raycast(Vector2 o, Vector2 d, float dist) {")
+        p("    RaycastHit2D h;")
+        p("    float out[6];")
+        p("    int k;")
+        p("    for (k = 0; k < 6; k = k + 1) out[k] = 0.f;")
+        p("    h.collider = engine_box2d_raycast(o.x, o.y, d.x, d.y, dist, out);")
+        p("    h.point = Vector2_make(out[0], out[1]);")
+        p("    h.normal = Vector2_make(out[2], out[3]);")
+        p("    h.fraction = out[4];")
+        p("    h.distance = out[5];")
+        p("    return h;")
+        p("}")
+        p("static int Physics2D_OverlapCircle(Vector2 c, float r) {")
+        p("    return engine_box2d_overlap_circle(c.x, c.y, r);")
+        p("}")
+        p("static int Physics2D_OverlapPoint(Vector2 q) {")
+        p("    return engine_box2d_overlap_point(q.x, q.y);")
+        p("}")
+        p("")
     if plan.get("physics2d_contacts"):
         p("/* UnityEngine.ContactPoint2D from Collision2D.GetContact. */")
         p("typedef struct ContactPoint2D {")
@@ -14797,7 +14955,12 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int _Rigidbody2D_body_type[%d];" % n2)
         p("extern int _Rigidbody2D_owner_class[%d];" % n2)
         p("extern int _Rigidbody2D_owner_inst[%d];" % n2)
-        _emit_rb2d_api(p)
+        if plan.get("physics2d_rotation"):
+            p("extern int _Rigidbody2D_freeze_rot[%d];" % n2)
+            p("extern float _Rigidbody2D_ang_vel[%d];" % n2)
+            p("extern float _Rigidbody2D_torque[%d];" % n2)
+            p("extern float _Rigidbody2D_ang_imp[%d];" % n2)
+        _emit_rb2d_api(p, plan)
     if want_rb3d:
         n3 = max(1, rb3d_cap if rb3d_cap else len(rb3d_list) or 1)
         p("extern int _Rigidbody_count;")
@@ -19230,6 +19393,85 @@ def _lower_string_nulls(text, cl, plan, site):
     return text
 
 
+def _query_vec2(arg):
+    """A query's point or direction as the engine's Vector2: a position
+    (`transform.position`, `x.transform.position`, a `(Vector2)` cast of
+    one) is a Vector3 in C#, taken by its x and y."""
+    a = re.sub(r"^\(\s*Vector2\s*\)\s*", "", arg.strip())
+    if re.match(r"^(?:[\w.]+\.)?(?:transform\s*\.\s*)?position$", a) and \
+            "position" in a:
+        return "Vector2_make(%s.x, %s.y)" % (a, a)
+    return arg.strip()
+
+
+def _lower_physics2d_queries(text):
+    """`Physics2D.Raycast(origin, direction[, distance])`, `OverlapCircle(
+    point, radius)` and `OverlapPoint(point)`, as the engine's (Box2D-Packed
+    queries). A RaycastHit2D is the engine's struct -- `collider` an index,
+    `point`, `normal`, `distance`, `fraction` -- and `if (hit)` is a hit;
+    `hit.collider`, `hit.transform` and a Collider2D local read their
+    GameObject as a handler's parameter does. Layer masks are not read: every
+    collider takes part."""
+    if "Physics2D" not in text and "RaycastHit2D" not in text:
+        return text
+
+    def call(m):
+        name = m.group(1)
+        op = m.end() - 1
+        return name, op
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        m = re.search(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
+                      r"(Raycast|OverlapCircle|OverlapPoint)\s*\(", scan)
+        if not m:
+            break
+        op = m.end() - 1
+        cp = _match_close(scan, op, "(", ")")
+        if cp is None:
+            break
+        args = [a.strip() for a in cs2cpp.split_call_args(text[op + 1:cp])]
+        which = m.group(1)
+        if which == "Raycast" and len(args) >= 2:
+            rep = "Physics2D_Raycast(%s, %s, %s)" % (
+                _query_vec2(args[0]), _query_vec2(args[1]),
+                args[2] if len(args) > 2 else "1e30f")
+        elif which == "OverlapCircle" and len(args) >= 2:
+            rep = "Physics2D_OverlapCircle(%s, %s)" % (_query_vec2(args[0]),
+                                                      args[1])
+        elif which == "OverlapPoint" and len(args) >= 1:
+            rep = "Physics2D_OverlapPoint(%s)" % _query_vec2(args[0])
+        else:
+            break
+        text = text[:m.start()] + rep + text[cp + 1:]
+    scan = cs2cpp._blank(text)
+    hits = set(re.findall(r"(?<![\w.])RaycastHit2D\s+(\w+)\s*[=;]", scan))
+    cols = set(re.findall(r"(?<![\w.])Collider2D\s+(\w+)\s*=", scan))
+    text = cs2cpp.code_sub(r"(?<![\w.])Collider2D(\s+\w+\s*=)",
+                           lambda m: "int" + m.group(1), text)
+    for h in sorted(hits):
+        q = re.escape(h)
+        # `if (hit)` / `!hit`: RaycastHit2D converts to bool -- a hit
+        text = cs2cpp.code_sub(r"(?<![\w.])!\s*%s(?![\w.])" % q,
+                               "(%s.collider < 0)" % h, text)
+        text = cs2cpp.code_sub(r"((?<![\w.])(?:if|while)\s*\(\s*)%s(\s*\))" % q,
+                               lambda m, h=h: "%s%s.collider >= 0%s" % (
+                                   m.group(1), h, m.group(2)), text)
+        text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*transform\b" % q,
+                               "%s.collider.gameObject" % h, text)
+        text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*collider\s*(==|!=)\s*null\b" % q,
+                               lambda m, h=h: "%s.collider %s" % (
+                                   h, "< 0" if m.group(1) == "==" else ">= 0"),
+                               text)
+        text = _lower_collider_param(text, "%s.collider" % h)
+    for c in sorted(cols):
+        text = cs2cpp.code_sub(r"(?<![\w.])%s\s*(==|!=)\s*null\b" % re.escape(c),
+                               lambda m, c=c: "%s %s" % (
+                                   c, "< 0" if m.group(1) == "==" else ">= 0"),
+                               text)
+        text = _lower_collider_param(text, c)
+    return text
+
+
 def _lower_collider_param(text, p):
     """A collision or trigger handler's parameter -- `Collision2D coll` or
     `Collider2D other`, the other collider's index here -- read for its
@@ -20001,6 +20243,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         _match_close)
     text = _lower_json_utility(text, cl, plan, site)
     text = _lower_get_type(text, cl, plan, site)
+    text = _lower_physics2d_queries(text)
     # `x == null` / `x != null` against the packed null (-1). This was part of
     # cs2cpp.lower_body, which the inline rewrites above replaced; the null
     # comparisons were lost with it and reached C as an undeclared `null`.
@@ -20107,6 +20350,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_file_text_streams(text, cl)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_transform_field_position(text, cl, plan, site)
+    if cl.get("name") in set(plan.get("live_rot_classes") or []):
+        # transform.eulerAngles.z of this object's live rotation (a turning
+        # Rigidbody2D's owner, or a script's)
+        _idn = _c_ident(cl["name"])
+        if re.search(r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles"
+                     r"\s*\.\s*z\b", text):
+            plan.setdefault("_cs_str_used", set()).add("_cs_euler_z")
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\s*\.\s*z\b",
+            "_cs_euler_z(_%s_rot_z[i], _%s_rot_w[i])" % (_idn, _idn), text)
     text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
@@ -20726,6 +20979,18 @@ def emit_data(plan, used_apis=None):
         p("int _Rigidbody2D_owner_inst[%d] = { %s };" % (
             cap, ", ".join(str(int(v)) for v in _pad_i(
                 [r["owner_inst"] for r in rb2d_list]))))
+        if plan.get("physics2d_rotation"):
+            # rotation: frozen, angular velocity (rad/s), and the torque and
+            # angular impulse scripts add before a step
+            p("int _Rigidbody2D_freeze_rot[%d] = { %s };" % (
+                cap, ", ".join(str(int(bool(v))) for v in _pad_i(
+                    [r.get("freeze_rot", False) for r in rb2d_list], 1))))
+            p("float _Rigidbody2D_ang_vel[%d] = { %s };" % (
+                cap, ", ".join("%sf" % repr(float(v)) for v in _pad_f(
+                    [math.radians(float(r.get("ang_vel", 0.0)))
+                     for r in rb2d_list]))))
+            p("float _Rigidbody2D_torque[%d];" % cap)
+            p("float _Rigidbody2D_ang_imp[%d];" % cap)
     asrc_list = plan.get("audiosources") or []
     as_add = int((plan.get("addcomponent_budget") or {}).get("AudioSource") or 0)
     as_cap = len(asrc_list) + as_add
@@ -22854,6 +23119,18 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))
     plan["rigidbody2d"] = rb2d
+    # Rigidbody2D rotation: a body Box2D-Packed may turn -- not static, not
+    # FreezeRotation -- turns its owner's Transform, which then keeps a live
+    # rotation (drawn rotated). Unity mode; the glue locked it before.
+    rotating = [r for r in rb2d if not r.get("freeze_rot")
+                and int(r.get("body_type") or 0) != 2
+                and r.get("owner_class") in plan["classes"]
+                and _class_has_position(plan["classes"][r["owner_class"]])]
+    if rotating and not plan.get("godot"):
+        plan["physics2d_rotation"] = True
+        plan["live_rot_classes"] = sorted(
+            set(plan.get("live_rot_classes") or [])
+            | {r["owner_class"] for r in rotating})
     plan["rigidbody"] = rb3d
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
@@ -22887,8 +23164,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     engine = emit_engine(plan, analyses, used_apis)
     _used_helpers = plan.pop("_cs_str_used", None) or set()
     helpers_c = _string_helpers_c(_used_helpers)
-    if runtime.needs_math(runtime.closure(
-            {h for h in _used_helpers if runtime.is_runtime_helper(h)})) \
+    if (runtime.needs_math(runtime.closure(
+            {h for h in _used_helpers if runtime.is_runtime_helper(h)}))
+            or "atan2f(" in engine) \
             and "#include <math.h>" not in engine:
         k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
         engine = engine[:k] + "#include <math.h>\n" + engine[k:]
