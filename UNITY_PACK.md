@@ -776,18 +776,27 @@ With no turning body in the scene the API reads 0 and writes nothing.
 Godot mode keeps its bodies' rotation locked.
 
 **Joints.** `HingeJoint2D`, `DistanceJoint2D`, `SpringJoint2D`,
-`FixedJoint2D`, `SliderJoint2D` and `WheelJoint2D` are read from the scene
+`FixedJoint2D`, `SliderJoint2D`, `WheelJoint2D`, `FrictionJoint2D`,
+`RelativeJoint2D` and `TargetJoint2D` are read from the scene
 (`plan["joints2d"]`, the `_Joint2D_*` tables in data.c) and built by
 Box2D-Packed as revolute, distance (rigid; a rope with `maxDistanceOnly`),
-distance with a spring, weld, prismatic and wheel joints, with the bodies
--- a script's `Start` sees them. The joint links its own body to the
+distance with a spring, weld, prismatic and wheel joints, and the last
+three as its motor joint: friction is velocity control to rest capped at
+`maxForce` / `maxTorque`; relative is a spring to the linear and angular
+offset (`autoConfigureOffset` as Unity has it), capped the same, whose
+frequency is `correctionScale`'s -- Box2D v2's motor joint corrected that
+fraction of the error a step, a spring of sqrt(scale) / (2 pi dt) hertz;
+target is a spring (`frequency`, `dampingRatio`, `maxForce`) pulling the
+anchor to a world point (`autoConfigureTarget`: where the anchor starts),
+the body free to turn. They are built with the bodies -- a script's `Start`
+sees them. The joint links its own body to the
 connected one (a wheel joint: the chassis it is on to the wheel), or to a
 static ground body at the origin when there is none; Unity's anchor and
 connected anchor are the frames' points (`autoConfigureConnectedAnchor`,
 `autoConfigureDistance` and a slider's `autoConfigureAngle` as Unity
 configures them), and a hinge's limits and angle are relative to its pose
-at creation. A joint on a GameObject without a Rigidbody2D is skipped, with
-a warning (Unity would add the body).
+at creation. A GameObject with a joint and no Rigidbody2D gets the one
+Unity adds (dynamic, mass 1, gravity 1).
 
 Scripts reach a joint through a field of a joint type (set by
 `GetComponent<XJoint2D>()`, or a serialized reference), a local, or
@@ -799,15 +808,22 @@ it:
 |----|--|
 | `enabled`, `useMotor`, `useLimits`, `enableCollision`, `maxDistanceOnly`, `distance`, `frequency`, `dampingRatio`, `breakForce`, `breakTorque` | get, set, `op=` |
 | `motor` (`JointMotor2D`), `limits` (`JointAngleLimits2D` / `JointTranslationLimits2D`), `suspension` (`JointSuspension2D`) | get, set; `new JointMotor2D { motorSpeed = .., maxMotorTorque = .. }`; `motor.motorSpeed`, `limits.min` read directly |
-| `jointAngle`, `jointSpeed` (degrees), `jointTranslation`, `connectedBody`, `attachedRigidbody` | get |
+| `maxForce`, `maxTorque`, `correctionScale`, `angularOffset`, `autoConfigureOffset`, `autoConfigureTarget`, `breakAction` | get, set |
+| `target`, `linearOffset` (Vector2) | get, set (a moved target moves the spring's end) |
+| `jointAngle`, `jointSpeed` (degrees), `jointTranslation`, `connectedBody`, `attachedRigidbody`, `reactionForce`, `reactionTorque`, `GetReactionForce(dt)`, `GetReactionTorque(dt)` | get (the reaction is Box2D's constraint force / torque after the last step) |
 
 Hinge and wheel motor speeds and hinge limits are in degrees, as Unity's
 (Box2D clamps a hinge's limits to ±178°). **Breaking**: `breakForce` and
-`breakTorque` are Box2D's force and torque thresholds; a joint past one is
-destroyed (Unity's default `JointBreakAction2D.Destroy`) and its
-GameObject's scripts get `OnJointBreak2D(Joint2D)`. `RelativeJoint2D`,
-`FrictionJoint2D` and `TargetJoint2D`, `reactionForce`, and the other
-break actions are not read yet.
+`breakTorque` are Box2D's force and torque thresholds; a joint past one
+gets its `breakAction` (`m_BreakAction`, `JointBreakAction2D`): `Destroy`
+(the default) removes it -- `GetComponent` no longer finds it -- `Disable`
+removes it from the world and sets `enabled` false (enabling it again
+builds it again), `CallbackOnly` keeps it, and each of them sends
+`OnJointBreak2D(Joint2D)` to its GameObject's scripts; `Ignore` never
+breaks.
+
+A Rigidbody2D's authored `m_GravityScale: 0` is kept; it was read as the
+default, 1.
 
 **Queries.** `Physics2D.Raycast(origin, direction[, distance[,
 layerMask]])`, `RaycastAll`, `OverlapCircle(point, radius[, layerMask])`,
