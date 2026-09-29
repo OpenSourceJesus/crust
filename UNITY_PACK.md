@@ -715,6 +715,46 @@ is decided, `x is T` for an `x` declared a `T` is `x != null`, and
 `nameof(x)` is `"x"`. A type used any other way -- reflection, a `Type`
 kept in a variable -- is left as written, and the method is reported.
 
+## Box2D-Packed: triggers and the Rigidbody2D API
+
+2D physics is Box2D-Packed (`box2d_unity.py` in its checkout generates
+`physics_box2d.c`, which steps a Box2D world over the packed tables).
+
+**Triggers.** `OnTriggerEnter2D`, `OnTriggerStay2D` and `OnTriggerExit2D
+(Collider2D other)` are sent -- Unity mode's trigger colliders were Box2D
+sensors that told no one. When a script has one, the plan's
+`physics2d_triggers` has the glue enable sensor events and report each
+step's overlapping sensor pairs with `engine_col2d_trigger(a, b)`, apart
+from the touching pairs; the engine sends Enter / Stay / Exit by comparing
+them with the step before, as it does collisions. (Standard API only: with
+`--physics-inject` the triggers stay silent.)
+
+**The other collider.** In a collision or trigger handler, the parameter
+-- `Collision2D coll` or `Collider2D other`, the other collider's index --
+reads its GameObject: `other.gameObject` (`_col2d_go`), and its `name`,
+`tag`, `CompareTag(..)`, `GetComponent<T>()`, `SetActive(..)` and
+`Destroy(other.gameObject)`; on a Collider2D those members are its own,
+and mean the same. `gameObject.CompareTag(..)` / `.tag` -- this object's,
+a bare `CompareTag(..)`, or a GameObject variable's -- read the authored
+`m_TagString` (`_engine_go_tag`).
+
+**Rigidbody2D.** On a Rigidbody2D field, local or
+`GetComponent<Rigidbody2D>()`, as the engine's `Rigidbody2D_*` over the
+tables the glue pushes before each step:
+
+| C# | |
+|----|--|
+| `AddForce(F)`, `AddForce(F, ForceMode2D.Impulse)` | the velocity change Unity's step makes: F·dt/m, F/m; not on a body that is not dynamic |
+| `position`, `position = V`, `MovePosition(V)` | the owner's position; a write is a teleport (Unity moves a kinematic body through space) |
+| `mass`, `gravityScale`, `drag` / `linearDamping`, `bodyType`, `isKinematic` | get, set, `op=` |
+| `velocity` / `linearVelocity` | as before |
+
+The glue now pushes a changed `mass` (the shape's mass data scaled to it,
+as at creation) and a changed `bodyType` (`b2Body_SetType`); it pushed
+velocity, a moved position, gravity scale and damping already. Rotation
+stays locked; `AddTorque`, `angularVelocity`, `rotation` and the
+`Physics2D` queries (`Raycast`, `OverlapCircle`) are not lowered yet.
+
 ## Fast feature check: `tools/unity_pack_features.py`
 
 The full suite packs a few hundred projects and takes most of a quarter
