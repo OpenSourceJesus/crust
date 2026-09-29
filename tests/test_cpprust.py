@@ -2918,7 +2918,9 @@ void A::set(int n) { v = n; }
         out = cpprust.translate(
             self.SPLIT + "int f(void) { A a(5); a.set(7); return a.get(); }",
             path="t.cpp")
-        self.assertIn("static int A_get(A *this) { return this->v; }", out)
+        # External linkage: an out-of-line member is the one definition
+        # other translation units link against.
+        self.assertIn("\nint A_get(A *this) { return this->v; }", out)
 
     def test_the_destructor_is_matched_through_its_tilde(self):
         # It is written `~A` where it is defined and recorded as `A` on the
@@ -2938,7 +2940,8 @@ void A::set(int n) { v = n; }
         # and the C front end checks the body regardless.
         out = cpprust.translate(self.SPLIT + "int f(void) { A a; return a.get(); }",
                                 path="t.cpp")
-        self.assertIn("static int A_get(A *this)", out)
+        self.assertIn("int A_get(A *this)", out)
+        self.assertNotIn("const", out.split("A_get(")[1].split(")")[0])
 
     def test_declared_and_never_defined_stays_a_declaration(self):
         # Ordinary once headers are spliced: `css_length.h` declares
@@ -2989,7 +2992,7 @@ class TestCppHeaderExpansion(unittest.TestCase):
             '#include "a.h"\nA::A() { v = 3; }\nint A::g() { return v; }\n'
             'int f(void) { A a; return a.g(); }\n',
             path="a.cpp", basedir=self.dir)
-        self.assertIn("static int A_g(A *this) { return this->v; }", out)
+        self.assertIn("\nint A_g(A *this) { return this->v; }", out)
 
     def test_a_header_is_spliced_once(self):
         # Which is what an include guard does, and saves understanding either
@@ -3117,7 +3120,7 @@ class TestCppIncludePath(unittest.TestCase):
             '#include "a.h"\nA::A() { v = 4; }\nint A::g() { return v; }\n'
             'int f(void) { A a; return a.g(); }\n',
             path="a.cpp", basedir=self.src, incdirs=[self.inc])
-        self.assertIn("static int A_g(A *this) { return this->v; }", out)
+        self.assertIn("\nint A_g(A *this) { return this->v; }", out)
 
 
 class TestCppNamespaceReopening(unittest.TestCase):
