@@ -1973,6 +1973,36 @@ class TestStubDiagnostics(unittest.TestCase):
                       cm.exception.message)
 
 
+class TestExtensionDesugar(unittest.TestCase):
+    """tools/unity_pack_extensions.py on its own: no pack, no compiler."""
+
+    def test_native_set_world_scale_chain_is_left_alone(self):
+        # SetX / SetZ inside SetWorldScale(..) are the packer's own; a
+        # project's SetZ anywhere else is an extension call like any other.
+        import tools.unity_pack_extensions as X
+        ext = ("public static class Extensions {\n"
+               "    public static Vector2 SetZ(this Vector2 v, float z)"
+               " { return v; }\n"
+               "    public static void SetWorldScale(this Transform t, Vector2 s)"
+               " { t.localScale = s; }\n}\n")
+        mb = ("public class P : MonoBehaviour {\n    void Update() {\n"
+              "        t.SetWorldScale(v.SetX(1).SetZ(1));\n"
+              "        Vector2 q = v.SetZ(2);\n    }\n}\n")
+        out = X.desugar_project({"E.cs": ext, "P.cs": mb})["P.cs"]
+        self.assertIn("t.SetWorldScale(v.SetX(1).SetZ(1));", out)
+        self.assertIn("Vector2 q = Extensions.SetZ(v, 2);", out)
+
+    def test_extension_block_keeps_every_line(self):
+        import tools.unity_pack_extensions as X
+        src = ("public static class U\n{\n    extension (GameObject go)\n"
+               "    {\n        public bool On => go.activeSelf;\n"
+               "        public int Twice(int n) { return n * 2; }\n    }\n}\n")
+        out = X.desugar_extension_blocks(src)
+        self.assertEqual(out.count("\n"), src.count("\n"))
+        self.assertIn("static bool get_On(this GameObject go) =>", out)
+        self.assertIn("static int Twice(this GameObject go, int n)", out)
+
+
 class TestRuntimeApis(unittest.TestCase):
     """tools/unity_pack_runtime.py: Mathf, Random, Parse, Path, bools as
     C# prints them, and `new string[n]` -- packed, built and run."""
@@ -2028,6 +2058,101 @@ class TestRuntimeApis(unittest.TestCase):
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-json-out-"))
         self.assertIn("CS8000", err.getvalue())
         self.assertIn("JsonUtility", err.getvalue())
+
+    @needs_coost
+    def test_methods_return_values(self):
+        # Methods emitted as `static void` only; a non-void one was a stub.
+        out = self._run(
+            "        string kept = Label(3);\n"
+            "        for (int k = 0; k < 20; k++) { string t = \"x\" + k; }\n"
+            "        Debug.Log(Score(2) + \",\" + Alive() + \",\" + kept);\n",
+            fields="    int Score(int n) { int s = n * 10; return s + hp; }\n"
+                   "    bool Alive() { return hp > 0; }\n"
+                   "    string Label(int n) { string s = \"L\";"
+                   " for (int k = 0; k < n; k++) s += k; return s; }\n")
+        self.assertEqual(out[0], "27,True,L012")
+
+    @needs_coost
+    def test_clock(self):
+        out = self._run(
+            "        var sw = System.Diagnostics.Stopwatch.StartNew();\n"
+            "        sw.Stop();\n"
+            "        System.DateTime now = System.DateTime.Now;\n"
+            "        string d = now.ToString(\"yyyy-MM-dd\");\n"
+            "        Debug.Log((sw.ElapsedMilliseconds >= 0) + \",\""
+            " + (now.Year >= 2024) + \",\" + d.Length + d[4]);\n")
+        self.assertEqual(out[0], "True,True,10-")
+
+    def _run_with(self, files, body):
+        """Pack MiniScene with extra scripts and `body` as Player.Start."""
+        root = os.path.join(tempfile.mkdtemp(prefix="upack-ext-"), "p")
+        shutil.copytree(PROJECT, root)
+        scripts = os.path.join(root, "Assets", "Scripts")
+        for n, (name, text) in enumerate(sorted(files.items())):
+            with open(os.path.join(scripts, name), "w") as f:
+                f.write(text)
+            with open(os.path.join(scripts, name + ".meta"), "w") as f:
+                f.write("guid: e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0%02d\n" % n)
+        with open(os.path.join(scripts, "Player.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Player : MonoBehaviour {\n"
+                    "    public int hp;\n    public float speed;\n"
+                    "    public void Start() {\n" + body + "    }\n}\n")
+        d = tempfile.mkdtemp(prefix="upack-ext-out-")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            plan = unity_pack.pack(root, d)
+            exe = unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player")
+        self.assertNotIn("CS8000", err.getvalue())
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, cwd=d, timeout=60)
+        return [l for l in run.stdout.splitlines()
+                if not l.startswith("ticks=")]
+
+    @needs_coost
+    def test_static_helpers_and_extension_methods(self):
+        # A static class had nothing to pack it as: every call stubbed.
+        util = ("using UnityEngine;\n"
+                "public static class Util {\n"
+                "    const int Bonus = 100;\n"
+                "    public static int Twice(int x) { int y = x * 2; return y + Bonus; }\n"
+                "    public static int Plus(int x, int n) => x + n;\n"
+                "    public static int Tripled(this int x) { int t = x * 3; return t; }\n"
+                "    public static string Shout(this string s) => s.ToUpper() + \"!\";\n"
+                "}\n")
+        out = self._run_with(
+            {"Util.cs": util},
+            "        Debug.Log(Util.Twice(hp) + \",\" + Util.Plus(hp, 1)"
+            " + \",\" + hp.Tripled() + \",\" + \"hi\".Shout());\n")
+        self.assertEqual(out[0], "114,8,21,HI!")
+
+    @needs_coost
+    def test_csharp14_extension_block(self):
+        ext = ("using UnityEngine;\n"
+               "public static class UnityExtensions\n{\n"
+               "    extension (GameObject go)\n    {\n"
+               "        public bool IsActiveInHierarchy => go.activeInHierarchy;\n"
+               "        public T GetOrAddComponent<T>() where T : Component\n"
+               "        {\n"
+               "            T component = go.GetComponent<T>();\n"
+               "            if (component == null)\n"
+               "                component = go.AddComponent<T>();\n"
+               "            return component;\n"
+               "        }\n"
+               "    }\n}\n")
+        badge = ("using UnityEngine;\n"
+                 "public class MaxInstancesAttribute : System.Attribute {\n"
+                 "    public MaxInstancesAttribute(int n) {}\n}\n"
+                 "[MaxInstances(2)]\n"
+                 "public class Badge : MonoBehaviour { public int n = 5; }\n")
+        out = self._run_with(
+            {"UnityExtensions.cs": ext, "Badge.cs": badge},
+            "        Badge a = gameObject.GetOrAddComponent<Badge>();\n"
+            "        a.n = 9;\n"
+            "        Badge b = gameObject.GetOrAddComponent<Badge>();\n"
+            "        Debug.Log(b.n + \",\" + gameObject.IsActiveInHierarchy);\n")
+        self.assertEqual(out[0], "9,True")
 
     @needs_coost
     def test_path_and_string_arrays(self):
@@ -4486,8 +4611,9 @@ class TestSystems(unittest.TestCase):
             out)
         self.assertNotIn("Toggle_set_isOn(CosmeticsMenu_equipped[i]", out)
 
-    def test_nonvoid_public_method_emits_stub(self):
-        """int CompareTo-style methods must not emit `return 1` as void."""
+    def test_nonvoid_public_method_returns_its_value(self):
+        """An int CompareTo-style method is emitted returning int -- it was a
+        `static void` stub, and `return 1;` could not stand in it."""
         root = tempfile.mkdtemp(prefix="upack-nonvoid-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
@@ -4527,12 +4653,12 @@ class TestSystems(unittest.TestCase):
             unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("static void Item_Rank(unsigned i", eng)
-        self.assertIn("unlowered C#", eng)
-        # Must not leave a valued return inside the void function.
-        rank = eng[eng.find("static void Item_Rank"):]
+        self.assertIn("static int Item_Rank(unsigned i", eng)
+        rank = eng[eng.find("static int Item_Rank(unsigned i, int other) {"):]
         rank = rank[:rank.find("\n}")]
-        self.assertNotRegex(rank, r"return\s+-?\d+")
+        # Its returns kept, whether the body lowered or is a stub (which
+        # returns 0): never a function that falls off its end.
+        self.assertRegex(rank, r"return\s+-?\d+")
 
     def test_unlowered_public_method_emits_stub(self):
         """Public GetComponents (no InChildren) helpers → empty stub."""
