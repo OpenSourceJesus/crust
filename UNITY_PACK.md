@@ -178,6 +178,7 @@ python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
 
 python3 tools/unity_pack.py <project> --strict   # a stub is an error
 python3 tools/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
+python3 tools/unity_pack.py <project> --coost PATH   # coost checkout (string locals)
 ```
 
 The linked player is `gles3_window.c` (OpenGL ES 3.1) when `pkg-config
@@ -277,6 +278,60 @@ and `memcpy`. Needs the `dotnet` SDK for the C# leg.
 Bit-packed struct fields and GLSL unpacking are a later step; this slice
 is the layout + upload path only. GPU alignment (std140 / `--soa-vec4`),
 SSBO stubs, and culling order of attack are in [UNITY_PACK_GPU.md](UNITY_PACK_GPU.md).
+
+## Strings: owned locals, and coost
+
+A C# `string` in a script body is a `const char *` in the packed engine, and
+a concatenation (`"hp=" + hp`) is a typed call, `_str_plus_i(..)`, whose
+result lives in a scratch slot. That is sound for a value used within its
+statement -- passed to `Debug.Log`, to `File.WriteAllText`, to another
+concatenation -- and was not for a value *kept*: a `string` local used to be
+a `const char *` too, pointing into a slot that later concatenations reuse.
+
+```csharp
+string saved = "saved-" + hp;
+for (int k = 0; k < 20; k++) { string t = "tmp-" + k; }
+Debug.Log(saved);                    // printed "tmp-..." -- now "saved-7"
+```
+
+So a `string` local owns its bytes. It is a
+[coost](https://github.com/crustos/coost) `fastring` -- coost is a C++
+library in the subset cpprust lowers -- and every other string stays as it
+was:
+
+| C# | packed C++ |
+|----|------------|
+| `string s = e;` | `fastring s; s.assign_cstr(e);` |
+| `s = e;` | `s.assign_cstr(e);` (`e` may read `s`) |
+| `s += e;` | `s.assign_cstr(_str_plus_K(s.c_str(), (e)));` |
+| any other read of `s` | `s.c_str()` |
+
+The scratch slots grow to fit (they were 512 bytes, and a longer result was
+cut short), and there are sixteen. A concatenation may start from a string
+variable (`s + "x"` was pointer arithmetic), and an integer operand is
+formatted as one: an `int` field, local or parameter, or a packed integer
+field's accessor (`Player_get_hp(i)`), where it used to print through `%g`
+(`1000000` as `1e+06`). The same typing picks `Debug_Log_i`.
+
+A declaration that cannot be split -- in a `for` head, or several
+declarators in one statement -- keeps its marker type (`_cs_string`), and the
+method is reported as a stub rather than guessed at. `string` *parameters*
+and fields are not owned yet: a parameter the method reassigns still points
+into a slot, and a writable `string` field is not packed at all.
+
+**Where coost comes from.** Only an engine that has a `string` local needs
+coost, and it is found the way Box2D-Packed is: `--coost PATH`, `$COOST_ROOT`,
+or a `coost` directory beside this repository. Without one, a pack that needs
+it stops with an error saying so; upstream coost (idealvin/coost, full C++)
+is refused by name. The string core -- `mem`, `fast`, `fastring` -- is
+expanded on its own and spliced into `engine.cpp` after the C headers, so
+`engine.cpp` stands alone and the lowered `engine.c` needs nothing from the
+checkout to build. (Expanded on its own, not by giving cpprust an include
+path for the engine: cpprust decides every simple `#if` in a file it splices
+into, and the engine's `#ifndef CRUST_NO_POSIX_MKDIR` belongs to the
+compiler.) The checkout's files are part of the pack's input fingerprint.
+
+`TestOwnedStrings` packs, builds and runs each case.
 
 ## Animation, input, lighting, camera, physics
 
@@ -399,7 +454,7 @@ cs2cpp's families before its own Unity API rewrites:
 | `x == null` / `!= null` | `lower_body` | `-1`, the missing-object index |
 | `true` / `false` | `lower_body` | `1` / `0` |
 | `this.x`, bare `this` | `lower_body` | `x`, `i` — an object is its index |
-| `string` locals | `lower_local_types` | `const char *` |
+| `string` locals | `lower_local_types`, then unity_pack's `_own_string_locals` | a coost `fastring` each (see [Strings](#strings-owned-locals-and-coost)) |
 | `byte[]`, `.Length`, `[i]` | `lower_byte_arrays` | `ByteArray`, `.length`, `.data[i]` |
 | `"s" + x` | `lower_string_concat`, `scalar_kind` | `_str_plus_i/f/c/s(..)` |
 | `List<T>`, `Dictionary<K,V>`, `SortedList` | `lower_packed_collections`, from a `PackedClass` per class | `std::vector` / `std::map`; `Add`, `Clear`, `Count`, `ContainsKey`, `Remove`; `Other.list` as `Other_list`; an instance field aliased to its slot, `&items = Owner_items[i]` |
@@ -502,8 +557,10 @@ python3 tools/unity_pack_golden.py record     # after an intended change
 The corpus is every `unity_pack.pack(..)` call `tests/test_unity_pack.py`
 makes, over the small projects the tests author themselves: inputs,
 options, and a sha256 of `engine.cpp` / `data.cpp` / `main.cpp`
-(`tests/unity_golden/corpus.json`). A check skips cpprust + shivyc
-validation, which does not change the emitted text, so it takes seconds.
+(`tests/unity_golden/corpus.json`). The corpus is **not in git**: `record`
+it on the code you start from, before a change, then `check` after. A check
+skips cpprust + shivyc validation, which does not change the emitted text,
+so it takes seconds; recording runs the unity tests, which takes minutes.
 
 **Fixtures.** `examples/unity_pack/MiniScene` is a self-authored project
 (scene, metas, a generated 8×8 PNG) and is tracked whole. SystemsScene is

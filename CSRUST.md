@@ -292,7 +292,7 @@ object is `-1`. `cs2cpp.ObjectModel` holds everything the two differ on;
 
 ```python
 cs2cpp.lower_body(text, model)         # float literals, null, booleans, `this`
-cs2cpp.lower_local_types(text, model)  # `string` locals
+cs2cpp.lower_local_types(text, model)  # `string` locals (packed: `_cs_string`)
 cs2cpp.lower_byte_arrays(text, model)  # `byte[]`
 cs2cpp.lower_string_concat(text, model, string_idents)  # "s" + x
 cs2cpp.lower_list_types(text, model)   # List<T>; lower_list_members_named

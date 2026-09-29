@@ -15,7 +15,7 @@ x=220
 ```
 
 `godot_pack.py` takes unity_pack's options (`-o`, `--force`, `--strict`,
-`--physics-inject`, `--box2d PATH`); `unity_pack.py` on a directory holding
+`--physics-inject`, `--box2d PATH`, `--coost PATH`); `unity_pack.py` on a directory holding
 `project.godot` does the same thing. As with Unity, what is not in the
 subset is refused where it is written, never dropped.
 
