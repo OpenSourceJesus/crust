@@ -646,7 +646,10 @@ BOX2D_BALL = (
     "        if (enters == 1) Debug.Log(\"b2d_status:\" + status);\n"
     "    }\n"
     "}\n")
-BOX2D_EXPECT = ["b2d_q:Ground,7,1,-2", "b2d_q:Ground,none",
+BOX2D_EXPECT = ["b2d_joint:broke gone", "b2d_joint:hinge held,swung",
+                "b2d_joint:slider slides", "b2d_joint:wheel spins",
+                "b2d_joint:spring hangs 1", "b2d_joint:motor 90",
+                "b2d_q:Ground,7,1,-2", "b2d_q:Ground,none",
                 "b2d_q:mask Ground,none,Ground", "b2d_q:all 3 Ball,Zone,Ground",
                 "b2d_q:circle 1 Ball",
                 "b2d_status:falling", "b2d_rb:1,2,2,0,True",
@@ -725,6 +728,107 @@ BOX2D_PROBE = (
     "    public LayerMask groundMask;\n"
     "}\n")
 
+#: 2D joints, each on its own body well away from the others: a pendulum on
+#: a HingeJoint2D (held at its length, then driven by its motor), a weight
+#: on a FixedJoint2D that breaks at once (breakForce 5 < its weight), a body
+#: hanging on a SpringJoint2D, a SliderJoint2D driven along x, and a
+#: WheelJoint2D whose motor spins a wheel.
+BOX2D_JOINT_SCRIPTS = {
+    "Swing": (
+        "using UnityEngine;\n"
+        "public class Swing : MonoBehaviour {\n"
+        "    HingeJoint2D hinge;\n"
+        "    int ticks;\n"
+        "    void Start() {\n"
+        "        hinge = GetComponent<HingeJoint2D>();\n"
+        "        GetComponent<Rigidbody2D>().velocity = new Vector2(3f, 0f);\n"
+        "    }\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 20) {\n"
+        "            float dx = transform.position.x + 6f;\n"
+        "            float dy = transform.position.y - 6f;\n"
+        "            float r = Mathf.Sqrt(dx * dx + dy * dy);\n"
+        "            Debug.Log(\"b2d_joint:hinge \" + (Mathf.Abs(r - 1f) < 0.05f ? \"held\" : \"loose\")"
+        " + \",\" + (Mathf.Abs(hinge.jointAngle) > 5f ? \"swung\" : \"still\"));\n"
+        "            JointMotor2D m = hinge.motor;\n"
+        "            m.motorSpeed = 90f;\n"
+        "            m.maxMotorTorque = 1000f;\n"
+        "            hinge.motor = m;\n"
+        "            hinge.useMotor = true;\n"
+        "        }\n"
+        "        if (ticks == 50) Debug.Log(\"b2d_joint:motor \""
+        " + (Mathf.Abs(hinge.jointSpeed - 90f) < 5f ? \"90\" : \"off\"));\n"
+        "    }\n"
+        "}\n"),
+    "Weight": (
+        "using UnityEngine;\n"
+        "public class Weight : MonoBehaviour {\n"
+        "    void OnJointBreak2D(Joint2D j) {\n"
+        "        FixedJoint2D f = GetComponent<FixedJoint2D>();\n"
+        "        Debug.Log(\"b2d_joint:broke \" + (f == null ? \"gone\" : \"kept\"));\n"
+        "    }\n"
+        "}\n"),
+    "Hang": (
+        "using UnityEngine;\n"
+        "public class Hang : MonoBehaviour {\n"
+        "    int ticks;\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 45) Debug.Log(\"b2d_joint:spring \" + (transform.position.y > 5.5f"
+        " && transform.position.y < 6.05f ? \"hangs\" : \"falls\") + \" \""
+        " + GetComponent<SpringJoint2D>().distance);\n"
+        "    }\n"
+        "}\n"),
+    "Slide": (
+        "using UnityEngine;\n"
+        "public class Slide : MonoBehaviour {\n"
+        "    SliderJoint2D s;\n"
+        "    int ticks;\n"
+        "    void Start() { s = GetComponent<SliderJoint2D>(); }\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 30) Debug.Log(\"b2d_joint:slider \" + (s.jointTranslation > 1.0f"
+        " && s.jointTranslation < 1.3f ? \"slides\" : \"stuck\"));\n"
+        "    }\n"
+        "}\n"),
+    "Car": (
+        "using UnityEngine;\n"
+        "public class Car : MonoBehaviour {\n"
+        "    public WheelJoint2D wheel;\n"
+        "    int ticks;\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 40) Debug.Log(\"b2d_joint:wheel \""
+        " + (Mathf.Abs(wheel.jointSpeed - 180f) < 10f ? \"spins\" : \"stalled\"));\n"
+        "    }\n"
+        "}\n"),
+}
+#: (hex GUIDs: a .meta's must be, and the joint objects are not named after
+#: their scripts, so the GameObject-name fallback would not bind them)
+
+
+def _joint_body(fid, name, pos, script_guid, joint_yaml, gravity=1, extra=""):
+    """A dynamic body with a circle, a script, and its joint (YAML, with
+    `{go}` for its GameObject)."""
+    return (
+        "--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_Component:\n"
+        "  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+        "  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+        "  - component: {fileID: %d}\n"
+        "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+        "  m_LocalPosition: {x: %s, y: %s, z: 0}\n"
+        "--- !u!50 &%d\nRigidbody2D:\n  m_GameObject: {fileID: %d}\n"
+        "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: %s\n"
+        "--- !u!58 &%d\nCircleCollider2D:\n  m_GameObject: {fileID: %d}\n"
+        "  m_Enabled: 1\n  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.25\n"
+        % (fid, name, fid + 1, fid + 2, fid + 3, fid + 4, fid + 5,
+           fid + 1, fid, pos[0], pos[1], fid + 2, fid, gravity, fid + 3, fid)
+        + (_mb(fid + 4, fid, script_guid, extra) if script_guid else
+           "--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n" % (fid + 4, fid))
+        + joint_yaml.format(jid=fid + 5, go=fid))
+
+
 #: A trigger zone the ball falls through on its way to the ground: static,
 #: `m_IsTrigger`, tagged "Finish"; the ball is tagged "Player".
 BOX2D_ZONE = (
@@ -786,45 +890,45 @@ def unity_project(root):
     scripts = os.path.join(root, "Assets", "Scripts")
     _write(os.path.join(scripts, "Player.cs"), "".join(player))
     _write(os.path.join(scripts, "Player.cs.meta"),
-           "guid: feat0000000000000000000000000001\n")
+           "guid: fea00000000000000000000000000001\n")
     _write(os.path.join(scripts, "Shot.cs"), UNITY_SHOT_SCRIPT)
     _write(os.path.join(scripts, "Shot.cs.meta"),
-           "guid: feat0000000000000000000000000004\n")
+           "guid: fea00000000000000000000000000004\n")
     for name, text, guid in (("Util", UNITY_UTIL_SCRIPT, "07"),
                              ("UnityExtensions", UNITY_EXT_SCRIPT, "08"),
                              ("Badge", UNITY_BADGE_SCRIPT, "09"),
                              ("VectorExtensions", UNITY_VEXT_SCRIPT, "10")):
         _write(os.path.join(scripts, name + ".cs"), text)
         _write(os.path.join(scripts, name + ".cs.meta"),
-               "guid: feat00000000000000000000000000%s\n" % guid)
+               "guid: fea000000000000000000000000000%s\n" % guid)
     _write(os.path.join(scripts, "Co.cs"), UNITY_CO_SCRIPT)
     _write(os.path.join(scripts, "Co.cs.meta"),
-           "guid: feat0000000000000000000000000011\n")
+           "guid: fea00000000000000000000000000011\n")
     _write(os.path.join(scripts, "Save.cs"), UNITY_SAVE_SCRIPT)
     _write(os.path.join(scripts, "Save.cs.meta"),
-           "guid: feat0000000000000000000000000006\n")
+           "guid: fea00000000000000000000000000006\n")
     _write(os.path.join(scripts, "Life.cs"), UNITY_LIFE_SCRIPT)
     _write(os.path.join(scripts, "Life.cs.meta"),
-           "guid: feat0000000000000000000000000005\n")
+           "guid: fea00000000000000000000000000005\n")
     _write(os.path.join(scripts, "Tag.cs"), UNITY_TAG_SCRIPT)
     _write(os.path.join(scripts, "Tag.cs.meta"),
-           "guid: feat0000000000000000000000000002\n")
+           "guid: fea00000000000000000000000000002\n")
     tags = [("alpha", 30), ("'two words'", 40), ("'it''s'", 50)]
     scene = ["%YAML 1.1\n",
              _go(1, "Player", [3]),
-             _mb(3, 1, "feat0000000000000000000000000001",
+             _mb(3, 1, "fea00000000000000000000000000001",
                  "  hp: 7\n  tag: {fileID: %d}\n" % (tags[0][1] + 2))]
     scene.append(_go(90, "Co", [92]))
-    scene.append(_mb(92, 90, "feat0000000000000000000000000011"))
+    scene.append(_mb(92, 90, "fea00000000000000000000000000011"))
     scene.append(_go(80, "Save", [82]))
-    scene.append(_mb(82, 80, "feat0000000000000000000000000006"))
+    scene.append(_mb(82, 80, "fea00000000000000000000000000006"))
     scene.append(_go(70, "Life", [72]))
-    scene.append(_mb(72, 70, "feat0000000000000000000000000005"))
+    scene.append(_mb(72, 70, "fea00000000000000000000000000005"))
     scene.append(_go(60, "Shot", [62]))
-    scene.append(_mb(62, 60, "feat0000000000000000000000000004"))
+    scene.append(_mb(62, 60, "fea00000000000000000000000000004"))
     for label, fid in tags:
         scene.append(_go(fid, "Tag", [fid + 2]))
-        scene.append(_mb(fid + 2, fid, "feat0000000000000000000000000002",
+        scene.append(_mb(fid + 2, fid, "fea00000000000000000000000000002",
                          "  label: %s\n" % label))
     _write(os.path.join(root, "Assets", "Scenes", "S.unity"), "".join(scene))
     expect = []
@@ -866,7 +970,7 @@ def box2d_project(root):
     scripts = os.path.join(root, "Assets", "Scripts")
     _write(os.path.join(scripts, "Ball.cs"), BOX2D_BALL)
     _write(os.path.join(scripts, "Ball.cs.meta"),
-           "guid: feat0000000000000000000000000003\n")
+           "guid: fea00000000000000000000000000003\n")
     scene = (
         "%YAML 1.1\n"
         "--- !u!1 &1\nGameObject:\n  m_Name: Ground\n"
@@ -889,16 +993,20 @@ def box2d_project(root):
         "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n"
         "  m_Enabled: 1\n  m_IsTrigger: 0\n"
         "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
-        + _mb(14, 10, "feat0000000000000000000000000003", "  enters: 0\n"))
+        + _mb(14, 10, "fea00000000000000000000000000003", "  enters: 0\n"))
+    for k, (cls, src) in enumerate(sorted(BOX2D_JOINT_SCRIPTS.items())):
+        _write(os.path.join(scripts, cls + ".cs"), src)
+        _write(os.path.join(scripts, cls + ".cs.meta"),
+               "guid: d0000000000000000000000000000%03d\n" % k)
     _write(os.path.join(scripts, "Probe.cs"), BOX2D_PROBE)
     _write(os.path.join(scripts, "Probe.cs.meta"),
-           "guid: feat0000000000000000000000000014\n")
+           "guid: fea00000000000000000000000000014\n")
     _write(os.path.join(scripts, "Kick.cs"), BOX2D_KICK)
     _write(os.path.join(scripts, "Kick.cs.meta"),
-           "guid: feat0000000000000000000000000013\n")
+           "guid: fea00000000000000000000000000013\n")
     _write(os.path.join(scripts, "Zone.cs"), BOX2D_ZONE)
     _write(os.path.join(scripts, "Zone.cs.meta"),
-           "guid: feat0000000000000000000000000012\n")
+           "guid: fea00000000000000000000000000012\n")
     scene = scene.replace("  m_Name: Ball\n", "  m_Name: Ball\n  m_TagString: Player\n")
     scene += (
         "--- !u!1 &20\nGameObject:\n  m_Name: Zone\n  m_TagString: Finish\n"
@@ -909,7 +1017,7 @@ def box2d_project(root):
         "--- !u!61 &22\nBoxCollider2D:\n  m_GameObject: {fileID: 20}\n"
         "  m_Enabled: 1\n  m_IsTrigger: 1\n"
         "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 4, y: 0.5}\n"
-        + _mb(23, 20, "feat0000000000000000000000000012")
+        + _mb(23, 20, "fea00000000000000000000000000012")
         + "--- !u!1 &30\nGameObject:\n  m_Name: Kick\n"
         "  m_Component:\n  - component: {fileID: 31}\n"
         "  - component: {fileID: 32}\n  - component: {fileID: 33}\n"
@@ -922,15 +1030,58 @@ def box2d_project(root):
         "--- !u!58 &33\nCircleCollider2D:\n  m_GameObject: {fileID: 30}\n"
         "  m_Enabled: 1\n  m_IsTrigger: 0\n"
         "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.25\n"
-        + _mb(34, 30, "feat0000000000000000000000000013")
+        + _mb(34, 30, "fea00000000000000000000000000013")
         + "--- !u!1 &40\nGameObject:\n  m_Name: Probe\n"
         "  m_Component:\n  - component: {fileID: 41}\n"
         "  - component: {fileID: 42}\n"
         "--- !u!4 &41\nTransform:\n  m_GameObject: {fileID: 40}\n"
         "  m_LocalPosition: {x: 5, y: 5, z: 0}\n"
-        + _mb(42, 40, "feat0000000000000000000000000014").rstrip("\n")
+        + _mb(42, 40, "fea00000000000000000000000000014").rstrip("\n")
         + "\n  groundMask: {serializedVersion: 2, m_Bits: 256}\n")
     scene = scene.replace("  m_Name: Ground\n", "  m_Name: Ground\n  m_Layer: 8\n", 1)
+    guid = {cls: "d0000000000000000000000000000%03d" % k
+            for k, cls in enumerate(sorted(BOX2D_JOINT_SCRIPTS))}
+    common = ("  m_Enabled: 1\n  m_EnableCollision: 0\n"
+              "  m_BreakForce: {bf}\n  m_BreakTorque: Infinity\n")
+    scene += _joint_body(100, "Bob", (-6, 5), guid["Swing"],
+        "--- !u!233 &{jid}\nHingeJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n"
+        "  m_AutoConfigureConnectedAnchor: 1\n  m_Anchor: {{x: 0, y: 1}}\n"
+        "  m_ConnectedAnchor: {{x: 0, y: 0}}\n  m_UseMotor: 0\n  m_Motor:\n"
+        "    m_MotorSpeed: 0\n    m_MaximumMotorForce: 10000\n  m_UseLimits: 0\n")
+    scene += _joint_body(110, "Weight", (-8, 6), guid["Weight"],
+        "--- !u!255 &{jid}\nFixedJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="5") +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 1\n"
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n"
+        "  m_DampingRatio: 0\n  m_Frequency: 0\n")
+    scene += _joint_body(120, "Spring", (8, 6), guid["Hang"],
+        "--- !u!231 &{jid}\nSpringJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 0\n"
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 8, y: 7}}\n"
+        "  m_AutoConfigureDistance: 0\n  m_Distance: 1\n"
+        "  m_DampingRatio: 0.7\n  m_Frequency: 2\n")
+    scene += _joint_body(130, "Slider", (-4, 8), guid["Slide"],
+        "--- !u!234 &{jid}\nSliderJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 1\n"
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n"
+        "  m_AutoConfigureAngle: 0\n  m_Angle: 0\n  m_UseMotor: 1\n  m_Motor:\n"
+        "    m_MotorSpeed: 2\n    m_MaximumMotorForce: 100\n  m_UseLimits: 0\n",
+        gravity=0)
+    # the wheel first: the car's joint refers to its Rigidbody2D (&142)
+    scene += _joint_body(140, "Wheel", (4, 7.5), None, "", gravity=0)
+    scene += _joint_body(150, "Car", (4, 8), guid["Car"],
+        "--- !u!235 &{jid}\nWheelJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_ConnectedRigidBody: {{fileID: 142}}\n  m_AutoConfigureConnectedAnchor: 1\n"
+        "  m_Anchor: {{x: 0, y: -0.5}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n"
+        "  m_Suspension:\n    m_DampingRatio: 0.7\n    m_Frequency: 2\n    m_Angle: 90\n"
+        "  m_UseMotor: 1\n  m_Motor:\n    m_MotorSpeed: 180\n"
+        "    m_MaximumMotorForce: 1000\n  m_UseLimits: 0\n",
+        gravity=0, extra="  wheel: {fileID: 155}\n")
     _write(os.path.join(root, "ProjectSettings", "TagManager.asset"),
            "%YAML 1.1\n--- !u!78 &1\nTagManager:\n  tags: []\n  layers:\n"
            + "".join("  - %s\n" % n for n in (

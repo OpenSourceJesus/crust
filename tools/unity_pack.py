@@ -2273,7 +2273,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|CapsuleCollider2D|"
             r"BoxCollider|"
-            r"SphereCollider|Animation|Animator|Canvas|AudioSource):",
+            r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
+            r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
+            r"SliderJoint2D|WheelJoint2D):",
             block)
         if km:
             kind = km.group(1)
@@ -2658,6 +2660,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "near_clip": float(near.group(1)) if near else 0.3,
                 "far_clip": float(far.group(1)) if far else 1000.0,
             }
+        if kind in _JOINT2D_KINDS:
+            rec["joint2d"] = _parse_joint2d(kind, block)
         if kind == "Rigidbody2D":
             bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
             mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
@@ -2914,6 +2918,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         canvas = None
         cam = None
         rb2d = None
+        joints2d = []
         rb3d = None
         col2d = None
         col3d = None
@@ -2984,6 +2989,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") == "Rigidbody2D" and k.get("rigidbody2d"):
                 rb2d = dict(k["rigidbody2d"])
                 rb2d["file_id"] = k.get("file_id")
+            if k.get("joint2d"):
+                joints2d.append(dict(k["joint2d"], file_id=k.get("file_id")))
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
@@ -3340,6 +3347,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "aspect_ratio_fitter": aspect_ratio_fitter,
             "canvas_scaler": canvas_scaler,
             "rigidbody2d": rb2d,
+            "joints2d": joints2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
             "collider3d": col3d,
@@ -4472,6 +4480,7 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     known = (set(plan.get("classes") or {})
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS
+             | _JOINT2D_COMPONENTS
              | _UI_GETCOMPONENT_TYPES
              | _TRANSFORM_GETCOMPONENT_TYPES
              | _analyzed_mb_typenames(analyses))
@@ -4674,6 +4683,7 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
         known = (
             resolved in classes
             or resolved in _PHYSICS_COMPONENTS
+            or resolved in _JOINT2D_COMPONENTS
             or resolved in _ADDABLE_BUILTINS
             or resolved in _UI_GETCOMPONENT_TYPES
             or resolved in _TRANSFORM_GETCOMPONENT_TYPES
@@ -4882,8 +4892,8 @@ def _wrap_log_component_tostring(text, locals_ty):
 # A scriptless GO named "Button" must not become packed class Button — C has
 # no overloading, so the UI helper and the packed-class emit would collide.
 _RESERVED_PACKED_CLASS_NAMES = (
-    _ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _UI_GETCOMPONENT_TYPES
-    | _TRANSFORM_GETCOMPONENT_TYPES | _REFUSED_ADDCOMPONENT)
+    _ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _JOINT2D_COMPONENTS
+    | _UI_GETCOMPONENT_TYPES | _TRANSFORM_GETCOMPONENT_TYPES | _REFUSED_ADDCOMPONENT)
 
 
 def _scriptless_packed_class(go_name):
@@ -5560,6 +5570,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     def _known_component(comp):
         return (comp in (plan.get("classes") or {})
                 or comp in _PHYSICS_COMPONENTS
+                or comp in _JOINT2D_COMPONENTS
                 or comp in _ADDABLE_BUILTINS
                 or comp in _UI_GETCOMPONENT_TYPES
                 or comp in _TRANSFORM_GETCOMPONENT_TYPES
@@ -6365,6 +6376,7 @@ _UNITY_EMIT_MESSAGES = frozenset({
     "OnDisable", "OnDestroy",
     "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
     "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
+    "OnJointBreak2D",
 })
 
 
@@ -7679,7 +7691,8 @@ def plan_layouts(objects, analyses, two_d=None):
             for b in c.get("bases") or []:
                 if b in analyzed:
                     referenced.add(b)
-    skip = (_ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _UI_GETCOMPONENT_TYPES
+    skip = (_ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _JOINT2D_COMPONENTS
+            | _UI_GETCOMPONENT_TYPES
             | _UI_COMPONENT_FIELD_TYPES | _TRANSFORM_GETCOMPONENT_TYPES)
     for t in referenced:
         if t in analyzed and t not in skip:
@@ -11955,6 +11968,7 @@ def _emit_engine_get_components_in_children(
             has_map = (
                 bool(collectors)
                 or tname in _PHYSICS_COMPONENTS
+                or tname in _JOINT2D_COMPONENTS
                 or tname in _ADDABLE_BUILTINS
                 or tname in _UI_GETCOMPONENT_TYPES
                 or tname in _TRANSFORM_GETCOMPONENT_TYPES
@@ -13746,6 +13760,103 @@ def _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d):
         p("")
 
 
+def _lower_joint2d_api(text, cl, plan, site):
+    """2D joints in a script, as the engine's `Joint2D_*` over the joint
+    tables (`_emit_joint2d_api`): a joint-typed field, local or parameter,
+    or `GetComponent<XJoint2D>()`, is a joint index; its members
+
+        enabled, useMotor, useLimits, enableCollision, maxDistanceOnly,
+        distance, frequency, dampingRatio, breakForce, breakTorque,
+        motor (JointMotor2D), limits (JointAngleLimits2D /
+        JointTranslationLimits2D), suspension      get, set
+        motor.motorSpeed / .maxMotorTorque, limits.min / .max   get
+        jointAngle, jointSpeed, jointTranslation, connectedBody,
+        attachedRigidbody                          get
+
+    and `new JointMotor2D { motorSpeed = .., maxMotorTorque = .. }` (and the
+    limits' / suspension's) is the struct."""
+    if not plan.get("joints2d"):
+        return text
+    idn = _c_ident(cl["name"])
+    tys = "|".join(sorted(_JOINT2D_COMPONENTS, key=len, reverse=True))
+    # the structs: object initializers and bare constructors
+    for ty, fields, maker in (
+            ("JointMotor2D", ("motorSpeed", "maxMotorTorque"), "JointMotor2D_make"),
+            ("JointAngleLimits2D", ("min", "max"), "JointAngleLimits2D_make"),
+            ("JointTranslationLimits2D", ("min", "max"), "JointAngleLimits2D_make"),
+            ("JointSuspension2D", ("dampingRatio", "frequency", "angle"),
+             "JointSuspension2D_make")):
+        def init(m, fields=fields, maker=maker):
+            vals = dict.fromkeys(fields, "0.f")
+            for a in cs2cpp.split_call_args(m.group(1) or ""):
+                am = re.match(r"\s*(\w+)\s*=\s*(.+?)\s*$", a, re.S)
+                if am and am.group(1) in vals:
+                    vals[am.group(1)] = "(float)(%s)" % am.group(2)
+            return "%s(%s)" % (maker, ", ".join(vals[f] for f in fields))
+        text = cs2cpp.code_sub(r"(?<![\w.])new\s+%s\s*(?:\(\s*\))?\s*\{([^{}]*)\}" % ty,
+                               init, text)
+        text = cs2cpp.code_sub(r"(?<![\w.])new\s+%s\s*\(\s*\)" % ty,
+                               lambda m, maker=maker, fields=fields: "%s(%s)" % (
+                                   maker, ", ".join(["0.f"] * len(fields))), text)
+    # GetComponent<XJoint2D>() on this object, or on a GameObject expression
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:this\s*\.\s*)?(?:gameObject\s*\.\s*)?GetComponent\s*<\s*"
+        r"(?:UnityEngine\s*\.\s*)?(%s)\s*>\s*\(\s*\)" % tys,
+        lambda m: "GameObject_GetComponent_%s(_engine_go_of_%s(i))" % (
+            m.group(1), idn), text)
+    recvs = {}
+    for f in cl.get("fields") or []:
+        if f.get("ty") in _JOINT2D_COMPONENTS:
+            recvs[r"(?<![\w.])(?:this\s*\.\s*)?%s" % re.escape(f["name"])] = \
+                "(int)%s_get_%s(i)" % (idn, f["name"])
+    decl = r"(?<![\w.<])(?:UnityEngine\s*\.\s*)?(?:%s)\s+(\w+)(?=\s*[=;,)])" % tys
+    names = set(re.findall(decl, cs2cpp._blank(text)))
+    names |= set(re.findall(decl, (site or {}).get("args") or ""))
+    for n in names:
+        recvs[r"(?<![\w.])%s" % re.escape(n)] = n
+    # GetComponent<XJoint2D>().member, on this object
+    for ty in _JOINT2D_COMPONENTS:
+        call = "GameObject_GetComponent_%s(_engine_go_of_%s(i))" % (ty, idn)
+        recvs[r"(?<![\w.])%s" % re.escape(call)] = call
+    text = cs2cpp.code_sub(r"(?<![\w.<])(?:UnityEngine\s*\.\s*)?(?:%s)(?=\s+\w+\s*[=;])"
+                           % tys, "int", text)
+    # a joint compared with null: no joint (-1), or one broken since
+    text = cs2cpp.code_sub(
+        r"(GameObject_GetComponent_(?:%s)\((?:[^()]|\([^()]*\))*\))\s*(==|!=)\s*null\b"
+        % tys, lambda m: "(%s %s)" % (m.group(1), "< 0" if m.group(2) == "==" else ">= 0"),
+        text)
+    for pat, rx in recvs.items():
+        text = cs2cpp.code_sub(pat + r"\s*(==|!=)\s*null\b",
+                               lambda m, rx=rx: "(%s %s)" % (
+                                   rx, "< 0" if m.group(1) == "==" else ">= 0"), text)
+    props = ("enabled", "useMotor", "useLimits", "enableCollision",
+             "maxDistanceOnly", "distance", "frequency", "dampingRatio",
+             "breakForce", "breakTorque", "motor", "limits", "suspension",
+             "jointAngle", "jointSpeed", "jointTranslation", "connectedBody",
+             "attachedRigidbody")
+    chained = {("motor", "motorSpeed"): "motorSpeed",
+               ("motor", "maxMotorTorque"): "maxMotorTorque",
+               ("limits", "min"): "limitMin", ("limits", "max"): "limitMax"}
+    for pat, rx in recvs.items():
+        for (a, b), fn in chained.items():
+            text = cs2cpp.code_sub(pat + r"\s*\.\s*%s\s*\.\s*%s\b(?!\s*=[^=])" % (a, b),
+                                   lambda m, rx=rx, fn=fn: "Joint2D_get_%s(%s)" % (
+                                       fn, rx), text)
+        for prop in props:
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\s*([-+*/])=\s*([^;]+);" % prop,
+                lambda m, rx=rx, n=prop: "Joint2D_set_%s(%s, Joint2D_get_%s(%s) %s "
+                "(%s));" % (n, rx, n, rx, m.group(1), m.group(2).strip()), text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\s*=(?!=)\s*([^;]+);" % prop,
+                lambda m, rx=rx, n=prop: "Joint2D_set_%s(%s, %s);" % (
+                    n, rx, m.group(1).strip()), text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\b" % prop,
+                lambda m, rx=rx, n=prop: "Joint2D_get_%s(%s)" % (n, rx), text)
+    return text
+
+
 def _lower_rb2d_api(text, cl, plan, site):
     """Rigidbody2D members on a Rigidbody2D field, local or
     `GetComponent<Rigidbody2D>()`, as the engine's `Rigidbody2D_*`
@@ -13838,6 +13949,159 @@ def _lower_rb2d_api(text, cl, plan, site):
                 pat + r"\s*\.\s*%s\b" % cs,
                 lambda m, rx=rx, n=name: "Rigidbody2D_get_%s(%s)" % (n, rx), text)
     return text
+
+
+#: The joint tables: (name, C type, record key, default). Scripts write the
+#: settings; Box2D-Packed pushes what changed before each step and fills
+#: the out_ ones after it.
+_JOINT2D_INT_TABLES = (
+    ("kind", "kind"), ("rb_a", "rb_a"), ("rb_b", "rb_b"),
+    ("enabled", "enabled"), ("collide", "collide"),
+    ("auto_anchor", "auto_anchor"), ("auto_distance", "auto_distance"),
+    ("max_distance_only", "max_distance_only"), ("use_motor", "use_motor"),
+    ("use_limits", "use_limits"), ("auto_angle", "auto_angle"))
+_JOINT2D_FLOAT_TABLES = (
+    "anchor_x", "anchor_y", "canchor_x", "canchor_y", "distance", "frequency",
+    "damping", "lower", "upper", "motor_speed", "motor_max", "angle",
+    "break_force", "break_torque")
+
+
+def _joint2d_float(j, name):
+    v = {"anchor_x": j["anchor"][0], "anchor_y": j["anchor"][1],
+         "canchor_x": j["canchor"][0], "canchor_y": j["canchor"][1]}.get(
+             name, j.get(name, 0.0))
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")):
+        return "3.0e38f" if v > 0 else "-3.0e38f"
+    return "%sf" % repr(v)
+
+
+def _emit_joint2d_data(p, plan, class_ids):
+    """data.c: the joint tables (mutable: scripts write the settings)."""
+    js = plan.get("joints2d") or []
+    if not js:
+        return
+    n = len(js)
+    p("/* 2D joints (Box2D-Packed) */")
+    p("int _Joint2D_count = %d;" % n)
+    for name, key in _JOINT2D_INT_TABLES:
+        p("int _Joint2D_%s[%d] = { %s };" % (
+            name, n, ", ".join(str(int(j[key])) for j in js)))
+    p("int _Joint2D_go[%d] = { %s };" % (n, ", ".join(
+        str(int(j["go_index"]) if j.get("go_index") is not None else -1)
+        for j in js)))
+    p("int _Joint2D_owner_class[%d] = { %s };" % (n, ", ".join(
+        str(class_ids.get(j["owner_class"], -1)) for j in js)))
+    p("int _Joint2D_owner_inst[%d] = { %s };" % (n, ", ".join(
+        str(int(j["owner_inst"])) for j in js)))
+    p("int _Joint2D_broken[%d];" % n)
+    for name in _JOINT2D_FLOAT_TABLES:
+        p("float _Joint2D_%s[%d] = { %s };" % (
+            name, n, ", ".join(_joint2d_float(j, name) for j in js)))
+    for name in ("out_angle", "out_speed", "out_translation"):
+        p("float _Joint2D_%s[%d];" % (name, n))
+
+
+def _emit_joint2d_api(p, plan):
+    """engine: the joint tables' externs, JointMotor2D / JointAngleLimits2D,
+    the scripts' `Joint2D_*` over the tables, GetComponent<XJoint2D>(), and
+    `engine_joint2d_broken` for the glue (OnJointBreak2D)."""
+    js = plan.get("joints2d") or []
+    if not js:
+        return
+    n = len(js)
+    p("/* 2D joints: the tables Box2D-Packed builds its joints from */")
+    p("extern int _Joint2D_count;")
+    for name, _key in _JOINT2D_INT_TABLES:
+        p("extern int _Joint2D_%s[%d];" % (name, n))
+    for name in ("go", "owner_class", "owner_inst", "broken"):
+        p("extern int _Joint2D_%s[%d];" % (name, n))
+    for name in _JOINT2D_FLOAT_TABLES + ("out_angle", "out_speed",
+                                         "out_translation"):
+        p("extern float _Joint2D_%s[%d];" % (name, n))
+    p("typedef struct JointMotor2D { float motorSpeed; float maxMotorTorque; } JointMotor2D;")
+    p("typedef struct JointAngleLimits2D { float min; float max; } JointAngleLimits2D;")
+    p("typedef JointAngleLimits2D JointTranslationLimits2D;")
+    p("typedef struct JointSuspension2D { float dampingRatio; float frequency;"
+      " float angle; } JointSuspension2D;")
+    p("static JointMotor2D JointMotor2D_make(float s, float m) {")
+    p("    JointMotor2D r; r.motorSpeed = s; r.maxMotorTorque = m; return r;")
+    p("}")
+    p("static JointAngleLimits2D JointAngleLimits2D_make(float a, float b) {")
+    p("    JointAngleLimits2D r; r.min = a; r.max = b; return r;")
+    p("}")
+    p("static JointSuspension2D JointSuspension2D_make(float d, float f, float a) {")
+    p("    JointSuspension2D r; r.dampingRatio = d; r.frequency = f; r.angle = a;")
+    p("    return r;")
+    p("}")
+    p("static int _j2d_ok(int j) { return j >= 0 && j < _Joint2D_count; }")
+    for prop, table, cty in (
+            ("enabled", "enabled", "int"), ("useMotor", "use_motor", "int"),
+            ("useLimits", "use_limits", "int"),
+            ("enableCollision", "collide", "int"),
+            ("maxDistanceOnly", "max_distance_only", "int"),
+            ("distance", "distance", "float"),
+            ("frequency", "frequency", "float"),
+            ("dampingRatio", "damping", "float"),
+            ("breakForce", "break_force", "float"),
+            ("breakTorque", "break_torque", "float"),
+            ("motorSpeed", "motor_speed", "float"),
+            ("maxMotorTorque", "motor_max", "float"),
+            ("limitMin", "lower", "float"), ("limitMax", "upper", "float"),
+            ("angle", "angle", "float")):
+        p("static %s Joint2D_get_%s(int j) {" % (cty, prop))
+        p("    return _j2d_ok(j) ? _Joint2D_%s[j] : 0;" % table)
+        p("}")
+        p("static void Joint2D_set_%s(int j, %s v) {" % (prop, cty))
+        p("    if (_j2d_ok(j)) _Joint2D_%s[j] = v;" % table)
+        p("}")
+    for prop, table in (("jointAngle", "out_angle"), ("jointSpeed", "out_speed"),
+                        ("jointTranslation", "out_translation")):
+        p("static float Joint2D_get_%s(int j) {" % prop)
+        p("    return _j2d_ok(j) ? _Joint2D_%s[j] : 0.f;" % table)
+        p("}")
+    p("static int Joint2D_get_connectedBody(int j) {")
+    p("    return _j2d_ok(j) ? _Joint2D_rb_b[j] : -1;")
+    p("}")
+    p("static int Joint2D_get_attachedRigidbody(int j) {")
+    p("    return _j2d_ok(j) ? _Joint2D_rb_a[j] : -1;")
+    p("}")
+    p("static JointMotor2D Joint2D_get_motor(int j) {")
+    p("    return JointMotor2D_make(Joint2D_get_motorSpeed(j), Joint2D_get_maxMotorTorque(j));")
+    p("}")
+    p("static void Joint2D_set_motor(int j, JointMotor2D m) {")
+    p("    Joint2D_set_motorSpeed(j, m.motorSpeed);")
+    p("    Joint2D_set_maxMotorTorque(j, m.maxMotorTorque);")
+    p("}")
+    p("static JointAngleLimits2D Joint2D_get_limits(int j) {")
+    p("    return JointAngleLimits2D_make(Joint2D_get_limitMin(j), Joint2D_get_limitMax(j));")
+    p("}")
+    p("static void Joint2D_set_limits(int j, JointAngleLimits2D l) {")
+    p("    Joint2D_set_limitMin(j, l.min);")
+    p("    Joint2D_set_limitMax(j, l.max);")
+    p("}")
+    p("static JointSuspension2D Joint2D_get_suspension(int j) {")
+    p("    return JointSuspension2D_make(Joint2D_get_dampingRatio(j),")
+    p("                                  Joint2D_get_frequency(j), Joint2D_get_angle(j));")
+    p("}")
+    p("static void Joint2D_set_suspension(int j, JointSuspension2D s) {")
+    p("    Joint2D_set_dampingRatio(j, s.dampingRatio);")
+    p("    Joint2D_set_frequency(j, s.frequency);")
+    p("}")
+    # GetComponent<XJoint2D>(): the first joint of that kind on the GameObject
+    for ty in sorted(_JOINT2D_COMPONENTS):
+        kind = _JOINT2D_KINDS.get(ty, -1)
+        p("static int GameObject_GetComponent_%s(int go) {" % ty)
+        p("    int j;")
+        p("    for (j = 0; j < _Joint2D_count; j = j + 1)")
+        cond = "_Joint2D_go[j] == go && !_Joint2D_broken[j]"
+        if kind >= 0:
+            cond += " && _Joint2D_kind[j] == %d" % kind
+        p("        if (%s) return j;" % cond)
+        p("    return -1;")
+        p("}")
+    p("void engine_joint2d_broken(int j);")
+    p("")
 
 
 def _emit_rb2d_api(p, plan=None):
@@ -14022,6 +14286,29 @@ def _emit_engine_box2d_exports(
             p("    default: break;")
             p("    }")
             p("    (void)oi; (void)s; (void)c;")
+            p("}")
+            p("")
+        if plan.get("joints2d"):
+            # A joint Box2D-Packed broke (breakForce / breakTorque): it is
+            # gone, as Unity's default JointBreakAction2D.Destroy has it, and
+            # its GameObject's scripts get OnJointBreak2D(Joint2D).
+            p("void engine_joint2d_broken(int j) {")
+            p("    unsigned oi;")
+            p("    if (j < 0 || j >= _Joint2D_count) return;")
+            p("    _Joint2D_broken[j] = 1;")
+            p("    _Joint2D_enabled[j] = 0;")
+            p("    oi = (unsigned)_Joint2D_owner_inst[j];")
+            p("    switch (_Joint2D_owner_class[j]) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                ms = [m for _c, m in (plan.get("_methods_by") or {}).get(cname, [])
+                      if m.get("name") == "OnJointBreak2D" and not m.get("static")]
+                if not ms:
+                    continue
+                p("    case %d: %s_OnJointBreak2D(oi, j); break;"
+                  % (cid, _c_ident(cname)))
+            p("    default: break;")
+            p("    }")
+            p("    (void)oi;")
             p("}")
             p("")
         p("void engine_col2d_center(int ci, float *x, float *y) {")
@@ -15037,6 +15324,7 @@ def emit_engine(plan, analyses, used_apis):
             p("extern float _Rigidbody2D_torque[%d];" % n2)
             p("extern float _Rigidbody2D_ang_imp[%d];" % n2)
         _emit_rb2d_api(p, plan)
+        _emit_joint2d_api(p, plan)
     if want_rb3d:
         n3 = max(1, rb3d_cap if rb3d_cap else len(rb3d_list) or 1)
         p("extern int _Rigidbody_count;")
@@ -20465,6 +20753,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = cs2cpp.code_sub(
             r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\s*\.\s*z\b",
             "_cs_euler_z(_%s_rot_z[i], _%s_rot_w[i])" % (_idn, _idn), text)
+    text = _lower_joint2d_api(text, cl, plan, site)
     text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
@@ -21084,6 +21373,7 @@ def emit_data(plan, used_apis=None):
         p("int _Rigidbody2D_owner_inst[%d] = { %s };" % (
             cap, ", ".join(str(int(v)) for v in _pad_i(
                 [r["owner_inst"] for r in rb2d_list]))))
+        _emit_joint2d_data(p, plan, class_ids)
         if plan.get("physics2d_rotation"):
             # rotation: frozen, angular velocity (rad/s), and the torque and
             # angular impulse scripts add before a step
@@ -21541,6 +21831,10 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:Rigidbody":
                     parts.append(str(_rb_field_init_index(
                         plan, o, name, "3d")))
+                elif str(kind)[4:] in _JOINT2D_COMPONENTS:
+                    fid = (o.get("object_refs") or {}).get(name)
+                    parts.append(str(int((plan.get("joint2d_by_file_id") or {})
+                                         .get(str(fid), -1))))
                 elif kind == "idx:AudioSource":
                     parts.append(str(_audiosource_field_init_index(
                         plan, o, name)))
@@ -23233,6 +23527,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))
     plan["rigidbody2d"] = rb2d
+    plan["rb2d_by_file_id"] = rb2d_by_fid
+    _build_joint2d_table(plan)
     # Rigidbody2D rotation: a body Box2D-Packed may turn -- not static, not
     # FreezeRotation -- turns its owner's Transform, which then keeps a live
     # rotation (drawn rotated). Unity mode; the glue locked it before.

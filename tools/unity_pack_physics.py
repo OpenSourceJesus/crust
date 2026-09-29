@@ -21,6 +21,10 @@ from tools.unity_pack_common import *  # noqa: E402,F401,F403
 
 __all__ = [
     '_COLLISION2D_MSGS',
+    '_JOINT2D_COMPONENTS',
+    '_JOINT2D_KINDS',
+    '_build_joint2d_table',
+    '_parse_joint2d',
     '_DEFAULT_MAT2D',
     '_DEFAULT_MAT3D',
     '_PHYSICS_COMPONENTS',
@@ -144,6 +148,90 @@ _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
 
 # MonoBehaviour 2D collision messages (Unity Physics2D).
 _TRIGGER2D_MSGS = ("OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D")
+
+#: 2D joints Box2D-Packed builds, by `_Joint2D_kind`: revolute, distance
+#: (rigid, or a rope with maxDistanceOnly), distance with a spring, weld,
+#: prismatic, wheel.
+_JOINT2D_KINDS = {"HingeJoint2D": 0, "DistanceJoint2D": 1, "SpringJoint2D": 2,
+                  "FixedJoint2D": 3, "SliderJoint2D": 4, "WheelJoint2D": 5}
+#: Script types a joint handle may have (the bases take any kind).
+_JOINT2D_COMPONENTS = frozenset(_JOINT2D_KINDS) | {"Joint2D", "AnchoredJoint2D"}
+
+
+def _parse_joint2d(kind, block):
+    """A joint component's YAML -> its record (Unity's defaults for what the
+    YAML leaves out; `Infinity` for an unbreakable joint)."""
+    def num(name, default):
+        m = re.search(r"(?m)^\s+%s:\s*(-?Infinity|[-0-9.eE+]+)\s*$" % name, block)
+        if not m:
+            return default
+        v = m.group(1)
+        return float("inf") if v == "Infinity" else (
+            float("-inf") if v == "-Infinity" else float(v))
+
+    def vec(name):
+        m = re.search(r"%s:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}" % name, block)
+        return (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
+    cm = re.search(r"m_ConnectedRigidBody:\s*\{fileID:\s*(-?\d+)", block)
+    k = _JOINT2D_KINDS[kind]
+    return {
+        "kind": k,
+        "enabled": int(num("m_Enabled", 1)),
+        "collide": int(num("m_EnableCollision", 0)),
+        "connected_fid": cm.group(1) if cm and cm.group(1) != "0" else None,
+        "anchor": vec("m_Anchor"),
+        "canchor": vec("m_ConnectedAnchor"),
+        "auto_anchor": int(num("m_AutoConfigureConnectedAnchor", 1)),
+        "auto_distance": int(num("m_AutoConfigureDistance", 1)),
+        "distance": num("m_Distance", 1.0),
+        "max_distance_only": int(num("m_MaxDistanceOnly", 0)),
+        "frequency": num("m_Frequency", {2: 1.0, 5: 2.0}.get(k, 0.0)),
+        "damping": num("m_DampingRatio", {5: 0.7}.get(k, 0.0)),
+        "use_motor": int(num("m_UseMotor", 0)),
+        "use_limits": int(num("m_UseLimits", 0)),
+        "motor_speed": num("m_MotorSpeed", 0.0),
+        "motor_max": num("m_MaximumMotorForce", 10000.0),
+        "lower": num("m_LowerAngle", num("m_LowerTranslation", 0.0)),
+        "upper": num("m_UpperAngle", num("m_UpperTranslation", 0.0)),
+        # slider: the axis (degrees); wheel: the suspension's (default up)
+        "angle": num("m_Angle", 90.0 if k == 5 else 0.0),
+        "auto_angle": int(num("m_AutoConfigureAngle", 0)),
+        "break_force": num("m_BreakForce", float("inf")),
+        "break_torque": num("m_BreakTorque", float("inf")),
+    }
+
+
+def _build_joint2d_table(plan):
+    """plan["joints2d"]: each authored joint whose GameObject has a
+    Rigidbody2D (Unity adds one; here it is skipped, with a warning), with
+    its own and connected body's indices, its owner (for OnJointBreak2D) and
+    GameObject; plan["joint2d_by_file_id"] for serialized references."""
+    rb_of = {(r["owner_class"], r["owner_inst"]): k
+             for k, r in enumerate(plan.get("rigidbody2d") or [])}
+    by_fid = plan.get("rb2d_by_file_id") or {}
+    joints, jfid = [], {}
+    for cname in sorted(plan["classes"]):
+        for i, o in enumerate(plan["classes"][cname].get("instances") or []):
+            for j in o.get("joints2d") or []:
+                own = rb_of.get((cname, i))
+                if own is None:
+                    sys.stderr.write(
+                        "unity_pack: warning: %s on %r has no Rigidbody2D "
+                        "(skipped)\n" % ({v: k for k, v in _JOINT2D_KINDS.items()}
+                                         [j["kind"]], o.get("name")))
+                    continue
+                other = by_fid.get(str(j.get("connected_fid"))) \
+                    if j.get("connected_fid") else None
+                rec = dict(j, owner_class=cname, owner_inst=i,
+                           go_index=o.get("go_index"), rb_a=own,
+                           rb_b=-1 if other is None else int(other))
+                if j.get("file_id") is not None:
+                    jfid[str(j["file_id"])] = len(joints)
+                joints.append(rec)
+    plan["joints2d"] = joints
+    plan["joint2d_by_file_id"] = jfid
+    plan["physics2d_joints"] = bool(joints)
+
 
 _COLLISION2D_MSGS = (
     "OnCollisionEnter2D",
