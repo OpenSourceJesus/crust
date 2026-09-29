@@ -395,8 +395,9 @@ def _blank_unity_editor_regions(text):
 # BCL collection types the pack does not emit (would need heap `new` / generics).
 # List → vector; Dictionary / SortedList → map — see cs2cpp.lower_packed_collections.
 _REFUSED_BCL_TYPES = frozenset((
-    # Stack / Queue / HashSet are Lists by then (unity_pack_collections).
-    "LinkedList", "ConcurrentBag",
+    # Stack / Queue / HashSet / LinkedList are Lists by then
+    # (unity_pack_collections).
+    "ConcurrentBag",
 ))
 
 
@@ -5905,7 +5906,8 @@ def analyze_script(path, text=None, shallow=False):
     # A Stack / Queue take checks emptiness with a runtime helper, and a
     # List search is a helper per element type: both are emitted with the
     # string helpers.
-    if "_cs_require_nonempty(" in scan or "_cs_idx" in scan or (
+    if "_cs_require_nonempty(" in scan or "_cs_idx" in scan or \
+            "_cs_ll_" in scan or (
             re.search(r"\bList\s*<", scan) and re.search(
                 r"\.\s*(?:RemoveAt|Insert|Contains|IndexOf|Remove)\s*\(",
                 scan)):
@@ -19640,9 +19642,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # table (tools/unity_pack_runtime.py), while the text is still C#.
     if "_cs_require_nonempty(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_require_nonempty")
-    for _r in ("2", "3"):
-        if "_cs_idx%s(" % _r in text:
-            plan.setdefault("_cs_str_used", set()).add("_cs_idx" + _r)
+    for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last"):
+        if _h + "(" in text:
+            plan.setdefault("_cs_str_used", set()).add(_h)
     _early_ints = _int_idents(cl, plan, text, site)
     text = runtime.lower_runtime_apis(
         text, plan.setdefault("_cs_str_used", set()), cs2cpp._blank,
@@ -22260,6 +22262,9 @@ def pack(root, outdir, *args, **kwargs):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
+        # Coroutines, as state machines (tools/unity_pack_coroutines.py).
+        import tools.unity_pack_coroutines as _co
+        t = _co.desugar_coroutines(t)
         if t != files[fp]:
             overlay[fp] = t
     # An API a copied or inlined static helper uses is its caller's too:

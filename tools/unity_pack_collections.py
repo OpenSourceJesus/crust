@@ -33,7 +33,7 @@ import re
 
 import tools.cs2cpp as cs2cpp
 
-_KINDS = ("Stack", "Queue", "HashSet")
+_KINDS = ("Stack", "Queue", "HashSet", "LinkedList")
 _Q = r"(?:System\s*\.\s*Collections\s*\.\s*Generic\s*\.\s*)?"
 
 
@@ -153,10 +153,11 @@ def _explicit_list_vars(text):
     packed list lowering reads the declared type (a `var` one's right-hand
     side was lowered as a temporary, which it refuses)."""
     return cs2cpp.code_sub(
-        r"(?<![\w.])var\s+(\w+)(\s*=\s*new\s+%s(?:List|Stack|Queue|HashSet)"
-        r"\s*<\s*([^<>;]+?)\s*>)" % _Q,
+        r"(?<![\w.])var\s+(\w+)(\s*=\s*new\s+%s(?:LinkedList|List|Stack|Queue|"
+        r"HashSet)\s*<\s*([^<>;]+?)\s*>)" % _Q,
         lambda m: "%s<%s> %s%s" % (
-            re.search(r"(List|Stack|Queue|HashSet)\s*<", m.group(2)).group(1),
+            re.search(r"(?<![\w])(LinkedList|List|Stack|Queue|HashSet)\s*<",
+                      m.group(2)).group(1),
             m.group(3), m.group(1), m.group(2)), text)
 
 
@@ -247,6 +248,39 @@ def desugar_collections(text, counter=None):
                 return m.start(), cp + 1, "%s[0]" % name
         return None
     sub(recv + r"\s*\.\s*(Push|Enqueue|Peek)\s*\(", simple)
+
+    # LinkedList: ends by value; node references are left for the stub check.
+    def ll_call(m, scan):
+        name, member = m.group(1), m.group(2)
+        if decls[name][0] != "LinkedList":
+            return None
+        op = scan.index("(", m.end() - 1)
+        cp = _match(scan, op, "(", ")")
+        if cp is None or not re.match(r"\s*;", scan[cp + 1:]):
+            return None                   # used as a value: a node, not ours
+        args = text[op + 1:cp].strip()
+        if member == "AddLast" and args:
+            return m.start(), cp + 1, "%s.Add(%s)" % (name, args)
+        if member == "AddFirst" and args:
+            return m.start(), cp + 1, "%s.Insert(0, %s)" % (name, args)
+        if member == "RemoveFirst" and not args:
+            return m.start(), cp + 1, "%s.RemoveAt(_cs_ll_first(%s.Count))" % (
+                name, name)
+        if member == "RemoveLast" and not args:
+            return m.start(), cp + 1, "%s.RemoveAt(_cs_ll_last(%s.Count))" % (
+                name, name)
+        return None
+    sub(recv + r"\s*\.\s*(AddLast|AddFirst|RemoveFirst|RemoveLast)\s*\(",
+        ll_call)
+
+    def ll_end(m, scan):
+        name, which = m.group(1), m.group(2)
+        if decls[name][0] != "LinkedList":
+            return None
+        idx = "_cs_ll_%s(%s.Count)" % ("first" if which == "First" else "last",
+                                       name)
+        return m.start(), m.end(), "%s[%s]" % (name, idx)
+    sub(recv + r"\s*\.\s*(First|Last)\s*\.\s*Value\b", ll_end)
 
     # Taking members, hoisted before their statement.
     for _pass in range(256):

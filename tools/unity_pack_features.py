@@ -300,6 +300,18 @@ UNITY_CHECKS = [
      ' + "," + this.GetType().ToString());\n',
      "", ["types:Player,Tag,Tag,TrueTrue,True,hp,Player"]),
 
+    ("linked",
+     'LinkedList<int> ll = new LinkedList<int>();\n'
+     'll.AddLast(2); ll.AddLast(3); ll.AddFirst(1);\n'
+     'string seen = "";\n'
+     'foreach (int v in ll) seen += v;\n'
+     'll.RemoveFirst();\n'
+     'Debug.Log("linked:" + seen + "," + ll.First.Value + ll.Last.Value + "," + ll.Count'
+     ' + "," + ll.Contains(3));\n'
+     'll.RemoveLast(); ll.Remove(2);\n'
+     'Debug.Log("linked:" + ll.Count);\n',
+     "", ["linked:123,23,2,True", "linked:0"]),
+
     ("self_assign",
      'string a = "x";\n'
      'string b = a;\n'
@@ -517,6 +529,35 @@ UNITY_BADGE_SCRIPT = (
     "    public int n = 5;\n"
     "}\n")
 
+#: Coroutines (tools/unity_pack_coroutines.py): one that yields null each
+#: frame -- resumed after Update, the frame after it yielded -- and one that
+#: waits WaitForSeconds and ends with `yield break` before a line that must
+#: not run. Started from Start, both run to their first yield at once.
+UNITY_CO_SCRIPT = (
+    "using UnityEngine;\n"
+    "using System.Collections;\n"
+    "public class Co : MonoBehaviour {\n"
+    "    int frames;\n"
+    "    void Start() { StartCoroutine(Count(3)); StartCoroutine(\"Late\"); }\n"
+    "    void Update() { frames++; if (frames > 1000) return; }\n"
+    "    IEnumerator Count(int n) {\n"
+    "        for (int k = 0; k < n; k++) {\n"
+    "            Debug.Log(\"co:count\" + k + \"@\" + frames);\n"
+    "            yield return null;\n"
+    "        }\n"
+    "        Debug.Log(\"co:done@\" + frames);\n"
+    "    }\n"
+    "    IEnumerator Late() {\n"
+    "        Debug.Log(\"co:late0\");\n"
+    "        yield return new WaitForSeconds(0.1f);\n"
+    "        Debug.Log(\"co:late1\");\n"
+    "        yield break;\n"
+    "        Debug.Log(\"co:never\");\n"
+    "    }\n"
+    "}\n")
+UNITY_CO_EXPECT = ["co:count0@0", "co:late0", "co:count1@2", "co:count2@3",
+                   "co:done@4", "co:late1"]
+
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (
     "using UnityEngine;\n"
@@ -636,6 +677,9 @@ def unity_project(root):
         _write(os.path.join(scripts, name + ".cs"), text)
         _write(os.path.join(scripts, name + ".cs.meta"),
                "guid: feat00000000000000000000000000%s\n" % guid)
+    _write(os.path.join(scripts, "Co.cs"), UNITY_CO_SCRIPT)
+    _write(os.path.join(scripts, "Co.cs.meta"),
+           "guid: feat0000000000000000000000000011\n")
     _write(os.path.join(scripts, "Save.cs"), UNITY_SAVE_SCRIPT)
     _write(os.path.join(scripts, "Save.cs.meta"),
            "guid: feat0000000000000000000000000006\n")
@@ -650,6 +694,8 @@ def unity_project(root):
              _go(1, "Player", [3]),
              _mb(3, 1, "feat0000000000000000000000000001",
                  "  hp: 7\n  tag: {fileID: %d}\n" % (tags[0][1] + 2))]
+    scene.append(_go(90, "Co", [92]))
+    scene.append(_mb(92, 90, "feat0000000000000000000000000011"))
     scene.append(_go(80, "Save", [82]))
     scene.append(_mb(82, 80, "feat0000000000000000000000000006"))
     scene.append(_go(70, "Life", [72]))
@@ -665,7 +711,7 @@ def unity_project(root):
     for _n, _b, _m, e in UNITY_CHECKS:
         expect += e
     return (expect + UNITY_TAG_EXPECT + UNITY_SHOT_EXPECT + UNITY_LIFE_EXPECT
-            + UNITY_SAVE_EXPECT)
+            + UNITY_SAVE_EXPECT + UNITY_CO_EXPECT)
 
 
 def godot_project(root):

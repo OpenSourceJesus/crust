@@ -669,6 +669,21 @@ _h("_cs_require_nonempty", "void",
    "        abort();\n"
    "    }\n}")
 
+# -- LinkedList ends -----------------------------------------------------------
+
+_h("_cs_ll_first", "int",
+   "static int _cs_ll_first(int n) {\n"
+   "    if (n <= 0) {\n"
+   "        fprintf(stderr, \"Unhandled exception: \"\n"
+   "                \"InvalidOperationException: The LinkedList is empty.\\n\");\n"
+   "        fflush(stderr);\n"
+   "        abort();\n"
+   "    }\n"
+   "    return 0;\n}")
+_h("_cs_ll_last", "int",
+   "static int _cs_ll_last(int n) {\n"
+   "    return _cs_ll_first(n) + n - 1;\n}", deps=("_cs_ll_first",))
+
 # -- T[,] / T[,,] element index ------------------------------------------------
 
 _h("_cs_idx_fail", "void",
