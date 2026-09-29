@@ -258,6 +258,48 @@ UNITY_CHECKS = [
      '    Vector2 Mid(Vector2 p, Vector2 q) { return new Vector2((p.x + q.x) / 2f, (p.y + q.y) / 2f); }\n',
      ["vec_ext:1,5,3,-1,3.5"]),
 
+    ("coll",
+     'Stack<int> st = new Stack<int>();\n'
+     'st.Push(1); st.Push(2); st.Push(3);\n'
+     'int top = st.Pop();\n'
+     'string order = "";\n'
+     'foreach (int v in st) order += v;\n'
+     'Queue<string> q = new Queue<string>();\n'
+     'q.Enqueue("a"); q.Enqueue("b");\n'
+     'string f = q.Dequeue();\n'
+     'HashSet<int> h = new HashSet<int>();\n'
+     'h.Add(5); h.Add(5); h.Add(6);\n'
+     'bool again = h.Add(6);\n'
+     'Debug.Log("coll:" + top + "," + order + "," + st.Peek() + "," + f + q.Peek() + q.Count'
+     ' + "," + h.Count + again + h.Contains(5));\n'
+     'hist.Push("x"); hist.Push("y");\n'
+     'if (hist.Count > 1) Debug.Log("coll:" + hist.Pop() + hist.Count);\n',
+     '    public Stack<string> hist = new Stack<string>();\n'
+     '    void Unused() { }\n',
+     ["coll:3,21,2,ab1,2FalseTrue", "coll:y1"]),
+
+    ("mdim",
+     'grid2[1, 2] = 5;\n'
+     'int[,] m = new int[2, 3];\n'
+     'for (int x = 0; x < 2; x++) { for (int y = 0; y < 3; y++) { m[x, y] = x * 10 + y; } }\n'
+     'int sum = 0;\n'
+     'foreach (int v in m) sum += v;\n'
+     'float[,,] vol = new float[2, 2, 2];\n'
+     'vol[1, 1, 1] = 2.5f;\n'
+     'Debug.Log("mdim:" + grid2[1, 2] + "," + grid2.GetLength(0) + "x" + grid2.GetLength(1)'
+     ' + "," + m.Length + "," + m[1, 2] + "," + sum + "," + vol[1, 1, 1] + "," + vol.Rank);\n',
+     '    int[,] grid2 = new int[3, 4];\n',
+     ["mdim:5,3x4,6,12,36,2.5,3"]),
+
+    ("types",
+     'Tag other = tag;\n'
+     'bool same = GetType() == typeof(Player);\n'
+     'bool diff = tag.GetType() != typeof(Player);\n'
+     'Debug.Log("types:" + GetType().Name + "," + other.GetType().Name + ","'
+     ' + typeof(Tag).Name + "," + same + diff + "," + (other is Tag) + "," + nameof(hp)'
+     ' + "," + this.GetType().ToString());\n',
+     "", ["types:Player,Tag,Tag,TrueTrue,True,hp,Player"]),
+
     ("self_assign",
      'string a = "x";\n'
      'string b = a;\n'
@@ -563,11 +605,12 @@ def _write(path, text):
 def unity_project(root):
     player = ["using UnityEngine;\n", "using System.IO;\n",
               "using System.Text;\n", "using System;\n",
+              "using System.Collections.Generic;\n",
               "public class Player : MonoBehaviour {\n",
               "    public int hp;\n",
               "    public Tag tag;\n"]
     for _n, _b, members, _e in UNITY_CHECKS:
-        if members and "string " in members and "(" not in members:
+        if members and "(" not in members:
             player.append(members)
     player.append("    void Start() {\n")
     for name, _b, _m, _e in UNITY_CHECKS:

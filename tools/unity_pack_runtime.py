@@ -658,6 +658,36 @@ for _n, _k in (("_cs_sw_ms", "int"), ("_cs_sw_s", "float"),
     _M[_n] = ("", _k, (("_cs_stopwatch",) if _n.startswith("_cs_sw")
                         else ("_cs_datetime",)), False)
 
+# -- Stack.Pop / Queue.Dequeue on an empty one ------------------------------
+
+_h("_cs_require_nonempty", "void",
+   "static void _cs_require_nonempty(int n, const char *what) {\n"
+   "    if (n <= 0) {\n"
+   "        fprintf(stderr, \"Unhandled exception: InvalidOperationException: \"\n"
+   "                \"%s empty.\\n\", what);\n"
+   "        fflush(stderr);\n"
+   "        abort();\n"
+   "    }\n}")
+
+# -- T[,] / T[,,] element index ------------------------------------------------
+
+_h("_cs_idx_fail", "void",
+   "static int _cs_idx_fail(void) {\n"
+   "    fprintf(stderr, \"Unhandled exception: IndexOutOfRangeException: \"\n"
+   "            \"Index was outside the bounds of the array.\\n\");\n"
+   "    fflush(stderr);\n"
+   "    abort();\n"
+   "    return 0;\n}")
+_h("_cs_idx2", "int",
+   "static int _cs_idx2(int x, int d0, int y, int d1) {\n"
+   "    if (x < 0 || x >= d0 || y < 0 || y >= d1) return _cs_idx_fail();\n"
+   "    return x * d1 + y;\n}", deps=("_cs_idx_fail",))
+_h("_cs_idx3", "int",
+   "static int _cs_idx3(int x, int d0, int y, int d1, int z, int d2) {\n"
+   "    if (x < 0 || x >= d0 || y < 0 || y >= d1 || z < 0 || z >= d2)\n"
+   "        return _cs_idx_fail();\n"
+   "    return (x * d1 + y) * d2 + z;\n}", deps=("_cs_idx_fail",))
+
 # -- string.GetHashCode -----------------------------------------------------
 
 _h("_cs_str_GetHashCode", "int",

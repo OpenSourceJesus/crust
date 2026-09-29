@@ -395,7 +395,7 @@ def _blank_unity_editor_regions(text):
 # BCL collection types the pack does not emit (would need heap `new` / generics).
 # List → vector; Dictionary / SortedList → map — see cs2cpp.lower_packed_collections.
 _REFUSED_BCL_TYPES = frozenset((
-    "HashSet", "Queue", "Stack",
+    # Stack / Queue / HashSet are Lists by then (unity_pack_collections).
     "LinkedList", "ConcurrentBag",
 ))
 
@@ -5901,6 +5901,14 @@ def analyze_script(path, text=None, shallow=False):
     # A method returning a string copies it to a scratch slot.
     if re.search(r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|"
                  r"override|virtual)\s+)*string\s+\w+\s*\(", scan):
+        apis.add("string.+")
+    # A Stack / Queue take checks emptiness with a runtime helper, and a
+    # List search is a helper per element type: both are emitted with the
+    # string helpers.
+    if "_cs_require_nonempty(" in scan or "_cs_idx" in scan or (
+            re.search(r"\bList\s*<", scan) and re.search(
+                r"\.\s*(?:RemoveAt|Insert|Contains|IndexOf|Remove)\s*\(",
+                scan)):
         apis.add("string.+")
     # StringBuilder appends formatted values from the scratch slots, and
     # JsonUtility's text is built the same way.
@@ -17182,8 +17190,170 @@ def _dict_kv_names(ty):
     return (m.group(1), m.group(2)) if m else None
 
 
+_VEC_PB = [0]
+
+
+def _vec_helper_suffix(cty):
+    return {"std::string": "str", "fastring": "fstr",
+            "float": "float"}.get(cty, "int")
+
+
+def _vec_helpers_c(ctys):
+    """The search helpers for each vector element type used: index of an
+    element (`==`, a string by its text) and remove-first-match."""
+    out = []
+    for cty in sorted(ctys):
+        suf = _vec_helper_suffix(cty)
+        texty = cty in ("std::string", "fastring")
+        arg = "const char *" if texty else cty
+        eq = "strcmp(v[k].c_str(), x) == 0" if texty else "v[k] == x"
+        out.append(
+            "static int _cs_vec_index_%s(std::vector<%s> &v, %s x) {\n"
+            "    int k;\n"
+            "    for (k = 0; k < (int)v.size(); k = k + 1)\n"
+            "        if (%s) return k;\n"
+            "    return -1;\n}\n"
+            "static int _cs_vec_remove_%s(std::vector<%s> &v, %s x) {\n"
+            "    int k = _cs_vec_index_%s(v, x);\n"
+            "    if (k < 0) return 0;\n"
+            "    v.erase(v.ptr(k));\n"
+            "    return 1;\n}" % (suf, cty, arg, eq, suf, cty, arg, suf))
+    out.append(
+        "static int _cs_vec_check_index(int k, int n) {\n"
+        "    if (k < 0 || k >= n) {\n"
+        "        fprintf(stderr, \"Unhandled exception: \"\n"
+        "                \"ArgumentOutOfRangeException: index %d, count %d\\n\", k, n);\n"
+        "        fflush(stderr);\n"
+        "        abort();\n"
+        "    }\n"
+        "    return k;\n}\n"
+        "static int _cs_vec_check_insert(int k, int n) {\n"
+        "    if (k < 0 || k > n) return _cs_vec_check_index(k, n);\n"
+        "    return k;\n}")
+    return "\n".join(out) + "\n"
+
+
+def _lower_list_searches(text, cl, plan):
+    """`RemoveAt`, `Insert`, `Contains`, `IndexOf`, `Remove` on a packed
+    `List` -- a local (`std::vector<T> xs` by now), an instance field's
+    table (`Cls_f[i]`) or a static (`Cls_f`). The packed lowering had only
+    `Add`, `Clear`, `Count`, indexing and `foreach`; these stubbed the
+    method. The index ones check as .NET does; the search ones are helpers
+    per element type, which pack() emits (`_vec_helpers_c`)."""
+    lists = {}                            # receiver pattern -> element C type
+    scan = cs2cpp._blank(text)
+    for m in re.finditer(r"std::vector<\s*([^<>;]+?)\s*>\s+(\w+)\s*[;=]", scan):
+        lists[r"(?<![\w.>])%s(?![\w\[])" % re.escape(m.group(2))] = \
+            text[m.start(1):m.end(1)].strip()
+    for cname, ocl in (plan.get("classes") or {}).items():
+        oidn = _c_ident(cname)
+        for f in ocl.get("list_fields") or []:
+            elem = _list_elem_name(f.get("ty") or "")
+            if elem:
+                lists[r"(?<![\w.>])%s_%s\s*\[[^\[\]]*\]" % (
+                    re.escape(oidn), re.escape(f["name"]))] = \
+                    _list_elem_c_ty(elem, plan)
+        for f in ocl.get("class_consts") or []:
+            elem = _list_elem_name(f.get("ty") or "")
+            if elem:
+                lists[r"(?<![\w.>])%s_%s(?![\w\[])" % (
+                    re.escape(oidn), re.escape(f["name"]))] = \
+                    _list_elem_c_ty(elem, plan)
+    # This class's own list fields and statics, still by their C# names.
+    own_recv = {}
+    idn = _c_ident(cl["name"])
+    for f in cl.get("list_fields") or []:
+        elem = _list_elem_name(f.get("ty") or "")
+        if elem:
+            pat = r"(?<![\w.>])(?:this\s*\.\s*)?%s(?![\w\[(])" % re.escape(f["name"])
+            lists[pat] = _list_elem_c_ty(elem, plan)
+            own_recv[pat] = "%s_%s[i]" % (idn, f["name"])
+    for f in cl.get("class_consts") or []:
+        elem = _list_elem_name(f.get("ty") or "")
+        if elem:
+            pat = r"(?<![\w.>])%s(?![\w\[(])" % re.escape(f["name"])
+            lists[pat] = _list_elem_c_ty(elem, plan)
+            own_recv[pat] = "%s_%s" % (idn, f["name"])
+    if not lists:
+        return text
+    # `xs.push_back(e)` on a vector of fastrings: the element is copied from
+    # a fastring made of `e` (a C string; a literal has no address to pass).
+    for pat, cty in lists.items():
+        if cty != "fastring":
+            continue
+        start = 0
+        for _pass in range(256):
+            scan = cs2cpp._blank(text)
+            m = re.compile("(%s)\\s*\\.\\s*push_back\\s*\\(" % pat).search(
+                scan, start)
+            if not m:
+                break
+            op = m.end() - 1
+            cp = _match_close(scan, op, "(", ")")
+            semi = re.match(r"\s*;", scan[cp + 1:]) if cp is not None else None
+            if not semi or text[op + 1:cp].strip().startswith("_cs_pb"):
+                start = m.end()
+                continue
+            _VEC_PB[0] += 1
+            tmp = "_cs_pb%d" % _VEC_PB[0]
+            r = text[m.start(1):m.end(1)].strip()
+            rep = "{ fastring %s; %s.assign_cstr(%s); %s.push_back(%s); }" % (
+                tmp, tmp, text[op + 1:cp].strip(), r, tmp)
+            text = text[:m.start()] + rep + text[cp + 1 + semi.end():]
+            start = m.start() + len(rep)
+    used = plan.setdefault("_vec_helper_types", set())
+    for pat, cty in lists.items():
+        call = re.compile("(%s)\\s*\\.\\s*(RemoveAt|Insert|Contains|IndexOf|"
+                          "Remove)\\s*\\(" % pat)
+        for _pass in range(256):
+            scan = cs2cpp._blank(text)
+            m = call.search(scan)
+            if not m:
+                break
+            op = m.end() - 1
+            cp = _match_close(scan, op, "(", ")")
+            if cp is None:
+                break
+            r = own_recv.get(pat) or text[m.start(1):m.end(1)].strip()
+            args = [a.strip() for a in cs2cpp.split_call_args(text[op + 1:cp])]
+            meth, suf = m.group(2), _vec_helper_suffix(cty)
+            used.add(cty)
+            if meth == "RemoveAt" and len(args) == 1:
+                rep = "%s.erase(%s.ptr(_cs_vec_check_index(%s, (int)%s.size())))" \
+                    % (r, r, args[0], r)
+            elif meth == "Insert" and len(args) == 2 and cty == "fastring" \
+                    and re.match(r"\s*;", scan[cp + 1:]):
+                # a string element is copied in from a fastring (a literal
+                # has no address to pass)
+                _VEC_PB[0] += 1
+                tmp = "_cs_pb%d" % _VEC_PB[0]
+                semi = re.match(r"\s*;", scan[cp + 1:])
+                rep = ("{ fastring %s; %s.assign_cstr(%s); %s.insert(%s.ptr("
+                       "_cs_vec_check_insert(%s, (int)%s.size())), %s); }"
+                       % (tmp, tmp, args[1], r, r, args[0], r, tmp))
+                text = text[:m.start()] + rep + text[cp + 1 + semi.end():]
+                continue
+            elif meth == "Insert" and len(args) == 2:
+                rep = ("%s.insert(%s.ptr(_cs_vec_check_insert(%s, (int)%s.size())), "
+                       "%s)" % (r, r, args[0], r, args[1]))
+            elif meth == "Contains" and len(args) == 1:
+                rep = "(_cs_vec_index_%s(%s, %s) >= 0)" % (suf, r, args[0])
+            elif meth == "IndexOf" and len(args) == 1:
+                rep = "_cs_vec_index_%s(%s, %s)" % (suf, r, args[0])
+            elif meth == "Remove" and len(args) == 1:
+                rep = "_cs_vec_remove_%s(%s, %s)" % (suf, r, args[0])
+            else:
+                break
+            text = text[:m.start()] + rep + text[cp + 1:]
+    return text
+
+
 def _list_elem_c_ty(elem, plan=None):
-    """C++ element type for a packed ``List<T>`` → ``std::vector<…>``."""
+    """C++ element type for a packed ``List<T>`` → ``std::vector<…>``.
+    A string element is an owned coost `fastring`, as a `string[]`'s is (a
+    Dictionary's string key or value stays `std::string`)."""
+    if (elem or "").split(".")[-1] == "string":
+        return "fastring"
     return _collection_elem_c_ty(elem, plan)
 
 
@@ -18087,6 +18257,14 @@ def _format_bool_comparisons(text):
         if cb is None:
             break
         inner = scan[k + 1:cb]
+        # `((a != b))`: look through parentheses that only wrap another
+        # group, to the expression.
+        while True:
+            st = inner.strip()
+            if st.startswith("(") and _match_close(st, 0, "(", ")") == len(st) - 1:
+                inner = st[1:-1]
+            else:
+                break
         depth, top = 0, []
         for ch in inner:
             if ch in "([{":
@@ -18123,8 +18301,6 @@ def _format_bools(text, names, calls):
     and accessors, `calls` helpers returning one.
     """
     text = _format_bool_comparisons(text)
-    if not names and not calls:
-        return text
     alts = []
     if names:
         alts.append(r"(?<![\w.>])(?:%s)(?![\w(\[])" % "|".join(
@@ -18132,6 +18308,10 @@ def _format_bools(text, names, calls):
     if calls:
         alts.append(r"(?<![\w.>])(?:%s)\s*\(" % "|".join(
             re.escape(n) for n in sorted(calls, key=len, reverse=True)))
+    # A collection's `Contains` / `ContainsKey` / `Remove` is a bool too,
+    # still in its C# spelling here.
+    alts.append(r"(?<![\w.>])[A-Za-z_]\w*(?:\s*\[[^\[\]]*\])?\s*\.\s*"
+                r"(?:Contains|ContainsKey|Remove)\s*\(")
     pat = re.compile("|".join(alts))
     log = re.compile(r"(?:Debug_Log|Debug\s*\.\s*Log|print|"
                      r"Console_WriteLine|Console\s*\.\s*WriteLine)\s*\(\s*$")
@@ -18377,6 +18557,74 @@ def _json_class_c(cname, cl, what):
         b.append("}")
         defs.append("\n".join(b))
     return "\n".join(protos), "\n\n".join(defs)
+
+
+def _lower_get_type(text, cl, plan, site):
+    """`GetType()`, `typeof(T)`, `is` and `nameof`, where the class is known
+    when packing -- `this`, or a handle field, local or parameter of a
+    packed class -- which for a packed object it always is:
+
+        GetType().Name / .FullName / .ToString()   ->  "Player"
+        other.GetType().Name                       ->  "Coin"
+        typeof(Coin).Name                          ->  "Coin"
+        GetType() == typeof(Coin)                  ->  0 (or 1), and !=
+        other is Coin  (other declared a Coin)     ->  other != null
+        nameof(hp)                                 ->  "hp"
+
+    A type used any other way (reflection, a `Type` kept in a variable) is
+    left as written, and the method is reported.
+    """
+    classes = plan.get("classes") or {}
+    holds = {"this": cl["name"], "i": cl["name"]}
+    for name, _ty, _bits, kind in cl.get("members") or ():
+        if str(kind).startswith("idx:"):
+            holds[name] = kind.split(":", 1)[1]
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in classes:
+            holds[prm.name] = prm.type
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[=;]",
+                         cs2cpp._blank(text)):
+        if m.group(1) in classes:
+            holds[m.group(2)] = m.group(1)
+    # nameof(x.y) -> "y"
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])nameof\s*\(\s*(?:[\w.]*\.)?(\w+)\s*\)",
+        lambda m: '"%s"' % m.group(1), text)
+    # GetType() -> a marker naming the class; typeof(T) likewise.
+    def gt(m):
+        recv = m.group(1)
+        if recv is None:
+            return "\x01%s\x01" % cl["name"]
+        recv = re.sub(r"\s*\.\s*$", "", recv).strip()
+        other = holds.get(recv)
+        return ("\x01%s\x01" % other) if other else m.group(0)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])((?:this|[A-Za-z_]\w*)\s*\.\s*)?GetType\s*\(\s*\)", gt, text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])typeof\s*\(\s*(?:[\w]+\s*\.\s*)*(\w+)\s*\)",
+        lambda m: "\x01%s\x01" % m.group(1), text)
+    # .Name / .FullName / .ToString()
+    text = re.sub(r"\x01(\w+)\x01\s*\.\s*(?:Name|FullName|ToString\s*\(\s*\))",
+                  lambda m: '"%s"' % m.group(1), text)
+    # comparisons of two known types
+    # decided, but still a comparison: a bool where C# prints one
+    text = re.sub(r"\x01(\w+)\x01\s*(==|!=)\s*\x01(\w+)\x01",
+                  lambda m: "(0 %s 0)" % ("==" if (m.group(1) == m.group(3))
+                                          == (m.group(2) == "==") else "!="),
+                  text)
+    # anything else: as written
+    text = re.sub(r"\x01(\w+)\x01", lambda m: "typeof(%s)" % m.group(1), text)
+    # `x is T` with x declared a T: a null check
+    def is_(m):
+        recv, ty = m.group(1), m.group(2)
+        if holds.get(recv) == ty and recv not in ("this", "i"):
+            return "(%s != null)" % recv
+        if recv == "this" and ty == cl["name"]:
+            return "true"
+        return m.group(0)
+    text = cs2cpp.code_sub(r"(?<![\w.])(\w+)\s+is\s+(\w+)(?![\w\s]*\s\w)", is_,
+                           text)
+    return text
 
 
 def _lower_json_utility(text, cl, plan, site):
@@ -19099,7 +19347,9 @@ def _lower_string_members(text, string_idents, plan):
                 continue
         changed = False
         for m in pat.finditer(scan):
-            rs = _string_receiver_start(scan, m.start(), string_idents | str_ret)
+            rs = _string_receiver_start(
+                scan, m.start(), string_idents | str_ret,
+                plan.get("_string_tables_local") or ())
             if rs is None:
                 continue
             member = m.group(1)
@@ -19154,9 +19404,10 @@ def _match_close(scan, k, o, c):
     return None
 
 
-def _string_receiver_start(scan, dot, names):
+def _string_receiver_start(scan, dot, names, tables=()):
     """Where the string receiver ending just before `dot` starts, or None
-    when what is there is not known to be a string."""
+    when what is there is not known to be a string. A name in `tables` (a
+    string array or list) is a string only through an index."""
     j = dot - 1
     while j >= 0 and scan[j] in " \t":
         j -= 1
@@ -19195,7 +19446,8 @@ def _string_receiver_start(scan, dot, names):
             w -= 1
         if w > 0 and scan[w - 1] in ".>":
             return None
-        return w if scan[w:j + 1] in names else None
+        word = scan[w:j + 1]
+        return w if word in names and word not in tables else None
     return None
 
 
@@ -19386,6 +19638,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text, plan.setdefault("_cs_str_used", set()))
     # Mathf / Random / Parse / Path / Directory / File reads: the runtime
     # table (tools/unity_pack_runtime.py), while the text is still C#.
+    if "_cs_require_nonempty(" in text:
+        plan.setdefault("_cs_str_used", set()).add("_cs_require_nonempty")
+    for _r in ("2", "3"):
+        if "_cs_idx%s(" % _r in text:
+            plan.setdefault("_cs_str_used", set()).add("_cs_idx" + _r)
     _early_ints = _int_idents(cl, plan, text, site)
     text = runtime.lower_runtime_apis(
         text, plan.setdefault("_cs_str_used", set()), cs2cpp._blank,
@@ -19393,6 +19650,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         lambda e: cs2cpp.scalar_kind(e, _PACKED_STRINGS, set(), _early_ints),
         _match_close)
     text = _lower_json_utility(text, cl, plan, site)
+    text = _lower_get_type(text, cl, plan, site)
     # `x == null` / `x != null` against the packed null (-1). This was part of
     # cs2cpp.lower_body, which the inline rewrites above replaced; the null
     # comparisons were lost with it and reached C as an undeclared `null`.
@@ -19488,6 +19746,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text, _packed_class(cl),
         [_packed_class(o) for o in (plan.get("classes") or {}).values()],
         _packed_model(plan))
+
     text = _rewrite_script_enums(text, (site or {}).get("file_text") or "")
     text = _rewrite_float_is_nan(text)
     text = _rewrite_static_ref_arrays(text, cl, plan)
@@ -19604,8 +19863,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Owned string storage of every class: `Cls_f` tables (read `Cls_f[i]`)
     # and writable statics, and the statics' spelling once lowered.
     string_idents |= _string_store_names(plan)
-    # `string[]` locals: an element is a string (`parts[i]`).
-    string_idents |= string_arrays
+    # `string[]` locals: an element is a string (`parts[i]`); so is a local
+    # `List<string>`'s (a vector of fastrings, below).
+    string_lists = set(re.findall(
+        r"(?<![\w.])(?:List\s*<\s*string\s*>|std::vector<\s*(?:std::string|"
+        r"fastring)\s*>)\s*&?\s*(\w+)\s*[=;]", cs2cpp._blank(text)))
+    string_lists |= {f["name"] for f in cl.get("list_fields") or []
+                     if _list_elem_name(f.get("ty") or "") == "string"}
+    plan["_string_lists_local"] = string_lists
+    plan["_string_tables_local"] = string_arrays | string_lists
+    string_idents |= string_arrays | string_lists
     string_idents |= plan.get("_json_string_fns") or set()
     _rk = dict(_method_ret_kinds(plan))
     # Before the calls are renamed: this class's methods by their C# names.
@@ -19629,7 +19896,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
         if prm.type in ("string", "String", "System.String")}
     text = _mark_string_chars(text, string_idents, string_arrays
-                              | _string_store_names(plan))
+                              | _string_store_names(plan)
+                              | plan.get("_string_lists_local", set()))
     text = _format_bools(text, _bool_names(cl, body, site),
                          _string_helper_names("bool") | {
                              "_engine_go_active_in_hierarchy",
@@ -19909,9 +20177,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(r"(?<![\w.>])(?:this\s*\.\s*)?gameObject(?![\w])",
                            "_engine_go_of_%s(i)" % idn, text)
     # Last: every rewrite above has read the string locals by name.
+    # Lists, at their final types: a List<string> -- a local from the shared
+    # lowering, a field's alias, a static -- is a vector of fastrings.
+    text = cs2cpp.code_sub(r"std::vector<\s*std::string\s*>",
+                           "std::vector<fastring>", text)
+    text = _lower_list_searches(text, cl, plan)
+    _sl = set(re.findall(r"std::vector<fastring>\s*&?\s*(\w+)\s*[;=]",
+                         cs2cpp._blank(text)))
     text = _own_string_locals(text, string_idents, int_idents,
-                              _string_store_names(plan) | string_arrays,
-                              arrays=string_arrays)
+                              _string_store_names(plan) | string_arrays | _sl,
+                              arrays=string_arrays | _sl)
     return text
 
 
@@ -21977,6 +22252,16 @@ def pack(root, outdir, *args, **kwargs):
                 except (OSError, UnicodeDecodeError):
                     pass
     overlay = _ext.desugar_project(files) if files else {}
+    # Stack / Queue / HashSet, as the List the packer lowers
+    # (tools/unity_pack_collections.py).
+    import tools.unity_pack_collections as _coll
+    _n = [0]
+    for fp in sorted(files):
+        t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
+        t = _coll.desugar_multidim(t)
+        t = _coll.desugar_list_foreach(t, _n)
+        if t != files[fp]:
+            overlay[fp] = t
     # An API a copied or inlined static helper uses is its caller's too:
     # the per-script scan does not see it there.
     _common.SOURCE_API_HINTS.clear()
@@ -22249,6 +22534,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
             and "#include <math.h>" not in engine:
         k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
         engine = engine[:k] + "#include <math.h>\n" + engine[k:]
+    vec_types = plan.pop("_vec_helper_types", None)
+    if vec_types:
+        helpers_c += _vec_helpers_c(vec_types)
     json_protos, json_defs = [], []
     for jc, what in sorted((plan.pop("_json_classes", None) or {}).items()):
         pr, df = _json_class_c(jc, plan["classes"][jc], what)

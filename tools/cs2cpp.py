@@ -1648,7 +1648,7 @@ def lower_bindings(text, bindings):
 #: lowered body is C++, not a C# member left behind.
 _CXX_MEMBERS = ("size|push_back|pop_back|clear|empty|begin|end|insert|erase|"
                 "find|count|at|resize|reserve|data|front|back|append|"
-                "c_str|length|substr|compare|assign_cstr")
+                "c_str|length|substr|compare|assign_cstr|ptr")
 
 
 def residual_csharp(text, model, known_types=(), value_ctors=()):
