@@ -798,6 +798,17 @@ configures them), and a hinge's limits and angle are relative to its pose
 at creation. A GameObject with a joint and no Rigidbody2D gets the one
 Unity adds (dynamic, mass 1, gravity 1).
 
+`gameObject.AddComponent<XJoint2D>()` (or on a GameObject variable) adds
+one of the joint kinds at run time: the joint tables keep a spare row per
+instance of each class that calls it, the row gets Unity's defaults for
+that kind, and it goes on the GameObject's Rigidbody2D -- added too, as
+Unity adds one, when there is none (with `AddComponent<Rigidbody2D>`'s own
+limits: a class planned without a body may not move). Box2D-Packed builds
+it before the next step, so the script sets it up first -- `connectedBody`
+(or `null`), `anchor`, `connectedAnchor`, `autoConfigureConnectedAnchor`,
+`autoConfigureDistance`, `autoConfigureAngle` are settable, and changing
+the bodies or anchors of a built joint builds it again.
+
 Scripts reach a joint through a field of a joint type (set by
 `GetComponent<XJoint2D>()`, or a serialized reference), a local, or
 `GetComponent<XJoint2D>()` itself; `== null` is no joint, or a broken one.
@@ -824,6 +835,20 @@ breaks.
 
 A Rigidbody2D's authored `m_GravityScale: 0` is kept; it was read as the
 default, 1.
+
+**Authored zeros.** A value authored as 0 is kept where 0 is not the
+default: a Rigidbody2D's `m_GravityScale`, an Animation / Animator's speed
+(a paused one), a Slider's `m_MaxValue` (a -1..0 slider) and a
+Scrollbar's `m_Size` were read as missing and given the default.
+
+**Animated rotation and scale.** An AnimationClip's `m_EulerCurves` and
+`m_ScaleCurves` on the root drive the owner's rotation (Euler degrees,
+sampled in Euler space as Unity's Euler curves are, turned into the
+quaternion in Unity's Z-X-Y order) and localScale x / y; they were parsed
+and dropped, only `m_PositionCurves` animating. The owner keeps live
+rotation / scale tables, and `transform.eulerAngles.z` and
+`transform.localScale.x / y` read them. A clip that is not looping and is
+played backwards (a negative speed) now stops at its start.
 
 **Queries.** `Physics2D.Raycast(origin, direction[, distance[,
 layerMask]])`, `RaycastAll`, `OverlapCircle(point, radius[, layerMask])`,
