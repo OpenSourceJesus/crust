@@ -386,6 +386,22 @@ int main(void) {
 """)
 
 
+class TestLiteralSemicolons(Base):
+    def test_initialiser_and_assignment_with_a_semicolon_in_a_literal(self):
+        # The `T x = ..;` and `x = ..;` patterns ran to the first `;`,
+        # inside the literal: `S a = mk("k=v;x=y");` was cut to `mk("k=v`.
+        self.assertRuns("""
+#include <stdlib.h>
+#include <string.h>
+class S { public: char *p; S() { p = 0; } S(const S &o) { p = strdup(o.p ? o.p : ""); }
+          ~S() { free(p); }
+          void operator=(const S &o) { free(p); p = strdup(o.p ? o.p : ""); } };
+static S mk(const char *x) { S s; s.p = strdup(x); return s; }
+int main(void) { S a = mk("k=v;x=y"); S b; b = mk("1;2");
+    return (strcmp(a.p, "k=v;x=y") == 0 && strcmp(b.p, "1;2") == 0) ? 0 : 1; }
+""")
+
+
 class TestSeparateTranslationUnits(Base):
     """A class declared in a header and defined in one `.cpp`, used from
     another. The defining unit emitted its out-of-line members `static`,

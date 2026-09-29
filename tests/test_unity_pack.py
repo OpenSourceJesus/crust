@@ -1973,6 +1973,74 @@ class TestStubDiagnostics(unittest.TestCase):
                       cm.exception.message)
 
 
+class TestSpawnLifecycle(unittest.TestCase):
+    """An instantiated object gets Awake at once and Start before its first
+    Update, each once -- they ran once per class, at the first tick, for the
+    instances there then, so a spawned object never started. And a clone's
+    private fields are what their initializers make them: Instantiate
+    copied the whole instance struct, so a clone carried on with the
+    original's counters."""
+
+    SCRIPT = (
+        "using UnityEngine;\n"
+        "public class MaxInstancesAttribute : System.Attribute {\n"
+        "    public MaxInstancesAttribute(int n) {}\n"
+        "}\n"
+        "[MaxInstances(4)]\n"
+        "public class Life : MonoBehaviour {\n"
+        "    public static int made;\n"
+        "    public int kept = 5;\n"
+        "    private int step;\n"
+        "    private int updates;\n"
+        "    void Awake() { step = step * 10 + 1; }\n"
+        "    void Start() { step = step * 10 + 2; }\n"
+        "    void Update() {\n"
+        "        updates = updates + 1;\n"
+        "        if (updates == 1) Debug.Log(\"life:\" + (step * 10 + 3) + \",\" + kept);\n"
+        "        if (made < 3) { made = made + 1; kept = kept + 1; Instantiate(this); }\n"
+        "    }\n"
+        "}\n")
+
+    @needs_cc
+    def test_each_spawned_object_awakes_and_starts_once(self):
+        root = tempfile.mkdtemp(prefix="upack-life-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(scenes)
+        with open(os.path.join(scripts, "Life.cs"), "w") as f:
+            f.write(self.SCRIPT)
+        with open(os.path.join(scripts, "Life.cs.meta"), "w") as f:
+            f.write("guid: 11fe11fe11fe11fe11fe11fe11fe11fe\n")
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &1\nGameObject:\n  m_Name: Life\n"
+                    "  m_Component:\n  - component: {fileID: 2}\n"
+                    "  - component: {fileID: 3}\n"
+                    "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, "
+                    "guid: 11fe11fe11fe11fe11fe11fe11fe11fe}\n"
+                    "  kept: 5\n")
+        d = tempfile.mkdtemp(prefix="upack-life-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d)
+            exe = unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player")
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, cwd=d, timeout=60)
+        lines = sorted(l for l in run.stdout.splitlines()
+                       if l.startswith("life:"))
+        # Every instance: Awake, Start, then its first Update. The public
+        # `kept` is copied from whichever object spawns: frame 1 the
+        # original (6), frame 2 the original (7) and its first clone,
+        # which bumped its own copy to 7 -- the private counters start
+        # again every time.
+        self.assertEqual(lines, ["life:123,5", "life:123,6", "life:123,7",
+                                 "life:123,7"])
+
+
 class TestOwnedStrings(unittest.TestCase):
     """C# `string` locals own their bytes: each is a coost `fastring`.
 
