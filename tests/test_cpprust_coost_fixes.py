@@ -354,6 +354,38 @@ int main(void) { return mk().get(); }
 """, "owns a resource")
 
 
+class TestArrayElementReceivers(Base):
+    """A method called on an element of an array of a class -- at file scope
+    or in a block -- reached the C unlowered (`g[i].set(5)`), because only a
+    declarator followed by `;`, `=`, `,` or `)` was recorded. A packed
+    engine keeps a table per class exactly so (`static fastring T[N]`)."""
+
+    def test_file_scope_and_local_arrays(self):
+        self.assertRuns("""
+class Box { public: int v; Box() { v = 0; } void set(int x) { v = x; }
+            int get() { return v; } Box *self() { return this; } };
+class Sel { public: int k; Sel() { k = 1; } int idx() { return k; } };
+static Box g_boxes[4];
+static int idx[2] = { 1, 3 };
+static int pick(int k) { return idx[k]; }
+int main(void) {
+    Box local[3];
+    Sel s;
+    local[0].v = 0; local[1].v = 0; local[2].v = 0;
+    g_boxes[0].set(5);
+    g_boxes[idx[1]].set(7);
+    g_boxes[pick(0)].set(9);
+    local[s.idx()].set(4);
+    local[2].v = 6;
+    local[0].self()->set(8);
+    int r = (g_boxes[0].get() == 5) + (g_boxes[3].get() == 7)
+          + (g_boxes[1].get() == 9) + (local[1].get() == 4)
+          + (local[2].get() == 6) + (local[0].get() == 8);
+    return r == 6 ? 0 : 1;
+}
+""")
+
+
 class TestSeparateTranslationUnits(Base):
     """A class declared in a header and defined in one `.cpp`, used from
     another. The defining unit emitted its out-of-line members `static`,

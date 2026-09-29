@@ -2065,6 +2065,56 @@ class TestOwnedStrings(unittest.TestCase):
             "        Debug.Log(b);\n")
         self.assertEqual(out[:2], ["xxxx", "x"])
 
+    @needs_coost
+    def test_a_reassigned_parameter_owns_its_string(self):
+        out = self._run(
+            "        Take(\"in-\" + hp);\n",
+            fields="    void Take(string p) {\n"
+                   "        for (int k = 0; k < 20; k++) { string t = \"x\" + k; }\n"
+                   "        p = p + \"!\";\n"
+                   "        Debug.Log(p);\n"
+                   "    }\n")
+        self.assertEqual(out[0], "in-7!")
+
+    @needs_coost
+    def test_writable_string_fields(self):
+        # An instance field was read as a handle to a class named `string`
+        # and never declared; a static one was a const char array.
+        out = self._run(
+            "        note = note + \"-x\";\n"
+            "        last = \"hp\" + hp;\n"
+            "        for (int k = 0; k < 20; k++) { string t = \"x\" + k; }\n"
+            "        Debug.Log(note);\n"
+            "        Debug.Log(last);\n",
+            fields="    public string note = \"init\";\n"
+                   "    public static string last;\n")
+        self.assertEqual(out[:2], ["init-x", "hp7"])
+        self.assertIn("static fastring Player_note[", self.engine)
+
+    @needs_coost
+    def test_string_members_chain(self):
+        out = self._run(
+            "        string s = \"  a-b  \";\n"
+            "        Debug.Log(s.Trim().Replace(\"-\", \"+\").ToUpper());\n"
+            "        Debug.Log(s.Length + \",\" + s.IndexOf(\"b\") + \",\""
+            " + s.Substring(2, 3));\n")
+        self.assertEqual(out[:2], ["A+B", "7,4,a-b"])
+
+    def test_a_comma_in_a_log_message_is_not_an_argument(self):
+        # `Debug.Log("a, b")` was cut at the comma, as if it were the
+        # `Debug.Log(msg, context)` form.
+        self.assertEqual(
+            unity_pack._strip_debug_log_context_arg(
+                'Debug_Log("a, b"); Debug_Log("x", ctx);'),
+            'Debug_Log("a, b"); Debug_Log("x");')
+
+    def test_a_literal_argument_is_not_read_as_a_concatenation(self):
+        model = cs2cpp.packed_model(True)
+        self.assertEqual(
+            cs2cpp.lower_string_concat(
+                'f("a", "b" + x); R(s, "-", "+");', model, {"x", "s"}),
+            'f("a", _str_plus_s("b", (x))); R(s, "-", "+");')
+
     def test_a_project_without_string_locals_needs_no_coost(self):
         # coost is an optional checkout: nothing changes for a project
         # that does not use it, even with no checkout to be found.
