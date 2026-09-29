@@ -2275,7 +2275,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"BoxCollider|"
             r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
             r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
-            r"SliderJoint2D|WheelJoint2D):",
+            r"SliderJoint2D|WheelJoint2D|FrictionJoint2D|RelativeJoint2D|"
+            r"TargetJoint2D):",
             block)
         if km:
             kind = km.group(1)
@@ -3346,7 +3347,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "content_size_fitter": content_size_fitter,
             "aspect_ratio_fitter": aspect_ratio_fitter,
             "canvas_scaler": canvas_scaler,
-            "rigidbody2d": rb2d,
+            # A joint requires a Rigidbody2D: Unity adds a default one.
+            "rigidbody2d": rb2d if rb2d or not joints2d else {
+                "body_type": 0, "mass": 1.0, "gravity_scale": 1.0,
+                "linear_damping": 0.0, "vel_x": 0.0, "vel_y": 0.0,
+                "freeze_rot": False, "ang_vel": 0.0, "file_id": None,
+                "auto_added": True},
             "joints2d": joints2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -5796,6 +5802,9 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![\w.])(?:this\s*\.\s*)?gameObject\s*\.\s*SetActive\s*\(",
                  scan):
         apis.add("GameObject.SetActive")
+    if re.search(r"\.\s*(?:reactionForce|GetReactionForce|linearOffset|target)\b",
+                 scan) and re.search(r"Joint2D\b", scan):
+        apis.add("Vector2")
     # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
     # read for its GameObject.
     if re.search(r"\bPhysics2D\s*\.\s*(?:Raycast|OverlapCircle|OverlapPoint)(?:All)?"
@@ -13829,11 +13838,47 @@ def _lower_joint2d_api(text, cl, plan, site):
         text = cs2cpp.code_sub(pat + r"\s*(==|!=)\s*null\b",
                                lambda m, rx=rx: "(%s %s)" % (
                                    rx, "< 0" if m.group(1) == "==" else ">= 0"), text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?JointBreakAction2D\s*\.\s*"
+                           r"(Ignore|CallbackOnly|Disable|Destroy)\b",
+                           lambda m: str(_JOINT2D_BREAK_ACTIONS[m.group(1)]), text)
     props = ("enabled", "useMotor", "useLimits", "enableCollision",
              "maxDistanceOnly", "distance", "frequency", "dampingRatio",
              "breakForce", "breakTorque", "motor", "limits", "suspension",
              "jointAngle", "jointSpeed", "jointTranslation", "connectedBody",
-             "attachedRigidbody")
+             "attachedRigidbody", "maxForce", "maxTorque", "correctionScale",
+             "angularOffset", "autoConfigureOffset", "autoConfigureTarget",
+             "breakAction", "reactionTorque")
+    vec2 = {"target": ("targetX", "targetY"),
+            "linearOffset": ("linearOffsetX", "linearOffsetY")}
+    for pat, rx in recvs.items():
+        # Vector2 members: target, linearOffset (set, read); reactionForce and
+        # GetReactionForce(dt) / GetReactionTorque(dt) (read)
+        for prop, (fx, fy) in vec2.items():
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\s*=(?!=)\s*([^;]+);" % prop,
+                lambda m, rx=rx, fx=fx, fy=fy: "{ Vector2 _cs_j = (%s); "
+                "Joint2D_set_%s(%s, _cs_j.x); Joint2D_set_%s(%s, _cs_j.y); }" % (
+                    m.group(1).strip(), fx, rx, fy, rx), text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\s*\.\s*([xy])\b" % prop,
+                lambda m, rx=rx, fx=fx, fy=fy: "Joint2D_get_%s(%s)" % (
+                    fx if m.group(1) == "x" else fy, rx), text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\b" % prop,
+                lambda m, rx=rx, fx=fx, fy=fy: "Vector2_make(Joint2D_get_%s(%s), "
+                "Joint2D_get_%s(%s))" % (fx, rx, fy, rx), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*(?:reactionForce|GetReactionForce\s*\([^()]*\))"
+            r"\s*\.\s*([xy])\b",
+            lambda m, rx=rx: "Joint2D_get_reactionForce%s(%s)" % (
+                m.group(1).upper(), rx), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*(?:reactionForce|GetReactionForce\s*\([^()]*\))",
+            lambda m, rx=rx: "Vector2_make(Joint2D_get_reactionForceX(%s), "
+            "Joint2D_get_reactionForceY(%s))" % (rx, rx), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*GetReactionTorque\s*\([^()]*\)",
+            lambda m, rx=rx: "Joint2D_get_reactionTorque(%s)" % rx, text)
     chained = {("motor", "motorSpeed"): "motorSpeed",
                ("motor", "maxMotorTorque"): "maxMotorTorque",
                ("limits", "min"): "limitMin", ("limits", "max"): "limitMax"}
@@ -13959,16 +14004,25 @@ _JOINT2D_INT_TABLES = (
     ("enabled", "enabled"), ("collide", "collide"),
     ("auto_anchor", "auto_anchor"), ("auto_distance", "auto_distance"),
     ("max_distance_only", "max_distance_only"), ("use_motor", "use_motor"),
-    ("use_limits", "use_limits"), ("auto_angle", "auto_angle"))
+    ("use_limits", "use_limits"), ("auto_angle", "auto_angle"),
+    ("auto_offset", "auto_offset"), ("auto_target", "auto_target"),
+    ("break_action", "break_action"))
 _JOINT2D_FLOAT_TABLES = (
     "anchor_x", "anchor_y", "canchor_x", "canchor_y", "distance", "frequency",
     "damping", "lower", "upper", "motor_speed", "motor_max", "angle",
-    "break_force", "break_torque")
+    "break_force", "break_torque", "max_force", "max_torque", "correction",
+    "offset_x", "offset_y", "offset_angle", "target_x", "target_y")
+_JOINT2D_OUT_TABLES = ("out_angle", "out_speed", "out_translation",
+                       "out_force_x", "out_force_y", "out_torque")
 
 
 def _joint2d_float(j, name):
     v = {"anchor_x": j["anchor"][0], "anchor_y": j["anchor"][1],
-         "canchor_x": j["canchor"][0], "canchor_y": j["canchor"][1]}.get(
+         "canchor_x": j["canchor"][0], "canchor_y": j["canchor"][1],
+         "offset_x": j.get("offset", (0.0, 0.0))[0],
+         "offset_y": j.get("offset", (0.0, 0.0))[1],
+         "target_x": j.get("target", (0.0, 0.0))[0],
+         "target_y": j.get("target", (0.0, 0.0))[1]}.get(
              name, j.get(name, 0.0))
     v = float(v)
     if v != v or v in (float("inf"), float("-inf")):
@@ -13998,7 +14052,7 @@ def _emit_joint2d_data(p, plan, class_ids):
     for name in _JOINT2D_FLOAT_TABLES:
         p("float _Joint2D_%s[%d] = { %s };" % (
             name, n, ", ".join(_joint2d_float(j, name) for j in js)))
-    for name in ("out_angle", "out_speed", "out_translation"):
+    for name in _JOINT2D_OUT_TABLES:
         p("float _Joint2D_%s[%d];" % (name, n))
 
 
@@ -14016,8 +14070,7 @@ def _emit_joint2d_api(p, plan):
         p("extern int _Joint2D_%s[%d];" % (name, n))
     for name in ("go", "owner_class", "owner_inst", "broken"):
         p("extern int _Joint2D_%s[%d];" % (name, n))
-    for name in _JOINT2D_FLOAT_TABLES + ("out_angle", "out_speed",
-                                         "out_translation"):
+    for name in _JOINT2D_FLOAT_TABLES + _JOINT2D_OUT_TABLES:
         p("extern float _Joint2D_%s[%d];" % (name, n))
     p("typedef struct JointMotor2D { float motorSpeed; float maxMotorTorque; } JointMotor2D;")
     p("typedef struct JointAngleLimits2D { float min; float max; } JointAngleLimits2D;")
@@ -14048,7 +14101,17 @@ def _emit_joint2d_api(p, plan):
             ("motorSpeed", "motor_speed", "float"),
             ("maxMotorTorque", "motor_max", "float"),
             ("limitMin", "lower", "float"), ("limitMax", "upper", "float"),
-            ("angle", "angle", "float")):
+            ("angle", "angle", "float"),
+            ("maxForce", "max_force", "float"),
+            ("maxTorque", "max_torque", "float"),
+            ("correctionScale", "correction", "float"),
+            ("angularOffset", "offset_angle", "float"),
+            ("autoConfigureOffset", "auto_offset", "int"),
+            ("autoConfigureTarget", "auto_target", "int"),
+            ("breakAction", "break_action", "int"),
+            ("targetX", "target_x", "float"), ("targetY", "target_y", "float"),
+            ("linearOffsetX", "offset_x", "float"),
+            ("linearOffsetY", "offset_y", "float")):
         p("static %s Joint2D_get_%s(int j) {" % (cty, prop))
         p("    return _j2d_ok(j) ? _Joint2D_%s[j] : 0;" % table)
         p("}")
@@ -14056,7 +14119,10 @@ def _emit_joint2d_api(p, plan):
         p("    if (_j2d_ok(j)) _Joint2D_%s[j] = v;" % table)
         p("}")
     for prop, table in (("jointAngle", "out_angle"), ("jointSpeed", "out_speed"),
-                        ("jointTranslation", "out_translation")):
+                        ("jointTranslation", "out_translation"),
+                        ("reactionForceX", "out_force_x"),
+                        ("reactionForceY", "out_force_y"),
+                        ("reactionTorque", "out_torque")):
         p("static float Joint2D_get_%s(int j) {" % prop)
         p("    return _j2d_ok(j) ? _Joint2D_%s[j] : 0.f;" % table)
         p("}")
@@ -14295,8 +14361,10 @@ def _emit_engine_box2d_exports(
             p("void engine_joint2d_broken(int j) {")
             p("    unsigned oi;")
             p("    if (j < 0 || j >= _Joint2D_count) return;")
-            p("    _Joint2D_broken[j] = 1;")
-            p("    _Joint2D_enabled[j] = 0;")
+            p("    /* JointBreakAction2D: 3 Destroy (gone), 2 Disable (enabled")
+            p("       false, the component kept), 1 CallbackOnly (kept) */")
+            p("    if (_Joint2D_break_action[j] == 3) _Joint2D_broken[j] = 1;")
+            p("    if (_Joint2D_break_action[j] >= 2) _Joint2D_enabled[j] = 0;")
             p("    oi = (unsigned)_Joint2D_owner_inst[j];")
             p("    switch (_Joint2D_owner_class[j]) {")
             for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):

@@ -22,6 +22,7 @@ from tools.unity_pack_common import *  # noqa: E402,F401,F403
 __all__ = [
     '_COLLISION2D_MSGS',
     '_JOINT2D_COMPONENTS',
+    '_JOINT2D_BREAK_ACTIONS',
     '_JOINT2D_KINDS',
     '_build_joint2d_table',
     '_parse_joint2d',
@@ -153,7 +154,15 @@ _TRIGGER2D_MSGS = ("OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D")
 #: (rigid, or a rope with maxDistanceOnly), distance with a spring, weld,
 #: prismatic, wheel.
 _JOINT2D_KINDS = {"HingeJoint2D": 0, "DistanceJoint2D": 1, "SpringJoint2D": 2,
-                  "FixedJoint2D": 3, "SliderJoint2D": 4, "WheelJoint2D": 5}
+                  "FixedJoint2D": 3, "SliderJoint2D": 4, "WheelJoint2D": 5,
+                  # Box2D-Packed's motor joint, three ways: friction (velocity
+                  # control to rest), relative (a spring to an offset), target
+                  # (a spring to a world point)
+                  "FrictionJoint2D": 6, "RelativeJoint2D": 7, "TargetJoint2D": 8}
+
+#: JointBreakAction2D: Ignore, CallbackOnly, Disable, Destroy (the default).
+_JOINT2D_BREAK_ACTIONS = {"Ignore": 0, "CallbackOnly": 1, "Disable": 2,
+                          "Destroy": 3}
 #: Script types a joint handle may have (the bases take any kind).
 _JOINT2D_COMPONENTS = frozenset(_JOINT2D_KINDS) | {"Joint2D", "AnchoredJoint2D"}
 
@@ -185,8 +194,8 @@ def _parse_joint2d(kind, block):
         "auto_distance": int(num("m_AutoConfigureDistance", 1)),
         "distance": num("m_Distance", 1.0),
         "max_distance_only": int(num("m_MaxDistanceOnly", 0)),
-        "frequency": num("m_Frequency", {2: 1.0, 5: 2.0}.get(k, 0.0)),
-        "damping": num("m_DampingRatio", {5: 0.7}.get(k, 0.0)),
+        "frequency": num("m_Frequency", {2: 1.0, 5: 2.0, 8: 5.0}.get(k, 0.0)),
+        "damping": num("m_DampingRatio", {5: 0.7, 8: 1.0}.get(k, 0.0)),
         "use_motor": int(num("m_UseMotor", 0)),
         "use_limits": int(num("m_UseLimits", 0)),
         "motor_speed": num("m_MotorSpeed", 0.0),
@@ -198,6 +207,16 @@ def _parse_joint2d(kind, block):
         "auto_angle": int(num("m_AutoConfigureAngle", 0)),
         "break_force": num("m_BreakForce", float("inf")),
         "break_torque": num("m_BreakTorque", float("inf")),
+        "break_action": int(num("m_BreakAction", 3)),
+        # friction / relative / target
+        "max_force": num("m_MaxForce", {7: 10000.0, 8: 1000.0}.get(k, 0.0)),
+        "max_torque": num("m_MaxTorque", {7: 10000.0}.get(k, 0.0)),
+        "correction": num("m_CorrectionScale", 0.3),
+        "auto_offset": int(num("m_AutoConfigureOffset", 1)),
+        "offset": vec("m_LinearOffset"),
+        "offset_angle": num("m_AngularOffset", 0.0),
+        "auto_target": int(num("m_AutoConfigureTarget", 1)),
+        "target": vec("m_Target"),
     }
 
 
@@ -314,7 +333,11 @@ def _build_rigidbody_tables(plan):
                     "file_id": fid,
                     "body_type": int(r2.get("body_type") or 0),
                     "mass": float(r2.get("mass") or 1.0),
-                    "gravity_scale": float(r2.get("gravity_scale") or 1.0),
+                    # an authored 0 is no gravity, not the default: `or`
+                    # would read it as missing
+                    "gravity_scale": float(r2["gravity_scale"]
+                                           if r2.get("gravity_scale") is not None
+                                           else 1.0),
                     "linear_damping": float(r2.get("linear_damping") or 0.0),
                     "vel_x": float(r2.get("vel_x") or 0.0),
                     "vel_y": float(r2.get("vel_y") or 0.0),

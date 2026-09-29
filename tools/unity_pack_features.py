@@ -649,6 +649,9 @@ BOX2D_BALL = (
 BOX2D_EXPECT = ["b2d_joint:broke gone", "b2d_joint:hinge held,swung",
                 "b2d_joint:slider slides", "b2d_joint:wheel spins",
                 "b2d_joint:spring hangs 1", "b2d_joint:motor 90",
+                "b2d_joint2:broke disabled,Disable", "b2d_joint2:target holds,pull",
+                "b2d_joint2:friction stopped", "b2d_joint2:relative returns,50",
+                "b2d_joint2:target moved",
                 "b2d_q:Ground,7,1,-2", "b2d_q:Ground,none",
                 "b2d_q:mask Ground,none,Ground", "b2d_q:all 3 Ball,Zone,Ground",
                 "b2d_q:circle 1 Ball",
@@ -792,6 +795,55 @@ BOX2D_JOINT_SCRIPTS = {
         " && s.jointTranslation < 1.3f ? \"slides\" : \"stuck\"));\n"
         "    }\n"
         "}\n"),
+    "Grab": (
+        "using UnityEngine;\n"
+        "public class Grab : MonoBehaviour {\n"
+        "    TargetJoint2D t;\n"
+        "    int ticks;\n"
+        "    void Start() { t = GetComponent<TargetJoint2D>(); }\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 8) Debug.Log(\"b2d_joint2:target \" + (Mathf.Abs(transform.position.y - 8f)"
+        " < 0.1f ? \"holds\" : \"drops\") + \",\" + (Mathf.Abs(t.reactionForce.y) > 5f"
+        " ? \"pull\" : \"none\"));\n"
+        "        if (ticks == 10) t.target = new Vector2(t.target.x, t.target.y + 1f);\n"
+        "        if (ticks == 50) Debug.Log(\"b2d_joint2:target \" + (Mathf.Abs(transform.position.y - 9f)"
+        " < 0.15f ? \"moved\" : \"stayed\"));\n"
+        "    }\n"
+        "}\n"),
+    "Rub": (
+        "using UnityEngine;\n"
+        "public class Rub : MonoBehaviour {\n"
+        "    Rigidbody2D rb;\n"
+        "    int ticks;\n"
+        "    void Start() { rb = GetComponent<Rigidbody2D>(); rb.velocity = new Vector2(3f, 0f); }\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 45) Debug.Log(\"b2d_joint2:friction \" + (Mathf.Abs(rb.velocity.x) < 0.05f"
+        " && transform.position.x > -2.9f ? \"stopped\" : \"sliding\"));\n"
+        "    }\n"
+        "}\n"),
+    "Follow": (
+        "using UnityEngine;\n"
+        "public class Follow : MonoBehaviour {\n"
+        "    int ticks;\n"
+        "    void Start() { GetComponent<Rigidbody2D>().velocity = new Vector2(0f, 4f); }\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 50) Debug.Log(\"b2d_joint2:relative \" + (Mathf.Abs(transform.position.y - 9f)"
+        " < 0.15f ? \"returns\" : \"drifts\") + \",\""
+        " + GetComponent<RelativeJoint2D>().maxForce);\n"
+        "    }\n"
+        "}\n"),
+    "Weight2": (
+        "using UnityEngine;\n"
+        "public class Weight2 : MonoBehaviour {\n"
+        "    void OnJointBreak2D(Joint2D j) {\n"
+        "        FixedJoint2D f = GetComponent<FixedJoint2D>();\n"
+        "        Debug.Log(\"b2d_joint2:broke \" + (f != null && !f.enabled ? \"disabled\" : \"other\")"
+        " + \",\" + (f.breakAction == JointBreakAction2D.Disable ? \"Disable\" : \"?\"));\n"
+        "    }\n"
+        "}\n"),
     "Car": (
         "using UnityEngine;\n"
         "public class Car : MonoBehaviour {\n"
@@ -808,9 +860,23 @@ BOX2D_JOINT_SCRIPTS = {
 #: their scripts, so the GameObject-name fallback would not bind them)
 
 
-def _joint_body(fid, name, pos, script_guid, joint_yaml, gravity=1, extra=""):
+def _joint_body(fid, name, pos, script_guid, joint_yaml, gravity=1, extra="",
+                rb=True):
     """A dynamic body with a circle, a script, and its joint (YAML, with
-    `{go}` for its GameObject)."""
+    `{go}` for its GameObject). `rb=False`: no Rigidbody2D (Unity adds one)."""
+    if not rb:
+        return (
+            "--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_Component:\n"
+            "  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+            "  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+            "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+            "  m_LocalPosition: {x: %s, y: %s, z: 0}\n"
+            "--- !u!58 &%d\nCircleCollider2D:\n  m_GameObject: {fileID: %d}\n"
+            "  m_Enabled: 1\n  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.25\n"
+            % (fid, name, fid + 1, fid + 3, fid + 4, fid + 5, fid + 1, fid,
+               pos[0], pos[1], fid + 3, fid)
+            + _mb(fid + 4, fid, script_guid, extra)
+            + joint_yaml.format(jid=fid + 5, go=fid))
     return (
         "--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_Component:\n"
         "  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
@@ -1071,6 +1137,31 @@ def box2d_project(root):
         "  m_AutoConfigureAngle: 0\n  m_Angle: 0\n  m_UseMotor: 1\n  m_Motor:\n"
         "    m_MotorSpeed: 2\n    m_MaximumMotorForce: 100\n  m_UseLimits: 0\n",
         gravity=0)
+    scene += _joint_body(160, "Grabbed", (-9, 8), guid["Grab"],
+        "--- !u!257 &{jid}\nTargetJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_Target: {{x: 0, y: 0}}\n"
+        "  m_AutoConfigureTarget: 1\n  m_MaxForce: 1000\n"
+        "  m_DampingRatio: 1\n  m_Frequency: 5\n")
+    scene += _joint_body(170, "Rubbed", (-3, 9), guid["Rub"],
+        "--- !u!256 &{jid}\nFrictionJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 1\n"
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n"
+        "  m_MaxForce: 10\n  m_MaxTorque: 10\n", gravity=0)
+    scene += _joint_body(180, "Follower", (2, 9), guid["Follow"],
+        "--- !u!254 &{jid}\nRelativeJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="Infinity") +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_MaxForce: 50\n  m_MaxTorque: 50\n"
+        "  m_CorrectionScale: 0.3\n  m_AutoConfigureOffset: 1\n"
+        "  m_LinearOffset: {{x: 0, y: 0}}\n  m_AngularOffset: 0\n", gravity=0)
+    scene += _joint_body(190, "Weight2", (9, 3), guid["Weight2"],
+        "--- !u!255 &{jid}\nFixedJoint2D:\n  m_GameObject: {{fileID: {go}}}\n"
+        + common.format(bf="5") +
+        "  m_BreakAction: 2\n"
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 1\n"
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n"
+        "  m_DampingRatio: 0\n  m_Frequency: 0\n", rb=False)
     # the wheel first: the car's joint refers to its Rigidbody2D (&142)
     scene += _joint_body(140, "Wheel", (4, 7.5), None, "", gravity=0)
     scene += _joint_body(150, "Car", (4, 8), guid["Car"],
