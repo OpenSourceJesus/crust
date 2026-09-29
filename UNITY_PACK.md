@@ -751,9 +751,45 @@ tables the glue pushes before each step:
 
 The glue now pushes a changed `mass` (the shape's mass data scaled to it,
 as at creation) and a changed `bodyType` (`b2Body_SetType`); it pushed
-velocity, a moved position, gravity scale and damping already. Rotation
-stays locked; `AddTorque`, `angularVelocity`, `rotation` and the
-`Physics2D` queries (`Raycast`, `OverlapCircle`) are not lowered yet.
+velocity, a moved position, gravity scale and damping already. A
+`velocity` assigned any Vector2 expression (`Vector2.zero`, a local) is
+set too.
+
+**Rotation.** A Rigidbody2D turns, as in Unity, unless it is static or its
+`m_Constraints` freeze rotation (`RigidbodyConstraints2D.FreezeRotation`);
+it was locked. Its owner's class keeps a live rotation (so its sprites draw
+turned), the plan's `physics2d_rotation` has the glue start each body at
+its owner's authored angle and angular velocity and pull both back after
+every step (`engine_rb2d_get_rot` / `set_rot`, radians), and a teleport
+keeps the rotation. Scripts have, in Unity's degrees:
+
+| C# | |
+|----|--|
+| `rotation`, `rotation = a`, `MoveRotation(a)` | the owner's angle (a write is pushed as a turn in place) |
+| `angularVelocity` | get, set, `op=` |
+| `AddTorque(t)`, `AddTorque(t, ForceMode2D.Impulse)` | applied by Box2D (`b2Body_ApplyTorque` / `ApplyAngularImpulse`), which knows the inertia |
+| `freezeRotation` | get, set (the motion lock follows) |
+| `transform.eulerAngles.z` | of a turning body's own Transform, [0, 360) |
+
+With no turning body in the scene the API reads 0 and writes nothing.
+Godot mode keeps its bodies' rotation locked.
+
+**Queries.** `Physics2D.Raycast(origin, direction[, distance])`,
+`Physics2D.OverlapCircle(point, radius)` and `Physics2D.OverlapPoint(point)`
+are Box2D-Packed's (`engine_box2d_raycast` / `_overlap_circle` /
+`_overlap_point`, the plan's `physics2d_queries`), and may run before the
+first step (a script's `Start`: the glue builds the world first). A
+`RaycastHit2D` is the engine's struct -- `collider` (an index, -1 for
+none), `point`, `normal`, `distance`, `fraction` -- `if (hit)` is a hit,
+and `hit.collider`, `hit.transform` and a `Collider2D` an overlap returns
+read their GameObject as a handler's parameter does (`.gameObject`,
+`.name`, `.tag`, `CompareTag`, `GetComponent<T>()`); `transform.position`
+as the origin is taken by its x and y. Triggers are hit, as Unity's
+`queriesHitTriggers` default has it; layer masks are not read (every
+collider takes part), and a ray ignores a collider it starts inside (Unity's
+`queriesStartInColliders` default would hit it). `RaycastAll`,
+`OverlapCircleAll` and the other `*All` / `*NonAlloc` forms are not
+lowered.
 
 ## Fast feature check: `tools/unity_pack_features.py`
 
