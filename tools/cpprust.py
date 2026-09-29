@@ -6590,6 +6590,35 @@ def _unconditional_at(look, i):
     return k < 0 or look[k] in ";{}"
 
 
+class _TextMatch(object):
+    """A match found on a blanked copy, answering with the text's groups.
+
+    The copy has the same length, so every offset is the text's; `group`
+    slices the text there, so a literal the copy blanked comes back as
+    written."""
+
+    def __init__(self, m, text):
+        self._m = m
+        self._text = text
+
+    @classmethod
+    def of(cls, m, text):
+        return cls(m, text) if m is not None else None
+
+    def group(self, i=0):
+        a, b = self._m.span(i)
+        return None if a < 0 else self._text[a:b]
+
+    def start(self, i=0):
+        return self._m.start(i)
+
+    def end(self, i=0):
+        return self._m.end(i)
+
+    def span(self, i=0):
+        return self._m.span(i)
+
+
 class _Frame(object):
     __slots__ = ("live", "kind", "ret", "vals", "ptrs", "ptrvals", "ret_mark")
 
@@ -7215,6 +7244,10 @@ def _rewrite_scopes_inner(text, type_info, _pos):
     # word "struct" reads as a struct body and quietly suppresses every
     # constructor after it.
     look = _strip_comments(text)
+    # With string and character literals blanked too, for the patterns that
+    # run to a `;`: `T x = f("a;b");` ended its initialiser inside the
+    # literal. Same length, so a match here addresses `text`.
+    look_lit = cpp_auto._blank_like(text)
 
     def opens_aggregate(at):
         """Does the `{` at `at` open a struct/union/enum body?
@@ -7586,7 +7619,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             i = m.end()
             continue
 
-        m = init_re.match(look, i)
+        m = _TextMatch.of(init_re.match(look_lit, i), text)
         if m and not aggs and \
                 _prev_word(look, i) not in ("struct", "typedef", "union"):
             # `T b = a;` -- copy initialization. Without this the object was
@@ -7790,7 +7823,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                 i = m.end()
                 continue
 
-        m = assign_re.match(look, i)
+        m = _TextMatch.of(assign_re.match(look_lit, i), text)
         if m and not aggs:
             lhs = m.group(1)
             ctype = None

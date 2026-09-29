@@ -12,6 +12,8 @@ them, and compares what they print with what C# prints. About a minute.
                                                     # godot or box2d
     python3 tools/unity_pack_features.py -v         # show every line
     python3 tools/unity_pack_features.py --keep     # keep the temp dirs
+    python3 tools/unity_pack_features.py --asan     # players under ASan +
+                                                    # UBSan (not box2d)
 
 Each check is a C# method of its own, called from `Start`, printing lines
 that begin with its name. A method the packer could not lower is emitted
@@ -72,6 +74,45 @@ UNITY_CHECKS = [
      'Debug.Log("value_first:" + s);\n'
      'Debug.Log("value_first:" + (hp * 2 + "!"));\n',
      "", ["value_first:7 hp", "value_first:14!"]),
+
+    ("value_chain",
+     'int x = 3;\n'
+     'int y = 4;\n'
+     'string s = x + y + "z";\n'
+     'Debug.Log("value_chain:" + s);\n'
+     'Debug.Log("value_chain:" + x + y);\n',
+     "", ["value_chain:7z", "value_chain:34"]),
+
+    ("string_null",
+     'string s = null;\n'
+     'if (s == null) Debug.Log("string_null:null");\n'
+     's = "x";\n'
+     'if (s != null) Debug.Log("string_null:" + s);\n'
+     'if (tag.label != null) Debug.Log("string_null:field");\n',
+     "", ["string_null:null", "string_null:x", "string_null:field"]),
+
+    ("format",
+     'float speed = 2.5f;\n'
+     'Debug.Log($"format:hp {hp} speed {speed:F2} id {hp:D3} {{x}}");\n'
+     'Debug.Log(string.Format("format:{0}/{1}", hp, "max"));\n'
+     'Debug.Log("format:" + speed.ToString("F1") + "," + hp.ToString());\n',
+     "", ["format:hp 7 speed 2.50 id 007 {x}", "format:7/max",
+          "format:2.5,7"]),
+
+    ("split_join",
+     'string csv = "a,b,,c";\n'
+     'string[] parts = csv.Split(\',\');\n'
+     'Debug.Log("split_join:" + parts.Length + "," + parts[1] + "," + parts[3]);\n'
+     'parts[0] = parts[0].ToUpper();\n'
+     'Debug.Log("split_join:" + string.Join("|", parts));\n'
+     'foreach (string w in "x y z".Split(\' \')) Debug.Log("split_join:" + w);\n'
+     'string[] two = "k=v;x=y".Split(\'=\', \';\');\n'
+     'Debug.Log("split_join:" + two.Length + two[3]);\n'
+     'string[] sep = "a::b".Split("::");\n'
+     'foreach (string q in sep) { Debug.Log("split_join:" + q); }\n',
+     "", ["split_join:4,b,c", "split_join:A|b||c", "split_join:x",
+          "split_join:y", "split_join:z", "split_join:4y", "split_join:a",
+          "split_join:b"]),
 
     ("self_assign",
      'string a = "x";\n'
@@ -161,6 +202,51 @@ UNITY_CHECKS = [
      'Debug.Log("member_on_field:" + tag.label.ToUpper() + "," + tag.label.Length);\n',
      "", ["member_on_field:ALPHA,5"]),
 ]
+
+#: A spawned class with a List field: the list tables must be as long as the
+#: instance array (scene count + spawn budget), not the scene count. The
+#: list is private, so a clone's starts empty (Unity copies only serialized
+#: fields); each instance fills it once and prints the same line. In
+#: Update: a spawned object does not get Start yet.
+UNITY_SHOT_SCRIPT = (
+    "using UnityEngine;\n"
+    "using System.Collections.Generic;\n"
+    "public class MaxInstancesAttribute : System.Attribute {\n"
+    "    public MaxInstancesAttribute(int n) {}\n"
+    "}\n"
+    "[MaxInstances(4)]\n"
+    "public class Shot : MonoBehaviour {\n"
+    "    public static int made;\n"
+    "    private List<int> marks = new List<int>();\n"
+    "    void Update() {\n"
+    "        if (marks.Count == 0) {\n"
+    "            for (int k = 0; k < 40; k++) marks.Add(k);\n"
+    "            Debug.Log(\"list_cap:\" + marks.Count + \",\" + marks[39]);\n"
+    "        }\n"
+    "        if (made < 3) { made = made + 1; Instantiate(this); }\n"
+    "    }\n"
+    "}\n")
+UNITY_SHOT_EXPECT = ["list_cap:40,39"] * 4
+
+#: A spawned object gets Awake at once and Start before its first Update,
+#: each exactly once, like an authored one. One authored Spawner makes three
+#: clones; every instance reports its own Awake/Start/first Update order.
+UNITY_LIFE_SCRIPT = (
+    "using UnityEngine;\n"
+    "[MaxInstances(4)]\n"
+    "public class Life : MonoBehaviour {\n"
+    "    public static int made;\n"
+    "    private int step;\n"
+    "    private int updates;\n"
+    "    void Awake() { step = step * 10 + 1; }\n"
+    "    void Start() { step = step * 10 + 2; }\n"
+    "    void Update() {\n"
+    "        updates = updates + 1;\n"
+    "        if (updates == 1) Debug.Log(\"life:\" + (step * 10 + 3));\n"
+    "        if (made < 3) { made = made + 1; Instantiate(this); }\n"
+    "    }\n"
+    "}\n")
+UNITY_LIFE_EXPECT = ["life:123"] * 4
 
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (
@@ -263,6 +349,12 @@ def unity_project(root):
     _write(os.path.join(scripts, "Player.cs"), "".join(player))
     _write(os.path.join(scripts, "Player.cs.meta"),
            "guid: feat0000000000000000000000000001\n")
+    _write(os.path.join(scripts, "Shot.cs"), UNITY_SHOT_SCRIPT)
+    _write(os.path.join(scripts, "Shot.cs.meta"),
+           "guid: feat0000000000000000000000000004\n")
+    _write(os.path.join(scripts, "Life.cs"), UNITY_LIFE_SCRIPT)
+    _write(os.path.join(scripts, "Life.cs.meta"),
+           "guid: feat0000000000000000000000000005\n")
     _write(os.path.join(scripts, "Tag.cs"), UNITY_TAG_SCRIPT)
     _write(os.path.join(scripts, "Tag.cs.meta"),
            "guid: feat0000000000000000000000000002\n")
@@ -271,6 +363,10 @@ def unity_project(root):
              _go(1, "Player", [3]),
              _mb(3, 1, "feat0000000000000000000000000001",
                  "  hp: 7\n  tag: {fileID: %d}\n" % (tags[0][1] + 2))]
+    scene.append(_go(70, "Life", [72]))
+    scene.append(_mb(72, 70, "feat0000000000000000000000000005"))
+    scene.append(_go(60, "Shot", [62]))
+    scene.append(_mb(62, 60, "feat0000000000000000000000000004"))
     for label, fid in tags:
         scene.append(_go(fid, "Tag", [fid + 2]))
         scene.append(_mb(fid + 2, fid, "feat0000000000000000000000000002",
@@ -279,7 +375,7 @@ def unity_project(root):
     expect = []
     for _n, _b, _m, e in UNITY_CHECKS:
         expect += e
-    return expect + UNITY_TAG_EXPECT
+    return expect + UNITY_TAG_EXPECT + UNITY_SHOT_EXPECT + UNITY_LIFE_EXPECT
 
 
 def godot_project(root):
@@ -344,7 +440,20 @@ def box2d_project(root):
 
 # --------------------------------------------------------------------------
 
-def run_project(kind, make, tmp, verbose):
+def _asan_player(out):
+    """The same player, rebuilt from its C with ASan and UBSan."""
+    exe = os.path.join(out, "asan_player")
+    srcs = [os.path.join(out, n) for n in ("engine.c", "data.c", "main.c")]
+    r = subprocess.run(["gcc", "-std=gnu11", "-g", "-w",
+                        "-fsanitize=address,undefined",
+                        "-fno-sanitize-recover=undefined"] + srcs
+                       + ["-o", exe, "-lm"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise unity_pack.PackError("asan build failed: %s" % r.stderr[:400])
+    return exe
+
+
+def run_project(kind, make, tmp, verbose, asan=False):
     """Pack, build and run one project; returns (ok, report lines)."""
     root = os.path.join(tmp, "feat_" + kind)
     out = os.path.join(tmp, kind + "-out")
@@ -356,6 +465,8 @@ def run_project(kind, make, tmp, verbose):
             plan = unity_pack.pack(root, out, force=True)
             exe = unity_pack.build_player_executable(
                 out, plan.get("product_name") or "Player")
+            if asan:
+                exe = _asan_player(out)
     except unity_pack.PackError as e:
         return False, ["pack failed: %s" % e.message.strip()]
     warnings = [l for l in err.getvalue().splitlines()
@@ -369,6 +480,9 @@ def run_project(kind, make, tmp, verbose):
     if run.returncode != 0:
         report.append("player exited %d: %s" % (run.returncode,
                                                 run.stderr.strip()[:300]))
+    if "ERROR: AddressSanitizer" in run.stderr or "runtime error" in run.stderr:
+        ok = False
+        report.append("sanitizer: %s" % run.stderr.strip()[:600])
     prefixes = sorted({e.split(":", 1)[0] for e in expect})
     for pre in prefixes:
         want = [e for e in expect if e.split(":", 1)[0] == pre]
@@ -401,6 +515,7 @@ def _short(s, n=70):
 def main(argv):
     verbose = "-v" in argv
     keep = "--keep" in argv
+    asan = "--asan" in argv
     only = [a for a in argv if not a.startswith("-")]
     if unity_pack.find_coost_root() is None:
         sys.stderr.write("no coost checkout (COOST_ROOT, or ../coost): the "
@@ -419,7 +534,8 @@ def main(argv):
             print("box2d: skipped (no Box2D-Packed checkout: "
                   "BOX2D_PACKED_ROOT, or ../box2d)")
             continue
-        ok, report = run_project(kind, make, tmp, verbose)
+        ok, report = run_project(kind, make, tmp, verbose,
+                                 asan=asan and kind != "box2d")
         all_ok = all_ok and ok
         print("\n".join(report))
     if keep:

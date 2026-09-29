@@ -763,26 +763,50 @@ def _string_led_by_value(text, model, names, int_idents):
         k = start - 1
         while k >= 0 and scan[k] in " \t\r\n":
             k -= 1
-        # `*`, `/` and `%` bind tighter than `+`: `hp * 2 + "!"` is
-        # `(hp * 2) + "!"`, so the operand is the whole product.
-        while k >= 0 and scan[k] in "*/%":
-            k -= 1
-            while k >= 0 and scan[k] in " \t\r\n":
-                k -= 1
-            if k < 0:
+        start, k = _product_start(scan, start)
+        # `x + y + "z"` is `(x + y) + "z"` in C#: the values before the
+        # first string are added, then the sum is concatenated. So the
+        # operand runs back over an additive chain -- as long as nothing in
+        # it is a string, which would make the whole chain a concatenation
+        # the fold below already reads left to right.
+        parts = [text[start:j + 1]]
+        chain_start = start
+        while k >= 1 and scan[k] in "+-" and scan[k - 1] not in "+-":
+            e = k - 1
+            while e >= 0 and scan[e] in " \t\r\n":
+                e -= 1
+            if e < 0:
                 break
-            prev = _operand_start(scan, k)
-            if prev is None:
+            ps = _operand_start(scan, e)
+            if ps is None:
                 break
-            start = prev
-            k = start - 1
-            while k >= 0 and scan[k] in " \t\r\n":
-                k -= 1
+            ps, pk = _product_start(scan, ps)
+            prev = text[ps:e + 1]
+            if scalar_kind(prev, model, string_idents=names,
+                           int_idents=int_idents) == "s" or '"' in prev:
+                chain_start = None
+                break
+            parts.insert(0, prev)
+            chain_start, k = ps, pk
+        if chain_start is None:
+            continue
+        start = chain_start
         if not (k < 0 or scan[k] in "(,=;{?:" or scan[:k + 1].endswith("return")):
             continue
         operand = text[start:j + 1]
-        kind = scalar_kind(operand, model, string_idents=names,
-                           int_idents=int_idents)
+        if len(parts) > 1:
+            kinds = [scalar_kind(x, model, string_idents=names,
+                                 int_idents=int_idents) for x in parts]
+            if "s" in kinds:
+                continue
+            kind = "i" if all(kd == "i" or _int_expr(x, int_idents)
+                              for kd, x in zip(kinds, parts)) else "f"
+            operand = "(%s)" % operand
+        else:
+            kind = scalar_kind(operand, model, string_idents=names,
+                               int_idents=int_idents)
+            if kind == "f" and _int_expr(operand, int_idents):
+                kind = "i"
         if kind == "s":
             continue                    # already a string: the fold's case
         out.append(text[last:start])
@@ -790,6 +814,45 @@ def _string_led_by_value(text, model, names, int_idents):
         last = j + 1
     out.append(text[last:])
     return "".join(out)
+
+
+def _int_expr(e, int_idents):
+    """An arithmetic expression over known integers and integer literals
+    only (`a * 2 + b`): its value is an integer."""
+    toks = re.findall(r"[A-Za-z_]\w*|\d+(?:\.\d*)?[fFdDmM]?|\S", e)
+    ints = frozenset(int_idents or ())
+    for t in toks:
+        if t in "+-*/%() ":
+            continue
+        if re.match(r"^\d+$", t):
+            continue
+        if re.match(r"^[A-Za-z_]", t) and t in ints:
+            continue
+        return False
+    return bool(toks)
+
+
+def _product_start(scan, start):
+    """Extend an operand starting at `start` back over `*`, `/` and `%`,
+    which bind tighter than `+` (`hp * 2 + "!"` is `(hp * 2) + "!"`).
+    Returns (start, index of the first non-space character before it)."""
+    k = start - 1
+    while k >= 0 and scan[k] in " \t\r\n":
+        k -= 1
+    while k >= 0 and scan[k] in "*/%":
+        k -= 1
+        while k >= 0 and scan[k] in " \t\r\n":
+            k -= 1
+        if k < 0:
+            break
+        prev = _operand_start(scan, k)
+        if prev is None:
+            break
+        start = prev
+        k = start - 1
+        while k >= 0 and scan[k] in " \t\r\n":
+            k -= 1
+    return start, k
 
 
 def _word_at(scan, k):
