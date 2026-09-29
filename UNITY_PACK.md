@@ -669,12 +669,41 @@ like any other:
   called from one made to call both, so its early `return` does not skip
   them -- `_co_tick()` resumes each coroutine whose wait is over.
 
+* `yield return StartCoroutine(Child(..))` -- or `yield return
+  Child(..)` -- of another coroutine of the same class starts it (to its
+  first `yield`) and waits, a field saying which, until it has ended. The
+  tick runs the coroutines in declaration order, once per coroutine, so a
+  parent resumes in the frame its child ends, however they are ordered.
+
 Each object has its own fields, so each runs its own coroutines; starting
 one that is already running restarts it (Unity would run a second). A
 coroutine keeps running after its object is disabled. Left for the stub
-check: `yield return StartCoroutine(..)`, `WaitUntil` / `WaitWhile` (a
-lambda), a `yield` inside a `foreach`, a `var` whose type the rewrite
-cannot see, and a `Coroutine` kept in a variable.
+check: another object's coroutine, `WaitUntil` / `WaitWhile` (a lambda), a
+`yield` inside a `foreach`, a `var` whose type the rewrite cannot see, and
+a `Coroutine` kept in a variable.
+
+## `byte[]`, `Encoding`, Base64, MD5 / SHA-256
+
+In a file that builds, converts or hashes bytes -- `Encoding`, `Convert`'s
+Base64, `MD5` / `SHA256`, `BitConverter`, or a sized `new byte[n]` -- a
+`byte[]` is a `List<byte>` (`tools/unity_pack_collections.py`), and the
+byte APIs are runtime helpers over it:
+
+| C# | |
+|----|--|
+| `new byte[n]`, `new byte[] { .. }`, `b.Length`, `b[i]`, `foreach (byte x in b)` | the list's (a `byte` local is an `int`, as the list holds it) |
+| `Encoding.UTF8` / `ASCII.GetBytes(s)`, `.GetString(b)` | UTF-8 bytes and back |
+| `Convert.ToBase64String(b)`, `Convert.FromBase64String(s)` | coost's `base64_encode` / `_decode`; bad input is .NET's `FormatException` |
+| `MD5.Create()` (a local, or in a `using`) then `.ComputeHash(b)`; `MD5.Create().ComputeHash(b)`; `MD5.HashData(b)`; `SHA256` alike | coost's `md5digest_to` / `sha256digest_to` |
+| `BitConverter.ToString(b)` | `"AB-CD-.."` |
+| `b.ToString("x2")`, `"X2"`, `{0:x2}` | hex |
+| `File.ReadAllBytes`, `File.WriteAllBytes` | over the list, in such a file |
+
+coost's hash and Base64 sources are spliced into the engine only when it
+calls them. A byte helper's argument that is itself a byte helper's result
+is hoisted into a temporary first (a reference parameter needs an
+address). A file whose bytes only go to and from `File.ReadAllBytes` /
+`WriteAllBytes` keeps the packer's `ByteArray` view, as before.
 
 ## `GetType`, `typeof`, `is`, `nameof`
 
