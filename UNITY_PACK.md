@@ -102,7 +102,30 @@ script; the packer reads the name and ignores the class). With it:
   in all);
 * a scene that already places more than N is an error at the attribute;
 * the spare slots are zeros C fills in, so `data.c` does not list 20000
-  empty rows.
+  empty rows;
+* the tables beside the instance array -- an instance `List`, `T[]`,
+  `Dictionary` or `string` field -- are as long as it (they were the
+  scene's count, and a clone wrote past the end), and `Instantiate` gives
+  the clone's row what Unity does: a serialized field (public, or
+  `[SerializeField]`) copied from the original, any other what its
+  initializer makes it, and a `Dictionary`, which Unity never serializes,
+  empty.
+
+**Awake and Start, per instance.** Every instance, authored or spawned,
+gets `Awake` and `Start` once, in Unity's order: a life byte per row
+records each. `Instantiate` calls the clone's `Awake` before it returns;
+`Start` runs at the next tick, before that object's first `Update` -- an
+`Update` loop skips a row until it has started. A destroyed object gets
+neither. They used to run once per class at the first tick, for the
+instances there then, so a spawned object never started.
+
+**What a clone keeps.** `Instantiate` copies the instance struct, and then
+puts back every member Unity does not serialize -- a private field without
+`[SerializeField]` -- to what its initializer makes it; a serialized one
+keeps the original's value. The struct copy used to hand a clone the
+original's private state, a counter or a flag, so it carried on as if it
+had already run. `TestSpawnLifecycle` and the fast check's `life` and
+`list_cap` cases run both.
 
 `TestMaxInstances` runs a bullet that clones itself every frame (held at
 N) and one that fires and is destroyed (firing for all 60 frames). A
@@ -312,9 +335,11 @@ variable (`s + "x"` was pointer arithmetic), and an integer operand is
 formatted as one: an `int` field, local or parameter, or a packed integer
 field's accessor (`Player_get_hp(i)`), where it used to print through `%g`
 (`1000000` as `1e+06`). The same typing picks `Debug_Log_i`. A
-concatenation may also start from a value (`hp + " hp"`), when that value
-stands alone -- after `(`, `,`, `=` and the like; `x + y + "z"` adds `x + y`
-first in C#, and is not lowered as a concatenation yet.
+concatenation may also start from a value (`hp + " hp"`, `hp * 2 + "!"`),
+when that value stands alone -- after `(`, `,`, `=` and the like. C#
+evaluates left to right, so `x + y + "z"` with integers adds first: it is
+`("" + (x + y)) + "z"`, and `"a" + x + y` is `"a34"`, a concatenation
+throughout. An all-integer expression is formatted as an integer.
 
 A declaration that cannot be split -- in a `for` head, or several
 declarators in one statement -- keeps its marker type (`_cs_string`), and the
@@ -358,8 +383,35 @@ They are ordinal -- .NET's defaults for `ToUpper`, `StartsWith` and
 `CompareTo` are culture-sensitive, which for ASCII is the same -- and an
 argument .NET rejects (`Substring` past the end, an empty `Replace`)
 aborts with the exception's name, as an unhandled one ends the process.
-Not yet: `Split`, `string.Join`, `string.Format` and `$"..."`, which need
-`string[]` or format parsing, and `s == null` on a string.
+
+**Formatting.** `$"..."`, `string.Format("..", ..)` and a number's
+`ToString` are read at pack time, so the format must be a literal:
+
+| C# | packed |
+|----|--------|
+| `$"hp {hp} of {max:F1}"` | `"" + "hp " + (hp) + " of " + _cs_fmt_F(max, 1)` |
+| `string.Format("{0}/{1}", a, b)` | `"" + (a) + "/" + (b)` |
+| `speed.ToString("F2")`, `id.ToString("D4")` | `_cs_fmt_F(speed, 2)`, `_cs_fmt_D(id, 4)` |
+| `hp.ToString()` (an int or float the method knows) | `"" + (hp)` |
+
+A hole with no spec is a concatenation operand, formatted as its type is;
+`{{` and `}}` are braces. Alignment (`{0,5}`), `N0`, `X` and a format that
+is not a literal are left as written, so the method is reported as a stub
+rather than printed wrongly.
+
+**`string[]`, `Split` and `Join`.** A `string[]` local is a
+`std::vector<fastring>`. `s.Split(',')`, `s.Split(", ")` and
+`s.Split(',', ';')` return one, keeping empty entries as .NET does;
+`parts.Length` is its size, `parts[i]` an owned string (read, written, a
+member receiver); `foreach (string p in parts)` -- or over
+`s.Split(' ')` directly -- is an index loop with `p` an owned local, on
+the same lines; `string.Join(sep, parts)` joins one. A `string[]` field,
+`new string[n]` and a `List<string>` are not packed yet.
+
+**Null.** A fastring has no null distinct from empty, so a string that is
+null reads as "": `s == null` is `string.IsNullOrEmpty(s)`, `s != null`
+its negation, and `s = null` assigns "". Right wherever a program does not
+tell null and "" apart.
 
 **Where coost comes from.** Only an engine that has a `string` local needs
 coost, and it is found the way Box2D-Packed is: `--coost PATH`, `$COOST_ROOT`,
@@ -388,6 +440,7 @@ and compares what they print with what C# prints. About half a minute.
 python3 tools/unity_pack_features.py              # unity, godot, box2d
 python3 tools/unity_pack_features.py godot -v     # one project, every line
 python3 tools/unity_pack_features.py --keep       # keep the packed projects
+python3 tools/unity_pack_features.py --asan       # players under ASan + UBSan
 ```
 
 Each check is a C# method of its own, called from `Start`, printing lines
