@@ -775,6 +775,40 @@ keeps the rotation. Scripts have, in Unity's degrees:
 With no turning body in the scene the API reads 0 and writes nothing.
 Godot mode keeps its bodies' rotation locked.
 
+**Joints.** `HingeJoint2D`, `DistanceJoint2D`, `SpringJoint2D`,
+`FixedJoint2D`, `SliderJoint2D` and `WheelJoint2D` are read from the scene
+(`plan["joints2d"]`, the `_Joint2D_*` tables in data.c) and built by
+Box2D-Packed as revolute, distance (rigid; a rope with `maxDistanceOnly`),
+distance with a spring, weld, prismatic and wheel joints, with the bodies
+-- a script's `Start` sees them. The joint links its own body to the
+connected one (a wheel joint: the chassis it is on to the wheel), or to a
+static ground body at the origin when there is none; Unity's anchor and
+connected anchor are the frames' points (`autoConfigureConnectedAnchor`,
+`autoConfigureDistance` and a slider's `autoConfigureAngle` as Unity
+configures them), and a hinge's limits and angle are relative to its pose
+at creation. A joint on a GameObject without a Rigidbody2D is skipped, with
+a warning (Unity would add the body).
+
+Scripts reach a joint through a field of a joint type (set by
+`GetComponent<XJoint2D>()`, or a serialized reference), a local, or
+`GetComponent<XJoint2D>()` itself; `== null` is no joint, or a broken one.
+Its members, pushed before each step when they change and read back after
+it:
+
+| C# | |
+|----|--|
+| `enabled`, `useMotor`, `useLimits`, `enableCollision`, `maxDistanceOnly`, `distance`, `frequency`, `dampingRatio`, `breakForce`, `breakTorque` | get, set, `op=` |
+| `motor` (`JointMotor2D`), `limits` (`JointAngleLimits2D` / `JointTranslationLimits2D`), `suspension` (`JointSuspension2D`) | get, set; `new JointMotor2D { motorSpeed = .., maxMotorTorque = .. }`; `motor.motorSpeed`, `limits.min` read directly |
+| `jointAngle`, `jointSpeed` (degrees), `jointTranslation`, `connectedBody`, `attachedRigidbody` | get |
+
+Hinge and wheel motor speeds and hinge limits are in degrees, as Unity's
+(Box2D clamps a hinge's limits to ±178°). **Breaking**: `breakForce` and
+`breakTorque` are Box2D's force and torque thresholds; a joint past one is
+destroyed (Unity's default `JointBreakAction2D.Destroy`) and its
+GameObject's scripts get `OnJointBreak2D(Joint2D)`. `RelativeJoint2D`,
+`FrictionJoint2D` and `TargetJoint2D`, `reactionForce`, and the other
+break actions are not read yet.
+
 **Queries.** `Physics2D.Raycast(origin, direction[, distance[,
 layerMask]])`, `RaycastAll`, `OverlapCircle(point, radius[, layerMask])`,
 `OverlapCircleAll`, `OverlapPoint(point[, layerMask])` and
