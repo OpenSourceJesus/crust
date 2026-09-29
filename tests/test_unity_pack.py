@@ -2214,7 +2214,8 @@ class TestRuntimeApis(unittest.TestCase):
         co = ("using UnityEngine;\nusing System.Collections;\n"
               "public class Co : MonoBehaviour {\n"
               "    int frames;\n"
-              "    void Start() { StartCoroutine(Count(2)); StartCoroutine(nameof(Stopped)); }\n"
+              "    void Start() { StartCoroutine(Count(2)); StartCoroutine(nameof(Stopped));"
+              " StartCoroutine(Chain()); }\n"
               "    void Update() { frames++; if (frames == 1) StopCoroutine(\"Stopped\"); }\n"
               "    IEnumerator Count(int n) {\n"
               "        for (int k = 0; k < n; k++) { Debug.Log(\"c\" + k + \"@\" + frames);"
@@ -2223,6 +2224,8 @@ class TestRuntimeApis(unittest.TestCase):
               "    }\n"
               "    IEnumerator Stopped() { Debug.Log(\"s0\"); yield return null;"
               " Debug.Log(\"s1\"); }\n"
+              "    IEnumerator Chain() { yield return StartCoroutine(Count(1));"
+              " Debug.Log(\"chained@\" + frames); }\n"
               "}\n")
         root = os.path.join(tempfile.mkdtemp(prefix="upack-co-"), "p")
         os.makedirs(os.path.join(root, "Assets", "Scripts"))
@@ -2251,8 +2254,23 @@ class TestRuntimeApis(unittest.TestCase):
         run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
                              text=True, cwd=d, timeout=60)
         lines = [l for l in run.stdout.splitlines()
-                 if re.match(r"^(c\d|done|s\d)", l)]
-        self.assertEqual(lines, ["c0@0", "s0", "c1@2", "done@3"])
+                 if re.match(r"^(c\d|done|s\d|chained)", l)]
+        # Chain restarts Count (one per object): its own run, then
+        # `chained` in the frame Count ends.
+        self.assertEqual(lines, ["c0@0", "s0", "c0@0", "done@2",
+                                 "chained@2"])
+
+    @needs_coost
+    def test_bytes_encoding_base64_md5(self):
+        # byte[] locals, Encoding, Convert Base64 and MD5 (coost's) stubbed.
+        out = self._run(
+            "        byte[] b = System.Text.Encoding.UTF8.GetBytes(\"abc\");\n"
+            "        string s = System.Convert.ToBase64String(b);\n"
+            "        byte[] h = System.Security.Cryptography.MD5.Create().ComputeHash(b);\n"
+            "        Debug.Log(s + \",\" + b.Length + \",\" + h.Length + \",\""
+            " + h[0].ToString(\"x2\") + System.Text.Encoding.UTF8.GetString("
+            "System.Convert.FromBase64String(s)));\n")
+        self.assertEqual(out[0], "YWJj,3,16,90abc")
 
     @needs_coost
     def test_get_type_typeof_nameof(self):
