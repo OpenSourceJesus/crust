@@ -1183,7 +1183,7 @@ def _apply_scrollbar_visuals(objects):
             val = 0.0
         if val > 1.0:
             val = 1.0
-        size = float(sb.get("size") or 0.2)
+        size = float(sb["size"] if sb.get("size") is not None else 0.2)
         if size < 0.0:
             size = 0.0
         if size > 1.0:
@@ -2129,7 +2129,9 @@ def _build_ui_sliders(plan, analyses=None):
                 "fill_go": int(fill_go),
                 "direction": direction,
                 "min": float(sl.get("min") or 0.0),
-                "max": float(sl.get("max") or 1.0),
+                # an authored 0 (a -1..0 slider) is kept: `or` read it as
+                # missing
+                "max": float(sl["max"] if sl.get("max") is not None else 1.0),
                 "value": float(sl.get("value") or 0.0),
                 "whole_numbers": int(sl.get("whole_numbers") or 0),
                 "calls": calls,
@@ -2257,7 +2259,7 @@ def _build_ui_scrollbars(plan, analyses=None):
                 "handle_go": int(handle_go),
                 "direction": int(sb.get("direction") or 0),
                 "value": float(sb.get("value") or 0.0),
-                "size": float(sb.get("size") or 0.2),
+                "size": float(sb["size"] if sb.get("size") is not None else 0.2),
                 "interactable": int(sb.get("interactable", 1)),
                 "mb_file_id": str(sb.get("mb_file_id") or ""),
                 "calls": calls,

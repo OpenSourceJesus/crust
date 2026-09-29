@@ -4464,7 +4464,8 @@ def _disallow_multiple_types(analyses):
 
 
 def _validate_addcomponent_types(types, plan, analyses=None):
-    known = set(plan.get("classes") or {}) | _ADDABLE_BUILTINS
+    # a joint kind (not Joint2D / AnchoredJoint2D: abstract, as in Unity)
+    known = set(plan.get("classes") or {}) | _ADDABLE_BUILTINS | set(_JOINT2D_KINDS)
     analyses = analyses or []
     for t in sorted(types):
         if t in _REFUSED_ADDCOMPONENT or t not in known:
@@ -8102,6 +8103,14 @@ def _emit_engine_anim_decls(
         p("extern const float _AnimKey_x[%d];" % nk)
         p("extern const float _AnimKey_y[%d];" % nk)
         p("extern const float _AnimKey_z[%d];" % nk)
+        for kind, tag in (("rot_keys", "Rot"), ("scale_keys", "Scale")):
+            if anim_plan.get(kind):
+                nr = len(anim_plan[kind])
+                for axis in "txyz":
+                    p("extern const float _Anim%sKey_%s[%d];" % (tag, axis, nr))
+                pre = "rkey" if tag == "Rot" else "skey"
+                p("extern const int _AnimClip_%s_begin[%d];" % (pre, nc))
+                p("extern const int _AnimClip_%s_count[%d];" % (pre, nc))
         anim_skeys = anim_plan.get("sprite_keys") or []
         anim_sbinds = anim_plan.get("sprite_binds") or []
         if anim_skeys or anim_sbinds:
@@ -8750,7 +8759,7 @@ def _emit_engine_file_streams(
 
 def _emit_engine_add_rigidbody2d(
         add_budget, class_ids, disallow_multi, go_names, go_rb2d, go_spawn_budget, p,
-        rb2d_cap, want_rb2d):
+        rb2d_cap, want_rb2d, plan=None):
     """_emit_engine_gameobject_tables: AddComponent<Rigidbody2D> into the packed Rigidbody2D tables."""
     if want_rb2d:
         vals = []
@@ -8804,6 +8813,7 @@ def _emit_engine_add_rigidbody2d(
             p("    return ex;")
             p("}")
             p("")
+            _emit_joint2d_addcomponent(p, plan or {}, class_ids, add_budget)
             p("static char _Rigidbody2D_tostring_buf[256];")
             p("static const char *Rigidbody2D_ToString(int ci) {")
             p("    int n, go;")
@@ -9228,7 +9238,7 @@ def _emit_engine_gameobject_tables(
             p("")
     _emit_engine_add_rigidbody2d(
             add_budget, class_ids, disallow_multi, go_names, go_rb2d, go_spawn_budget,
-            p, rb2d_cap, want_rb2d)
+            p, rb2d_cap, want_rb2d, plan)
     _emit_engine_add_rigidbody(
             add_budget, class_ids, disallow_multi, go_names, go_rb3d, go_spawn_budget,
             p, rb3d_cap, want_rb3d)
@@ -13807,6 +13817,16 @@ def _lower_joint2d_api(text, cl, plan, site):
         text = cs2cpp.code_sub(r"(?<![\w.])new\s+%s\s*\(\s*\)" % ty,
                                lambda m, maker=maker, fields=fields: "%s(%s)" % (
                                    maker, ", ".join(["0.f"] * len(fields))), text)
+    # AddComponent<XJoint2D>(): on this object, or a GameObject variable
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:this\s*\.\s*)?(?:gameObject\s*\.\s*)?AddComponent\s*<\s*"
+        r"(?:UnityEngine\s*\.\s*)?(%s)\s*>\s*\(\s*\)" % tys,
+        lambda m: "GameObject_AddComponent_%s(_engine_go_of_%s(i))" % (
+            m.group(1), idn), text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(\w+)\s*\.\s*AddComponent\s*<\s*(?:UnityEngine\s*\.\s*)?(%s)\s*>"
+        r"\s*\(\s*\)" % tys,
+        lambda m: "GameObject_AddComponent_%s(%s)" % (m.group(2), m.group(1)), text)
     # GetComponent<XJoint2D>() on this object, or on a GameObject expression
     text = cs2cpp.code_sub(
         r"(?<![\w.])(?:this\s*\.\s*)?(?:gameObject\s*\.\s*)?GetComponent\s*<\s*"
@@ -13847,10 +13867,16 @@ def _lower_joint2d_api(text, cl, plan, site):
              "jointAngle", "jointSpeed", "jointTranslation", "connectedBody",
              "attachedRigidbody", "maxForce", "maxTorque", "correctionScale",
              "angularOffset", "autoConfigureOffset", "autoConfigureTarget",
-             "breakAction", "reactionTorque")
+             "autoConfigureConnectedAnchor", "autoConfigureDistance",
+             "autoConfigureAngle", "breakAction", "reactionTorque")
     vec2 = {"target": ("targetX", "targetY"),
-            "linearOffset": ("linearOffsetX", "linearOffsetY")}
+            "linearOffset": ("linearOffsetX", "linearOffsetY"),
+            "connectedAnchor": ("connectedAnchorX", "connectedAnchorY"),
+            "anchor": ("anchorX", "anchorY")}
     for pat, rx in recvs.items():
+        text = cs2cpp.code_sub(pat + r"\s*\.\s*connectedBody\s*=\s*null\s*;",
+                               lambda m, rx=rx: "Joint2D_set_connectedBody(%s, -1);" % rx,
+                               text)
         # Vector2 members: target, linearOffset (set, read); reactionForce and
         # GetReactionForce(dt) / GetReactionTorque(dt) (read)
         for prop, (fx, fy) in vec2.items():
@@ -14016,6 +14042,14 @@ _JOINT2D_OUT_TABLES = ("out_angle", "out_speed", "out_translation",
                        "out_force_x", "out_force_y", "out_torque")
 
 
+def _joint2d_cap(plan):
+    """The joint tables' rows: the authored joints and AddComponent's spares
+    (also left in the plan for Box2D-Packed's glue)."""
+    cap = len(plan.get("joints2d") or []) + int(plan.get("joints2d_add") or 0)
+    plan["joints2d_cap"] = cap
+    return cap
+
+
 def _joint2d_float(j, name):
     v = {"anchor_x": j["anchor"][0], "anchor_y": j["anchor"][1],
          "canchor_x": j["canchor"][0], "canchor_y": j["canchor"][1],
@@ -14033,27 +14067,76 @@ def _joint2d_float(j, name):
 def _emit_joint2d_data(p, plan, class_ids):
     """data.c: the joint tables (mutable: scripts write the settings)."""
     js = plan.get("joints2d") or []
-    if not js:
+    n = _joint2d_cap(plan)
+    if not n:
         return
-    n = len(js)
-    p("/* 2D joints (Box2D-Packed) */")
-    p("int _Joint2D_count = %d;" % n)
+    # spares for AddComponent: unused (no body), until one is added
+    spare = dict(_parse_joint2d("HingeJoint2D", ""), rb_a=-1, rb_b=-1,
+                 enabled=0)
+
+    def rows(key, fmt):
+        return ", ".join(fmt(j, key) for j in js + [spare] * (n - len(js)))
+    p("/* 2D joints (Box2D-Packed); %d authored, the rest AddComponent's */"
+      % len(js))
+    p("int _Joint2D_count = %d;" % len(js))
     for name, key in _JOINT2D_INT_TABLES:
         p("int _Joint2D_%s[%d] = { %s };" % (
-            name, n, ", ".join(str(int(j[key])) for j in js)))
+            name, n, rows(key, lambda j, k: str(int(j[k])))))
     p("int _Joint2D_go[%d] = { %s };" % (n, ", ".join(
-        str(int(j["go_index"]) if j.get("go_index") is not None else -1)
-        for j in js)))
+        [str(int(j["go_index"]) if j.get("go_index") is not None else -1)
+         for j in js] + ["-1"] * (n - len(js)))))
     p("int _Joint2D_owner_class[%d] = { %s };" % (n, ", ".join(
-        str(class_ids.get(j["owner_class"], -1)) for j in js)))
+        [str(class_ids.get(j["owner_class"], -1)) for j in js]
+        + ["-1"] * (n - len(js)))))
     p("int _Joint2D_owner_inst[%d] = { %s };" % (n, ", ".join(
-        str(int(j["owner_inst"])) for j in js)))
+        [str(int(j["owner_inst"])) for j in js] + ["0"] * (n - len(js)))))
     p("int _Joint2D_broken[%d];" % n)
     for name in _JOINT2D_FLOAT_TABLES:
         p("float _Joint2D_%s[%d] = { %s };" % (
-            name, n, ", ".join(_joint2d_float(j, name) for j in js)))
+            name, n, rows(name, _joint2d_float)))
     for name in _JOINT2D_OUT_TABLES:
         p("float _Joint2D_%s[%d];" % (name, n))
+
+
+def _emit_joint2d_addcomponent(p, plan, class_ids, add_budget):
+    """GameObject_AddComponent_<XJoint2D>(go): the next spare joint, Unity's
+    defaults for that kind, on the GameObject's Rigidbody2D (added, as Unity
+    adds one, when it has none). Box2D-Packed builds it before the next step,
+    after the script has set its connected body and anchors."""
+    cap = _joint2d_cap(plan)
+    for ty, kind in sorted(_JOINT2D_KINDS.items()):
+        if not int(add_budget.get(ty) or 0):
+            continue
+        d = _parse_joint2d(ty, "")
+        p("static int GameObject_AddComponent_%s(int go) {" % ty)
+        p("    int j, rb, c;")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    if (_Joint2D_count >= %d) return -1;" % max(1, cap))
+        p("    rb = GameObject_GetComponent_Rigidbody2D(go);")
+        p("    if (rb < 0) rb = GameObject_AddComponent_Rigidbody2D(go);")
+        p("    if (rb < 0) return -1;")
+        p("    j = _Joint2D_count;")
+        p("    _Joint2D_count = _Joint2D_count + 1;")
+        p("    _Joint2D_rb_a[j] = rb;")
+        p("    _Joint2D_rb_b[j] = -1;")
+        p("    _Joint2D_go[j] = go;")
+        p("    _Joint2D_broken[j] = 0;")
+        for name, key in _JOINT2D_INT_TABLES:
+            if name in ("rb_a", "rb_b"):
+                continue
+            p("    _Joint2D_%s[j] = %d;" % (name, int(d[key])))
+        for name in _JOINT2D_FLOAT_TABLES:
+            p("    _Joint2D_%s[j] = %s;" % (name, _joint2d_float(d, name)))
+        p("    _Joint2D_owner_class[j] = -1;")
+        p("    _Joint2D_owner_inst[j] = 0;")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            p("    c = _engine_go_%s[go];" % _c_ident(cname))
+            p("    if (c >= 0) { _Joint2D_owner_class[j] = %d; _Joint2D_owner_inst[j] = c; }"
+              % cid)
+        p("    (void)c;")
+        p("    return j;")
+        p("}")
+        p("")
 
 
 def _emit_joint2d_api(p, plan):
@@ -14061,9 +14144,9 @@ def _emit_joint2d_api(p, plan):
     the scripts' `Joint2D_*` over the tables, GetComponent<XJoint2D>(), and
     `engine_joint2d_broken` for the glue (OnJointBreak2D)."""
     js = plan.get("joints2d") or []
-    if not js:
+    n = _joint2d_cap(plan)
+    if not n:
         return
-    n = len(js)
     p("/* 2D joints: the tables Box2D-Packed builds its joints from */")
     p("extern int _Joint2D_count;")
     for name, _key in _JOINT2D_INT_TABLES:
@@ -14108,6 +14191,9 @@ def _emit_joint2d_api(p, plan):
             ("angularOffset", "offset_angle", "float"),
             ("autoConfigureOffset", "auto_offset", "int"),
             ("autoConfigureTarget", "auto_target", "int"),
+            ("autoConfigureConnectedAnchor", "auto_anchor", "int"),
+            ("autoConfigureDistance", "auto_distance", "int"),
+            ("autoConfigureAngle", "auto_angle", "int"),
             ("breakAction", "break_action", "int"),
             ("targetX", "target_x", "float"), ("targetY", "target_y", "float"),
             ("linearOffsetX", "offset_x", "float"),
@@ -14129,6 +14215,19 @@ def _emit_joint2d_api(p, plan):
     p("static int Joint2D_get_connectedBody(int j) {")
     p("    return _j2d_ok(j) ? _Joint2D_rb_b[j] : -1;")
     p("}")
+    p("/* a new connected body, anchor or connected anchor rebuilds the joint */")
+    p("static void Joint2D_set_connectedBody(int j, int rb) {")
+    p("    if (_j2d_ok(j)) _Joint2D_rb_b[j] = rb;")
+    p("}")
+    for prop, table in (("anchorX", "anchor_x"), ("anchorY", "anchor_y"),
+                        ("connectedAnchorX", "canchor_x"),
+                        ("connectedAnchorY", "canchor_y")):
+        p("static float Joint2D_get_%s(int j) {" % prop)
+        p("    return _j2d_ok(j) ? _Joint2D_%s[j] : 0.f;" % table)
+        p("}")
+        p("static void Joint2D_set_%s(int j, float v) {" % prop)
+        p("    if (_j2d_ok(j)) _Joint2D_%s[j] = v;" % table)
+        p("}")
     p("static int Joint2D_get_attachedRigidbody(int j) {")
     p("    return _j2d_ok(j) ? _Joint2D_rb_a[j] : -1;")
     p("}")
@@ -14499,6 +14598,63 @@ def _emit_engine_physics_fixed(
         p("")
 
 
+def _emit_anim_rot_scale(anim_plan, class_ids, p, plan):
+    """engine_animation_tick: a clip's rotation (Euler degrees -> the owner's
+    quaternion, Unity's Z then X then Y, and its 2D draw matrix) and scale
+    (localScale x, y) curves, sampled as the position is."""
+    rot = set(plan.get("anim_rot_classes") or []) & set(
+        plan.get("live_rot_classes") or [])
+    scl = set(plan.get("anim_scale_classes") or []) & set(
+        plan.get("live_scale_classes") or [])
+    if anim_plan.get("rot_keys") and rot:
+        p("        if (_AnimClip_rkey_count[ci] > 0) {")
+        p("            int rb = _AnimClip_rkey_begin[ci], rc = _AnimClip_rkey_count[ci];")
+        p("            float d = 0.00872664626f; /* degrees to half radians */")
+        p("            float hx = _anim_sample(_AnimRotKey_t, _AnimRotKey_x, rb, rc, t) * d;")
+        p("            float hy = _anim_sample(_AnimRotKey_t, _AnimRotKey_y, rb, rc, t) * d;")
+        p("            float hz = _anim_sample(_AnimRotKey_t, _AnimRotKey_z, rb, rc, t) * d;")
+        p("            float cx = cosf(hx), sx = sinf(hx), cy = cosf(hy), sy = sinf(hy);")
+        p("            float cz = cosf(hz), sz = sinf(hz);")
+        p("            /* qy * qx * qz */")
+        p("            float ax = sx * cz, ay = -sx * sz, az = cx * sz, aw = cx * cz;")
+        p("            float qx = cy * ax + sy * az, qy = cy * ay + sy * aw;")
+        p("            float qz = cy * az - sy * ax, qw = cy * aw - sy * ay;")
+        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
+        p("            switch (_AnimPlayer_owner_class[i]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            if cname not in rot:
+                continue
+            idn = _c_ident(cname)
+            p("            case %d:" % cid)
+            p("                _%s_rot_x[oi] = qx; _%s_rot_y[oi] = qy;" % (idn, idn))
+            p("                _%s_rot_z[oi] = qz; _%s_rot_w[oi] = qw;" % (idn, idn))
+            p("                _%s_rot_m00[oi] = 1.f - 2.f * (qy * qy + qz * qz);" % idn)
+            p("                _%s_rot_m01[oi] = 2.f * (qx * qy - qz * qw);" % idn)
+            p("                _%s_rot_m10[oi] = 2.f * (qx * qy + qz * qw);" % idn)
+            p("                _%s_rot_m11[oi] = 1.f - 2.f * (qx * qx + qz * qz);" % idn)
+            p("                break;")
+        p("            default: break;")
+        p("            }")
+        p("        }")
+    if anim_plan.get("scale_keys") and scl:
+        p("        if (_AnimClip_skey_count[ci] > 0) {")
+        p("            int sb = _AnimClip_skey_begin[ci], sc = _AnimClip_skey_count[ci];")
+        p("            float lx = _anim_sample(_AnimScaleKey_t, _AnimScaleKey_x, sb, sc, t);")
+        p("            float ly = _anim_sample(_AnimScaleKey_t, _AnimScaleKey_y, sb, sc, t);")
+        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
+        p("            switch (_AnimPlayer_owner_class[i]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            if cname not in scl:
+                continue
+            idn = _c_ident(cname)
+            p("            case %d:" % cid)
+            p("                _%s_scale_x[oi] = lx; _%s_scale_y[oi] = ly;" % (idn, idn))
+            p("                break;")
+        p("            default: break;")
+        p("            }")
+        p("        }")
+
+
 def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_anim):
     """emit_engine: Animation / Animator sampling: root position and sprite curves."""
     if want_anim and anim_players:
@@ -14579,6 +14735,11 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
         p("            t = len;")
         p("            _AnimPlayer_time[i] = t;")
         p("            _AnimPlayer_playing[i] = 0;")
+        p("        } else if (t < 0.f) {")
+        p("            /* played backwards (a negative speed): stops at the start */")
+        p("            t = 0.f;")
+        p("            _AnimPlayer_time[i] = t;")
+        p("            _AnimPlayer_playing[i] = 0;")
         p("        }")
         p("        kb = _AnimClip_key_begin[ci];")
         p("        kc = _AnimClip_key_count[ci];")
@@ -14603,6 +14764,7 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
         p("            default: break;")
         p("            }")
         p("        }")
+        _emit_anim_rot_scale(anim_plan, class_ids, p, plan)
         if anim_skeys and anim_sbinds:
             mutable = set(plan.get("sprite_draw_mutable") or [])
             p("        {")
@@ -20821,6 +20983,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = cs2cpp.code_sub(
             r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\s*\.\s*z\b",
             "_cs_euler_z(_%s_rot_z[i], _%s_rot_w[i])" % (_idn, _idn), text)
+    if cl.get("name") in set(plan.get("live_scale_classes") or []):
+        # transform.localScale.x / .y of this object's live scale (an
+        # animated one, or a script's)
+        _sidn = _c_ident(cl["name"])
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*localScale\s*\.\s*([xy])\b"
+            r"(?!\s*[-+*/]?=[^=])",
+            lambda m: "_%s_scale_%s[i]" % (_sidn, m.group(1)), text)
     text = _lower_joint2d_api(text, cl, plan, site)
     text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
@@ -21667,6 +21837,19 @@ def emit_data(plan, used_apis=None):
         p("const float _AnimKey_z[%d] = { %s };" % (
             len(keys),
             ", ".join("%sf" % repr(float(k["z"])) for k in keys)))
+        for kind, tag, pre in (("rot_keys", "Rot", "rkey"),
+                               ("scale_keys", "Scale", "skey")):
+            ks = anim_plan.get(kind) or []
+            if not ks:
+                continue
+            for axis in "txyz":
+                p("const float _Anim%sKey_%s[%d] = { %s };" % (
+                    tag, axis, len(ks),
+                    ", ".join("%sf" % repr(float(k[axis])) for k in ks)))
+            p("const int _AnimClip_%s_begin[%d] = { %s };" % (
+                pre, nc, ", ".join(str(int(c[pre + "_begin"])) for c in anim_clips)))
+            p("const int _AnimClip_%s_count[%d] = { %s };" % (
+                pre, nc, ", ".join(str(int(c[pre + "_count"])) for c in anim_clips)))
         anim_skeys = anim_plan.get("sprite_keys") or []
         anim_sbinds = anim_plan.get("sprite_binds") or []
         if anim_skeys or anim_sbinds:
@@ -23497,6 +23680,16 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["player_prefs"] = _uses_player_prefs(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
+    # AddComponent<XJoint2D>(): the joint tables' spares, and the Rigidbody2D
+    # Unity adds with a joint when the GameObject has none.
+    _jadd = sum(int(v) for t, v in plan["addcomponent_budget"].items()
+                if t in _JOINT2D_KINDS)
+    # (the joint table is built later: the capacity is authored + these)
+    plan["joints2d_add"] = _jadd
+    if _jadd:
+        plan["physics2d_joints"] = True
+        plan["addcomponent_budget"]["Rigidbody2D"] = int(
+            plan["addcomponent_budget"].get("Rigidbody2D") or 0) + _jadd
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
     plan["new_budget"] = _new_budget(analyses, plan)
     # Each clone takes a GameObject too: a `[MaxInstances(N)]` class's share
@@ -23626,9 +23819,13 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
+    # a clip's rotation / scale curves need their owners' live tables
+    plan["live_rot_classes"] = sorted(set(plan.get("live_rot_classes") or [])
+                                      | set(plan.get("anim_rot_classes") or []))
     _resolve_transform_field_targets(plan)
     # Transform.TransformPoint / matrices need live localScale (seeded authored).
     live_scale = set(plan.get("live_scale_classes") or [])
+    live_scale |= set(plan.get("anim_scale_classes") or [])
     live_scale |= set(plan.get("transform_point_classes") or [])
     live_scale |= set(plan.get("transform_matrix_classes") or [])
     plan["live_scale_classes"] = sorted(live_scale)

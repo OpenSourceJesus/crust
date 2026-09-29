@@ -273,6 +273,10 @@ def _build_animation_tables(plan):
             "loop": int(clip.get("loop") or 0),
             "legacy": int(clip.get("legacy") or 0),
             "pos_keys": pos,
+            # rotation (Euler degrees, sampled in Euler space as Unity's Euler
+            # curves are) and scale: they were parsed, then dropped
+            "euler_keys": list(clip.get("euler_keys") or []),
+            "scale_keys": list(clip.get("scale_keys") or []),
             "sprite_curves": list(clip.get("sprite_curves") or []),
             "key_begin": 0,
             "key_count": len(pos),
@@ -298,7 +302,8 @@ def _build_animation_tables(plan):
                 "owner_obj": o,
                 "clip": ci,
                 "playing": int(p.get("playing") or 0),
-                "speed": float(p.get("speed") or 1.0),
+                # an authored 0 is a paused player, not the default
+                "speed": float(p["speed"] if p.get("speed") is not None else 1.0),
                 "loop": int(p.get("loop")
                             if p.get("loop") is not None
                             else clip_list[ci]["loop"]),
@@ -317,6 +322,19 @@ def _build_animation_tables(plan):
         for t, x, y, z in c["pos_keys"]:
             keys.append({"t": t, "x": x, "y": y, "z": z})
         c["key_count"] = len(c["pos_keys"])
+    rot_keys, scale_keys = [], []
+    for c in clip_list:
+        for field, table, name in (("euler_keys", rot_keys, "rkey"),
+                                   ("scale_keys", scale_keys, "skey")):
+            c[name + "_begin"] = len(table)
+            for t, x, y, z in c[field]:
+                table.append({"t": t, "x": x, "y": y, "z": z})
+            c[name + "_count"] = len(c[field])
+    # the owners they turn / scale keep live rotation / scale tables
+    plan["anim_rot_classes"] = sorted({pl["owner_class"] for pl in players
+                                       if clip_list[pl["clip"]]["euler_keys"]})
+    plan["anim_scale_classes"] = sorted({pl["owner_class"] for pl in players
+                                         if clip_list[pl["clip"]]["scale_keys"]})
 
     sprite_keys = []
     sprite_binds = []
@@ -379,6 +397,8 @@ def _build_animation_tables(plan):
     return {
         "clips": clip_list,
         "keys": keys,
+        "rot_keys": rot_keys,
+        "scale_keys": scale_keys,
         "players": players,
         "sprite_keys": sprite_keys,
         "sprite_binds": sprite_binds,

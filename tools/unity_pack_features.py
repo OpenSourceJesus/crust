@@ -587,6 +587,37 @@ UNITY_CO_EXPECT = ["co:count0@0", "co:late0", "co:outer0@0", "co:inner0@0",
                    "co:count1@2", "co:inner1@2", "co:count2@3", "co:outer1@3",
                    "co:inner0@3", "co:done@4", "co:outer2@4", "co:late1"]
 
+#: A legacy Animation clip that turns z 0 -> 360 and scales 1 -> 3 over a
+#: looping second: its Euler and scale curves were parsed, then dropped
+#: (only position was animated). A quarter of the way in, about 90 and 1.5.
+UNITY_SPIN_CLIP = (
+    "%YAML 1.1\n--- !u!74 &7400000\nAnimationClip:\n  m_Name: Spin\n  m_Legacy: 1\n"
+    "  m_EulerCurves:\n  - curve:\n      serializedVersion: 2\n      m_Curve:\n"
+    "      - serializedVersion: 3\n        time: 0\n        value: {x: 0, y: 0, z: 0}\n"
+    "      - serializedVersion: 3\n        time: 1\n        value: {x: 0, y: 0, z: 360}\n"
+    "    path: \n"
+    "  m_PositionCurves: []\n"
+    "  m_ScaleCurves:\n  - curve:\n      serializedVersion: 2\n      m_Curve:\n"
+    "      - serializedVersion: 3\n        time: 0\n        value: {x: 1, y: 1, z: 1}\n"
+    "      - serializedVersion: 3\n        time: 1\n        value: {x: 3, y: 3, z: 1}\n"
+    "    path: \n"
+    "  m_AnimationClipSettings:\n    m_StopTime: 1\n    m_LoopTime: 1\n")
+UNITY_SPIN_SCRIPT = (
+    "using UnityEngine;\n"
+    "public class SpinCheck : MonoBehaviour {\n"
+    "    int frames;\n"
+    "    void Update() {\n"
+    "        frames++;\n"
+    "        if (frames == 15) {\n"
+    "            float z = transform.eulerAngles.z;\n"
+    "            float s = transform.localScale.x;\n"
+    "            Debug.Log(\"anim:\" + (z > 70f && z < 110f ? \"turning\" : \"still\") + \",\""
+    " + (s > 1.3f && s < 1.7f ? \"growing\" : \"fixed\"));\n"
+    "        }\n"
+    "    }\n"
+    "}\n")
+UNITY_SPIN_EXPECT = ["anim:turning,growing"]
+
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (
     "using UnityEngine;\n"
@@ -652,6 +683,7 @@ BOX2D_EXPECT = ["b2d_joint:broke gone", "b2d_joint:hinge held,swung",
                 "b2d_joint2:broke disabled,Disable", "b2d_joint2:target holds,pull",
                 "b2d_joint2:friction stopped", "b2d_joint2:relative returns,50",
                 "b2d_joint2:target moved",
+                "b2d_joint3:added yes,found", "b2d_joint3:rope taut,swung",
                 "b2d_q:Ground,7,1,-2", "b2d_q:Ground,none",
                 "b2d_q:mask Ground,none,Ground", "b2d_q:all 3 Ball,Zone,Ground",
                 "b2d_q:circle 1 Ball",
@@ -844,6 +876,30 @@ BOX2D_JOINT_SCRIPTS = {
         " + \",\" + (f.breakAction == JointBreakAction2D.Disable ? \"Disable\" : \"?\"));\n"
         "    }\n"
         "}\n"),
+    "Rope": (
+        "using UnityEngine;\n"
+        "public class Rope : MonoBehaviour {\n"
+        "    DistanceJoint2D rope;\n"
+        "    int ticks;\n"
+        "    void Start() {\n"
+        "        rope = gameObject.AddComponent<DistanceJoint2D>();\n"
+        "        rope.autoConfigureConnectedAnchor = false;\n"
+        "        rope.connectedAnchor = new Vector2(0f, 10f);\n"
+        "        rope.autoConfigureDistance = false;\n"
+        "        rope.distance = 1.8f;\n"
+        "        Debug.Log(\"b2d_joint3:added \" + (rope != null ? \"yes\" : \"no\") + \",\""
+        " + (GetComponent<DistanceJoint2D>() == rope ? \"found\" : \"lost\"));\n"
+        "    }\n"
+        "    void FixedUpdate() {\n"
+        "        ticks++;\n"
+        "        if (ticks == 45) {\n"
+        "            float dx = transform.position.x;\n"
+        "            float dy = transform.position.y - 10f;\n"
+        "            Debug.Log(\"b2d_joint3:rope \" + (Mathf.Abs(Mathf.Sqrt(dx * dx + dy * dy) - 1.8f)"
+        " < 0.05f ? \"taut\" : \"free\") + \",\" + (transform.position.y < 8.5f ? \"swung\" : \"stuck\"));\n"
+        "        }\n"
+        "    }\n"
+        "}\n"),
     "Car": (
         "using UnityEngine;\n"
         "public class Car : MonoBehaviour {\n"
@@ -967,6 +1023,12 @@ def unity_project(root):
         _write(os.path.join(scripts, name + ".cs"), text)
         _write(os.path.join(scripts, name + ".cs.meta"),
                "guid: fea000000000000000000000000000%s\n" % guid)
+    _write(os.path.join(scripts, "SpinCheck.cs"), UNITY_SPIN_SCRIPT)
+    _write(os.path.join(scripts, "SpinCheck.cs.meta"),
+           "guid: fea00000000000000000000000000015\n")
+    _write(os.path.join(root, "Assets", "Anim", "Spin.anim"), UNITY_SPIN_CLIP)
+    _write(os.path.join(root, "Assets", "Anim", "Spin.anim.meta"),
+           "guid: fea00000000000000000000000000016\n")
     _write(os.path.join(scripts, "Co.cs"), UNITY_CO_SCRIPT)
     _write(os.path.join(scripts, "Co.cs.meta"),
            "guid: fea00000000000000000000000000011\n")
@@ -984,6 +1046,16 @@ def unity_project(root):
              _go(1, "Player", [3]),
              _mb(3, 1, "fea00000000000000000000000000001",
                  "  hp: 7\n  tag: {fileID: %d}\n" % (tags[0][1] + 2))]
+    scene.append(
+        "--- !u!1 &95\nGameObject:\n  m_Name: Spin\n  m_Component:\n"
+        "  - component: {fileID: 96}\n  - component: {fileID: 97}\n"
+        "  - component: {fileID: 98}\n"
+        "--- !u!4 &96\nTransform:\n  m_GameObject: {fileID: 95}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+        "--- !u!111 &97\nAnimation:\n  m_GameObject: {fileID: 95}\n  m_Enabled: 1\n"
+        "  m_Animation: {fileID: 7400000, guid: fea00000000000000000000000000016, type: 2}\n"
+        "  m_PlayAutomatically: 1\n  m_WrapMode: 2\n"
+        + _mb(98, 95, "fea00000000000000000000000000015"))
     scene.append(_go(90, "Co", [92]))
     scene.append(_mb(92, 90, "fea00000000000000000000000000011"))
     scene.append(_go(80, "Save", [82]))
@@ -1001,7 +1073,7 @@ def unity_project(root):
     for _n, _b, _m, e in UNITY_CHECKS:
         expect += e
     return (expect + UNITY_TAG_EXPECT + UNITY_SHOT_EXPECT + UNITY_LIFE_EXPECT
-            + UNITY_SAVE_EXPECT + UNITY_CO_EXPECT)
+            + UNITY_SAVE_EXPECT + UNITY_CO_EXPECT + UNITY_SPIN_EXPECT)
 
 
 def godot_project(root):
@@ -1162,6 +1234,18 @@ def box2d_project(root):
         "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 1\n"
         "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n"
         "  m_DampingRatio: 0\n  m_Frequency: 0\n", rb=False)
+    # a joint added by a script, on a body with no Rigidbody2D either
+    scene += (
+        "--- !u!1 &200\nGameObject:\n  m_Name: Hanger\n  m_Component:\n"
+        "  - component: {fileID: 201}\n  - component: {fileID: 202}\n"
+        "  - component: {fileID: 203}\n  - component: {fileID: 204}\n"
+        "--- !u!4 &201\nTransform:\n  m_GameObject: {fileID: 200}\n"
+        "  m_LocalPosition: {x: -1, y: 8.5, z: 0}\n"
+        "--- !u!50 &204\nRigidbody2D:\n  m_GameObject: {fileID: 200}\n"
+        "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+        "--- !u!58 &202\nCircleCollider2D:\n  m_GameObject: {fileID: 200}\n"
+        "  m_Enabled: 1\n  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.25\n"
+        + _mb(203, 200, guid["Rope"]))
     # the wheel first: the car's joint refers to its Rigidbody2D (&142)
     scene += _joint_body(140, "Wheel", (4, 7.5), None, "", gravity=0)
     scene += _joint_body(150, "Car", (4, 8), guid["Car"],
