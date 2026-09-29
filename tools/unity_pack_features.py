@@ -646,7 +646,53 @@ BOX2D_BALL = (
     "        if (enters == 1) Debug.Log(\"b2d_status:\" + status);\n"
     "    }\n"
     "}\n")
-BOX2D_EXPECT = ["b2d_status:falling", "b2d_status:hit-1"]
+BOX2D_EXPECT = ["b2d_status:falling", "b2d_rb:1,2,2,0,True",
+                "b2d_status:hit-1",
+                "b2d_trig:enter Ball Player", "b2d_trig:exit Ball",
+                "b2d_rb:up", "b2d_rb:moved 5,2"]
+
+#: Rigidbody2D's script API on another dynamic body: mass, gravityScale,
+#: drag, bodyType / isKinematic, AddForce (Force and Impulse), position and
+#: MovePosition. A Kick body floats (gravityScale 0) and is kicked upward.
+BOX2D_KICK = (
+    "using UnityEngine;\n"
+    "public class Kick : MonoBehaviour {\n"
+    "    Rigidbody2D rb;\n"
+    "    int ticks;\n"
+    "    void Start() {\n"
+    "        rb = GetComponent<Rigidbody2D>();\n"
+    "        rb.gravityScale = 0f;\n"
+    "        rb.mass = 2f;\n"
+    "        rb.drag = 0f;\n"
+    "        rb.isKinematic = true;\n"
+    "        bool kin = rb.isKinematic;\n"
+    "        rb.bodyType = RigidbodyType2D.Dynamic;\n"
+    "        Debug.Log(\"b2d_rb:\" + rb.position.x + \",\" + rb.position.y + \",\" + rb.mass"
+    " + \",\" + rb.gravityScale + \",\" + kin);\n"
+    "        rb.AddForce(new Vector2(0f, 4f), ForceMode2D.Impulse);\n"
+    "    }\n"
+    "    void FixedUpdate() {\n"
+    "        ticks++;\n"
+    "        if (ticks == 10 && rb.position.y > 2.2f) Debug.Log(\"b2d_rb:up\");\n"
+    "        if (ticks == 20) rb.MovePosition(new Vector2(5f, 2f));\n"
+    "        if (ticks == 21) Debug.Log(\"b2d_rb:moved \" + Mathf.RoundToInt(rb.position.x)"
+    " + \",\" + Mathf.RoundToInt(rb.position.y));\n"
+    "    }\n"
+    "}\n")
+
+#: A trigger zone the ball falls through on its way to the ground: static,
+#: `m_IsTrigger`, tagged "Finish"; the ball is tagged "Player".
+BOX2D_ZONE = (
+    "using UnityEngine;\n"
+    "public class Zone : MonoBehaviour {\n"
+    "    void OnTriggerEnter2D(Collider2D other) {\n"
+    "        if (other.CompareTag(\"Player\") && gameObject.CompareTag(\"Finish\"))\n"
+    "            Debug.Log(\"b2d_trig:enter \" + other.gameObject.name + \" \" + other.tag);\n"
+    "    }\n"
+    "    void OnTriggerExit2D(Collider2D other) {\n"
+    "        Debug.Log(\"b2d_trig:exit \" + other.name);\n"
+    "    }\n"
+    "}\n")
 
 
 # --------------------------------------------------------------------------
@@ -799,6 +845,36 @@ def box2d_project(root):
         "  m_Enabled: 1\n  m_IsTrigger: 0\n"
         "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
         + _mb(14, 10, "feat0000000000000000000000000003", "  enters: 0\n"))
+    _write(os.path.join(scripts, "Kick.cs"), BOX2D_KICK)
+    _write(os.path.join(scripts, "Kick.cs.meta"),
+           "guid: feat0000000000000000000000000013\n")
+    _write(os.path.join(scripts, "Zone.cs"), BOX2D_ZONE)
+    _write(os.path.join(scripts, "Zone.cs.meta"),
+           "guid: feat0000000000000000000000000012\n")
+    scene = scene.replace("  m_Name: Ball\n", "  m_Name: Ball\n  m_TagString: Player\n")
+    scene += (
+        "--- !u!1 &20\nGameObject:\n  m_Name: Zone\n  m_TagString: Finish\n"
+        "  m_Component:\n  - component: {fileID: 21}\n"
+        "  - component: {fileID: 22}\n  - component: {fileID: 23}\n"
+        "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        "--- !u!61 &22\nBoxCollider2D:\n  m_GameObject: {fileID: 20}\n"
+        "  m_Enabled: 1\n  m_IsTrigger: 1\n"
+        "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 4, y: 0.5}\n"
+        + _mb(23, 20, "feat0000000000000000000000000012")
+        + "--- !u!1 &30\nGameObject:\n  m_Name: Kick\n"
+        "  m_Component:\n  - component: {fileID: 31}\n"
+        "  - component: {fileID: 32}\n  - component: {fileID: 33}\n"
+        "  - component: {fileID: 34}\n"
+        "--- !u!4 &31\nTransform:\n  m_GameObject: {fileID: 30}\n"
+        "  m_LocalPosition: {x: 1, y: 2, z: 0}\n"
+        "--- !u!50 &32\nRigidbody2D:\n  m_GameObject: {fileID: 30}\n"
+        "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+        "  m_LinearDamping: 0\n"
+        "--- !u!58 &33\nCircleCollider2D:\n  m_GameObject: {fileID: 30}\n"
+        "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+        "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.25\n"
+        + _mb(34, 30, "feat0000000000000000000000000013"))
     _write(os.path.join(root, "Assets", "Scenes", "S.unity"), scene)
     return BOX2D_EXPECT
 

@@ -143,10 +143,16 @@ _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
 
 
 # MonoBehaviour 2D collision messages (Unity Physics2D).
+_TRIGGER2D_MSGS = ("OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D")
+
 _COLLISION2D_MSGS = (
     "OnCollisionEnter2D",
     "OnCollisionStay2D",
     "OnCollisionExit2D",
+    # OnTrigger*2D(Collider2D other) take the other collider the same way.
+    "OnTriggerEnter2D",
+    "OnTriggerStay2D",
+    "OnTriggerExit2D",
 )
 
 
@@ -155,7 +161,7 @@ def _collision2d_arg_name(args):
     if not args:
         return None
     m = re.match(
-        r"(?:UnityEngine\.)?Collision2D\s+(\w+)\s*$",
+        r"(?:UnityEngine\.)?(?:Collision2D|Collider2D)\s+(\w+)\s*$",
         args.strip())
     return m.group(1) if m else None
 

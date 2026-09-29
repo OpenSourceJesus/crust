@@ -3118,6 +3118,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "comp_ids": [str(k.get("file_id")) for k in kids
                              if k.get("file_id") is not None],
                 "active": active,
+                "tag": go.get("tag") or "Untagged",
                 "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
@@ -4184,6 +4185,17 @@ def _build_go_active(plan, go_names):
             act[gi] = 1 if int(o.get("active", 1)) else 0
     return act
 
+
+
+def _build_go_tags(plan, go_names):
+    """Authored ``m_TagString`` per go_names index ("Untagged" when none)."""
+    tags = ["Untagged"] * len(go_names or [])
+    for h in plan.get("scene_hierarchy") or []:
+        gi = h.get("go_index")
+        if gi is None or gi < 0 or gi >= len(tags):
+            continue
+        tags[gi] = h.get("tag") or "Untagged"
+    return tags
 
 
 def _build_go_scene(plan, go_names):
@@ -5734,6 +5746,9 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("transform.SetParent")
     if re.search(r"(?<![\w.])(?:this\s*\.\s*)?gameObject\s*\.\s*SetActive\s*\(",
                  scan):
+        apis.add("GameObject.SetActive")
+    # A collision / trigger handler reads the other's GameObject from them.
+    if re.search(r"\bOn(?:Trigger|Collision)(?:Enter|Stay|Exit)2D\s*\(", scan):
         apis.add("GameObject.SetActive")
     # Reading activeSelf / activeInHierarchy needs the same active tables.
     if re.search(r"\.\s*active(?:Self|InHierarchy)\b", scan):
@@ -8922,6 +8937,27 @@ def _emit_engine_gameobject_tables(
         p("};")
     else:
         p("static const char *_engine_go_name[1] = { \"\" };")
+    # GameObject.tag / CompareTag / name, on a GameObject index (a spawned
+    # one is its original's clone: Untagged here).
+    p("static const char *_engine_go_tag[%d] = {" % go_cap)
+    for t in (plan.get("go_tags") or [])[:len(go_names)]:
+        p("    %s," % _c_string(t))
+    for _pad in range(go_cap - min(len(go_names), len(plan.get("go_tags") or []))):
+        p("    \"Untagged\",")
+    p("};")
+    p("static const char *GameObject_name(int go) {")
+    p("    return go >= 0 && go < %d ? _engine_go_name[go] : \"\";" % go_cap)
+    p("}")
+    p("static const char *GameObject_tag(int go) {")
+    p("    return go >= 0 && go < %d ? _engine_go_tag[go] : \"Untagged\";"
+      % go_cap)
+    p("}")
+    p("static int GameObject_CompareTag(int go, const char *t) {")
+    p("    return strcmp(GameObject_tag(go), t ? t : \"\") == 0;")
+    p("}")
+    if plan.get("collider2d"):
+        # defined with the colliders, after the scripts that call it
+        p("static int _col2d_go(int ci);")
     # Unity catches script exceptions: log + unwind the current method.
     p("static jmp_buf _engine_script_jmp;")
     p("static int _engine_in_script = 0;")
@@ -13375,6 +13411,118 @@ def _emit_engine_colliders_2d(
             p("    }")
             p("}")
             p("")
+    if want_col2d and col2d_list and want_go_tables:
+        # A collider's GameObject, for a handler's `other.gameObject`.
+        p("static int _col2d_go(int ci) {")
+        p("    unsigned oi;")
+        p("    if (ci < 0 || ci >= _Collider2D_count) return -1;")
+        p("    oi = (unsigned)_Collider2D_owner_inst[ci];")
+        p("    switch (_Collider2D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            p("    case %d: return _engine_go_of_%s(oi);" % (cid, _c_ident(cname)))
+        p("    default: break;")
+        p("    }")
+        p("    (void)oi;")
+        p("    return -1;")
+        p("}")
+        p("")
+    if want_col2d and col2d_list and plan.get("physics2d_triggers"):
+        # OnTriggerEnter / Stay / Exit2D: Box2D-Packed reports each step's
+        # overlapping sensor pairs (engine_col2d_trigger); the messages come
+        # from comparing them with the step before, as collisions' do.
+        nc = max(1, len(col2d_list))
+        mp = max(1, nc * (nc - 1) // 2)
+        p("/* MonoBehaviour OnTriggerEnter/Stay/Exit2D after the step */")
+        p("static int _col2d_trig_a[%d];" % mp)
+        p("static int _col2d_trig_b[%d];" % mp)
+        p("static int _col2d_trig_n;")
+        p("static int _col2d_tprev_a[%d];" % mp)
+        p("static int _col2d_tprev_b[%d];" % mp)
+        p("static int _col2d_tprev_n;")
+        p("void engine_col2d_trigger(int a, int b) {")
+        p("    int lo, hi, i;")
+        p("    if (a < 0 || b < 0 || a == b) return;")
+        p("    lo = (a < b) ? a : b;")
+        p("    hi = (a < b) ? b : a;")
+        p("    for (i = 0; i < _col2d_trig_n; i = i + 1)")
+        p("        if (_col2d_trig_a[i] == lo && _col2d_trig_b[i] == hi) return;")
+        p("    if (_col2d_trig_n >= %d) return;" % mp)
+        p("    _col2d_trig_a[_col2d_trig_n] = lo;")
+        p("    _col2d_trig_b[_col2d_trig_n] = hi;")
+        p("    _col2d_trig_n = _col2d_trig_n + 1;")
+        p("}")
+        p("static int _col2d_tpair_in(int lo, int hi, const int *pa,")
+        p("    const int *pb, int n) {")
+        p("    int i;")
+        p("    for (i = 0; i < n; i = i + 1)")
+        p("        if (pa[i] == lo && pb[i] == hi) return 1;")
+        p("    return 0;")
+        p("}")
+        trig = {}
+        for cname, msgs in collision2d_handlers.items():
+            t = [m for m in ("OnTriggerEnter2D", "OnTriggerStay2D",
+                             "OnTriggerExit2D") if m in msgs]
+            if t:
+                trig[cname] = t
+        p("static void _col2d_send_trigger(int ci_self, int ci_other, int kind) {")
+        p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
+        p("    int oc = _Collider2D_owner_class[ci_self];")
+        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+        p("    switch (oc) {")
+        for cname in sorted(trig):
+            cid = class_ids.get(cname)
+            if cid is None:
+                continue
+            idn = _c_ident(cname)
+            p("    case %d:" % cid)
+            for kind_i, msg in enumerate(("OnTriggerEnter2D", "OnTriggerStay2D",
+                                          "OnTriggerExit2D")):
+                if msg not in trig[cname]:
+                    continue
+                p("        if (kind == %d) {" % kind_i)
+                if want_go_tables:
+                    p("            _engine_in_script = 1;")
+                    p("            if (setjmp(_engine_script_jmp) == 0)")
+                    p("                %s_%s(oi, ci_other);" % (idn, msg))
+                    p("            _engine_in_script = 0;")
+                else:
+                    p("            %s_%s(oi, ci_other);" % (idn, msg))
+                p("        }")
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    (void)oi;")
+        p("}")
+        p("static void engine_physics_trigger2d_messages(void) {")
+        p("    int i, lo, hi;")
+        p("    for (i = 0; i < _col2d_trig_n; i = i + 1) {")
+        p("        lo = _col2d_trig_a[i];")
+        p("        hi = _col2d_trig_b[i];")
+        p("        if (_col2d_tpair_in(lo, hi, _col2d_tprev_a, _col2d_tprev_b,")
+        p("                            _col2d_tprev_n)) {")
+        p("            _col2d_send_trigger(lo, hi, 1);")
+        p("            _col2d_send_trigger(hi, lo, 1);")
+        p("        } else {")
+        p("            _col2d_send_trigger(lo, hi, 0);")
+        p("            _col2d_send_trigger(hi, lo, 0);")
+        p("        }")
+        p("    }")
+        p("    for (i = 0; i < _col2d_tprev_n; i = i + 1) {")
+        p("        lo = _col2d_tprev_a[i];")
+        p("        hi = _col2d_tprev_b[i];")
+        p("        if (!_col2d_tpair_in(lo, hi, _col2d_trig_a, _col2d_trig_b,")
+        p("                             _col2d_trig_n)) {")
+        p("            _col2d_send_trigger(lo, hi, 2);")
+        p("            _col2d_send_trigger(hi, lo, 2);")
+        p("        }")
+        p("    }")
+        p("    _col2d_tprev_n = _col2d_trig_n;")
+        p("    for (i = 0; i < _col2d_trig_n; i = i + 1) {")
+        p("        _col2d_tprev_a[i] = _col2d_trig_a[i];")
+        p("        _col2d_tprev_b[i] = _col2d_trig_b[i];")
+        p("    }")
+        p("}")
+        p("")
     if plan.get("physics2d_contacts") and not (
             want_col2d and col2d_list and want_collision2d_msgs):
         p("/* No packed collision messages: no contact ever exists. */")
@@ -13553,6 +13701,131 @@ def _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d):
         p("")
 
 
+def _lower_rb2d_api(text, cl, plan, site):
+    """Rigidbody2D members on a Rigidbody2D field, local or
+    `GetComponent<Rigidbody2D>()`, as the engine's `Rigidbody2D_*`
+    (`_emit_rb2d_api`). Velocity keeps its own rewrite
+    (`_rewrite_rigidbody_assigns`).
+
+        rb.AddForce(F[, ForceMode2D.Impulse])   Rigidbody2D_AddForce(..)
+        rb.position, rb.position = V, MovePosition(V)   the owner's position
+        rb.mass / gravityScale / drag / linearDamping / bodyType / isKinematic
+                                                get, set, `op=`
+
+    MovePosition teleports (Unity moves a kinematic body through space).
+    """
+    if not plan.get("rigidbody2d") and not (plan.get("addcomponent_budget")
+                                            or {}).get("Rigidbody2D"):
+        return text
+    idn = _c_ident(cl["name"])
+    recvs = {}
+    for f in cl.get("fields") or []:
+        if f.get("ty") == "Rigidbody2D":
+            recvs[r"(?<![\w.])(?:this\s*\.\s*)?%s" % re.escape(f["name"])] = \
+                "(int)%s_get_%s(i)" % (idn, f["name"])
+    for m in re.finditer(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Rigidbody2D\s+(\w+)\s*[=;]",
+                         cs2cpp._blank(text)):
+        recvs[r"(?<![\w.])%s" % re.escape(m.group(1))] = m.group(1)
+    recvs[r"(?<![\w.])(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\s*\.\s*)?"
+          r"Rigidbody2D\s*>\s*\(\s*\)"] = \
+        "GameObject_GetComponent_Rigidbody2D(_engine_go_of_%s(i))" % idn
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?RigidbodyType2D\s*\.\s*"
+                           r"(Dynamic|Kinematic|Static)\b",
+                           lambda m: {"Dynamic": "0", "Kinematic": "1",
+                                      "Static": "2"}[m.group(1)], text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?ForceMode2D\s*\.\s*"
+                           r"(Force|Impulse)\b",
+                           lambda m: "0" if m.group(1) == "Force" else "1", text)
+    props = {"mass": "mass", "gravityScale": "gravityScale", "drag": "drag",
+             "linearDamping": "drag", "bodyType": "bodyType",
+             "isKinematic": "isKinematic"}
+    for pat, rx in recvs.items():
+        def force(m, rx=rx):
+            args = [a.strip() for a in cs2cpp.split_call_args(m.group(1))]
+            mode = args[1] if len(args) > 1 else "0"
+            return ("{ Vector2 _cs_f = (%s); Rigidbody2D_AddForce(%s, _cs_f.x, "
+                    "_cs_f.y, %s); }" % (args[0], rx, mode))
+        text = cs2cpp.code_sub(pat + r"\s*\.\s*AddForce\s*\(((?:[^;])*)\)\s*;",
+                               force, text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*(?:MovePosition\s*\(((?:[^;])*)\)|position\s*=(?!=)"
+            r"((?:[^;])*))\s*;",
+            lambda m, rx=rx: ("{ Vector2 _cs_p = (%s); Rigidbody2D_set_position("
+                              "%s, _cs_p.x, _cs_p.y); }"
+                              % ((m.group(1) or m.group(2)).strip(), rx)), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*position\b",
+            lambda m, rx=rx: "Vector2_make(Rigidbody2D_position_x(%s), "
+                             "Rigidbody2D_position_y(%s))" % (rx, rx), text)
+        for cs, name in props.items():
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\s*([-+*/])=\s*([^;]+);" % cs,
+                lambda m, rx=rx, n=name: "Rigidbody2D_set_%s(%s, Rigidbody2D_get_%s("
+                "%s) %s (%s));" % (n, rx, n, rx, m.group(1), m.group(2).strip()),
+                text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\s*=(?!=)\s*([^;]+);" % cs,
+                lambda m, rx=rx, n=name: "Rigidbody2D_set_%s(%s, %s);" % (
+                    n, rx, m.group(1).strip()), text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*%s\b" % cs,
+                lambda m, rx=rx, n=name: "Rigidbody2D_get_%s(%s)" % (n, rx), text)
+    return text
+
+
+def _emit_rb2d_api(p):
+    """Rigidbody2D's script API over the packed tables, which Box2D-Packed
+    reads before each step (velocity, the owner's position as a teleport,
+    gravity scale, damping; mass and body type when they change). An `rb`
+    of -1 -- no Rigidbody2D -- reads 0 and writes nothing. Floats in and
+    out: the scripts' Vector2 is made at the call."""
+    p("/* Rigidbody2D: AddForce, position, mass, gravityScale, drag, bodyType */")
+    p("void engine_rb2d_get_pos(int rb, float *x, float *y);")
+    p("void engine_rb2d_set_pos(int rb, float x, float y);")
+    p("static int _rb2d_ok(int rb) { return rb >= 0 && rb < _Rigidbody2D_count; }")
+    p("/* ForceMode2D: Force (0) is F dt / m, Impulse (1) F / m; a body that")
+    p("   is not dynamic takes no force, as in Unity. */")
+    p("static void Rigidbody2D_AddForce(int rb, float fx, float fy, int mode) {")
+    p("    float m, k;")
+    p("    if (!_rb2d_ok(rb) || _Rigidbody2D_body_type[rb] != 0) return;")
+    p("    m = _Rigidbody2D_mass[rb] > 1e-6f ? _Rigidbody2D_mass[rb] : 1.f;")
+    p("    k = mode == 1 ? 1.f / m")
+    p("        : (Time_fixedDeltaTime > 1e-8f ? Time_fixedDeltaTime : 0.02f) / m;")
+    p("    _Rigidbody2D_vel_x[rb] = _Rigidbody2D_vel_x[rb] + fx * k;")
+    p("    _Rigidbody2D_vel_y[rb] = _Rigidbody2D_vel_y[rb] + fy * k;")
+    p("}")
+    p("static float Rigidbody2D_position_x(int rb) {")
+    p("    float x = 0.f, y = 0.f;")
+    p("    if (_rb2d_ok(rb)) engine_rb2d_get_pos(rb, &x, &y);")
+    p("    return x;")
+    p("}")
+    p("static float Rigidbody2D_position_y(int rb) {")
+    p("    float x = 0.f, y = 0.f;")
+    p("    if (_rb2d_ok(rb)) engine_rb2d_get_pos(rb, &x, &y);")
+    p("    return y;")
+    p("}")
+    p("static void Rigidbody2D_set_position(int rb, float x, float y) {")
+    p("    if (_rb2d_ok(rb)) engine_rb2d_set_pos(rb, x, y);")
+    p("}")
+    for prop, table, cty in (("mass", "mass", "float"),
+                             ("gravityScale", "gravity_scale", "float"),
+                             ("drag", "linear_damping", "float"),
+                             ("bodyType", "body_type", "int")):
+        p("static %s Rigidbody2D_get_%s(int rb) {" % (cty, prop))
+        p("    return _rb2d_ok(rb) ? _Rigidbody2D_%s[rb] : 0;" % table)
+        p("}")
+        p("static void Rigidbody2D_set_%s(int rb, %s v) {" % (prop, cty))
+        p("    if (_rb2d_ok(rb)) _Rigidbody2D_%s[rb] = v;" % table)
+        p("}")
+    p("static int Rigidbody2D_get_isKinematic(int rb) {")
+    p("    return Rigidbody2D_get_bodyType(rb) == 1;")
+    p("}")
+    p("static void Rigidbody2D_set_isKinematic(int rb, int v) {")
+    p("    Rigidbody2D_set_bodyType(rb, v ? 1 : 0);")
+    p("}")
+    p("")
+
+
 def _emit_engine_box2d_exports(
         box2d_backend, class_ids, col2d_list, p, plan, want_col2d,
         want_collision2d_msgs):
@@ -13659,9 +13932,13 @@ def _emit_engine_physics_fixed(
         if box2d_backend:
             if want_collision2d_msgs:
                 p("    _col2d_contact_n = 0;")
+            if plan.get("physics2d_triggers") and plan.get("collider2d"):
+                p("    _col2d_trig_n = 0;")
             p("    engine_box2d_step();")
             if want_collision2d_msgs:
                 p("    engine_physics_collide2d_messages();")
+            if plan.get("physics2d_triggers") and plan.get("collider2d"):
+                p("    engine_physics_trigger2d_messages();")
         if want_rb3d and rb3d_list:
             p("    for (i = 0; i < _Rigidbody_count; i = i + 1) {")
             p("        unsigned oi;")
@@ -14520,6 +14797,7 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int _Rigidbody2D_body_type[%d];" % n2)
         p("extern int _Rigidbody2D_owner_class[%d];" % n2)
         p("extern int _Rigidbody2D_owner_inst[%d];" % n2)
+        _emit_rb2d_api(p)
     if want_rb3d:
         n3 = max(1, rb3d_cap if rb3d_cap else len(rb3d_list) or 1)
         p("extern int _Rigidbody_count;")
@@ -15115,6 +15393,12 @@ def emit_engine(plan, analyses, used_apis):
             collision2d_handlers[cname] = msgs
     want_collision2d_msgs = (bool(collision2d_handlers)
                              or bool(plan.get("godot_signals"))) and want_col2d
+    trigger2d_handlers = {c: {k: v for k, v in msgs.items()
+                              if k.startswith("OnTrigger")}
+                          for c, msgs in collision2d_handlers.items()}
+    trigger2d_handlers = {c: m for c, m in trigger2d_handlers.items() if m}
+    plan["physics2d_triggers"] = bool(trigger2d_handlers) and want_col2d \
+        and not plan.get("godot")
 
     if want_collision2d_msgs:
         p("/* Collision2D.ToString — Unity object type name. */")
@@ -18849,9 +19133,22 @@ def _lower_go_active_reads(text, cl, site):
             return "_engine_go_active_in_hierarchy(%s)" % go
         return "GameObject_activeSelf(%s)" % go
     alt = ["(?:this\\s*\\.\\s*)?gameObject"] + [re.escape(g) for g in sorted(gos)]
-    return cs2cpp.code_sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])(%s)\s*\.\s*(activeSelf|activeInHierarchy)\b"
         % "|".join(alt), rep, text)
+    # CompareTag / tag on this object or a GameObject variable; a bare
+    # `CompareTag(..)` / `tag` is this object's (a Component's members).
+
+    def go_of(recv):
+        return own if recv is None or re.match(r"(?:this\s*\.\s*)?gameObject$",
+                                               recv) else recv
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:(%s)\s*\.\s*)?CompareTag\s*\(" % "|".join(alt),
+        lambda m: "GameObject_CompareTag(%s, " % go_of(m.group(1)), text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\s*\.\s*tag\b(?!\s*=[^=])" % "|".join(alt),
+        lambda m: "GameObject_tag(%s)" % go_of(m.group(1)), text)
+    return text
 
 
 def _local_handle_fields(text, cl, plan, site):
@@ -18930,6 +19227,39 @@ def _lower_string_nulls(text, cl, plan, site):
     text = cs2cpp.code_sub(
         r"(?<![\w.])(?P<d>string\s+\w+)\s*=\s*null\s*;",
         lambda m: '%s = "";' % m.group("d"), text)
+    return text
+
+
+def _lower_collider_param(text, p):
+    """A collision or trigger handler's parameter -- `Collision2D coll` or
+    `Collider2D other`, the other collider's index here -- read for its
+    GameObject: `P.gameObject` is `_col2d_go(P)`, and its `name`, `tag`,
+    `CompareTag(..)`, `GetComponent<T>()`, `SetActive(..)` and
+    `Destroy(P.gameObject)` are the engine's GameObject calls. On a
+    Collider2D those members are the collider's own (a Component's) and mean
+    the same; `coll.collider` is the other collider itself."""
+    q = re.escape(p)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*collider\b(?!\s*\.\s*"
+                           r"(?:bounds|offset|isTrigger))" % q, p, text)
+    go = r"(?<![\w.])%s(?:\s*\.\s*gameObject)?" % q
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:Object\s*\.\s*)?Destroy\s*\(\s*%s\s*\.\s*gameObject\s*\)" % q,
+        "Object_Destroy(_col2d_go(%s))" % p, text)
+    text = cs2cpp.code_sub(go + r"\s*\.\s*CompareTag\s*\(",
+                           "GameObject_CompareTag(_col2d_go(%s), " % p, text)
+    text = cs2cpp.code_sub(go + r"\s*\.\s*name\b(?!\s*=[^=])",
+                           "GameObject_name(_col2d_go(%s))" % p, text)
+    text = cs2cpp.code_sub(go + r"\s*\.\s*tag\b(?!\s*=[^=])",
+                           "GameObject_tag(_col2d_go(%s))" % p, text)
+    text = cs2cpp.code_sub(
+        go + r"\s*\.\s*GetComponent\s*<\s*(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
+        lambda m: "GameObject_GetComponent_%s(_col2d_go(%s))" % (
+            _c_ident(m.group(1)), p), text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])%s\s*\.\s*gameObject\s*\.\s*SetActive\s*\(" % q,
+        "GameObject_SetActive(_col2d_go(%s), " % p, text)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*gameObject\b" % q,
+                           "_col2d_go(%s)" % p, text)
     return text
 
 
@@ -19631,6 +19961,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
+    if collision2d_param:
+        text = _lower_collider_param(text, collision2d_param)
     # Before `true` becomes 1: a builder's Append(true) and a bool literal
     # in a concatenation print as C# prints them.
     text = _lower_string_builders(text)
@@ -19775,6 +20107,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_file_text_streams(text, cl)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_transform_field_position(text, cl, plan, site)
+    text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
     text = _rewrite_transform_look_at(text, cl)
@@ -19892,6 +20225,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     plan["_string_tables_local"] = string_arrays | string_lists
     string_idents |= string_arrays | string_lists
     string_idents |= plan.get("_json_string_fns") or set()
+    string_idents |= {"GameObject_name", "GameObject_tag"}
     _rk = dict(_method_ret_kinds(plan))
     # Before the calls are renamed: this class's methods by their C# names.
     for _c, _m in (plan.get("_methods_by") or {}).get(cl.get("name"), []):
@@ -19919,7 +20253,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _format_bools(text, _bool_names(cl, body, site),
                          _string_helper_names("bool") | {
                              "_engine_go_active_in_hierarchy",
-                             "GameObject_activeSelf"} | {
+                             "GameObject_activeSelf",
+                             "GameObject_CompareTag"} | {
                              k for k, v in (plan.get("_method_ret_kinds_local")
                                             or {}).items() if v == "b"})
     text = _lower_string_concat(text, string_idents=string_idents,
@@ -22500,6 +22835,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["go_names"] = go_names
     plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["go_active"] = _build_go_active(plan, go_names)
+    plan["go_tags"] = _build_go_tags(plan, go_names)
     plan["scenes"] = list(
         getattr(_load_scenes_lights_cameras, "scenes", None) or [])
     plan["go_scene"] = _build_go_scene(plan, go_names)
