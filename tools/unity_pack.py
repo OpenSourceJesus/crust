@@ -38,7 +38,8 @@ import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tools.cs2cpp as cs2cpp  # noqa: E402
+import tools.cs2cpp as cs2cpp
+import tools.unity_pack_runtime as runtime  # noqa: E402
 
 # unity_pack is split by subsystem; each module's names are re-exported here.
 from tools.unity_pack_common import *  # noqa: E402,F401,F403
@@ -236,6 +237,8 @@ def _analyzed_mb_typenames(analyses):
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
     "Exists", "Delete", "CreateText", "OpenText", "Copy",
+    # tools/unity_pack_runtime.py
+    "ReadAllText", "ReadAllLines",
 })
 
 # UnityEngine.Application members we emit. Others → CS0117.
@@ -5872,6 +5875,12 @@ def analyze_script(path, text=None, shallow=False):
             r"productName)\s*\+",
             scan):
         apis.add("string.+")
+    # The runtime table's APIs are helpers emitted with the string ones.
+    if runtime.API_RE.search(scan):
+        apis.add("string.+")
+        if re.search(r"\bTime\s*\.\s*(?:realtimeSinceStartup|unscaledTime)",
+                     scan):
+            apis.add("Time.time")
     # A string compared with null is lowered to a string helper, which
     # lives with the scratch slots.
     if re.search(r"(?<![\w.])string\b", scan) and re.search(
@@ -17730,7 +17739,7 @@ def _parse_format(raw, interpolated):
     return out
 
 
-def _lower_string_arrays(text):
+def _lower_string_arrays(text, used=None):
     """C# `string[]` locals, as the engine's `std::vector<fastring>`.
 
         string[] parts = s.Split(',');   (a vector the Split helper returns)
@@ -17789,6 +17798,54 @@ def _lower_string_arrays(text):
                 "{ string %s = %s[%s]; %s} }"
                 % (pre, idx, idx, arr, idx, idx, var, arr, idx, body))
         text = text[:m.start()] + loop + text[end:]
+    # `new string[n]`, `new string[] { .. }`, `new[] { .. }`, `{ .. }`:
+    # a sized array (empty strings -- C#'s nulls read as ""), then each
+    # initializer element written, in the same statement.
+    used = used if used is not None else set()
+    names |= set(re.findall(r"(?<![\w.])string\s*\[\s*\]\s+(\w+)",
+                            cs2cpp._blank(text)))
+    alloc = re.compile(
+        r"(?<![\w.])((?:string\s*\[\s*\]\s+)?(\w+))\s*=\s*"
+        r"(?:new\s+string\s*\[\s*([^\]]*?)\s*\]|"
+        r"new\s+(?:string\s*)?\[\s*\]\s*(?=\{)|(?=\{))")
+    start = 0
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        m = alloc.search(scan, start)
+        if not m:
+            break
+        decl, name = m.group(1), m.group(2)
+        if name not in names:
+            start = m.end()
+            continue
+        k = m.end()
+        size, elems = m.group(3), []
+        if size is not None and not size.strip():
+            size = None                  # `new string[] { .. }`
+            while k < len(scan) and scan[k] in " \t\r\n":
+                k += 1
+        if size is None:
+            if k >= len(scan) or scan[k] != "{":
+                start = m.end()
+                continue
+            ce = _match_close(scan, k, "{", "}")
+            if ce is None:
+                break
+            inner = text[k + 1:ce]
+            elems = [e.strip() for e in cs2cpp.split_call_args(inner)
+                     if e.strip()]
+            size = str(len(elems))
+            k = ce + 1
+        semi = scan.find(";", k)
+        if semi < 0:
+            break
+        used.add("_cs_strarray_new")
+        rep = "%s = _cs_strarray_new(%s)" % (text[m.start(1):m.end(1)], size)
+        tail = "".join(" %s[%d] = %s;" % (name, n, e)
+                       for n, e in enumerate(elems))
+        text = text[:m.start()] + rep + text[k:semi + 1] + tail \
+            + text[semi + 1:]
+        start = m.start() + len(rep)
     # declarations
     scan = cs2cpp._blank(text)
     names |= set(re.findall(r"(?<![\w.])string\s*\[\s*\]\s+(\w+)", scan))
@@ -17801,6 +17858,71 @@ def _lower_string_arrays(text):
             re.escape(n) for n in sorted(names, key=len, reverse=True)),
         lambda m: "((int)%s.size())" % m.group(1), text)
     return text, names
+
+
+def _bool_names(cl, body, site):
+    """Names holding a bool in this method: `bool` locals and parameters,
+    and the class's bool fields -- by their C# name and, once lowered, their
+    accessor (`Player_get_alive`)."""
+    out = set(re.findall(r"(?<![\w.])bool\s+(\w+)\s*[;=,)]",
+                         cs2cpp._blank(body or "")))
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in ("bool", "Boolean", "System.Boolean"):
+            out.add(prm.name)
+    idn = _c_ident(cl["name"])
+    for f in cl.get("fields") or []:
+        if f.get("ty") == "bool" and not f.get("static"):
+            out.add(f["name"])
+            out.add("%s_get_%s" % (idn, f["name"]))
+    return out
+
+
+def _format_bools(text, names, calls):
+    """A bool as C# formats it: `"alive " + alive` is "alive True", and
+    `Debug.Log(ok)` prints "False" -- the engine printed 1 and 0.
+
+    `bool + x` is C# only when the other side is a string, so a bool next
+    to a binary `+` is in a concatenation, and so is one that is the whole
+    argument of a log call. Each becomes `(b ? "True" : "False")`, which
+    the typed concatenation reads as a string. `names` are bool variables
+    and accessors, `calls` helpers returning one.
+    """
+    if not names and not calls:
+        return text
+    alts = []
+    if names:
+        alts.append(r"(?<![\w.>])(?:%s)(?![\w(\[])" % "|".join(
+            re.escape(n) for n in sorted(names, key=len, reverse=True)))
+    if calls:
+        alts.append(r"(?<![\w.>])(?:%s)\s*\(" % "|".join(
+            re.escape(n) for n in sorted(calls, key=len, reverse=True)))
+    pat = re.compile("|".join(alts))
+    log = re.compile(r"(?:Debug_Log|Debug\s*\.\s*Log|print|"
+                     r"Console_WriteLine|Console\s*\.\s*WriteLine)\s*\(\s*$")
+    out, last = [], 0
+    scan = cs2cpp._blank(text)
+    for m in pat.finditer(scan):
+        if m.start() < last:
+            continue
+        end = m.end()
+        if scan[end - 1] == "(":
+            cl_ = _match_close(scan, end - 1, "(", ")")
+            if cl_ is None:
+                continue
+            end = cl_ + 1
+        # Also `(b ? .. : ..)` wrapped already, or a `!b`: only a bare one.
+        before = scan[:m.start()].rstrip()
+        after = scan[end:].lstrip()
+        prev_plus = before.endswith("+") and not before.endswith("++")
+        next_plus = after.startswith("+") and not after.startswith(("++", "+="))
+        in_log = bool(log.search(before)) and after.startswith(")")
+        if before.endswith("!") or not (prev_plus or next_plus or in_log):
+            continue
+        out.append(text[last:m.start()])
+        out.append('(%s ? "True" : "False")' % text[m.start():end])
+        last = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _lower_string_formats(text, cl, plan, site):
@@ -18105,6 +18227,7 @@ _CS_STRING_MEMBERS = {
                                            "bool"),
     ("string.Equals", 2, ""): ("_cs_str_Equals", "bool"),
     ("string.Compare", 2, ""): ("_cs_str_CompareTo", "int"),
+    ("GetHashCode", 0, ""): ("_cs_str_GetHashCode", "int"),
     ("Split", 1, "c"): ("_cs_str_Split_c", "strarray"),
     ("Split", 1, ""): ("_cs_str_Split", "strarray"),
     ("string.Join", 2, ""): ("_cs_str_Join", "string"),
@@ -18121,11 +18244,12 @@ _CS_STRING_STATIC_NAMES = sorted({k[0].split(".", 1)[1]
 
 
 def _string_helper_names(kind):
-    """Engine helpers whose result is `kind` ("string", "int", "bool")."""
+    """Engine helpers whose result is `kind` ("string", "int", "bool") --
+    the string members', the formatters', and the runtime table's."""
     out = {h for h, r in _CS_STRING_MEMBERS.values() if r == kind}
     if kind == "string":
         out |= _CS_FORMAT_HELPERS
-    return out
+    return out | runtime.helpers_of_kind(kind)
 
 
 #: The engine's C for each helper: the C# semantics, ordinal. What returns a
@@ -18355,11 +18479,16 @@ _CS_STRING_HELPER_MARKER = "/* unity_pack:string-members */"
 
 
 def _string_helpers_c(used):
-    """The C for the helpers in `used`, or "" for none."""
+    """The C for the helpers in `used`, or "" for none: the string
+    members' and formatters', then the runtime table's with the helpers
+    they call, each after what it calls."""
     if not used:
         return ""
-    return "\n".join([_CS_STRING_HELPER_PRELUDE]
-                     + [_CS_STRING_HELPER_C[h] for h in sorted(used)]) + "\n"
+    own = [_CS_STRING_HELPER_C[h] for h in sorted(used)
+           if h in _CS_STRING_HELPER_C]
+    rt = [runtime.helper_c(h) for h in runtime.closure(
+        {h for h in used if runtime.is_runtime_helper(h)})]
+    return "\n".join([_CS_STRING_HELPER_PRELUDE] + own + rt) + "\n"
 
 
 def _lower_string_members(text, string_idents, plan):
@@ -18657,7 +18786,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _string_field_tables(text, cl, plan, site)
     text = _lower_string_nulls(text, cl, plan, site)
     text = _lower_string_formats(text, cl, plan, site)
-    text, string_arrays = _lower_string_arrays(text)
+    text, string_arrays = _lower_string_arrays(
+        text, plan.setdefault("_cs_str_used", set()))
+    # Mathf / Random / Parse / Path / Directory / File reads: the runtime
+    # table (tools/unity_pack_runtime.py), while the text is still C#.
+    _early_ints = _int_idents(cl, plan, text, site)
+    text = runtime.lower_runtime_apis(
+        text, plan.setdefault("_cs_str_used", set()), cs2cpp._blank,
+        cs2cpp.split_call_args,
+        lambda e: cs2cpp.scalar_kind(e, _PACKED_STRINGS, set(), _early_ints),
+        _match_close)
     # `x == null` / `x != null` against the packed null (-1). This was part of
     # cs2cpp.lower_body, which the inline rewrites above replaced; the null
     # comparisons were lost with it and reached C as an undeclared `null`.
@@ -18874,6 +19012,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     string_idents |= {
         prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
         if prm.type in ("string", "String", "System.String")}
+    text = _format_bools(text, _bool_names(cl, body, site),
+                         _string_helper_names("bool"))
     text = _lower_string_concat(text, string_idents=string_idents,
                                 int_idents=int_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
@@ -21433,7 +21573,13 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     # an error (`_report_stub`).
     plan["strict"] = bool(strict)
     engine = emit_engine(plan, analyses, used_apis)
-    helpers_c = _string_helpers_c(plan.pop("_cs_str_used", None))
+    _used_helpers = plan.pop("_cs_str_used", None) or set()
+    helpers_c = _string_helpers_c(_used_helpers)
+    if runtime.needs_math(runtime.closure(
+            {h for h in _used_helpers if runtime.is_runtime_helper(h)})) \
+            and "#include <math.h>" not in engine:
+        k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
+        engine = engine[:k] + "#include <math.h>\n" + engine[k:]
     if _CS_STRING_HELPER_MARKER in engine:
         engine = engine.replace(_CS_STRING_HELPER_MARKER + "\n", helpers_c, 1)
     # C# string locals are coost fastrings (`_own_string_locals`). Only an

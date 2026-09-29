@@ -649,6 +649,24 @@ def _parse_plus_rhs(text, i):
     return start, i
 
 
+def _top_level_ternary(e):
+    """The two branches of `c ? a : b` at the top level of `e`, or None."""
+    scan = _blank(e)
+    depth, q = 0, None
+    for k, ch in enumerate(scan):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and ch == "?" and q is None:
+            if scan[k + 1:k + 2] in ("?", ".", "["):
+                return None           # `??`, `?.`, `?[`: not a conditional
+            q = k
+        elif depth == 0 and ch == ":" and q is not None:
+            return (e[q + 1:k].strip(), e[k + 1:].strip())
+    return None
+
+
 def scalar_kind(expr, model, string_idents=None, int_idents=None):
     """`s` / `c` / `i` / `f`: what an operand is, for a typed C call.
 
@@ -672,6 +690,18 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
         if not inner:
             break
         e = inner
+    # `c ? a : b` has its branches' type: a string if either is one.
+    tern = _top_level_ternary(e)
+    if tern is not None:
+        kinds = [scalar_kind(b, model, string_idents, int_idents)
+                 for b in tern]
+        if "s" in kinds:
+            return "s"
+        if all(k == "i" for k in kinds):
+            return "i"
+        if all(k == "c" for k in kinds):
+            return "c"
+        return "f"
     whole = [c for c in model.string_calls if c.endswith(")")]
     prefixes = [c for c in model.string_calls if not c.endswith(")")]
     if (e.startswith('"') or (model.string_plus and

@@ -114,6 +114,84 @@ UNITY_CHECKS = [
           "split_join:y", "split_join:z", "split_join:4y", "split_join:a",
           "split_join:b"]),
 
+    ("rt_mathf",
+     'Debug.Log("rt_mathf:" + Mathf.Sqrt(16f) + "," + Mathf.Pow(2f, 10f) + ","'
+     ' + Mathf.FloorToInt(2.7f) + "," + Mathf.CeilToInt(2.1f) + ","'
+     ' + Mathf.RoundToInt(2.5f) + "," + Mathf.RoundToInt(3.5f));\n'
+     'Debug.Log("rt_mathf:" + Mathf.Clamp01(1.5f) + "," + Mathf.InverseLerp(0f, 10f, 5f)'
+     ' + "," + Mathf.Repeat(7f, 3f) + "," + Mathf.PingPong(5f, 3f) + ","'
+     ' + Mathf.DeltaAngle(350f, 10f) + "," + Mathf.MoveTowards(0f, 10f, 3f));\n'
+     'if (Mathf.Approximately(Mathf.PI * Mathf.Rad2Deg, 180f)) Debug.Log("rt_mathf:pi");\n'
+     'if (1e30f < Mathf.Infinity) Debug.Log("rt_mathf:inf");\n',
+     "", ["rt_mathf:4,1024,2,3,2,4", "rt_mathf:1,0.5,1,1,20,3",
+          "rt_mathf:pi", "rt_mathf:inf"]),
+
+    ("rt_random",
+     'Random.InitState(42);\n'
+     'int lo = 99; int hi = -1; bool fl = true;\n'
+     'for (int k = 0; k < 1000; k++) {\n'
+     '    int r = Random.Range(0, 5);\n'
+     '    if (r < lo) lo = r;\n'
+     '    if (r > hi) hi = r;\n'
+     '    float f = Random.Range(-1f, 1f);\n'
+     '    if (f < -1f || f > 1f) fl = false;\n'
+     '    float v = Random.value;\n'
+     '    if (v < 0f || v > 1f) fl = false;\n'
+     '}\n'
+     'Debug.Log("rt_random:" + lo + "," + hi + "," + (fl ? "in" : "out"));\n',
+     "", ["rt_random:0,4,in"]),
+
+    ("rt_parse",
+     'int a = int.Parse(" 42 ");\n'
+     'float b = float.Parse("2.5");\n'
+     'int c;\n'
+     'bool okc = int.TryParse("x7", out c);\n'
+     'if (int.TryParse("-13", out int d)) Debug.Log("rt_parse:" + a + "," + b + "," + okc + "," + d);\n',
+     "", ["rt_parse:42,2.5,False,-13"]),
+
+    ("bool_format",
+     'bool yes = true;\n'
+     'bool no = !yes;\n'
+     'Debug.Log("bool_format:" + yes + "," + no + "," + "abc".Contains("b"));\n'
+     'Debug.Log(yes);\n',
+     "", ["bool_format:True,False,True"]),
+
+    ("rt_path",
+     'string p = Path.Combine("/tmp/a", "b.txt");\n'
+     'Debug.Log("rt_path:" + p + "," + Path.GetFileName(p) + "," + Path.GetExtension(p)'
+     ' + "," + Path.GetFileNameWithoutExtension(p) + "," + Path.GetDirectoryName(p));\n'
+     'Debug.Log("rt_path:" + Path.Combine("a", "b", "c") + "," + Path.Combine("a/", "/abs"));\n',
+     "", ["rt_path:/tmp/a/b.txt,b.txt,.txt,b,/tmp/a", "rt_path:a/b/c,/abs"]),
+
+    ("rt_files",
+     'string dir = Path.Combine(Application.persistentDataPath, "rt_files/deep");\n'
+     'Directory.CreateDirectory(dir);\n'
+     'string f = Path.Combine(dir, "t.txt");\n'
+     'File.WriteAllText(f, "one\\r\\ntwo\\n");\n'
+     'string[] lines = File.ReadAllLines(f);\n'
+     'Debug.Log("rt_files:" + Directory.Exists(dir) + "," + Directory.Exists(f)'
+     ' + "," + lines.Length + "," + lines[0] + "," + lines[1] + ","'
+     ' + File.ReadAllText(f).Length);\n',
+     "", ["rt_files:True,False,2,one,two,9"]),
+
+    ("rt_hash",
+     'string a = "abc";\n'
+     'string b = "ab" + "c";\n'
+     'if (a.GetHashCode() == b.GetHashCode() && a.GetHashCode() != "abd".GetHashCode())'
+     ' Debug.Log("rt_hash:ok");\n',
+     "", ["rt_hash:ok"]),
+
+    ("strarray_new",
+     'string[] a = new string[3];\n'
+     'a[0] = "x"; a[2] = "z";\n'
+     'string[] b = new string[] { "p", "q" + hp };\n'
+     'string[] c = { "u", "v" };\n'
+     'Debug.Log("strarray_new:" + string.Join("-", a) + "," + a.Length + ","'
+     ' + string.Join("", b) + "," + c[1]);\n'
+     'a = new string[1];\n'
+     'Debug.Log("strarray_new:" + a.Length);\n',
+     "", ["strarray_new:x--z,3,pq7,v", "strarray_new:1"]),
+
     ("self_assign",
      'string a = "x";\n'
      'string b = a;\n'
@@ -328,7 +406,7 @@ def _write(path, text):
 
 
 def unity_project(root):
-    player = ["using UnityEngine;\n",
+    player = ["using UnityEngine;\n", "using System.IO;\n",
               "public class Player : MonoBehaviour {\n",
               "    public int hp;\n",
               "    public Tag tag;\n"]
