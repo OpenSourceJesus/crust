@@ -726,8 +726,9 @@ sensors that told no one. When a script has one, the plan's
 `physics2d_triggers` has the glue enable sensor events and report each
 step's overlapping sensor pairs with `engine_col2d_trigger(a, b)`, apart
 from the touching pairs; the engine sends Enter / Stay / Exit by comparing
-them with the step before, as it does collisions. (Standard API only: with
-`--physics-inject` the triggers stay silent.)
+them with the step before, as it does collisions. With `--physics-inject`
+the sensor begin / end events are injected into Box2D-Packed, as the
+contacts are.
 
 **The other collider.** In a collision or trigger handler, the parameter
 -- `Collision2D coll` or `Collider2D other`, the other collider's index --
@@ -774,22 +775,37 @@ keeps the rotation. Scripts have, in Unity's degrees:
 With no turning body in the scene the API reads 0 and writes nothing.
 Godot mode keeps its bodies' rotation locked.
 
-**Queries.** `Physics2D.Raycast(origin, direction[, distance])`,
-`Physics2D.OverlapCircle(point, radius)` and `Physics2D.OverlapPoint(point)`
-are Box2D-Packed's (`engine_box2d_raycast` / `_overlap_circle` /
-`_overlap_point`, the plan's `physics2d_queries`), and may run before the
-first step (a script's `Start`: the glue builds the world first). A
+**Queries.** `Physics2D.Raycast(origin, direction[, distance[,
+layerMask]])`, `RaycastAll`, `OverlapCircle(point, radius[, layerMask])`,
+`OverlapCircleAll`, `OverlapPoint(point[, layerMask])` and
+`OverlapPointAll` are Box2D-Packed's (`engine_box2d_raycast[_all]` /
+`_overlap_circle[_all]` / `_overlap_point`, the plan's
+`physics2d_queries`), and may run before the first step (a script's
+`Start`: the glue builds the world first). `RaycastAll` is nearest first,
+as Unity's; the `*All` arrays (`RaycastHit2D[]`, `Collider2D[]`) are lists,
+so `foreach`, `hits[i]` and `.Length` work. A
 `RaycastHit2D` is the engine's struct -- `collider` (an index, -1 for
 none), `point`, `normal`, `distance`, `fraction` -- `if (hit)` is a hit,
 and `hit.collider`, `hit.transform` and a `Collider2D` an overlap returns
 read their GameObject as a handler's parameter does (`.gameObject`,
 `.name`, `.tag`, `CompareTag`, `GetComponent<T>()`); `transform.position`
 as the origin is taken by its x and y. Triggers are hit, as Unity's
-`queriesHitTriggers` default has it; layer masks are not read (every
-collider takes part), and a ray ignores a collider it starts inside (Unity's
-`queriesStartInColliders` default would hit it). `RaycastAll`,
-`OverlapCircleAll` and the other `*All` / `*NonAlloc` forms are not
-lowered.
+`queriesHitTriggers` default has it, and a ray ignores a collider it
+starts inside (Unity's `queriesStartInColliders` default would hit it). The
+`*NonAlloc` forms are not lowered.
+
+**Layers.** Each collider has its GameObject's `m_Layer`
+(`_Collider2D_layer`), and a query's layer mask is tested against it in the
+glue's callbacks -- Box2D-Packed's filters are 16 bits, Unity has 32
+layers, and contacts are left alone (the layer collision matrix is not
+read). With no mask a query takes `Physics2D.DefaultRaycastLayers`: every
+layer but "Ignore Raycast". At the source level, a `LayerMask` (field,
+local, parameter) is an `int` -- a field's scene value is its `m_Bits` --
+`mask.value` is the mask, and `LayerMask.GetMask("A", ..)` /
+`NameToLayer("A")` are constants from the project's layer names
+(`ProjectSettings/TagManager.asset`, Unity's built-in names without one;
+an unknown name is no bit / -1). A `RaycastHit2D` is a bool wherever C#
+converts it: `if (hit)`, `hit ? a : b`, `hit && ..`.
 
 ## Fast feature check: `tools/unity_pack_features.py`
 
