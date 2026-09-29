@@ -1973,6 +1973,22 @@ class TestStubDiagnostics(unittest.TestCase):
                       cm.exception.message)
 
 
+class TestBox2DIntegration(unittest.TestCase):
+    """unity_pack with Box2D-Packed: OnTriggerEnter / Exit2D (Unity mode's
+    triggers were silent), the other collider's GameObject and tags, and
+    Rigidbody2D's script API -- AddForce, position, MovePosition, mass,
+    gravityScale, drag, bodyType / isKinematic. The fast feature check's
+    Box2D project, packed, built and run."""
+
+    @needs_box2d
+    @needs_coost
+    def test_triggers_and_rigidbody_api(self):
+        import tools.unity_pack_features as F
+        tmp = tempfile.mkdtemp(prefix="upack-b2d-it-")
+        ok, report = F.run_project("box2d", F.box2d_project, tmp, False)
+        self.assertTrue(ok, "\n".join(report))
+
+
 class TestExtensionDesugar(unittest.TestCase):
     """tools/unity_pack_extensions.py on its own: no pack, no compiler."""
 
