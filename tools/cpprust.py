@@ -4542,6 +4542,74 @@ def _scalar_ref_names(params):
     return out
 
 
+def _class_ref_names(params, names):
+    """Names of parameters declared as a reference to a class (`T &` or
+    `T &&`). Each is a pointer once lowered."""
+    out = []
+    for part in _split_top(params or ""):
+        if "&" not in part:
+            continue
+        p = _parse_param(part, names)
+        if p is not None and "*" not in part:
+            out.append(p[2])
+    return out
+
+
+def _addr_of_class_refs(body, rnames):
+    """`&o` -> `(o)` for each class reference parameter `o`.
+
+    A class reference is lowered to a pointer, and a *use* of it needs no
+    rewriting because every use is a member access, which the symbol table
+    turns into `->`. Taking its address is the exception: in C++ `&o` is
+    the address of the referred-to object, which is exactly the pointer the
+    parameter already holds. Left alone it became the address of the
+    parameter itself, so `if (&o != this)` compared a stack slot with
+    `this` and was always true -- a self-assignment guard that never fired.
+
+    The replacement is parenthesised on purpose: the comparison-operator
+    pass reads a bare class name on the left of `==` as an object and
+    calls `operator==` on it, and `&o == this` compares addresses.
+
+    Only a unary `&`: one following a value (`a & o`) is a binary operator,
+    and one followed by a member access (`&o.x`) takes a member's address.
+    """
+    if not rnames:
+        return body
+    alt = _type_alt(rnames)
+    pat = r"(?:(?<=[^\w\s)\]&])|(?<=\breturn)|^)(\s*)&\s*(%s)\b(?!\s*(?:\.|->|\[|\())" % alt
+    return _sub_code(pat, lambda m: "%s(%s)" % (m.group(1), m.group(2)), body)
+
+
+def _addr_of_free_refs(text, names):
+    """`_addr_of_class_refs` for every free function with a class reference
+    parameter. Methods were emitted with their parameters already lowered,
+    so only a free function still spells `T &` here."""
+    look = cpp_auto._blank_like(text)
+    out, i = [], 0
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\(", look):
+        if m.start() < i or m.group(1) in _KEYWORDS:
+            continue
+        close = _match_paren(look, m.end() - 1)
+        if close is None:
+            continue
+        rnames = _class_ref_names(text[m.end():close], names)
+        if not rnames:
+            continue
+        j = close + 1
+        while j < len(look) and look[j] in " \t\n":
+            j += 1
+        if j >= len(look) or look[j] != "{":
+            continue
+        end = _match(look, j, "{", "}")
+        if end is None:
+            continue
+        out.append(text[i:j])
+        out.append(_addr_of_class_refs(text[j:end + 1], rnames))
+        i = end + 1
+    out.append(text[i:])
+    return "".join(out)
+
+
 def _with_scalars(names):
     return set(names) | _SCALAR_TYPES
 
@@ -5537,6 +5605,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
 
     tail = []
     emitting_outline = [False]
+    # The member being emitted is only declared here: its definition is in
+    # another translation unit, so it gets an external prototype and no body.
+    decl_only = [False]
+    # Out-of-line members of an ordinary class are the one definition other
+    # units link against -- C++ gives them external linkage, and a member
+    # with its body in the class is implicitly `inline`. A template's
+    # members are instantiated into every unit that uses them, and the
+    # supplied prelude is in every unit too, so both stay `static`.
+    outline_external = not prelude and not targs
 
     # Contract clauses for the member being emitted. A cell rather than an
     # argument because every operator kind reaches `emit` by its own path,
@@ -5559,6 +5636,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # go through, so `int &k` lowered to `int *k` left the body comparing
         # a value against a pointer.
         scalar_refs = _scalar_ref_names(params)
+        class_refs = _class_ref_names(params, names)
         params = _lower_refs(params, _with_scalars(names))
         # `this` is a pointer, exactly as an `impl` method's `self` is --
         # unless the member is `static`, which by definition has no
@@ -5570,12 +5648,18 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # Members are emitted in declaration order, but a body may call a
         # method declared below it -- ordinary in a class, and an implicit
         # declaration in C. Prototype everything first.
-        mprotos.append("%s %s %s(%s);" % (stor, kind, mname, arglist))
+        external = decl_only[0] or (emitting_outline[0] and outline_external)
+        linkage = "" if external else stor + " "
+        mprotos.append("%s%s %s(%s);" % (linkage, kind, mname, arglist))
+        if decl_only[0]:
+            # Prototype only; whoever has the body defines it.
+            return refs
         inner = raw
         for rname in scalar_refs:
             inner = _sub_code(
                 r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
                 lambda _m: "(*%s)" % rname, inner)
+        inner = _addr_of_class_refs(inner, class_refs)
         inner = _implicit_this(inner, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
@@ -5645,29 +5729,23 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                         % (cname, cl, mname, ", ".join(sorted(unknown))))
             cbits = "\n" + "\n".join(cur_contracts[0]) + "\n"
         (tail if emitting_outline[0] else out).append(
-            "%s %s %s(%s)%s {%s}" % (stor, kind, mname, arglist, cbits,
-                                     inner))
+            "%s%s %s(%s)%s {%s}" % (linkage, kind, mname, arglist, cbits,
+                                    inner))
         return refs
 
     for m in cls.members:
         cur_contracts[0] = list(getattr(m, "contracts", ()) or ())
         if m.kind in ("field", "anon") or m.pure:
             continue
-        if m.declared_only:
-            # Prototype only. `emit` writes both, so the declaration is made
-            # here and the definition left to whoever has the body.
-            dparams = _lower_refs(_expand_cpp_ref(_expand_cpp_rref(sub(m.params or ""), names), names),
-                                  _with_scalars(names))
-            dparams = _strip_default_args(dparams)
-            mname = _member_symbol(cname, m)
-            if mname is not None:
-                # External linkage, not `static`: the definition is in
-                # another translation unit, and a `static` declaration with
-                # no definition there could never be resolved.
-                mprotos.append(
-                    "%s %s(%s *this%s);"
-                    % (tsub(sub(m.ret or "void")).strip() or "void",
-                       mname, cname, (", " + dparams) if dparams else ""))
+        # A member declared here and defined in another unit goes through
+        # the same path as one with a body -- so it gets the same symbol,
+        # overload suffix and all, and is registered for calls -- and
+        # `emit` writes only its prototype.
+        decl_only[0] = m.declared_only
+        if m.declared_only and m.kind not in ("method", "ctor", "dtor"):
+            # A `static const` data member is marked declared-only too,
+            # having no body to attach; it is emitted at file scope
+            # elsewhere and has no function symbol here.
             continue
         emitting_outline[0] = m.outline
         params = sub(m.params or "").strip()
@@ -6492,11 +6570,25 @@ def _stmt_end(text, i):
     return None
 
 
+def _unconditional_at(look, i):
+    """Whether the statement starting at `i` is reached whenever the one
+    before it finishes: it follows a `;`, `{` or `}`. After `if (c)` or
+    `else` it is a branch, and after `case 1:` a jump target, so a return
+    there does not make the end of the enclosing block unreachable."""
+    k = i - 1
+    while k >= 0 and look[k] in " \t\r\n":
+        k -= 1
+    return k < 0 or look[k] in ";{}"
+
+
 class _Frame(object):
-    __slots__ = ("live", "kind", "ret", "vals", "ptrs", "ptrvals")
+    __slots__ = ("live", "kind", "ret", "vals", "ptrs", "ptrvals", "ret_mark")
 
     def __init__(self, kind, ret):
         self.live = []        # (ctype, vname), in declaration order
+        # Length of the output just after an unwinding `return` written
+        # directly in this frame, or -1. See the `}` handler.
+        self.ret_mark = -1
         self.kind = kind      # "file" | "func" | "loop" | "switch" | "block"
         self.ret = ret        # enclosing function's return type
         self.vals = {}        # class-typed locals: vname -> class
@@ -6552,6 +6644,15 @@ def _named_object(expr, scopes, type_info):
     deref_m = re.match(r"^\*\s*(\w+)$", expr)
     if deref_m is not None:
         nm = deref_m.group(1)
+        if nm == "this":
+            # `*this` is the object a method runs on. Without this, `T
+            # c(*this)` named nothing, fell through to arity, and called
+            # the one-argument constructor with a struct where it wanted
+            # (say) a `size_t` -- the copy constructor was never chosen.
+            for fr in reversed(scopes):
+                if "this" in fr.vals:
+                    return ("(*this)", fr.vals["this"])
+            return None
         for fr in reversed(scopes):
             if nm in fr.ptrvals:
                 return ("(*%s)" % nm, fr.ptrvals[nm])
@@ -7236,7 +7337,14 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             if aggs:
                 aggs -= 1
             fr = scopes.pop() if len(scopes) > 1 else _Frame("block", None)
-            for ctype, vname in reversed(fr.live):
+            # A frame whose last statement was an unwinding `return` has
+            # already run every drop on the way out, so the scope-exit drops
+            # would be dead code. Worse than dead: they sit after the return
+            # block, so a non-void function appeared to fall off its end and
+            # gcc warned `control reaches end of non-void function`.
+            dead = fr.ret_mark >= 0 and \
+                not "".join(out[fr.ret_mark:]).strip()
+            for ctype, vname in ([] if dead else reversed(fr.live)):
                 out.append("%s(&%s); "
                            % (_dropfn(type_info.get(ctype), ctype), vname))
             if not scopes:
@@ -7305,6 +7413,8 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                                        "%sreturn %s; }"
                                        % (rcls, name, rcls, name, rsrc,
                                           drops, name))
+                            if _unconditional_at(look, m.start()):
+                                scopes[-1].ret_mark = len(out)
                             i = end + 1
                             continue
                 if end is not None and (drops or moved):
@@ -7328,6 +7438,8 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                                    % (rtype, name, expr, drops, name))
                     else:
                         out.append("{ %sreturn %s; }" % (drops, expr))
+                    if _unconditional_at(look, m.start()):
+                        scopes[-1].ret_mark = len(out)
                     i = end + 1
                     continue
 
@@ -7799,6 +7911,26 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                 out.append("%s__assign(&%s, &%s);" % (ctype, lhs, src))
                 i = m.end()
                 continue
+            if ctype is not None and type_info[ctype]["moveassign"]:
+                rhs = m.group(2).strip()
+                if _copy_source(rhs, ctype, scopes, type_info) is None and \
+                        (_is_call_result(rhs)
+                         or _is_binop_result(rhs, scopes, type_info, ctype)):
+                    # `a = f();` on a class with `operator=(T &&)` and no
+                    # copy assignment: the result is an rvalue, so C++ calls
+                    # the move assignment. Written out: evaluate into a
+                    # temporary, move-assign from it, then destroy the
+                    # moved-from husk -- a temporary is destroyed at the end
+                    # of the full expression, moved from or not.
+                    info_a = type_info[ctype]
+                    tmpn = "__cpp_ma%d" % mvn[0]
+                    mvn[0] += 1
+                    tail = (" %s(&%s);" % (_dropfn(info_a, ctype), tmpn)
+                            if info_a["dtor"] else "")
+                    out.append("{ %s %s = %s; %s__moveassign(&%s, &%s);%s }"
+                               % (ctype, tmpn, rhs, ctype, lhs, tmpn, tail))
+                    i = m.end()
+                    continue
             if ctype is not None and type_info[ctype]["dtor"]:
                 # A struct assignment copies the representation and leaves
                 # both objects owning it, so both destructors run on the same
@@ -8735,6 +8867,37 @@ def _assign_target(look, at, scopes, cinfo):
     return None
 
 
+def _free_class_returns(scan, cinfo):
+    """`{function: (class, is_ptr)}` for free functions declared at file
+    scope that return a class or a pointer to one.
+
+    The call pass chains a method onto a call result only when it knows the
+    result's class. It used to learn that only for monomorphised templates,
+    so `mk().get()` on an ordinary `S mk()` was left as written and reached
+    the C front end as a member access on a struct.
+    """
+    out = {}
+    depth = 0
+    starts = set()
+    for k, c in enumerate(scan):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and (k == 0 or scan[k - 1] in ";}\n"):
+            starts.add(k)
+    pat = re.compile(r"\s*(?:(?:static|inline|extern)\s+)*(?:const\s+)?"
+                     r"(\w+)\s*(\*\s*)?(\w+)\s*\(")
+    for k in sorted(starts):
+        m = pat.match(scan, k)
+        if m is None:
+            continue
+        cls, fn = m.group(1), m.group(3)
+        if cls in cinfo and fn not in cinfo and fn not in _KEYWORDS:
+            out.setdefault(fn, (cls, bool(m.group(2))))
+    return out
+
+
 def _ret_class(ret, cinfo):
     """`(class, is_ptr)` for a method's return type, or `(None, False)`.
 
@@ -8799,7 +8962,29 @@ def _drop_global_scope(text):
     file that defines no classes -- which is exactly the file most likely
     to call a C library function this way.
     """
-    return text.replace("__gsq__", "")
+    text = text.replace("__gsq__", "")
+    return _c_linkage_fixups(text)
+
+
+def _c_linkage_fixups(text):
+    """Spellings that mean one thing in C++ and another in C.
+
+    * **`inline`** on a free function is external linkage in C++, with the
+      linker merging the copies. In C99 a plain `inline` definition
+      provides *no* external definition at all, so every call that the
+      compiler chose not to inline -- all of them at `-O0` -- is an
+      undefined reference at link time. `static inline` is what the C++
+      meant for a function defined in the unit that uses it, and the
+      output of this pass is always that unit. Already `static` or
+      `extern` is left alone.
+    * **`#pragma once`** has nothing left to guard: headers are spliced in
+      once each before lowering, and in a `.c` file gcc warns about it.
+    """
+    text = re.sub(r"(?m)^[ \t]*#[ \t]*pragma[ \t]+once[ \t]*\n", "", text)
+    return _sub_code(
+        r"(?<![\w])((?:static|extern)\s+)?inline\b(\s+(?:static|extern)\b)?",
+        lambda m: m.group(0) if (m.group(1) or m.group(2)) else "static inline",
+        text)
 
 
 #: The type spellings a functional-style cast may use. Deliberately only
@@ -11999,6 +12184,51 @@ def _enclosing_end(text, pos):
     return len(text)
 
 
+
+def _bisect_right(a, x):
+    """Index after the last element of sorted `a` that is <= `x`.
+
+    Written out rather than imported: this file is also lowered to C by
+    py2c, which has no `bisect`.
+    """
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+_TOPLEVEL_BOUNDS = {}
+
+
+def _toplevel_bounds(text):
+    """Every position where a top-level declaration may begin, in order.
+
+    One scan per distinct text, cached: `_toplevel_start` is asked once
+    per candidate local, and rescanning the prefix each time made the
+    owning-argument check quadratic in the translation unit.
+    """
+    b = _TOPLEVEL_BOUNDS.get(text)
+    if b is None:
+        b = []
+        depth = 0
+        for k, c in enumerate(text):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth <= 0:
+                    depth = 0
+                    b.append(k + 1)
+            elif c == ";" and depth == 0:
+                b.append(k + 1)
+        _TOPLEVEL_BOUNDS.clear()
+        _TOPLEVEL_BOUNDS[text] = b
+    return b
+
+
 def _toplevel_start(text, idx):
     """Index where the top-level declaration containing `idx` begins.
 
@@ -12006,18 +12236,9 @@ def _toplevel_start(text, idx):
     but after anything that code depends on. The enclosing top-level
     declaration is the nearest point satisfying both.
     """
-    depth, bound = 0, 0
-    for k, c in enumerate(text[:idx]):
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth <= 0:
-                depth = 0
-                bound = k + 1
-        elif c == ";" and depth == 0:
-            bound = k + 1
-    return bound
+    b = _toplevel_bounds(text)
+    i = _bisect_right(b, idx)
+    return b[i - 1] if i else 0
 
 
 def _param_types(params):
@@ -13159,12 +13380,30 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # so a call to one can be chained onto. Read back off the definition
     # rather than threaded down from the substitution: what was substituted
     # is `T *`, and the concrete spelling is what is on the page now.
-    free_rets = {}
+    free_rets = _free_class_returns(_strip_comments(out), cinfo)
     for fn in _ftmpl:
         dm = re.search(r"(?<![\w])(\w+)\s*(\*\s*)?%s\s*\("
                        % re.escape(fn), _strip_comments(out))
         if dm and dm.group(1) in cinfo:
             free_rets[fn] = (dm.group(1), bool(dm.group(2)))
+    out = _addr_of_free_refs(out, names)
+    # `Cls::k` for a `static const` member, named from outside the class.
+    # Inside one, the bare `k` is already rewritten as the class is
+    # emitted; a use from free code or another class's method still has
+    # its qualification, which C reads as a syntax error.
+    sconst_alt = []
+    for _s, _e, _cls in classes:
+        for _mem in _cls.members:
+            if _mem.kind == "sconst":
+                sconst_alt.append((_cls.name, _mem.name))
+    if sconst_alt:
+        out = _sub_code(
+            r"(?<![\w.>])(%s)\s*::\s*(\w+)\b" % _type_alt(
+                set(c for c, _n in sconst_alt)),
+            lambda m: ("%s_%s" % (m.group(1), m.group(2))
+                       if (m.group(1), m.group(2)) in sconst_alt
+                       else m.group(0)),
+            out)
     out = _lower_refs(out, names)
     # `vector<T>` stores elements by assignment, which for an owning class
     # would leave two objects holding one resource. Caught here, against the

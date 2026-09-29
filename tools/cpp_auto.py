@@ -1501,8 +1501,14 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         # left alone. A forward declaration in one header and the definition
         # in another is exactly that shape, and prefixing again gave
         # `litehtml_litehtml_html_tag`.
-        renaming = [name for name in declared
-                    if not (name.startswith(ns + "_") and name in produced)]
+        #
+        # Any name this pass produced, not only one carrying this block's own
+        # prefix. With nesting and reopening together -- `namespace co {
+        # namespace now { .. } }` written twice -- flattening the first outer
+        # block renames `now_ms` to `co_now_ms` inside the second outer
+        # block's still-nested `now`, and that block then saw `co_now_ms`
+        # as its own declaration and emitted `co_now_co_now_ms`.
+        renaming = [name for name in declared if name not in produced]
         pat = _flatten_pattern(renaming)
         if pat is not None:
             body = _sub_flattened(body, _blank_like(body), pat, ns)
@@ -1706,6 +1712,15 @@ def _rename_in_blocks(text, scan, ns, names):
         scan = _blank_like(text)
 
 
+#: A tag the enclosing scope *declares*: a definition (`struct X {`, `class
+#: X : public B {`, `class X final {`) or a forward declaration (`struct
+#: X;`). Not an elaborated use -- `struct timespec t;` in a function body
+#: names libc's struct, and counting it renamed it to `ns_timespec`, a
+#: type nothing defines.
+_TAG_DECL = re.compile(
+    r"\b(?:class|struct|enum|union)\s+(\w+)\s*(?:\{|;|:(?!:)|final\b)")
+
+
 def _declared_in(body_scan):
     """Names a namespace body declares: types, functions, and variables."""
     # A template parameter list is not a declaration of anything the
@@ -1716,11 +1731,10 @@ def _declared_in(body_scan):
     body_scan = _TEMPLATE_HEAD.sub(lambda m: " " * (m.end() - m.start()),
                                    body_scan)
     out = set()
-    for m in re.finditer(r"\b(?:class|struct|enum|union)\s+(\w+)",
-                         body_scan):
+    for m in _TAG_DECL.finditer(body_scan):
         out.add(m.group(1))
     body_scan = _blank_braced(body_scan)
-    for m in re.finditer(r"\b(?:class|struct|enum|union)\s+(\w+)", body_scan):
+    for m in _TAG_DECL.finditer(body_scan):
         out.add(m.group(1))
     for m in _anchored_finditer(_DECLARATOR, body_scan):
         ret, extra = _split_declarator(m.group(1))
@@ -2033,72 +2047,303 @@ def _sub_qualified_class(text, scan, outer, iname, new_name):
 # Default arguments
 # --------------------------------------------------------------------------
 
+
+def _bisect_right(a, x):
+    """Index after the last element of sorted `a` that is <= `x`.
+
+    Written out rather than imported: this file is also lowered to C by
+    py2c, which has no `bisect`.
+    """
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+def _block_kinds(scan):
+    """Every brace block of `scan`, as parallel lists (opens, closes, kinds,
+    parents), in order of the opening brace.
+
+    A kind says what the block *is*, from the text before its brace:
+    `ns` for a namespace or `extern "C"`, `class` for a class, struct or
+    union body, `enum`, `init` for a braced initialiser, and `code` for
+    everything else -- function bodies and the statements inside them.
+    """
+    opens, closes, kinds, parents = [], [], [], []
+    stack = []
+    last = 0                                     # end of the previous head
+    for k, c in enumerate(scan):
+        if c == "{":
+            head = scan[last:k]
+            h = head.strip()
+            if re.search(r"\bnamespace\b", h) or re.match(r"extern\s", h):
+                kind = "ns"
+            elif re.search(r"\benum\b", h):
+                kind = "enum"
+            elif re.search(r"(?:^|[^\w])(?:class|struct|union)\b", h) \
+                    and "(" not in h:
+                kind = "class"
+            elif h.endswith("=") or h.endswith(",") or h.endswith("(") \
+                    or h.endswith("return"):
+                kind = "init"
+            else:
+                kind = "code"
+            parents.append(stack[-1] if stack else -1)
+            stack.append(len(opens))
+            opens.append(k)
+            closes.append(len(scan))
+            kinds.append(kind)
+            last = k + 1
+        elif c == "}":
+            if stack:
+                closes[stack.pop()] = k
+            last = k + 1
+        elif c == ";":
+            last = k + 1
+    return opens, closes, kinds, parents
+
+
+def _kind_at(blocks, pos):
+    """The kind of the innermost block containing `pos`, None at file scope."""
+    opens, closes, kinds, parents = blocks
+    i = _bisect_right(opens, pos) - 1
+    while i >= 0 and closes[i] < pos:
+        i = parents[i]
+    return kinds[i] if i >= 0 else None
+
+
+_DECL_SPECIFIERS = ("virtual", "static", "inline", "explicit", "constexpr",
+                    "friend")
+
+
 def resolve_default_arguments(text, path="<cpp>", blank=None):
-    """Expand `f(A a, B b = e)` into one member per callable arity.
+    """Remove default arguments, keeping every call that relied on one.
 
     Overloads are resolved by argument *count* in this subset, so a default
-    argument is not a spelling -- it is several members that happen to share
-    a body. They are written out:
+    argument is not a spelling -- it is several callable arities sharing one
+    body. How that is written out depends on what declares it.
+
+    A **member with a body** gets one member per arity:
 
         f(A a, B b, C c) { body }
         f(A a, B b)      { C c = e2; body }
         f(A a)           { B b = e1; C c = e2; body }
 
     The shorter forms declare the missing parameters as locals holding their
-    defaults, which is exactly what the caller would have passed. Delegating
-    to the longest form would be tidier, but delegating constructors are not
-    in the subset either, and this works for a constructor and a method
-    alike.
+    defaults, which is exactly what the caller would have passed. That works
+    for a constructor too, which could not delegate.
 
-    Only members with a body. A declaration whose definition is out of line
-    has nothing here to copy, and is left for the reference-return-style
-    report rather than half-expanded.
+    A **member declared here and defined out of line** gets forwarding
+    members instead, since its body is not here to copy:
+
+        R f(A a, B b);
+        R f(A a) { return f(a, e1); }
+
+    A constructor or destructor declared that way is refused: it has no
+    body to copy and cannot delegate.
+
+    A **free function** cannot be given more arities at all -- free
+    functions lower to one C symbol per name, so the shorter forms would
+    redefine the longer. Its defaults are removed from every declaration
+    and supplied at each call that omits them, which is what a C++ compiler
+    does too. Calls are matched by name, so this reads calls inside
+    function bodies only, and never a `.f(` or `->f(` member call.
+
+    Any other default -- a qualified out-of-line definition, a pure virtual
+    -- is refused rather than passed on to the C front end, which rejects
+    `int y = 2` in a parameter list with a message naming neither.
     """
     scan = blank if blank is not None else text
     if "=" not in scan:
         return text
+    blocks = None
+    free = {}                                    # name -> (nparams, defaults)
     out, i = [], 0
-    while True:
-        m = _DEFAULTED_PARAMS.search(scan, i)
-        if m is None:
-            out.append(text[i:])
-            return "".join(out)
+    for m in _DEFAULTED_PARAMS.finditer(scan):
+        if m.start() < i:
+            continue
         op = scan.index("(", m.start())
         cp = _match(scan, op, "(", ")")
         if cp is None:
-            out.append(text[i:m.end()])
-            i = m.end()
             continue
-        parts = _split_top(text[op + 1:cp])
-        split = [_split_default(p) for p in parts]
+        split = _split_params_blanked(text[op + 1:cp], scan[op + 1:cp])
         if not any(d is not None for _n, d in split):
-            out.append(text[i:cp + 1])
-            i = cp + 1
             continue
-        # The body has to follow, with nothing but qualifiers between.
-        brace = scan.find("{", cp)
-        between = scan[cp + 1:brace] if brace >= 0 else ";"
-        if brace < 0 or ";" in between or "}" in between:
-            out.append(text[i:cp + 1])
-            i = cp + 1
-            continue
-        close = _match(scan, brace, "{", "}")
-        if close is None:
-            out.append(text[i:cp + 1])
-            i = cp + 1
-            continue
-        head = text[m.start():op]
-        body = text[brace + 1:close]
         first = next(k for k, (_n, d) in enumerate(split) if d is not None)
-        forms = []
-        for keep in range(len(split), first - 1, -1):
-            sig = ", ".join(n for n, _d in split[:keep])
-            pre = "".join(" %s = %s;" % (split[k][0].strip(), split[k][1])
-                          for k in range(keep, len(split)))
-            forms.append("%s(%s) {%s%s}" % (head.rstrip(), sig, pre, body))
-        out.append(text[i:m.start()])
-        out.append("\n".join(forms))
-        i = close + 1
+        if any(d is None for _n, d in split[first:]):
+            continue                             # not a parameter list
+        if blocks is None:
+            blocks = _block_kinds(scan)
+        kind = _kind_at(blocks, op)
+        head = text[m.start():op]
+        # The regex may start at an access label: `{ public: S(int x = 1)`.
+        lead = re.sub(r"\b(?:public|private|protected)\s*:", " ",
+                      scan[m.start():op])
+        words = re.findall(r"[~\w:]+", lead)
+        if not words:
+            continue
+        name = words[-1]
+        line = text.count("\n", 0, op) + 1
+        where = "%s:%d" % (path, line)
+        # What follows the parameter list decides declaration or definition.
+        tail = re.match(r"[^;{}]*", scan[cp + 1:]).group(0)
+        end = cp + 1 + len(tail)
+        has_body = end < len(scan) and scan[end] == "{"
+        is_decl = end < len(scan) and scan[end] == ";"
+        if not (has_body or is_decl):
+            continue
+        if kind not in (None, "ns", "class"):
+            continue                             # a statement, not a declaration
+
+        if kind == "class" and has_body:
+            brace = end
+            close = _match(scan, brace, "{", "}")
+            if close is None:
+                continue
+            body = text[brace + 1:close]
+            forms = []
+            for keep in range(len(split), first - 1, -1):
+                sig = ", ".join(n for n, _d in split[:keep])
+                pre = "".join(" %s = %s;" % (split[k][0].strip(), split[k][1])
+                              for k in range(keep, len(split)))
+                forms.append("%s(%s)%s{%s%s}" % (
+                    head.rstrip(), sig, text[cp + 1:brace], pre, body))
+            out.append(text[i:m.start()])
+            out.append("\n".join(forms))
+            i = close + 1
+            continue
+
+        if kind == "class":
+            specs = [w for w in words[:-1] if w in _DECL_SPECIFIERS]
+            ret = [w for w in re.findall(r"[\w:]+|[*&]", lead[:lead.rfind(name)])
+                   if w not in _DECL_SPECIFIERS]
+            if not ret or name.startswith("~"):
+                raise AutoError(
+                    "%s: `%s` takes a default argument but its body is "
+                    "defined out of line. A constructor cannot delegate, "
+                    "so there is nothing to give the shorter form: define "
+                    "it in the class, or write the overload out." % (
+                        where, name))
+            quals = text[cp + 1:end]
+            if re.search(r"=\s*0", quals):
+                raise AutoError(
+                    "%s: `%s` is pure virtual with a default argument. A "
+                    "virtual overload would need a vtable slot of its own; "
+                    "write the default at the call instead." % (where, name))
+            quals = re.sub(r"\b(?:override|final|noexcept)\b", "", quals)
+            full = ", ".join(n for n, _d in split)
+            forms = ["%s(%s)%s;" % (head.rstrip(), full, text[cp + 1:end])]
+            names = [_declarator_name(n) for n, _d in split]
+            for keep in range(len(split) - 1, first - 1, -1):
+                sig = ", ".join(n for n, _d in split[:keep])
+                args = ", ".join(names[:keep] + [split[k][1] for k in
+                                                 range(keep, len(split))])
+                ret_kw = "" if ret == ["void"] else "return "
+                forms.append("%s(%s)%s{ %s%s(%s); }" % (
+                    head.rstrip(), sig, quals.rstrip(), ret_kw, name, args))
+            out.append(text[i:m.start()])
+            out.append("\n".join(forms))
+            i = end + 1
+            continue
+
+        # A free function, declared or defined at file or namespace scope.
+        if "::" in name:
+            raise AutoError(
+                "%s: default argument on the out-of-line definition of "
+                "`%s`. Put the default on its declaration in the class." % (
+                    where, name))
+        if len(words) < 2:
+            continue                             # no type: not a declaration
+        bare = name
+        entry = (len(split), tuple(d for _n, d in split))
+        prev = free.get(bare)
+        if prev is not None and prev != entry:
+            raise AutoError(
+                "%s: `%s` is declared twice with different default "
+                "arguments. Free functions lower to one C symbol per name, "
+                "so there is one set of defaults to supply at each call." % (
+                    where, bare))
+        free[bare] = entry
+        out.append(text[i:op + 1])
+        out.append(", ".join(n for n, _d in split))
+        i = cp
+    out.append(text[i:])
+    text = "".join(out)
+    if free:
+        text = _fill_default_arguments(text, free)
+    return text
+
+
+def _split_params_blanked(tseg, bseg):
+    """`[(declarator, default)]` for a parameter list.
+
+    Commas and `=` are found in `bseg`, the same span with literals
+    blanked, and the pieces cut from `tseg`. Reading them off the real text
+    split `f(const char *s = "a,b")` at the comma inside the string, and
+    took the `=` inside `'='` for a default -- which is how
+    `if (s[2] == '=')` was once rewritten into two functions named `if`.
+    """
+    out = []
+    depth, start = 0, 0
+    cuts = []
+    for k, c in enumerate(bseg):
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        elif c == "," and depth == 0:
+            cuts.append((start, k))
+            start = k + 1
+    cuts.append((start, len(bseg)))
+    for a, b in cuts:
+        if not bseg[a:b].strip():
+            continue
+        n, d = _split_default(bseg[a:b])
+        if d is None:
+            out.append((tseg[a:b].strip(), None))
+            continue
+        eq = bseg.index("=", a + len(bseg[a:b]) - len(bseg[a:b].lstrip()) + len(n))
+        out.append((tseg[a:eq].strip(), tseg[eq + 1:b].strip()))
+    return out
+
+
+def _declarator_name(decl):
+    """The parameter name in a declarator: `const char *s` -> `s`."""
+    d = re.sub(r"\[[^\]]*\]\s*$", "", decl.strip())
+    m = re.search(r"(\w+)\s*$", d)
+    return m.group(1) if m else d
+
+
+def _fill_default_arguments(text, free):
+    """Append the omitted defaults at every call to a function in `free`."""
+    scan = _blank_like(text)
+    blocks = _block_kinds(scan)
+    pat = re.compile(r"(?<![\w.])(?:\w+::)*(%s)\s*\(" %
+                     "|".join(re.escape(n) for n in free))
+    out, i = [], 0
+    for m in pat.finditer(scan):
+        if m.start() < i or scan[max(0, m.start() - 2):m.start()] == "->":
+            continue
+        if _kind_at(blocks, m.start()) not in ("code", "init"):
+            continue
+        op = m.end() - 1
+        cp = _match(scan, op, "(", ")")
+        if cp is None:
+            continue
+        nparams, defaults = free[m.group(1)]
+        inner = scan[op + 1:cp]
+        nargs = len(_split_top(inner)) if inner.strip() else 0
+        missing = [d for d in defaults[nargs:] if d is not None]
+        if nargs >= nparams or len(missing) != nparams - nargs:
+            continue
+        out.append(text[i:cp])
+        out.append((", " if nargs else "") + ", ".join(missing))
+        i = cp
+    out.append(text[i:])
+    return "".join(out)
 
 
 _DEFAULTED_PARAMS = re.compile(
