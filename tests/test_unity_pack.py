@@ -2000,6 +2000,39 @@ class TestBox2DIntegration(unittest.TestCase):
         self.assertTrue(ok, "\n".join(report))
 
 
+class TestAuthoredZeroValues(unittest.TestCase):
+    """An authored 0 read as missing -- `float(x or default)` -- and given
+    the default: a Rigidbody2D's gravity scale 0 fell under gravity, a
+    paused Animator (speed 0) played, a -1..0 Slider ran -1..1, and a
+    Scrollbar's size 0 became 0.2."""
+
+    def test_slider_max_zero(self):
+        block = ("MonoBehaviour:\n  m_Enabled: 1\n  m_Interactable: 1\n"
+                 "  m_MinValue: -1\n  m_MaxValue: 0\n  m_Value: -0.5\n")
+        sl = unity_pack._parse_ui_slider(block, 55)
+        plan = {"classes": {"S": {"n": 1, "instances": [
+            {"name": "S", "go_index": 0, "ui_slider": sl}]}}}
+        out = unity_pack._build_ui_sliders(plan)
+        self.assertEqual((out[0]["min"], out[0]["max"]), (-1.0, 0.0))
+
+    def test_animation_speed_zero(self):
+        clip = {"name": "C", "length": 1.0, "loop": 1, "pos_keys": [],
+                "sprite_curves": []}
+        plan = {"classes": {"A": {"n": 1, "instances": [
+            {"name": "A", "anim_player": {"clip": clip, "clip_guid": "g",
+                                          "playing": 1, "speed": 0.0,
+                                          "kind": "animator"}}]}}}
+        anim = unity_pack._build_animation_tables(plan)
+        self.assertEqual(anim["players"][0]["speed"], 0.0)
+
+    def test_rigidbody2d_gravity_scale_zero(self):
+        plan = {"classes": {"B": {"n": 1, "instances": [
+            {"name": "B", "go_index": 0, "rigidbody2d": {
+                "body_type": 0, "mass": 1.0, "gravity_scale": 0.0}}]}}}
+        rb2d = unity_pack._build_rigidbody_tables(plan)[0]
+        self.assertEqual(rb2d[0]["gravity_scale"], 0.0)
+
+
 class TestExtensionDesugar(unittest.TestCase):
     """tools/unity_pack_extensions.py on its own: no pack, no compiler."""
 
