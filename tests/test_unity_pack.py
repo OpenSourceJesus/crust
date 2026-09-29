@@ -11931,7 +11931,11 @@ class TestSystems(unittest.TestCase):
             eng = f.read()
         self.assertIn("static void Menu_Awake(unsigned i)", eng)
         self.assertIn("GameObject_SetActive(_engine_go_of_Menu(i), (0))", eng)
-        self.assertIn("Menu_Awake((unsigned)n)", eng)
+        # Awake through the lifecycle message; one that deactivated its
+        # GameObject is not enabled (no OnEnable, no Update)
+        self.assertIn("Menu_Awake(n);", eng)
+        self.assertIn("if (!_engine_go_active_in_hierarchy(_engine_go_of_Menu(n)))"
+                      " return;", eng)
         # SetActive alone sets want_ui; ColorBlock tint must not be referenced
         # without authored Buttons (would be undeclared).
         self.assertNotIn("_engine_ui_btn_tint_init", eng)
@@ -14523,16 +14527,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
 
     def test_refuses_input_action_and_ui_invent(self):
+        # (InputAction is supported now: tools/unity_pack_input.py)
         cases = [
-            (
-                "using UnityEngine;\n"
-                "using UnityEngine.InputSystem;\n"
-                "public class Act : MonoBehaviour {\n"
-                "    public InputAction move;\n"
-                "    public void Update() { move.ReadValue<float>(); }\n"
-                "}\n",
-                ("CS0246", "InputAction"),
-            ),
             (
                 "using UnityEngine;\n"
                 "public class Hud : MonoBehaviour {\n"
