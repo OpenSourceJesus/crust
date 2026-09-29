@@ -6123,6 +6123,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     _with_scalars(names)),
                 "owner": cname, "virtual": False, "decl": cname}
 
+    # The per-member flags describe the member the loop last saw. Everything
+    # emitted from here on -- implicit constructors, the implicit copy and
+    # assignment, allocators -- is written by this pass, in the class, so it
+    # is neither out of line nor declared-only. Left set, an out-of-line last
+    # member gave the implicit copy external linkage, and two units including
+    # the same header then both defined it.
+    emitting_outline[0] = False
+    decl_only[0] = False
+
     # A base, a member, or a vtable pointer all oblige the class to have a
     # constructor; a base or member destructor obliges a destructor.
     if not plain and prologue:
@@ -6656,6 +6665,17 @@ def _named_object(expr, scopes, type_info):
         for fr in reversed(scopes):
             if nm in fr.ptrvals:
                 return ("(*%s)" % nm, fr.ptrvals[nm])
+            if nm in fr.vals and nm in fr.ptrs:
+                # A pointer *parameter* (`Holder *h`) is kept with the
+                # objects it points at, in `vals` and `ptrs`, not in
+                # `ptrvals` with the pointer locals -- so `Holder c(*h)`
+                # named nothing and fell through to picking a constructor
+                # by arity. A class with its own `operator*` means that
+                # instead, and is left to it.
+                cls_ = fr.vals[nm]
+                if (type_info.get(cls_) or {}).get("star"):
+                    return None
+                return ("(*%s)" % nm, cls_)
             if nm in fr.vals:
                 break            # a value local: `*v` is not the object
         return None
