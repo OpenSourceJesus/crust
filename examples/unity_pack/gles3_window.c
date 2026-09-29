@@ -111,6 +111,22 @@ UNITY_KEYS(UNITY_KEY_DECL)
 float engine_pointer_x __attribute__((weak)) = 0.f;
 float engine_pointer_y __attribute__((weak)) = 0.f;
 int engine_pointer_down __attribute__((weak)) = 0;
+/* Mouse wheel since the last frame (notches, y > 0 up / away); the engine
+ * takes and zeroes it each tick. */
+float engine_scroll_x __attribute__((weak)) = 0.f;
+float engine_scroll_y __attribute__((weak)) = 0.f;
+/* The first gamepad, for the Input System's Gamepad.current (GLFW's
+ * standard layout; y up as Unity; triggers 0..1). */
+int engine_gamepad_connected __attribute__((weak)) = 0;
+int engine_gamepad_button[15] __attribute__((weak));
+float engine_gamepad_axis[6] __attribute__((weak));
+
+static void on_scroll(GLFWwindow *w, double dx, double dy)
+{
+    (void)w;
+    engine_scroll_x += (float)dx;
+    engine_scroll_y += (float)dy;
+}
 
 /* Player Settings defaultScreenWidth/Height (data.c defines). */
 extern int Screen_width;
@@ -149,6 +165,23 @@ static void poll_input_axes(GLFWwindow *win)
 #define UNITY_KEY_SET(n, k) engine_keyboard_##n = glfwGetKey(win, k) == GLFW_PRESS;
     UNITY_KEYS(UNITY_KEY_SET)
 #undef UNITY_KEY_SET
+
+    {
+        GLFWgamepadstate gs;
+        int k;
+        engine_gamepad_connected = glfwJoystickIsGamepad(GLFW_JOYSTICK_1)
+            && glfwGetGamepadState(GLFW_JOYSTICK_1, &gs);
+        if (engine_gamepad_connected) {
+            for (k = 0; k < 15; ++k)
+                engine_gamepad_button[k] = gs.buttons[k] == GLFW_PRESS;
+            engine_gamepad_axis[0] = gs.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
+            engine_gamepad_axis[1] = -gs.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
+            engine_gamepad_axis[2] = gs.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
+            engine_gamepad_axis[3] = -gs.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
+            engine_gamepad_axis[4] = (gs.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] + 1.f) * 0.5f;
+            engine_gamepad_axis[5] = (gs.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] + 1.f) * 0.5f;
+        }
+    }
 
     /* uGUI Button — screen space, origin bottom-left (Unity).
      * glfwGetCursorPos is in window coordinates; map via window size, not
@@ -238,6 +271,7 @@ int main(int argc, char **argv)
         return 1;
     }
     glfwMakeContextCurrent(win);
+    glfwSetScrollCallback(win, on_scroll);
     glfwSwapInterval(1);
 
     printf("GLES %s\n", (const char *)glGetString(GL_VERSION));

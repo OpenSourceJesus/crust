@@ -83,6 +83,7 @@ static const char *G3_FRAG_SRC =
 
 static GLfloat g3_vert[MAX_FLOATS];
 static GLuint g3_tex[MAX_TEX];
+static GLuint g3_white_tex;
 static int g3_tex_n;
 static GLuint g3_prog;
 static GLint g3_u_tex;
@@ -221,6 +222,14 @@ static int g3_upload_textures(void)
     g3_tex_n = engine_texture_count();
     if (g3_tex_n > MAX_TEX)
         g3_tex_n = MAX_TEX;
+    {
+        static const unsigned char white[4] = { 255, 255, 255, 255 };
+        glGenTextures(1, &g3_white_tex);
+        glBindTexture(GL_TEXTURE_2D, g3_white_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
     if (g3_tex_n < 1)
         return 1;
     glGenTextures(g3_tex_n, g3_tex);
@@ -367,10 +376,11 @@ static int g3_draw(int width, int height)
     for (i = 0; i < ndraw; i++) {
         int nfloats = 0;
         int tid = draws[i].tex;
-        if (tid < 0 || tid >= g3_tex_n)
+        /* -2: no texture, the entry's color (a particle) */
+        if (tid != -2 && (tid < 0 || tid >= g3_tex_n))
             continue;
         g3_emit_quad(&nfloats, &draws[i]);
-        glBindTexture(GL_TEXTURE_2D, g3_tex[tid]);
+        glBindTexture(GL_TEXTURE_2D, tid == -2 ? g3_white_tex : g3_tex[tid]);
         glBufferSubData(GL_ARRAY_BUFFER, 0,
                         (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)), g3_vert);
         glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);

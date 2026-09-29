@@ -80,6 +80,7 @@ static const char *FRAG_SRC =
 static unsigned char pixels[WIDTH * HEIGHT * 4];
 static GLfloat vert_buf[MAX_FLOATS];
 static GLuint gl_tex[MAX_TEX];
+static GLuint view_white_tex;
 static int tex_n;
 static GLint u_tex_loc;
 static float world_left, world_right, world_bottom, world_top;
@@ -315,6 +316,14 @@ static int upload_textures(void)
     tex_n = engine_texture_count();
     if (tex_n > MAX_TEX)
         tex_n = MAX_TEX;
+    {
+        static const unsigned char white[4] = { 255, 255, 255, 255 };
+        glGenTextures(1, &view_white_tex);
+        glBindTexture(GL_TEXTURE_2D, view_white_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
     if (tex_n < 1)
         return 1;
     glGenTextures(tex_n, gl_tex);
@@ -385,10 +394,11 @@ static int draw_scene(GLuint prog)
     for (i = 0; i < ndraw; i++) {
         int nfloats = 0;
         int tid = draws[i].tex;
-        if (tid < 0 || tid >= tex_n)
+        /* -2: no texture, the entry's color (a particle) */
+        if (tid != -2 && (tid < 0 || tid >= tex_n))
             continue;
         emit_quad(&nfloats, &draws[i]);
-        glBindTexture(GL_TEXTURE_2D, gl_tex[tid]);
+        glBindTexture(GL_TEXTURE_2D, tid == -2 ? view_white_tex : gl_tex[tid]);
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)),
                      vert_buf, GL_DYNAMIC_DRAW);

@@ -107,6 +107,22 @@ UNITY_KEYS(UNITY_KEY_DECL)
 float engine_pointer_x __attribute__((weak)) = 0.f;
 float engine_pointer_y __attribute__((weak)) = 0.f;
 int engine_pointer_down __attribute__((weak)) = 0;
+/* Mouse wheel since the last frame (notches, y > 0 up / away); the engine
+ * takes and zeroes it each tick. */
+float engine_scroll_x __attribute__((weak)) = 0.f;
+float engine_scroll_y __attribute__((weak)) = 0.f;
+/* The first gamepad, for the Input System's Gamepad.current (GLFW's
+ * standard layout; y up as Unity; triggers 0..1). */
+int engine_gamepad_connected __attribute__((weak)) = 0;
+int engine_gamepad_button[15] __attribute__((weak));
+float engine_gamepad_axis[6] __attribute__((weak));
+
+static void on_scroll(GLFWwindow *w, double dx, double dy)
+{
+    (void)w;
+    engine_scroll_x += (float)dx;
+    engine_scroll_y += (float)dy;
+}
 
 /* Player Settings defaultScreenWidth/Height (data.c defines). */
 extern int Screen_width;
@@ -312,6 +328,14 @@ static int upload_textures(void)
     tex_n = engine_texture_count();
     if (tex_n > MAX_TEX)
         tex_n = MAX_TEX;
+    {
+        static const unsigned char white[4] = { 255, 255, 255, 255 };
+        glGenTextures(1, &white_tex);
+        glBindTexture(GL_TEXTURE_2D, white_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
     if (tex_n < 1)
         return 1;
     glGenTextures(tex_n, gl_tex);
@@ -356,6 +380,23 @@ static void poll_input_axes(GLFWwindow *win)
     UNITY_KEYS(UNITY_KEY_SET)
 #undef UNITY_KEY_SET
 
+    {
+        GLFWgamepadstate gs;
+        int k;
+        engine_gamepad_connected = glfwJoystickIsGamepad(GLFW_JOYSTICK_1)
+            && glfwGetGamepadState(GLFW_JOYSTICK_1, &gs);
+        if (engine_gamepad_connected) {
+            for (k = 0; k < 15; ++k)
+                engine_gamepad_button[k] = gs.buttons[k] == GLFW_PRESS;
+            engine_gamepad_axis[0] = gs.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
+            engine_gamepad_axis[1] = -gs.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
+            engine_gamepad_axis[2] = gs.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
+            engine_gamepad_axis[3] = -gs.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
+            engine_gamepad_axis[4] = (gs.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] + 1.f) * 0.5f;
+            engine_gamepad_axis[5] = (gs.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] + 1.f) * 0.5f;
+        }
+    }
+
     /* uGUI Button — screen space, origin bottom-left (Unity).
      * glfwGetCursorPos is in window coordinates; map via window size, not
      * framebuffer (HiDPI would stretch hits and miss ColorBlock hover). */
@@ -374,6 +415,8 @@ static void poll_input_axes(GLFWwindow *win)
     }
 }
 
+static GLuint white_tex;
+
 static void draw_one(const EngineDraw *d)
 {
     int nfloats = 0;
@@ -382,9 +425,13 @@ static void draw_one(const EngineDraw *d)
 
     emit_quad(&nfloats, d);
     tid = d->tex;
-    if (tid < 0 || tid >= tex_n)
+    /* -2: no texture, the entry's color (a particle) -- a white texel */
+    if (tid == -2)
+        glBindTexture(GL_TEXTURE_2D, white_tex);
+    else if (tid < 0 || tid >= tex_n)
         return;
-    glBindTexture(GL_TEXTURE_2D, gl_tex[tid]);
+    else
+        glBindTexture(GL_TEXTURE_2D, gl_tex[tid]);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER,
                  (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)),
@@ -501,6 +548,7 @@ int main(int argc, char **argv)
         return 1;
     }
     glfwMakeContextCurrent(win);
+    glfwSetScrollCallback(win, on_scroll);
     glfwSwapInterval(1);
 
     printf("GLES %s\n", (const char *)glGetString(GL_VERSION));
