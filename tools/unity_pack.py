@@ -5858,6 +5858,13 @@ def analyze_script(path, text=None, shallow=False):
             r"productName)\s*\+",
             scan):
         apis.add("string.+")
+    # ... nor a concatenation that starts from a string variable
+    # (`s = s + "x"`, `s += n`), which cs2cpp now lowers too.
+    str_names = set(re.findall(r"(?<![\w.])string\s+(\w+)", scan))
+    if str_names and re.search(
+            r"(?<![\w.])(?:%s)\s*\+(?!\+)" % "|".join(
+                re.escape(n) for n in sorted(str_names)), scan):
+        apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
     apis.discard("Console.WriteLine")  # may have matched via _UNITY_API
     if re.search(r"System\.Console\.WriteLine\s*\(", scan):
@@ -12242,7 +12249,7 @@ def _emit_engine_class_groups(
                 emitted.add(prm.name)
             why = _unlowered_csharp(
                 body, args_str=m.get("args") or "", emitted_params=emitted,
-                known_types=_engine_types_declared(lines),
+                known_types=_engine_types_declared(lines) | {"fastring"},
                 properties=class_properties.get(cname) or ())
             # MB methods always emit as `static void`. A non-void C# return
             # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
@@ -14080,7 +14087,8 @@ def emit_engine(plan, analyses, used_apis):
             break
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
-            or want_app_open_url or plan.get("player_prefs")):
+            or want_app_open_url or plan.get("player_prefs")
+            or want_str_plus):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -14421,32 +14429,36 @@ def emit_engine(plan, analyses, used_apis):
         # live until the callee returns — two slots are not enough for
         # AppendAllText(pathExpr, contentExpr) where both are concatenations.
         p("/* C# string + value (not C pointer arithmetic) */")
-        p("static char _engine_str_buf[8][512];")
+        # A concatenation's result lives in a scratch slot until the end of
+        # its statement: a string local copies it into storage of its own
+        # (a coost fastring), so nothing kept points here. Slots grow to
+        # fit -- they were 512 bytes, and a longer string was cut short.
+        p("static char *_engine_str_buf[16];")
+        p("static size_t _engine_str_cap[16];")
         p("static int _engine_str_which;")
-        p("static const char *_str_plus_i(const char *a, int b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
-        p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%d\",")
-        p("             a ? a : \"\", b);")
-        p("    return out;")
+        p("static char *_engine_str_slot(size_t n) {")
+        p("    int k = _engine_str_which++ & 15;")
+        p("    if (_engine_str_cap[k] < n) {")
+        p("        _engine_str_buf[k] = (char *)realloc(_engine_str_buf[k], n);")
+        p("        if (!_engine_str_buf[k]) abort();")
+        p("        _engine_str_cap[k] = n;")
+        p("    }")
+        p("    return _engine_str_buf[k];")
         p("}")
-        p("static const char *_str_plus_f(const char *a, float b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
-        p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%g\",")
-        p("             a ? a : \"\", (double)b);")
-        p("    return out;")
-        p("}")
-        p("static const char *_str_plus_c(const char *a, char b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
-        p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%c\",")
-        p("             a ? a : \"\", b);")
-        p("    return out;")
-        p("}")
-        p("static const char *_str_plus_s(const char *a, const char *b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
-        p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%s\",")
-        p("             a ? a : \"\", b ? b : \"\");")
-        p("    return out;")
-        p("}")
+        for kind, cty, fmt, arg in (("i", "int", "%d", "b"),
+                                     ("f", "float", "%g", "(double)b"),
+                                     ("c", "char", "%c", "b"),
+                                     ("s", "const char *", "%s",
+                                      'b ? b : ""')):
+            p("static const char *_str_plus_%s(const char *a, %s%sb) {"
+              % (kind, cty, "" if cty.endswith("*") else " "))
+            p("    int n = snprintf((char *)0, 0, \"%%s%s\", a ? a : \"\", %s);"
+              % (fmt, arg))
+            p("    char *out = _engine_str_slot((size_t)n + 1);")
+            p("    snprintf(out, (size_t)n + 1, \"%%s%s\", a ? a : \"\", %s);"
+              % (fmt, arg))
+            p("    return out;")
+            p("}")
         p("/* Call sites pick _str_plus_{i,f,c,s} at rewrite (no C11 generics). */")
         p("")
     if want_data_path:
@@ -16661,13 +16673,14 @@ def _rewrite_local_rotation_reads(text, cl, plan):
     return text
 
 
-def _c_expr_scalar_kind(expr, string_idents=None):
+def _c_expr_scalar_kind(expr, string_idents=None, int_idents=None):
     """Pick i/f/c/s for Debug_Log / Console_WriteLine: cs2cpp's classifier,
     under the packed model (whose engine defines what returns a string)."""
-    return cs2cpp.scalar_kind(expr, _PACKED_STRINGS, string_idents)
+    return cs2cpp.scalar_kind(expr, _PACKED_STRINGS, string_idents,
+                              int_idents)
 
 
-def _rewrite_typed_call_name(text, name, string_idents=None):
+def _rewrite_typed_call_name(text, name, string_idents=None, int_idents=None):
     """Rewrite Name(arg) → Name_{i,f,s}(arg). Skips already-typed Names."""
     out = []
     i = 0
@@ -16697,7 +16710,8 @@ def _rewrite_typed_call_name(text, name, string_idents=None):
             out.append(text[i + m.start():])
             break
         args = text[start:j]
-        kind = _c_expr_scalar_kind(args, string_idents=string_idents)
+        kind = _c_expr_scalar_kind(args, string_idents=string_idents,
+                                   int_idents=int_idents)
         out.append("%s_%s(%s)" % (name, kind, args))
         i = j + 1
     return "".join(out)
@@ -17150,9 +17164,10 @@ _PACKED_STRINGS.string_calls = (_PACKED_STRINGS.string_calls
                                 + _godot.STRING_CALLS)
 
 
-def _lower_string_concat(text, string_idents=None):
+def _lower_string_concat(text, string_idents=None, int_idents=None):
     """cs2cpp's typed concatenation under the packed model."""
-    return cs2cpp.lower_string_concat(text, _PACKED_STRINGS, string_idents)
+    return cs2cpp.lower_string_concat(text, _PACKED_STRINGS, string_idents,
+                                      int_idents)
 
 
 
@@ -17264,6 +17279,145 @@ def _rewrite_csharp_float_literals(text):
     out.append(text[pos:])
     return "".join(out)
 
+
+
+#: C# integer types that fit the engine's `int` formatters (`_str_plus_i`,
+#: `Debug_Log_i`). `long`, `uint` and `ulong` do not, and keep the float
+#: path rather than be truncated.
+_CS_INT_TYPES = ("int", "short", "ushort", "byte", "sbyte")
+
+#: Packed member kinds whose accessor returns an integer.
+_INT_MEMBER_KINDS = ("bits", "u8", "u16", "i32")
+
+
+def _int_idents(cl, plan, body, site):
+    """Names that hold an integer in this method, for typed formatting.
+
+    The C# ones -- int locals and parameters, and the class's int fields --
+    and the engine's: each class's integer field accessor
+    (`Player_get_hp`), since by the time `Debug.Log(hp)` is typed the field
+    read has become a call. Without these an integer printed through `%g`.
+    """
+    out = set()
+    ints = "|".join(_CS_INT_TYPES)
+    out |= set(re.findall(r"(?<![\w.])(?:%s)\s+(\w+)\s*[;=,)]" % ints,
+                          cs2cpp._blank(body or "")))
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in _CS_INT_TYPES:
+            out.add(prm.name)
+    for ocname, ocl in (plan.get("classes") or {}).items():
+        oidn = _c_ident(ocname)
+        for name, _ty, _bits, kind in ocl.get("members") or ():
+            if kind in _INT_MEMBER_KINDS:
+                out.add("%s_get_%s" % (oidn, name))
+                if ocname == cl.get("name"):
+                    out.add(name)
+    return out
+
+
+def _own_string_locals(text, string_idents, int_idents):
+    """Give each C# `string` local owned storage: a coost `fastring`.
+
+    Strings in the lowered code are `const char *`, and the engine's
+    concatenation writes its results into a ring of scratch buffers. That
+    is sound for a value used within its statement, and was not for one
+    kept: `string saved = "a" + hp;` pointed into a slot the next several
+    concatenations reused, and printed whatever came last.
+
+    So the storage owns its bytes and everything else stays as it was:
+
+        _cs_string s = e;   ->  fastring s; s.assign_cstr(e);
+        _cs_string s;       ->  fastring s;
+        s = e;              ->  s.assign_cstr(e);
+        s += e;             ->  s.assign_cstr(_str_plus_K(s.c_str(), (e)));
+        s (any other read)  ->  s.c_str()
+
+    `assign_cstr` copies, and copes with `e` pointing into `s` itself. A
+    declaration this cannot split -- one in a `for` head, or several
+    declarators in one statement -- is left with its marker type, which
+    the stub check reports rather than guessing.
+    """
+    marker = cs2cpp.PACKED_STRING_LOCAL
+    scan = cs2cpp._blank(text)
+    if marker not in scan:
+        return text
+    names = sorted(set(re.findall(r"\b%s\s+(\w+)" % marker, scan)),
+                   key=len, reverse=True)
+    if not names:
+        return text
+
+    def stmt_start(k):
+        j = k - 1
+        while j >= 0 and scan[j] in " \t\r\n":
+            j -= 1
+        return j < 0 or scan[j] in ";{}"
+
+    def expr_end(k):
+        """Index of the `;` ending the expression at k, or -1 (a top-level
+        comma means several declarators)."""
+        depth = 0
+        while k < len(scan):
+            c = scan[k]
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                if depth == 0:
+                    return -1
+                depth -= 1
+            elif c == "," and depth == 0:
+                return -1
+            elif c == ";" and depth == 0:
+                return k
+            k += 1
+        return -1
+
+    alt = "|".join(re.escape(n) for n in names)
+    stmt = re.compile(
+        r"(%s\s+)?(?<![\w.>])(%s)\s*(\+=|=(?!=)|;)" % (re.escape(marker), alt))
+    out, i = [], 0
+    for m in stmt.finditer(scan):
+        if m.start() < i or not stmt_start(m.start()):
+            continue
+        decl, name, op = m.group(1), m.group(2), m.group(3)
+        if op == ";":
+            if not decl:
+                continue                      # `s;` -- not a statement of ours
+            out.append(text[i:m.start()])
+            out.append("fastring %s;" % name)
+            i = m.end()
+            continue
+        if decl is None and name not in string_idents:
+            continue
+        end = expr_end(m.end())
+        if end < 0:
+            continue
+        expr = text[m.end():end].strip()
+        out.append(text[i:m.start()])
+        if decl:
+            out.append("fastring %s; " % name)
+        if op == "+=":
+            kind = _c_expr_scalar_kind(expr, string_idents=string_idents,
+                                       int_idents=int_idents)
+            out.append("%s.assign_cstr(_str_plus_%s(%s, (%s)));"
+                       % (name, kind, name, expr))
+        else:
+            out.append("%s.assign_cstr(%s);" % (name, expr))
+        i = end + 1
+    out.append(text[i:])
+    text = "".join(out)
+
+    # Every other read of a string local is its C string.
+    scan = cs2cpp._blank(text)
+    out, i = [], 0
+    for m in re.finditer(r"(?<![\w.>])(?:%s)(?![\w])(?!\s*(?:\.|\())" % alt,
+                         scan):
+        if re.search(r"\bfastring\s+$", scan[max(0, m.start() - 16):m.start()]):
+            continue                          # its own declaration
+        out.append(text[i:m.start()])
+        out.append("%s.c_str()" % text[m.start():m.end()])
+        i = m.end()
+    out.append(text[i:])
+    return "".join(out)
 
 
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
@@ -17476,11 +17630,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     }
     # Locals: `string x` / `const char *x` (after string→const char * rewrite).
     string_idents |= set(re.findall(
-        r"\b(?:string|const char \*)\s+(\w+)\b", text))
+        r"\b(?:string|const char \*|%s)\s+(\w+)\b"
+        % cs2cpp.PACKED_STRING_LOCAL, text))
+    int_idents = _int_idents(cl, plan, body, site)
     string_idents |= {
         prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
         if prm.type in ("string", "String", "System.String")}
-    text = _lower_string_concat(text, string_idents=string_idents)
+    text = _lower_string_concat(text, string_idents=string_idents,
+                                int_idents=int_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
@@ -17743,9 +17900,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = "\n".join(fixed)
     # Typed Debug_Log / Console_WriteLine — crust has no _Generic.
     text = _rewrite_typed_call_name(
-        text, "Debug_Log", string_idents=string_idents)
+        text, "Debug_Log", string_idents=string_idents, int_idents=int_idents)
     text = _rewrite_typed_call_name(
-        text, "Console_WriteLine", string_idents=string_idents)
+        text, "Console_WriteLine", string_idents=string_idents,
+        int_idents=int_idents)
+    # Last: every rewrite above has read the string locals by name.
+    text = _own_string_locals(text, string_idents, int_idents)
     return text
 
 
@@ -19487,7 +19647,7 @@ def _file_fingerprint_entry(path, root):
     return (rel, int(st.st_size), int(mtime_ns))
 
 
-def _fingerprint_entries(root, box2d_root=None):
+def _fingerprint_entries(root, box2d_root=None, coost_root=None):
     """Sorted (relpath, size, mtime_ns) for packer + project inputs.
 
     Every module that shapes the output counts, the Box2D-Packed glue
@@ -19507,6 +19667,15 @@ def _fingerprint_entries(root, box2d_root=None):
         e = _file_fingerprint_entry(os.path.join(b2d, "box2d_unity.py"), b2d)
         if e:
             entries.append(("box2d/box2d_unity.py",) + e[1:])
+    coost = find_coost_root(coost_root)
+    if coost:
+        # What a string-using engine splices in: an edit is a new pack.
+        for rel in ("include/co/fastring.h", "include/co/fast.h",
+                    "include/co/mem.h", "include/co/def.h",
+                    "include/co/__/dtoa_milo.h") + COOST_STRING_CORE:
+            e = _file_fingerprint_entry(os.path.join(coost, rel), coost)
+            if e:
+                entries.append(("coost/" + rel,) + e[1:])
     ps = os.path.join(root, "ProjectSettings")
     if os.path.isdir(ps):
         for dirpath, _dns, names in os.walk(ps):
@@ -19551,13 +19720,13 @@ def _hash_fingerprint_entries(entries, soa=True, soa_vec4=False,
 
 
 def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False,
-                        box2d_root=None):
+                        box2d_root=None, coost_root=None):
     """(full, assets, scripts) fingerprints.
 
     *assets* covers tools, ProjectSettings, and non-``.cs`` Assets inputs.
     *scripts* covers ``Assets/**/*.cs`` only. *full* is the early-exit key.
     """
-    entries = _fingerprint_entries(root, box2d_root)
+    entries = _fingerprint_entries(root, box2d_root, coost_root)
     script_entries = [e for e in entries if e[0].endswith(".cs")]
     asset_entries = [e for e in entries if not e[0].endswith(".cs")]
     full = _hash_fingerprint_entries(entries, soa=soa, soa_vec4=soa_vec4,
@@ -19780,12 +19949,16 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
 
 
 def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
-         gpu_handles=False, physics_inject=False, box2d_root=None):
+         gpu_handles=False, physics_inject=False, box2d_root=None,
+         coost_root=None):
     """Pack the Unity-subset project at *root* into *outdir*.
 
     2D physics (Rigidbody2D, Collider2D) is Box2D-Packed: box2d_unity.py from
     the Box2D-Packed checkout at *box2d_root*, $BOX2D_PACKED_ROOT, or a
-    ``box2d`` directory beside this repository. physics_inject=True routes
+    ``box2d`` directory beside this repository. C# string locals are coost
+    fastrings, spliced into engine.cpp when a script has one: the coost
+    checkout at *coost_root*, $COOST_ROOT, or a ``coost`` directory beside
+    this repository (only needed then). physics_inject=True routes
     contact begin / end through box2d_pack injection markers instead of
     Box2D's event arrays.
     """
@@ -19794,7 +19967,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
         root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles,
-        box2d_root=box2d_root)
+        box2d_root=box2d_root, coost_root=coost_root)
     if not force:
         stamp = _read_stamp(outdir)
         if (stamp
@@ -20020,6 +20193,15 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     # an error (`_report_stub`).
     plan["strict"] = bool(strict)
     engine = emit_engine(plan, analyses, used_apis)
+    # C# string locals are coost fastrings (`_own_string_locals`). Only an
+    # engine that has one needs coost: splice its string core in after the
+    # C headers, for cpprust to lower with the rest.
+    if re.search(r"\bfastring\b", engine):
+        croot = require_coost_root(coost_root)
+        anchor = "#include <stdint.h>\n"
+        k = engine.index(anchor) + len(anchor)
+        engine = engine[:k] + coost_string_core(croot) + engine[k:]
+        plan["coost_root"] = croot
     if gpu_handles:
         # Packed handle streams for a GLES 3.1 SSBO (`_handle_streams`).
         engine += emit_handles_c(plan)
@@ -20177,6 +20359,14 @@ def main():
     if "--box2d-lto" in args:
         box2d_lto = True
         args.remove("--box2d-lto")
+    coost_root = None
+    if "--coost" in args:
+        i = args.index("--coost")
+        if i + 1 >= len(args):
+            sys.stderr.write("unity_pack: --coost needs a coost checkout\n")
+            return 2
+        coost_root = args[i + 1]
+        del args[i:i + 2]
     box2d_root = None
     if "--box2d" in args:
         i = args.index("--box2d")
@@ -20196,7 +20386,8 @@ def main():
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
             "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
-            "       [--physics-inject] [--box2d PATH] [--box2d-lto]\n"
+            "       [--physics-inject] [--box2d PATH] [--box2d-lto]"
+            " [--coost PATH]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  default layout:  SoA position tables (use --aos for AoS)\n"
@@ -20207,7 +20398,8 @@ def main():
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
                     strict=strict, gpu_handles=gpu_handles,
-                    physics_inject=physics_inject, box2d_root=box2d_root)
+                    physics_inject=physics_inject, box2d_root=box2d_root,
+                    coost_root=coost_root)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player",
             box2d_root=box2d_root, box2d_lto=box2d_lto)

@@ -454,6 +454,10 @@ class ObjectModel(object):
                    and lowers `this.` to `this->` itself.
     string_type -- the C type a `string` local is declared as, or None to
                    leave `string` to the type map (csrust: its `string`).
+                   The packed engine's is a marker, `_cs_string`, which
+                   unity_pack's last pass turns into owned storage (a coost
+                   `fastring`) once every other rewrite has read the local
+                   as a string.
     byte_array  -- the C struct a `byte[]` is (`ByteArray`, with `.data` and
                    `.length`), or None for the C# subset's own arrays.
     string_plus -- the prefix of the engine's typed concatenation helpers
@@ -503,6 +507,12 @@ class ObjectModel(object):
 #: csrust: owned values; `null` is handled as a literal.
 OWNED = ObjectModel()
 
+#: What a C# `string` local is declared as under the packed model, until
+#: unity_pack gives it storage. A marker rather than `const char *`: the
+#: expressions a string local takes part in stay `const char *`, and the
+#: storage is the one thing that must not be.
+PACKED_STRING_LOCAL = "_cs_string"
+
 
 #: What the packed engine's API returns as a string, once lowered.
 _PACKED_STRING_CALLS = ("Application_dataPath()",
@@ -522,7 +532,7 @@ def packed_model(has_objects, byte_arrays=False, elem_type=None):
     the engine's collection element typing (see `ObjectModel`)."""
     return ObjectModel(null_handle="-1" if has_objects else None,
                        bool_ints=True, this_index=True,
-                       string_type="const char *",
+                       string_type=PACKED_STRING_LOCAL,
                        byte_array="ByteArray" if byte_arrays else None,
                        string_plus="_str_plus",
                        string_calls=_PACKED_STRING_CALLS,
@@ -639,7 +649,7 @@ def _parse_plus_rhs(text, i):
     return start, i
 
 
-def scalar_kind(expr, model, string_idents=None):
+def scalar_kind(expr, model, string_idents=None, int_idents=None):
     """`s` / `c` / `i` / `f`: what an operand is, for a typed C call.
 
     Strings are what the model's engine says are strings (`string_calls`),
@@ -648,8 +658,13 @@ def scalar_kind(expr, model, string_idents=None):
     is `c`, an integer literal `i`, and anything else `f`. The typed
     concatenation below uses it, and so do the engine's typed log calls
     (`Debug_Log_s` ..).
+
+    `int_idents` are names known to hold an integer (an `int` field, local
+    or parameter). Without them an integer variable fell to `f`, and
+    `"hp=" + hp` printed through `%g` -- 1000000 as `1e+06`.
     """
     string_idents = frozenset(string_idents or ())
+    int_idents = frozenset(int_idents or ())
     e = expr.strip()
     while (e.startswith("(") and e.endswith(")")
            and e.count("(") == e.count(")")):
@@ -670,10 +685,34 @@ def scalar_kind(expr, model, string_idents=None):
         return "c"
     if re.match(r"^-?\d+$", e):
         return "i"
+    if re.match(r"^\w+$", e) and e in int_idents:
+        return "i"
+    cm = re.match(r"^(\w+)\s*\(", e)
+    if cm and cm.group(1) in int_idents and _is_one_call(e):
+        return "i"               # an accessor the engine types as integer
     return "f"
 
 
-def lower_string_concat(text, model, string_idents=None):
+def _is_one_call(e):
+    """`f(..)` and nothing after the call's closing parenthesis."""
+    depth = 0
+    k = e.index("(")
+    while k < len(e):
+        c = e[k]
+        if c == '"':
+            k = skip_string_literal(e, k)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return k == len(e) - 1
+        k += 1
+    return False
+
+
+def lower_string_concat(text, model, string_idents=None, int_idents=None):
     """C# `string + value` as the engine's typed concatenation.
 
     `+` on a C string adds to the pointer. From a left operand known to be
@@ -687,6 +726,7 @@ def lower_string_concat(text, model, string_idents=None):
         return text
     helper = model.string_plus
     whole = [c for c in model.string_calls if c.endswith(")")]
+    names = frozenset(string_idents or ())
     changed = True
     while changed:
         changed = False
@@ -726,16 +766,29 @@ def lower_string_concat(text, model, string_idents=None):
                 j = skip_string_literal(text, i)
                 left = text[i:j]
                 left_end = j
+            elif names and (text[i].isalpha() or text[i] == "_") and (
+                    i == 0 or not (text[i - 1].isalnum()
+                                   or text[i - 1] in "_.>")):
+                # A variable known to hold a string: `s + "x"`. Before, a
+                # chain had to *start* with a literal or an engine call, so
+                # `s = s + "x"` was left as pointer arithmetic.
+                wm = re.match(r"\w+", text[i:])
+                if wm and wm.group(0) in names:
+                    left = wm.group(0)
+                    left_end = i + len(left)
             if left is not None:
                 k = left_end
                 while k < len(text) and text[k] in " \t\n\r":
                     k += 1
-                if k < len(text) and text[k] == "+":
+                if k < len(text) and text[k] == "+" and \
+                        text[k + 1:k + 2] not in ("=", "+"):
+                    # `s += x` and `s++` are not a concatenation's `+`.
                     rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
                     rhs = text[rhs_start:rhs_end].strip()
                     if rhs:
                         kind = scalar_kind(rhs, model,
-                                           string_idents=string_idents)
+                                           string_idents=string_idents,
+                                           int_idents=int_idents)
                         out.append("%s_%s(%s, (%s))"
                                    % (helper, kind, left, rhs))
                         i = rhs_end

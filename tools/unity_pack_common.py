@@ -20,6 +20,12 @@ import tools.cs2cpp as cs2cpp  # noqa: E402
 
 __all__ = [
     'PackError',
+    'COOST_STRING_CORE',
+    'coost_include_block',
+    'coost_incdirs',
+    'coost_string_core',
+    'find_coost_root',
+    'require_coost_root',
     '_B',
     '_EVENTTRIGGER_SCRIPT_GUID',
     '_UE',
@@ -61,6 +67,82 @@ class PackError(Exception):
         self.message = message
         Exception.__init__(self, message)
 
+
+
+# --------------------------------------------------------------------------
+# coost: the C++-subset library the engine's owned strings come from.
+# An external checkout, found the way Box2D-Packed's is (`--box2d PATH`).
+# --------------------------------------------------------------------------
+
+#: coost sources a `fastring` needs, spliced into engine.cpp after its
+#: headers. Relative to the checkout.
+COOST_STRING_CORE = ("src/mem.cc", "src/fast.cc", "src/fastring.cc")
+
+_COOST_URL = "https://github.com/crustos/coost"
+
+
+def find_coost_root(coost_root=None):
+    """coost checkout: *coost_root*, $COOST_ROOT, or a ``coost`` directory
+    beside this repository. None when there is none."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [coost_root, os.environ.get("COOST_ROOT"),
+                  os.path.join(os.path.dirname(here), "coost")]
+    for c in candidates:
+        if c and os.path.isfile(os.path.join(c, "include", "co", "fastring.h")):
+            return os.path.abspath(c)
+    return None
+
+
+def require_coost_root(coost_root=None):
+    """The coost checkout, or PackError naming how to supply one.
+
+    Upstream coost (idealvin/coost) has a `fastring.h` too, written in full
+    C++ that cpprust refuses; the crust edition is told apart by
+    `assign_cstr`, which only it has.
+    """
+    root = find_coost_root(coost_root)
+    if not root:
+        raise PackError(
+            "C# string locals are stored as coost fastrings: pass --coost "
+            "PATH, set COOST_ROOT, or clone %s beside this repository"
+            % _COOST_URL)
+    with open(os.path.join(root, "include", "co", "fastring.h")) as f:
+        if "assign_cstr" not in f.read():
+            raise PackError(
+                "%s is not the crust edition of coost (no "
+                "fastring::assign_cstr); clone %s" % (root, _COOST_URL))
+    for rel in COOST_STRING_CORE:
+        if not os.path.isfile(os.path.join(root, rel)):
+            raise PackError("no %s in %s (coost checkout?)" % (rel, root))
+    return root
+
+
+def coost_incdirs(root):
+    """Include path for splicing coost: its headers, and its root for the
+    sources (`#include "src/fastring.cc"`)."""
+    return [os.path.join(root, "include"), root]
+
+
+def coost_string_core(root):
+    """coost's string core as one self-contained C++ text, for engine.cpp.
+
+    Expanded here, on its own, rather than handing cpprust an include path
+    for the whole engine: cpprust evaluates every simple `#if` in a file it
+    splices headers into, and the engine's `#ifndef CRUST_NO_POSIX_MKDIR`
+    -- decided by the compiler, host or crust -- would be decided for the
+    host at lowering time, putting `<errno.h>` in front of crust's. It also
+    makes engine.cpp stand alone, whichever checkout it was packed from.
+    """
+    import tools.cpprust as cpprust
+    return cpprust._expand_headers(coost_include_block(), root,
+                                   coost_incdirs(root))
+
+
+def coost_include_block():
+    """The lines engine.cpp gets when it uses a fastring."""
+    return ("/* coost string core (fastring), spliced in by cpprust */\n"
+            "#include \"co/fastring.h\"\n"
+            + "".join("#include \"%s\"\n" % rel for rel in COOST_STRING_CORE))
 
 def _progress(msg):
     """Incremental status for long packs (large scenes / many PNGs)."""

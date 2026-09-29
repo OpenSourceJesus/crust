@@ -1690,11 +1690,21 @@ def main(argv=None):
     """`godot_pack.py <project> [unity_pack options]`: unity_pack's CLI,
     for a Godot project."""
     args = list(sys.argv[1:] if argv is None else argv)
-    project = next((a for a in args if not a.startswith("-")), None)
+    # The project is the argument that is neither an option nor an
+    # option's value: `--box2d PATH project` used to take PATH.
+    project, skip = None, False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in ("-o", "--box2d", "--coost"):
+            skip = True
+        elif not a.startswith("-"):
+            project = a
+            break
     if project is None or not is_godot_project(project):
         sys.stderr.write(
             "usage: godot_pack.py <godot project> [-o DIR] [--force] "
-            "[--strict] [--physics-inject] [--box2d PATH]\n"
+            "[--strict] [--physics-inject] [--box2d PATH] [--coost PATH]\n"
             "  (a directory holding project.godot)\n")
         return 2
     import tools.unity_pack as unity_pack
