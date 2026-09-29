@@ -1988,6 +1988,17 @@ class TestBox2DIntegration(unittest.TestCase):
         ok, report = F.run_project("box2d", F.box2d_project, tmp, False)
         self.assertTrue(ok, "\n".join(report))
 
+    @needs_box2d
+    @needs_coost
+    def test_same_through_physics_inject(self):
+        # --physics-inject: triggers came from sensor event arrays only, and
+        # stayed silent there; injected now, as the contacts are.
+        import tools.unity_pack_features as F
+        tmp = tempfile.mkdtemp(prefix="upack-b2d-inj-")
+        ok, report = F.run_project("box2d-inject", F.box2d_project, tmp, False,
+                                   inject=True)
+        self.assertTrue(ok, "\n".join(report))
+
 
 class TestExtensionDesugar(unittest.TestCase):
     """tools/unity_pack_extensions.py on its own: no pack, no compiler."""
