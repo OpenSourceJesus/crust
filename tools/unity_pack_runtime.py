@@ -684,6 +684,86 @@ _h("_cs_ll_last", "int",
    "static int _cs_ll_last(int n) {\n"
    "    return _cs_ll_first(n) + n - 1;\n}", deps=("_cs_ll_first",))
 
+# -- byte[] as a vector of ints (a List<byte>) --------------------------------
+# Hashes and Base64 are coost's (md5digest_to, sha256digest_to,
+# base64_encode / _decode): the pack splices their sources in when used.
+
+_h("_cs_bytes_to_c", "void",
+   "/* A byte list's bytes, contiguous, for coost (a scratch buffer). */\n"
+   "static const char *_cs_bytes_raw(std::vector<int> &v) {\n"
+   "    char *out = _engine_str_slot(v.size() + 1);\n"
+   "    int k;\n"
+   "    for (k = 0; k < (int)v.size(); k = k + 1) out[k] = (char)v[k];\n"
+   "    out[v.size()] = 0;\n"
+   "    return out;\n}\n"
+   "static std::vector<int> _cs_bytes_of(const char *p, size_t n) {\n"
+   "    std::vector<int> v;\n"
+   "    size_t k;\n"
+   "    for (k = 0; k < n; k = k + 1) {\n"
+   "        int b = (int)(unsigned char)p[k];\n"
+   "        v.push_back(b);\n"
+   "    }\n"
+   "    return v;\n}")
+_h("_cs_bytes_utf8", "bytes",
+   "static std::vector<int> _cs_bytes_utf8(const char *s) {\n"
+   "    return _cs_bytes_of(s, strlen(s));\n}", deps=("_cs_bytes_to_c",))
+_h("_cs_bytes_to_string", "string",
+   "static const char *_cs_bytes_to_string(std::vector<int> &v) {\n"
+   "    return _cs_bytes_raw(v);\n}", deps=("_cs_bytes_to_c",))
+_h("_cs_bytes_base64", "string",
+   "static const char *_cs_bytes_base64(std::vector<int> &v) {\n"
+   "    fastring t = base64_encode(_cs_bytes_raw(v), v.size());\n"
+   "    return _engine_str_keep(t.data(), t.size());\n}",
+   deps=("_cs_bytes_to_c",))
+_h("_cs_bytes_unbase64", "bytes",
+   "static std::vector<int> _cs_bytes_unbase64(const char *s) {\n"
+   "    fastring t = base64_decode(s, strlen(s));\n"
+   "    if (t.size() == 0 && s[0])\n"
+   "        _cs_throw(\"FormatException: The input is not a valid Base-64 string\");\n"
+   "    return _cs_bytes_of(t.data(), t.size());\n}",
+   deps=("_cs_bytes_to_c",))
+_h("_cs_bytes_md5", "bytes",
+   "static std::vector<int> _cs_bytes_md5(std::vector<int> &v) {\n"
+   "    char d[16];\n"
+   "    md5digest_to(_cs_bytes_raw(v), v.size(), d);\n"
+   "    return _cs_bytes_of(d, 16);\n}", deps=("_cs_bytes_to_c",))
+_h("_cs_bytes_sha256", "bytes",
+   "static std::vector<int> _cs_bytes_sha256(std::vector<int> &v) {\n"
+   "    char d[32];\n"
+   "    sha256digest_to(_cs_bytes_raw(v), v.size(), d);\n"
+   "    return _cs_bytes_of(d, 32);\n}", deps=("_cs_bytes_to_c",))
+_h("_cs_bytes_hex_dash", "string",
+   "static const char *_cs_bytes_hex_dash(std::vector<int> &v) {\n"
+   "    fastring t;\n"
+   "    char b[4];\n"
+   "    int k;\n"
+   "    for (k = 0; k < (int)v.size(); k = k + 1) {\n"
+   "        if (k > 0) t.append_char('-');\n"
+   "        snprintf(b, sizeof b, \"%02X\", (unsigned)(v[k] & 255));\n"
+   "        t.append_cstr(b);\n"
+   "    }\n"
+   "    return _engine_str_keep(t.data(), t.size());\n}")
+_h("_cs_file_read_bytes", "bytes",
+   "static std::vector<int> _cs_file_read_bytes(const char *p) {\n"
+   "    std::vector<int> v;\n"
+   "    FILE *f = fopen(p, \"rb\");\n"
+   "    int c;\n"
+   "    if (!f) _cs_throw(\"FileNotFoundException: Could not find file\");\n"
+   "    c = fgetc(f);\n"
+   "    while (c != -1) {\n"
+   "        v.push_back(c);\n"
+   "        c = fgetc(f);\n"
+   "    }\n"
+   "    fclose(f);\n"
+   "    return v;\n}")
+_h("_cs_file_write_bytes", "void",
+   "static void _cs_file_write_bytes(const char *p, std::vector<int> &v) {\n"
+   "    FILE *f = fopen(p, \"wb\");\n"
+   "    int k;\n"
+   "    if (!f) _cs_throw(\"IOException: could not write the file\");\n"
+   "    for (k = 0; k < (int)v.size(); k = k + 1) fputc(v[k] & 255, f);\n"
+   "    fclose(f);\n}")
+
 # -- T[,] / T[,,] element index ------------------------------------------------
 
 _h("_cs_idx_fail", "void",

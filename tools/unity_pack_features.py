@@ -312,6 +312,24 @@ UNITY_CHECKS = [
      'Debug.Log("linked:" + ll.Count);\n',
      "", ["linked:123,23,2,True", "linked:0"]),
 
+    ("bytes",
+     'byte[] b = System.Text.Encoding.UTF8.GetBytes("hello");\n'
+     'string b64 = System.Convert.ToBase64String(b);\n'
+     'byte[] back = System.Convert.FromBase64String(b64);\n'
+     'string again = System.Text.Encoding.UTF8.GetString(back);\n'
+     'byte[] z = new byte[3];\n'
+     'z[1] = 255;\n'
+     'Debug.Log("bytes:" + b.Length + "," + b64 + "," + again + "," + b[1] + ","'
+     ' + System.BitConverter.ToString(z));\n'
+     'using (var md5 = System.Security.Cryptography.MD5.Create()) {\n'
+     '    byte[] h = md5.ComputeHash(b);\n'
+     '    var sb = new System.Text.StringBuilder();\n'
+     '    foreach (byte x in h) sb.Append(x.ToString("x2"));\n'
+     '    Debug.Log("bytes:" + sb.ToString());\n'
+     '}\n',
+     "", ["bytes:5,aGVsbG8=,hello,101,00-FF-00",
+          "bytes:5d41402abc4b2a76b9719d911017c592"]),
+
     ("self_assign",
      'string a = "x";\n'
      'string b = a;\n'
@@ -538,7 +556,7 @@ UNITY_CO_SCRIPT = (
     "using System.Collections;\n"
     "public class Co : MonoBehaviour {\n"
     "    int frames;\n"
-    "    void Start() { StartCoroutine(Count(3)); StartCoroutine(\"Late\"); }\n"
+    "    void Start() { StartCoroutine(Count(3)); StartCoroutine(\"Late\"); StartCoroutine(Outer()); }\n"
     "    void Update() { frames++; if (frames > 1000) return; }\n"
     "    IEnumerator Count(int n) {\n"
     "        for (int k = 0; k < n; k++) {\n"
@@ -546,6 +564,16 @@ UNITY_CO_SCRIPT = (
     "            yield return null;\n"
     "        }\n"
     "        Debug.Log(\"co:done@\" + frames);\n"
+    "    }\n"
+    "    IEnumerator Outer() {\n"
+    "        Debug.Log(\"co:outer0@\" + frames);\n"
+    "        yield return StartCoroutine(Inner(2));\n"
+    "        Debug.Log(\"co:outer1@\" + frames);\n"
+    "        yield return Inner(1);\n"
+    "        Debug.Log(\"co:outer2@\" + frames);\n"
+    "    }\n"
+    "    IEnumerator Inner(int n) {\n"
+    "        for (int j = 0; j < n; j++) { Debug.Log(\"co:inner\" + j + \"@\" + frames); yield return null; }\n"
     "    }\n"
     "    IEnumerator Late() {\n"
     "        Debug.Log(\"co:late0\");\n"
@@ -555,8 +583,9 @@ UNITY_CO_SCRIPT = (
     "        Debug.Log(\"co:never\");\n"
     "    }\n"
     "}\n")
-UNITY_CO_EXPECT = ["co:count0@0", "co:late0", "co:count1@2", "co:count2@3",
-                   "co:done@4", "co:late1"]
+UNITY_CO_EXPECT = ["co:count0@0", "co:late0", "co:outer0@0", "co:inner0@0",
+                   "co:count1@2", "co:inner1@2", "co:count2@3", "co:outer1@3",
+                   "co:inner0@3", "co:done@4", "co:outer2@4", "co:late1"]
 
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (

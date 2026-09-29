@@ -123,7 +123,7 @@ def coost_incdirs(root):
     return [os.path.join(root, "include"), root]
 
 
-def coost_string_core(root):
+def coost_string_core(root, extra=()):
     """coost's string core as one self-contained C++ text, for engine.cpp.
 
     Expanded here, on its own, rather than handing cpprust an include path
@@ -134,15 +134,17 @@ def coost_string_core(root):
     makes engine.cpp stand alone, whichever checkout it was packed from.
     """
     import tools.cpprust as cpprust
-    return cpprust._expand_headers(coost_include_block(), root,
+    return cpprust._expand_headers(coost_include_block(extra), root,
                                    coost_incdirs(root))
 
 
-def coost_include_block():
-    """The lines engine.cpp gets when it uses a fastring."""
+def coost_include_block(extra=()):
+    """The lines engine.cpp gets when it uses a fastring; `extra` are more
+    coost sources the engine calls into (its hashes: `src/hash/md5.cc`)."""
     return ("/* coost string core (fastring), spliced in by cpprust */\n"
             "#include \"co/fastring.h\"\n"
-            + "".join("#include \"%s\"\n" % rel for rel in COOST_STRING_CORE))
+            + "".join("#include \"%s\"\n" % rel
+                      for rel in tuple(COOST_STRING_CORE) + tuple(extra)))
 
 def _progress(msg):
     """Incremental status for long packs (large scenes / many PNGs)."""

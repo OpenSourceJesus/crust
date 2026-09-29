@@ -5907,7 +5907,7 @@ def analyze_script(path, text=None, shallow=False):
     # List search is a helper per element type: both are emitted with the
     # string helpers.
     if "_cs_require_nonempty(" in scan or "_cs_idx" in scan or \
-            "_cs_ll_" in scan or (
+            "_cs_ll_" in scan or "_cs_bytes_" in scan or "_cs_file_" in scan or (
             re.search(r"\bList\s*<", scan) and re.search(
                 r"\.\s*(?:RemoveAt|Insert|Contains|IndexOf|Remove)\s*\(",
                 scan)):
@@ -17957,11 +17957,15 @@ def _format_spec(spec):
     False when it is not one this lowers (alignment, `N0`, `X`, ...)."""
     if spec is None:
         return None
-    m = re.match(r"^([FfDd])(\d{0,2})$", spec)
+    m = re.match(r"^([FfDdXx])(\d{0,2})$", spec)
     if not m:
         return False
     if m.group(1) in "Ff":
         return ("_cs_fmt_F", int(m.group(2) or 2))
+    if m.group(1) == "x":
+        return ("_cs_fmt_x", int(m.group(2) or 1))
+    if m.group(1) == "X":
+        return ("_cs_fmt_X", int(m.group(2) or 1))
     return ("_cs_fmt_D", int(m.group(2) or 1))
 
 
@@ -19265,7 +19269,15 @@ _CS_STRING_HELPER_C["_cs_str_ret"] = """static const char *_cs_str_ret(const cha
 
 #: Numeric format helpers (`{0:F2}`, `x.ToString("D4")`): strings, in a
 #: scratch slot like every other string result.
-_CS_FORMAT_HELPERS = {"_cs_fmt_F", "_cs_fmt_D"}
+_CS_FORMAT_HELPERS = {"_cs_fmt_F", "_cs_fmt_D", "_cs_fmt_x", "_cs_fmt_X"}
+for _case, _f in (("x", "%0*lx"), ("X", "%0*lX")):
+    _CS_STRING_HELPER_C["_cs_fmt_" + _case] = (
+        "static const char *_cs_fmt_%s(long v, int k) {\n"
+        "    unsigned long u = (unsigned long)v & 0xFFFFFFFFul;\n"
+        "    int n = snprintf((char *)0, 0, \"%s\", k, u);\n"
+        "    char *out = _engine_str_slot((size_t)n + 1);\n"
+        "    snprintf(out, (size_t)n + 1, \"%s\", k, u);\n"
+        "    return out;\n}" % (_case, _f, _f))
 _CS_STRING_HELPER_C["_cs_fmt_F"] = """static const char *_cs_fmt_F(double v, int k) {
     int n = snprintf((char *)0, 0, "%.*f", k, v);
     char *out = _engine_str_slot((size_t)n + 1);
@@ -19642,7 +19654,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # table (tools/unity_pack_runtime.py), while the text is still C#.
     if "_cs_require_nonempty(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_require_nonempty")
-    for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last"):
+    for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last",
+               "_cs_bytes_utf8", "_cs_bytes_to_string", "_cs_bytes_base64",
+               "_cs_bytes_unbase64", "_cs_bytes_md5", "_cs_bytes_sha256",
+               "_cs_bytes_hex_dash", "_cs_file_read_bytes",
+               "_cs_file_write_bytes"):
         if _h + "(" in text:
             plan.setdefault("_cs_str_used", set()).add(_h)
     _early_ints = _int_idents(cl, plan, text, site)
@@ -22260,6 +22276,7 @@ def pack(root, outdir, *args, **kwargs):
     _n = [0]
     for fp in sorted(files):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
+        t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
         # Coroutines, as state machines (tools/unity_pack_coroutines.py).
@@ -22565,7 +22582,12 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
         croot = require_coost_root(coost_root)
         anchor = "#include <stdint.h>\n"
         k = engine.index(anchor) + len(anchor)
-        engine = engine[:k] + coost_string_core(croot) + engine[k:]
+        # coost's hashes, when the engine calls into them.
+        extra = [src for fn, src in (("md5digest_to", "src/hash/md5.cc"),
+                                     ("sha256digest_to", "src/hash/sha256.cc"),
+                                     ("base64_", "src/hash/base64.cc"))
+                 if fn in engine]
+        engine = engine[:k] + coost_string_core(croot, extra) + engine[k:]
         plan["coost_root"] = croot
     if gpu_handles:
         # Packed handle streams for a GLES 3.1 SSBO (`_handle_streams`).

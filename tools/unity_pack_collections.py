@@ -587,3 +587,169 @@ def desugar_list_foreach(text, counter=None):
                                           name, idx, body))
         text = text[:m.start()] + loop + text[end:]
     return text
+
+
+# ---------------------------------------------------------------------------
+# byte[] as a List<byte>, where a file does more with bytes than File I/O
+# ---------------------------------------------------------------------------
+
+#: What makes a file's `byte[]` a List<byte>: bytes built, converted or
+#: hashed. A file whose bytes only go to and from File.ReadAllBytes /
+#: WriteAllBytes keeps the packer's ByteArray view, as it had.
+_BYTES_TRIGGER = re.compile(
+    r"\bEncoding\s*\.|\bConvert\s*\.\s*(?:To|From)Base64String\b|"
+    r"\b(?:MD5|SHA256)\b|\bBitConverter\b|\bnew\s+byte\s*\[\s*[^\]\s]")
+_ENC = r"(?:System\s*\.\s*Text\s*\.\s*)?Encoding\s*\.\s*(?:UTF8|ASCII|Default)"
+_CONV = r"(?:System\s*\.\s*)?Convert"
+_HASHNS = r"(?:System\s*\.\s*Security\s*\.\s*Cryptography\s*\.\s*)?"
+
+
+def desugar_bytes(text):
+    """`byte[]` locals and fields as a `List<byte>`, with .NET's byte APIs
+    as runtime helpers over it (tools/unity_pack_runtime.py):
+
+        byte[] b = new byte[n];          filled with 0; `{ .. }` added
+        b.Length                         b.Count
+        Encoding.UTF8.GetBytes(s)        _cs_bytes_utf8(s)    (.GetString)
+        Convert.ToBase64String(b)        _cs_bytes_base64(b)  (coost)
+        Convert.FromBase64String(s)      _cs_bytes_unbase64(s)
+        md5.ComputeHash(b)               _cs_bytes_md5(b)     (coost), from
+          `var md5 = MD5.Create()` (also in a `using`); MD5.HashData(b);
+          SHA256 alike
+        BitConverter.ToString(b)         "AB-CD-.."
+        File.ReadAllBytes / WriteAllBytes  over the list, in such a file
+    """
+    scan = cs2cpp._blank(text)
+    if not _BYTES_TRIGGER.search(scan) or not re.search(r"\bbyte\s*\[", scan):
+        if not re.search(r"\b(?:MD5|SHA256)\s*\.\s*(?:Create|HashData)\b|"
+                         r"\bEncoding\s*\.|\bConvert\s*\.\s*(?:To|From)"
+                         r"Base64String\b", scan):
+            return text
+    # hashers: `var md5 = MD5.Create();` (in a `using (..)` too) goes; its
+    # ComputeHash is the digest
+    hashers = {}
+    for m in re.finditer(r"(?<![\w.])(?:var|%s(MD5|SHA256))\s+(\w+)\s*=\s*"
+                         % _HASHNS + r"%s(MD5|SHA256)\s*\.\s*Create\s*\(\s*\)"
+                         % _HASHNS, scan):
+        hashers[m.group(2)] = m.group(3)
+    text = re.sub(r"(?<![\w.])using\s*\(\s*((?:var|%s(?:MD5|SHA256))\s+\w+\s*=\s*"
+                  r"%s(?:MD5|SHA256)\s*\.\s*Create\s*\(\s*\))\s*\)"
+                  % (_HASHNS, _HASHNS), lambda m: "", text)
+    text = re.sub(r"(?<![\w.])(?:var|%s(?:MD5|SHA256))\s+\w+\s*=\s*%s(?:MD5|"
+                  r"SHA256)\s*\.\s*Create\s*\(\s*\)\s*;" % (_HASHNS, _HASHNS),
+                  "", text)
+    for name, kind in hashers.items():
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*ComputeHash\s*\(" % re.escape(name),
+            "_cs_bytes_%s(" % kind.lower(), text)
+    # MD5.Create().ComputeHash(b) inline, and MD5.HashData(b)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s(MD5|SHA256)\s*\.\s*Create\s*\(\s*\)"
+                           r"\s*\.\s*ComputeHash\s*\(" % _HASHNS,
+                           lambda m: "_cs_bytes_%s(" % m.group(1).lower(), text)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s(MD5|SHA256)\s*\.\s*HashData\s*\("
+                           % _HASHNS,
+                           lambda m: "_cs_bytes_%s(" % m.group(1).lower(), text)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*GetBytes\s*\(" % _ENC,
+                           "_cs_bytes_utf8(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*GetString\s*\(" % _ENC,
+                           "_cs_bytes_to_string(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*ToBase64String\s*\(" % _CONV,
+                           "_cs_bytes_base64(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*FromBase64String\s*\(" % _CONV,
+                           "_cs_bytes_unbase64(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:System\s*\.\s*)?BitConverter\s*\.\s*"
+                           r"ToString\s*\(", "_cs_bytes_hex_dash(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:System\s*\.\s*IO\s*\.\s*)?File\s*\.\s*"
+                           r"ReadAllBytes\s*\(", "_cs_file_read_bytes(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:System\s*\.\s*IO\s*\.\s*)?File\s*\.\s*"
+                           r"WriteAllBytes\s*\(", "_cs_file_write_bytes(", text)
+    text = _hoist_byte_producers(text)
+    # the arrays
+    scan = cs2cpp._blank(text)
+    names = set(re.findall(r"(?<![\w.])byte\s*\[\s*\]\s+(\w+)", scan))
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        m = re.search(r"(?<![\w.])byte\s*\[\s*\]\s+(\w+)\s*=\s*new\s+byte\s*\["
+                      r"\s*([^\]]*?)\s*\]\s*(\{[^{}]*\})?\s*;", scan)
+        if not m:
+            break
+        name = m.group(1)
+        if m.group(3):
+            elems = [e.strip() for e in cs2cpp.split_call_args(
+                text[m.start(3) + 1:m.end(3) - 1]) if e.strip()]
+            fill = " ".join("%s.Add(%s);" % (name, e) for e in elems)
+        else:
+            fill = ("for (int _cs_k = 0; _cs_k < %s; _cs_k = _cs_k + 1) "
+                    "%s.Add(0);" % (text[m.start(2):m.end(2)], name))
+        text = (text[:m.start()] + "List<byte> %s = new List<byte>(); %s"
+                % (name, fill) + text[m.end():])
+    text = cs2cpp.code_sub(r"(?<![\w.])byte\s*\[\s*\](?=\s+\w)", "List<byte>",
+                           text)
+    if names:
+        alt = "|".join(re.escape(n) for n in sorted(names, key=len,
+                                                    reverse=True))
+        text = cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*Length\b" % alt,
+                               lambda m: "%s.Count" % m.group(1), text)
+    # A `byte` local (a list's element, `foreach (byte x in h)`) is an int,
+    # as the list holds it.
+    text = cs2cpp.code_sub(r"(?<![\w.<])byte(?=\s+[A-Za-z_]\w*\s*(?:[=;,)]|in\b))",
+                           "int", text)
+    return text
+
+
+
+_BYTE_PRODUCERS = ("_cs_bytes_utf8", "_cs_bytes_unbase64", "_cs_bytes_md5",
+                   "_cs_bytes_sha256", "_cs_file_read_bytes")
+_BYTE_CONSUMERS = ("_cs_bytes_to_string", "_cs_bytes_base64", "_cs_bytes_md5",
+                   "_cs_bytes_sha256", "_cs_bytes_hex_dash",
+                   "_cs_file_write_bytes")
+_HOIST_N = [0]
+
+
+def _hoist_byte_producers(text):
+    """A byte helper taking a list takes it by reference, and a call's
+    result has no address: `GetString(FromBase64String(s))` hoists the inner
+    call into a `List<byte>` temporary before the statement."""
+    prod = "|".join(_BYTE_PRODUCERS)
+    cons = "|".join(_BYTE_CONSUMERS)
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        found = None
+        for m in re.finditer(r"(?<![\w.])(?:%s)\s*\(" % cons, scan):
+            op = m.end() - 1
+            cp = _match(scan, op, "(", ")")
+            if cp is None:
+                continue
+            for a in re.finditer(r"(?<![\w.])(?:%s)\s*\(" % prod,
+                                 scan[op + 1:cp]):
+                a0 = op + 1 + a.start()
+                ae = _match(scan, op + 1 + a.end() - 1, "(", ")")
+                # only an argument by itself, not inside another expression
+                before = scan[op + 1:a0].rstrip()
+                if before and not before.endswith(","):
+                    continue
+                if ae is None:
+                    continue
+                found = (a0, ae + 1)
+                break
+            if found:
+                break
+        if not found:
+            break
+        a0, a1 = found
+        s0 = _statement_start(scan, a0)
+        if s0 is None or isinstance(s0, tuple):
+            break
+        s1 = _statement_end(scan, s0)
+        if s1 is None:
+            break
+        _HOIST_N[0] += 1
+        tmp = "_cs_bytes%d" % _HOIST_N[0]
+        pre = "byte[] %s = %s; " % (tmp, text[a0:a1])
+        stmt = text[s0:a0] + tmp + text[a1:s1 + 1]
+        if re.match(r"(?:var|[\w.<>\[\],]+)\s+\w+\s*=", scan[s0:s1]):
+            rep = pre + stmt
+        else:
+            rep = "{ %s%s }" % (pre, stmt)
+        text = text[:s0] + rep + text[s1 + 1:]
+    return text

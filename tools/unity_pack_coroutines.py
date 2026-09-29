@@ -43,9 +43,13 @@ private fields and methods of its class:
   class's `Update` -- which is renamed and called from an `Update` made to
   call both, so its early `return` does not skip the coroutines.
 
+`yield return StartCoroutine(Child(..))` (or `yield return Child(..)`) of
+another coroutine of the same class starts it -- to its first `yield` --
+and waits, a field saying which, until it has ended.
+
 Each object has its own fields, so each runs its own; starting one that
 is already running restarts it (Unity would run a second). One this does
-not read -- `yield return StartCoroutine(..)`, `WaitUntil` (a lambda), a
+not read -- another object's coroutine, `WaitUntil` (a lambda), a
 `yield` in a `foreach`, a `var` whose type it cannot see, a `Coroutine`
 kept in a variable -- is left as written, for the stub check. The class's
 lines stay on their lines; what is generated goes after its last one.
@@ -83,12 +87,17 @@ def _locals(body):
     return out
 
 
-def _transform(name, params, body):
-    """(step method body, fields, param list) for one coroutine, or None."""
+def _transform(name, params, body, known=None):
+    """(step method body, fields, param list) for one coroutine, or None.
+    `known` maps the class's coroutine names to their indices (from 1), for
+    `yield return StartCoroutine(Child(..))`, which waits for that one."""
+    known = known or {}
     scan = cs2cpp._blank(body)
+    kalt = "|".join(re.escape(n) for n in sorted(known, key=len, reverse=True))
+    child = (r"|(?:StartCoroutine\s*\(\s*)?(?:%s)\s*\(" % kalt) if kalt else ""
     if re.search(r"\byield\s+return\s+(?!null\b|0\b|new\s+Wait(?:ForSeconds|"
-                 r"ForEndOfFrame|ForFixedUpdate)\b)", scan):
-        return None                        # StartCoroutine, WaitUntil, ..
+                 r"ForEndOfFrame|ForFixedUpdate)\b%s)" % child, scan):
+        return None                        # another object's, WaitUntil, ..
     # a yield inside a foreach cannot be resumed
     for m in re.finditer(r"\bforeach\s*\(", scan):
         cp = _match(scan, m.end() - 1, "(", ")")
@@ -107,7 +116,7 @@ def _transform(name, params, body):
     # as halves, and a stored time read back below Time.time resumed a
     # `yield return null` in the frame it yielded in.
     fields = [("int", pre + "state"), ("int", pre + "f0"),
-              ("int", pre + "until")]
+              ("int", pre + "until"), ("int", pre + "on")]
     renames = {}
     for ty, pn in params:
         fields.append((ty, pre + pn))
@@ -139,11 +148,24 @@ def _transform(name, params, body):
             return "{ %sstate = 0; return false; }" % pre
         n[0] += 1
         k = n[0]
+        # yield return StartCoroutine(Child(..)) / Child(..): start it, and
+        # wait until it has ended (its state 0) as well as the next frame.
+        cm = re.match(r"(?:StartCoroutine\s*\(\s*)?(%s)\s*\((.*)\)\s*\)?\s*$"
+                      % kalt, what, re.S) if kalt else None
+        if cm and cm.group(1) in known:
+            args = cm.group(2)
+            if what.startswith("StartCoroutine"):
+                args = args[:args.rfind(")")] if args.rstrip().endswith(")") \
+                    else args
+            return ("{ _co_%s_start(%s); %sstate = %d; %sf0 = _co_frame; "
+                    "%suntil = 0; %son = %d; return true; %sL%d: ; }"
+                    % (cm.group(1), args.strip(), pre, k, pre, pre, pre,
+                       known[cm.group(1)], pre, k))
         wm = re.match(r"new\s+WaitForSeconds\s*\((.*)\)\s*$", what, re.S)
         wait = "(float)(%s)" % wm.group(1).strip() if wm else "0f"
         return ("{ %sstate = %d; %sf0 = _co_frame; %suntil = (int)((Time.time"
-                " + %s) * 1000f); return true; %sL%d: ; }"
-                % (pre, k, pre, pre, wait, pre, k))
+                " + %s) * 1000f); %son = 0; return true; %sL%d: ; }"
+                % (pre, k, pre, pre, wait, pre, pre, k))
     text = cs2cpp.code_sub(r"\byield\s+(break|return\s+[^;]*)\s*;",
                            lambda m: y(re.match(r"(?:return\s+)?(.*)",
                                                 m.group(1), re.S)), text)
@@ -161,6 +183,9 @@ def desugar_coroutines(text):
     head = re.compile(r"(?m)^([ \t]*)((?:(?:public|private|protected|internal)"
                       r"\s+)*)(?:System\s*\.\s*Collections\s*\.\s*)?IEnumerator"
                       r"\s+(\w+)\s*\(([^)]*)\)\s*\{")
+    known = {}
+    for m in head.finditer(scan):
+        known.setdefault(m.group(3), len(known) + 1)
     found = []
     for m in head.finditer(scan):
         ob = m.end() - 1
@@ -171,7 +196,7 @@ def desugar_coroutines(text):
         params = []
         for p in cs2cpp.parse_params(text[m.start(4):m.end(4)]):
             params.append((p.type, p.name))
-        t = _transform(m.group(3), params, text[ob:cb + 1])
+        t = _transform(m.group(3), params, text[ob:cb + 1], known)
         if t is None:
             continue
         found.append((m, ob, cb, cls, t, params))
@@ -235,17 +260,29 @@ def desugar_coroutines(text):
                 tail.append("private %s %s;" % (ty, fn))
             plist = ", ".join("%s %s" % (t, p) for t, p in params)
             sets = " ".join("%s%s = %s;" % (pre, p, p) for _t, p in params)
-            tail.append("private void %sstart(%s) { %s %sstate = 1; "
-                        "%sstep(); }" % (pre, plist, sets, pre, pre))
+            tail.append("private void %sstart(%s) { %s %sstate = 1; %son = 0; "
+                        "%sstep(); }" % (pre, plist, sets, pre, pre, pre))
         # A frame count per object, advanced after the resumes: a yield in
         # Start, or in a resume, waits for the next frame's.
+        cos = sorted(cos, key=lambda c: known.get(c[0], 0))
+        names_here = [n for n, _f, _p in cos]
+
+        def child_done(n):
+            # waiting on a sibling: it has ended
+            return " && ".join(
+                "(_co_%s_on != %d || _co_%s_state == 0)" % (n, known[c], c)
+                for c in names_here if c in known)
         tick = " ".join(
             "if (_co_%s_state != 0 && _co_frame > _co_%s_f0 && "
-            "(int)(Time.time * 1000f) >= _co_%s_until) _co_%s_step();"
-            % ((n,) * 4) for n, _f, _p in cos)
+            "(int)(Time.time * 1000f) >= _co_%s_until && %s) _co_%s_step();"
+            % (n, n, n, child_done(n) or "1", n) for n, _f, _p in cos)
         tail.append("private int _co_frame;")
-        tail.append("private void _co_tick() { %s _co_frame = _co_frame + 1; }"
-                    % tick)
+        # In declaration order, as many passes as there are coroutines: a
+        # parent resumes in the frame its child ends. One that yielded this
+        # frame cannot run again in it (its frame is this one).
+        tail.append("private void _co_tick() { for (int _co_p = 0; _co_p < %d; "
+                    "_co_p = _co_p + 1) { %s } _co_frame = _co_frame + 1; }"
+                    % (len(cos), tick))
         # Update: the author's, renamed, then the coroutines
         body = scan[ob:cb]
         um = re.search(r"(?m)^([ \t]*)((?:(?:public|private|protected)\s+)*)"
