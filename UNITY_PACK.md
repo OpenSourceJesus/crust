@@ -613,6 +613,13 @@ for them too:
 | `h.Add(x)` | `if (!h.Contains(x)) h.Add(x)`; as a value, hoisted with its bool |
 | `h.UnionWith(o)`, `IntersectWith`, `ExceptWith` | loops |
 
+**`LinkedList<T>`**, a subset without nodes: `AddLast` is `Add`,
+`AddFirst` is `Insert(0, ..)`, `RemoveFirst` / `RemoveLast` remove at an
+end, `First.Value` / `Last.Value` read one -- each end checked, as .NET's
+null `First` would throw -- and `Count`, `Clear`, `Contains`, `Remove(x)`
+and `foreach` are the list's. A `LinkedListNode` (`.First` kept as a node,
+`.Next`, `AddAfter`, `Find`) is left for the stub check.
+
 A take hoisted from inside a `while` / `for` header would run once, not
 each time round, and is left for the stub check; one in an `if` / `switch`
 condition is hoisted before it. A `HashSet` keeps insertion order (.NET's
@@ -636,6 +643,38 @@ one (`IndexOutOfRangeException`), and `GetLength(k)`, `Length`, `Rank` and
 (one is made if the class has none); its dimension fields go after the
 class's last line. An array literal (`{ {1, 2}, .. }`) or a `T[,]`
 parameter is left for the stub check.
+
+## Coroutines
+
+An `IEnumerator` method of a MonoBehaviour that `yield`s is rewritten at
+the source level (`tools/unity_pack_coroutines.py`) into a state machine
+of private fields and methods of its class -- things the packer lowers
+like any other:
+
+* its parameters and locals become fields (`_co_Blink_k`), so they survive
+  a `yield`; the body becomes `bool _co_Blink_step()`, which a `switch`
+  enters at the resume point of its last `yield` (a `goto` into the loop
+  body holding it);
+* `yield return null` -- and `0`, `WaitForEndOfFrame`, `WaitForFixedUpdate`
+  -- waits for the next frame; `yield return new WaitForSeconds(t)` until
+  `Time.time` has moved on by `t`; `yield break` ends it. The frame is an
+  `int` count per object and the deadline integer milliseconds: a class
+  that does not move packs its floats as halves, and a stored time read
+  back below `Time.time` resumed a null yield in the frame it yielded in;
+* `StartCoroutine(Blink(3))`, `StartCoroutine("Blink")` and
+  `StartCoroutine(nameof(Blink))` set the parameters and run the body to
+  its first `yield` at once, as Unity does; `StopCoroutine(..)` and
+  `StopAllCoroutines()` clear the state;
+* each frame, after the object's `Update` -- the author's is renamed and
+  called from one made to call both, so its early `return` does not skip
+  them -- `_co_tick()` resumes each coroutine whose wait is over.
+
+Each object has its own fields, so each runs its own coroutines; starting
+one that is already running restarts it (Unity would run a second). A
+coroutine keeps running after its object is disabled. Left for the stub
+check: `yield return StartCoroutine(..)`, `WaitUntil` / `WaitWhile` (a
+lambda), a `yield` inside a `foreach`, a `var` whose type the rewrite
+cannot see, and a `Coroutine` kept in a variable.
 
 ## `GetType`, `typeof`, `is`, `nameof`
 
