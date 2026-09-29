@@ -2419,6 +2419,17 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 continue
             val = fm.group(2)
             rec["fields"][key] = float(val) if "." in val else int(val)
+        # Every plain scalar as its text too: a `string` field's value
+        # (`label: hello`, `'two words'`). Kept apart from `fields`, which
+        # holds numbers -- "007" is not 7 -- and read only for fields the
+        # script declares `string`.
+        for fm in re.finditer(r"(?m)^\s{2}(\w+):[ \t]*(.*?)[ \t]*$", block):
+            key = fm.group(1)
+            if key.startswith("m_"):
+                continue
+            sv = _yaml_scalar_text(fm.group(2))
+            if sv is not None:
+                rec.setdefault("str_fields", {})[key] = sv
         # Vector2 serialized fields: name: {x: A, y: B}
         # y stops at ',' so Vector3 `{x,y,z}` does not match as Vector2.
         for fm in re.finditer(
@@ -2864,6 +2875,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         xf = None
         script = None
         fields = {}
+        str_fields = {}
         object_refs = {}
         object_ref_arrays = {}
         mb_ids = []
@@ -2909,6 +2921,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 # holds this block's fileID: keep it to resolve that.
                 mb_ids.append(str(k.get("file_id")))
                 fields.update(k.get("fields") or {})
+                str_fields.update(k.get("str_fields") or {})
                 object_refs.update(k.get("object_refs") or {})
                 object_ref_arrays.update(k.get("object_ref_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
@@ -3284,6 +3297,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "go_id": go.get("file_id"),
             "active": active,
             "fields": fields,
+            "str_fields": str_fields,
             "object_refs": object_refs,
             "object_ref_arrays": object_ref_arrays,
             "mb_ids": mb_ids,
@@ -5858,6 +5872,12 @@ def analyze_script(path, text=None, shallow=False):
             r"productName)\s*\+",
             scan):
         apis.add("string.+")
+    # String members (`s.ToUpper()`) return strings in scratch slots too.
+    if re.search(r"\.\s*(?:%s)\b|(?<![\w.])(?:string|String)\s*\.\s*(?:%s)\b"
+                 % ("|".join(_CS_STRING_MEMBER_NAMES),
+                    "|".join(_CS_STRING_STATIC_NAMES)), scan) and \
+            re.search(r"(?<![\w.])string\b|\"", scan):
+        apis.add("string.+")
     # ... nor a concatenation that starts from a string variable
     # (`s = s + "x"`, `s += n`), which cs2cpp now lowers too.
     str_names = set(re.findall(r"(?<![\w.])string\s+(\w+)", scan))
@@ -6005,6 +6025,52 @@ def analyze_script(path, text=None, shallow=False):
 
 _PRIM = ("int", "float", "bool", "byte", "short", "uint", "long",
          "double", "sbyte", "ushort", "ulong")
+
+
+def _authored_string(o, name, default):
+    """An instance's authored value for string field `name`: the Unity
+    reader's text (`str_fields`), else a string godot_pack put in `fields`,
+    else the field's initializer."""
+    sf = o.get("str_fields") or {}
+    if name in sf:
+        return sf[name]
+    v = (o.get("fields") or {}).get(name)
+    return v if isinstance(v, str) else default
+
+
+def _yaml_scalar_text(raw):
+    """A Unity YAML scalar as text: plain, 'single' ('' is a quote) or
+    "double" (backslash escapes). None for a mapping, a sequence or a
+    reference (`{fileID: ..}`), which no string field holds."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    if raw[0] in "{[&*|>":
+        return None
+    if raw[0] == "'" and raw.endswith("'") and len(raw) >= 2:
+        return raw[1:-1].replace("''", "'")
+    if raw[0] == '"' and raw.endswith('"') and len(raw) >= 2:
+        out, k, body = [], 0, raw[1:-1]
+        esc = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\",
+               "/": "/", "0": "\0"}
+        while k < len(body):
+            c = body[k]
+            if c == "\\" and k + 1 < len(body):
+                nx = body[k + 1]
+                if nx == "u" and k + 5 < len(body) + 0:
+                    try:
+                        out.append(chr(int(body[k + 2:k + 6], 16)))
+                        k += 6
+                        continue
+                    except ValueError:
+                        pass
+                out.append(esc.get(nx, nx))
+                k += 2
+                continue
+            out.append(c)
+            k += 1
+        return "".join(out)
+    return raw
 
 
 def _parse_csharp_field_init(ty, raw):
@@ -7608,6 +7674,12 @@ def plan_layouts(objects, analyses, two_d=None):
                     members.append((fname, "uint16_t", 16, "f16"))
                 else:
                     members.append((fname, "float", 32, "f32"))
+            elif ty == "string":
+                # Not a struct member: a table of owned strings beside the
+                # instance array (`string_fields`). It used to fall through
+                # to the handle case below, as an index into a class named
+                # `string`, and never declared at all.
+                continue
             else:
                 # Foreign MonoBehaviour → index into that class's array, as
                 # wide as *that* class's index: the owner's could be
@@ -7639,6 +7711,19 @@ def plan_layouts(objects, analyses, two_d=None):
             if not f.get("static") and not f.get("const")
             and _array_elem_name(f.get("ty") or "")
         ]
+        # Instance `string` fields: a fastring table each, seeded per
+        # instance from the scene's value, else the field's initializer.
+        string_fields = []
+        for f in script_fields:
+            if f.get("static") or f.get("const") or f.get("ty") != "string":
+                continue
+            d = f.get("default")
+            d = d if isinstance(d, str) else ""
+            string_fields.append({
+                "name": f["name"],
+                "values": [_authored_string(o, f["name"], d) for o in insts],
+                "default": d,
+            })
         # Do not bake Application.* paths used in illegal field initializers.
         if ctor_forbidden:
             forbid_names = {x["field"] for x in ctor_forbidden}
@@ -7665,6 +7750,7 @@ def plan_layouts(objects, analyses, two_d=None):
             "dict_fields": dict_fields,
             "list_fields": list_fields,
             "ref_array_fields": ref_array_fields,
+            "string_fields": string_fields,
             "ctor_forbidden": ctor_forbidden,
             "script_path": script_path,
         }
@@ -10861,6 +10947,9 @@ def _emit_engine_scene_apply(lines, plan, class_ids):
     loop_vars = ", ".join(["i"] + [chr(ord("j") + k) for k in range(depth - 1)])
     for cname in sorted(plan.get("ref_array_seeds") or {}):
         p("static void _%s_seed_refs(unsigned i);" % _c_ident(cname))
+    for cname, cl in sorted(plan["classes"].items()):
+        if cl.get("string_fields"):
+            p("static void _%s_seed_strings(unsigned i);" % _c_ident(cname))
     p("static void _engine_scene_snapshot(void) {")
     p("    int %s;" % loop_vars)
     for _kind, _key, rows, arrays in groups:
@@ -10894,6 +10983,8 @@ def _emit_engine_scene_apply(lines, plan, class_ids):
             _copy(name, "_engine_snap" + name, dims, "        ")
         if kind == "class" and key in (plan.get("ref_array_seeds") or {}):
             p("        _%s_seed_refs((unsigned)i);" % _c_ident(key))
+        if kind == "class" and plan["classes"][key].get("string_fields"):
+            p("        _%s_seed_strings((unsigned)i);" % _c_ident(key))
         p("    }")
     p("}")
     p("static void _engine_scene_unload(int s) {")
@@ -11551,6 +11642,10 @@ def _emit_engine_instantiate(
                 p("    ex = _%s_inst_count;" % idn)
                 p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
             p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
+            for f in cl.get("string_fields") or []:
+                # A string field is not in the struct: copy it too.
+                p("    %s_%s[ex].assign_cstr(%s_%s[src].c_str());"
+                  % (idn, f["name"], idn, f["name"]))
             if cl.get("soa_dims"):
                 dims = int(cl["soa_dims"])
                 p("    {")
@@ -12009,8 +12104,16 @@ def _emit_class_scalar_statics(p, plan, cl, idn):
                 path = default
             else:
                 path = ""
-            p("static const char %s_%s[] = %s;" % (
-                idn, fname, _c_string(path)))
+            if f.get("const") or not f.get("static"):
+                p("static const char %s_%s[] = %s;" % (
+                    idn, fname, _c_string(path)))
+            else:
+                # A writable static: owned, seeded at the first tick (a
+                # zeroed fastring is empty until then). As a char array it
+                # could not be assigned at all.
+                p("static fastring %s_%s;" % (idn, fname))
+                p("static const char _%s_%s_init[] = %s;" % (
+                    idn, fname, _c_string(path)))
         elif f.get("ty") == "bool":
             # `static bool flag;` / `= false` — mutable unless C# const.
             truthy = default in (True, 1, "true", "True")
@@ -12085,6 +12188,7 @@ def _emit_engine_static_collections(_emitted_coll, p, plan):
             p("static std::vector<int> %s_%s[%d];" % (idn, f["name"], cap))
             _emitted_coll = True
         _emit_ref_array_seed(p, plan, cname, cl, idn)
+        _emit_string_storage(p, plan, cname, cl, idn)
         for f in cl.get("dict_fields") or []:
             kv = _dict_kv_names(f.get("ty") or "")
             if not kv:
@@ -14460,6 +14564,7 @@ def emit_engine(plan, analyses, used_apis):
             p("    return out;")
             p("}")
         p("/* Call sites pick _str_plus_{i,f,c,s} at rewrite (no C11 generics). */")
+        p(_CS_STRING_HELPER_MARKER)
         p("")
     if want_data_path:
         data_path = plan.get("data_path") or ""
@@ -15052,6 +15157,22 @@ def emit_engine(plan, analyses, used_apis):
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
     p("    if (_dt < 0.f) _dt = 0.f;")
+    stringed = sorted(c for c, cl in plan["classes"].items()
+                      if _has_owned_strings(cl))
+    if stringed:
+        p("    {")
+        p("        static int _engine_strings_seeded = 0;")
+        p("        unsigned _k;")
+        p("        if (!_engine_strings_seeded) {")
+        p("            _engine_strings_seeded = 1;")
+        for cname in stringed:
+            idn = _c_ident(cname)
+            p("            _%s_seed_static_strings();" % idn)
+            p("            for (_k = 0u; _k < %du; _k = _k + 1u) "
+              "_%s_seed_strings(_k);"
+              % (max(1, int(plan["classes"][cname]["n"])), idn))
+        p("        }")
+        p("    }")
     seeded = sorted(plan.get("ref_array_seeds") or {})
     if seeded:
         p("    {")
@@ -16733,6 +16854,16 @@ def _strip_debug_log_context_arg(text):
         comma = None
         while j < len(text) and depth:
             c = text[j]
+            if c == '"':
+                # A comma inside the message is not an argument separator:
+                # `Debug.Log("a, b")` was cut to `Debug_Log("a)`.
+                j = cs2cpp.skip_string_literal(text, j)
+                continue
+            if c == "'":
+                m2 = re.match(r"'(?:[^'\\]|\\.)'", text[j:])
+                if m2:
+                    j += m2.end()
+                    continue
             if c == "(":
                 depth += 1
             elif c == ")":
@@ -16967,6 +17098,49 @@ def _emit_iref_struct(p):
     p("    int inst;")
     p("};")
     p("")
+
+
+def _string_statics(cl):
+    """The class's writable `static string` fields (owned fastrings)."""
+    return [f for f in (cl.get("class_consts") or [])
+            if f.get("ty") == "string" and f.get("static")
+            and not f.get("const")]
+
+
+def _has_owned_strings(cl):
+    return bool(cl.get("string_fields") or _string_statics(cl))
+
+
+def _emit_string_storage(p, plan, cname, cl, idn):
+    """A class's owned strings: a fastring table per instance `string`
+    field, as long as the instance array, and `_<Cls>_seed_strings(i)`,
+    which gives row i the value it was authored with (the scene's, else
+    the field's initializer). `_<Cls>_seed_static_strings()` does the same
+    for its writable statics. Both run at the first tick, before any
+    Start, and a scene reload re-seeds its rows."""
+    fields = cl.get("string_fields") or []
+    statics = _string_statics(cl)
+    if not fields and not statics:
+        return
+    cap = max(1, int(cl.get("n") or 0) + _mb_pool_extra(plan, cname))
+    n = int(cl.get("n") or 0)
+    for f in fields:
+        p("static fastring %s_%s[%d];" % (idn, f["name"], cap))
+        vals = list(f.get("values") or [])[:n]
+        p("static const char *const _%s_%s_init[%d] = { %s };" % (
+            idn, f["name"], max(1, len(vals)),
+            ", ".join(_c_string(v) for v in vals) or _c_string("")))
+    p("static void _%s_seed_strings(unsigned i) {" % idn)
+    for f in fields:
+        p("    %s_%s[i].assign_cstr(i < %du ? _%s_%s_init[i] : %s);" % (
+            idn, f["name"], n, idn, f["name"], _c_string(f.get("default") or "")))
+    if not fields:
+        p("    (void)i;")
+    p("}")
+    p("static void _%s_seed_static_strings(void) {" % idn)
+    for f in statics:
+        p("    %s_%s.assign_cstr(_%s_%s_init);" % (idn, f["name"], idn, f["name"]))
+    p("}")
 
 
 def _emit_ref_array_seed(p, plan, cname, cl, idn):
@@ -17315,8 +17489,453 @@ def _int_idents(cl, plan, body, site):
     return out
 
 
-def _own_string_locals(text, string_idents, int_idents):
-    """Give each C# `string` local owned storage: a coost `fastring`.
+def _string_store_names(plan):
+    """C names of owned string storage outside a method: each class's
+    instance `string` field tables (`Cls_f`, indexed) and writable string
+    statics (`Cls_f`)."""
+    out = set()
+    for cname, cl in (plan.get("classes") or {}).items():
+        idn = _c_ident(cname)
+        for f in cl.get("string_fields") or []:
+            out.add("%s_%s" % (idn, f["name"]))
+        for f in _string_statics(cl):
+            out.add("%s_%s" % (idn, f["name"]))
+    return out
+
+
+def _declared_names(text):
+    """Names a C# body declares as locals (`T x =`, `T x;`, `foreach (T x
+    in`, `out T x`)."""
+    scan = cs2cpp._blank(text)
+    return set(re.findall(
+        r"(?<![\w.])(?:[A-Za-z_][\w.]*(?:<[^<>;]*>)?(?:\[\s*\])*)\s+"
+        r"([A-Za-z_]\w*)\s*(?:=(?!=)|;|,|\bin\b|\))", scan))
+
+
+def _own_string_params(body, site):
+    """A `string` parameter the body uses becomes an owned local.
+
+    A caller may pass a concatenation's result, which lives in a scratch
+    slot only until later concatenations reuse it -- and those include the
+    callee's own. So the parameter is copied on entry into a C# `string`
+    local, `_cs_arg_<name>`, which the rest of the lowering gives storage
+    of its own like any other; the body's uses are renamed to it. The
+    declaration goes on the body's first line, so no line moves.
+    """
+    params = [prm.name for prm in cs2cpp.parse_params(
+        (site or {}).get("args") or "")
+        if prm.type in ("string", "String", "System.String")]
+    if not params:
+        return body
+    scan = cs2cpp._blank(body)
+    decls = []
+    for name in params:
+        pat = r"(?<![\w.])%s(?![\w])" % re.escape(name)
+        if not re.search(pat, scan):
+            continue
+        body = cs2cpp.code_sub(pat, "_cs_arg_" + name, body)
+        scan = cs2cpp._blank(body)
+        decls.append("string _cs_arg_%s = %s; " % (name, name))
+    if not decls:
+        return body
+    lead = len(body) - len(body.lstrip(" \t"))
+    return body[:lead] + "".join(decls) + body[lead:]
+
+
+def _string_field_tables(text, cl, plan, site):
+    """Instance `string` fields as their owned tables: `label` in a method
+    of `Player` is `Player_label[i]`, and `other.label` -- `other` a handle
+    field, local or parameter of class `Other` -- is `Other_label[other]`.
+
+    Before the struct-field lowering, which would read `other.label` as a
+    member of `Other`'s struct: the string is not in it. A local or
+    parameter of the same name shadows the field, as in C#.
+    """
+    classes = plan.get("classes") or {}
+    own = {f["name"] for f in cl.get("string_fields") or []}
+    by_class = {c: {f["name"] for f in o.get("string_fields") or []}
+                for c, o in classes.items()}
+    if not any(by_class.values()):
+        return text
+    idn = _c_ident(cl["name"])
+    shadow = _declared_names(text) | {
+        prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")}
+    # What class each receiver name holds: handle fields, then locals and
+    # parameters declared with a class type.
+    holds = {}
+    for name, _ty, _bits, kind in cl.get("members") or ():
+        if str(kind).startswith("idx:"):
+            holds[name] = kind.split(":", 1)[1]
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in classes:
+            holds[prm.name] = prm.type
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[=;]",
+                         cs2cpp._blank(text)):
+        if m.group(1) in classes:
+            holds[m.group(2)] = m.group(1)
+    for recv, other in sorted(holds.items()):
+        names = by_class.get(other) or set()
+        if not names:
+            continue
+        oidn = _c_ident(other)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*(%s)(?![\w(])" % (
+                re.escape(recv),
+                "|".join(re.escape(n) for n in sorted(names))),
+            lambda m, r=recv, o=oidn: "%s_%s[%s]" % (o, m.group(1), r), text)
+    for name in sorted(own - shadow, key=len, reverse=True):
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s(?![\w(])" % re.escape(name),
+            "%s_%s[i]" % (idn, name), text)
+    return text
+
+
+#: C# string members: (member, argument count, "c" when the first
+#: argument is a char) -> (engine helper, result type). `string.X(s)`
+#: statics are keyed with a leading `string.`.
+_CS_STRING_MEMBERS = {
+    ("Length", None, ""): ("_cs_str_Length", "int"),
+    ("Substring", 1, ""): ("_cs_str_Substring", "string"),
+    ("Substring", 2, ""): ("_cs_str_Substring_len", "string"),
+    ("ToUpper", 0, ""): ("_cs_str_ToUpper", "string"),
+    ("ToLower", 0, ""): ("_cs_str_ToLower", "string"),
+    ("ToUpperInvariant", 0, ""): ("_cs_str_ToUpper", "string"),
+    ("ToLowerInvariant", 0, ""): ("_cs_str_ToLower", "string"),
+    ("Trim", 0, ""): ("_cs_str_Trim", "string"),
+    ("TrimStart", 0, ""): ("_cs_str_TrimStart", "string"),
+    ("TrimEnd", 0, ""): ("_cs_str_TrimEnd", "string"),
+    ("Replace", 2, ""): ("_cs_str_Replace", "string"),
+    ("Replace", 2, "c"): ("_cs_str_Replace_c", "string"),
+    ("ToString", 0, ""): ("_cs_str_ToString", "string"),
+    ("IndexOf", 1, ""): ("_cs_str_IndexOf", "int"),
+    ("IndexOf", 1, "c"): ("_cs_str_IndexOf_c", "int"),
+    ("IndexOf", 2, ""): ("_cs_str_IndexOf_from", "int"),
+    ("IndexOf", 2, "c"): ("_cs_str_IndexOf_c_from", "int"),
+    ("LastIndexOf", 1, ""): ("_cs_str_LastIndexOf", "int"),
+    ("LastIndexOf", 1, "c"): ("_cs_str_LastIndexOf_c", "int"),
+    ("Contains", 1, ""): ("_cs_str_Contains", "bool"),
+    ("Contains", 1, "c"): ("_cs_str_Contains_c", "bool"),
+    ("StartsWith", 1, ""): ("_cs_str_StartsWith", "bool"),
+    ("StartsWith", 1, "c"): ("_cs_str_StartsWith_c", "bool"),
+    ("EndsWith", 1, ""): ("_cs_str_EndsWith", "bool"),
+    ("EndsWith", 1, "c"): ("_cs_str_EndsWith_c", "bool"),
+    ("Equals", 1, ""): ("_cs_str_Equals", "bool"),
+    ("CompareTo", 1, ""): ("_cs_str_CompareTo", "int"),
+    ("string.IsNullOrEmpty", 1, ""): ("_cs_str_IsNullOrEmpty", "bool"),
+    ("string.IsNullOrWhiteSpace", 1, ""): ("_cs_str_IsNullOrWhiteSpace",
+                                           "bool"),
+    ("string.Equals", 2, ""): ("_cs_str_Equals", "bool"),
+    ("string.Compare", 2, ""): ("_cs_str_CompareTo", "int"),
+}
+
+_CS_STRING_MEMBER_NAMES = sorted({k[0] for k in _CS_STRING_MEMBERS
+                                  if not k[0].startswith("string.")})
+_CS_STRING_STATIC_NAMES = sorted({k[0].split(".", 1)[1]
+                                  for k in _CS_STRING_MEMBERS
+                                  if k[0].startswith("string.")})
+
+
+def _string_helper_names(kind):
+    """Engine helpers whose result is `kind` ("string", "int", "bool")."""
+    return {h for h, r in _CS_STRING_MEMBERS.values() if r == kind}
+
+
+#: The engine's C for each helper: the C# semantics, ordinal. What returns a
+#: string writes it to a scratch slot, like a concatenation, and a local
+#: that keeps it copies it out. Searching is coost's (`str::memmem`,
+#: `str::memrmem`); case, trim and replace go through a coost `fastring`.
+#: An argument .NET rejects aborts with the exception's name, as an
+#: unhandled exception ends the process.
+_CS_STRING_HELPER_C = {
+    "_cs_str_Length": """static int _cs_str_Length(const char *s) {
+    return (int)strlen(s);
+}""",
+    "_cs_str_Substring": """static const char *_cs_str_Substring(const char *s, int a) {
+    int n = (int)strlen(s);
+    if (a < 0 || a > n) _cs_throw("ArgumentOutOfRangeException: Substring startIndex");
+    return _engine_str_keep(s + a, (size_t)(n - a));
+}""",
+    "_cs_str_Substring_len": """static const char *_cs_str_Substring_len(const char *s, int a, int len) {
+    int n = (int)strlen(s);
+    if (a < 0 || len < 0 || a > n || len > n - a)
+        _cs_throw("ArgumentOutOfRangeException: Substring startIndex / length");
+    return _engine_str_keep(s + a, (size_t)len);
+}""",
+    "_cs_str_ToUpper": """static const char *_cs_str_ToUpper(const char *s) {
+    fastring t = fastring::from_cstr(s);
+    t.toupper();
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_ToLower": """static const char *_cs_str_ToLower(const char *s) {
+    fastring t = fastring::from_cstr(s);
+    t.tolower();
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_Trim": """static const char *_cs_str_Trim(const char *s) {
+    fastring t = fastring::from_cstr(s);
+    t.trim_cstr(" \\t\\r\\n\\v\\f", 'b');
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_TrimStart": """static const char *_cs_str_TrimStart(const char *s) {
+    fastring t = fastring::from_cstr(s);
+    t.trim_cstr(" \\t\\r\\n\\v\\f", 'l');
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_TrimEnd": """static const char *_cs_str_TrimEnd(const char *s) {
+    fastring t = fastring::from_cstr(s);
+    t.trim_cstr(" \\t\\r\\n\\v\\f", 'r');
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_Replace": """static const char *_cs_str_Replace(const char *s, const char *a, const char *b) {
+    fastring t = fastring::from_cstr(s);
+    if (!a || !*a) _cs_throw("ArgumentException: Replace oldValue is empty");
+    t.replace_cstr(a, b ? b : "", 0);
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_Replace_c": """static const char *_cs_str_Replace_c(const char *s, char a, char b) {
+    fastring t = fastring::from_cstr(s);
+    size_t k;
+    for (k = 0; k < t.size(); k = k + 1) {
+        if (t[k] == a) t[k] = b;
+    }
+    return _engine_str_keep(t.data(), t.size());
+}""",
+    "_cs_str_ToString": """static const char *_cs_str_ToString(const char *s) {
+    return s;
+}""",
+    "_cs_str_IndexOf": """static int _cs_str_IndexOf(const char *s, const char *x) {
+    const char *p = str::memmem(s, strlen(s), x, strlen(x));
+    return p ? (int)(p - s) : -1;
+}""",
+    "_cs_str_IndexOf_from": """static int _cs_str_IndexOf_from(const char *s, const char *x, int from) {
+    int n = (int)strlen(s);
+    const char *p;
+    if (from < 0 || from > n) _cs_throw("ArgumentOutOfRangeException: IndexOf startIndex");
+    p = str::memmem(s + from, (size_t)(n - from), x, strlen(x));
+    return p ? (int)(p - s) : -1;
+}""",
+    "_cs_str_IndexOf_c": """static int _cs_str_IndexOf_c(const char *s, char c) {
+    const char *p = (const char *)memchr(s, c, strlen(s));
+    return p ? (int)(p - s) : -1;
+}""",
+    "_cs_str_IndexOf_c_from": """static int _cs_str_IndexOf_c_from(const char *s, char c, int from) {
+    int n = (int)strlen(s);
+    const char *p;
+    if (from < 0 || from > n) _cs_throw("ArgumentOutOfRangeException: IndexOf startIndex");
+    p = (const char *)memchr(s + from, c, (size_t)(n - from));
+    return p ? (int)(p - s) : -1;
+}""",
+    "_cs_str_LastIndexOf": """static int _cs_str_LastIndexOf(const char *s, const char *x) {
+    size_t n = strlen(s);
+    size_t m = strlen(x);
+    const char *p;
+    if (m == 0) return n > 0 ? (int)n - 1 : 0;
+    p = str::memrmem(s, n, x, m);
+    return p ? (int)(p - s) : -1;
+}""",
+    "_cs_str_LastIndexOf_c": """static int _cs_str_LastIndexOf_c(const char *s, char c) {
+    const char *p = str::memrchr(s, c, strlen(s));
+    return p ? (int)(p - s) : -1;
+}""",
+    "_cs_str_Contains": """static int _cs_str_Contains(const char *s, const char *x) {
+    return str::memmem(s, strlen(s), x, strlen(x)) != 0;
+}""",
+    "_cs_str_Contains_c": """static int _cs_str_Contains_c(const char *s, char c) {
+    return memchr(s, c, strlen(s)) != 0;
+}""",
+    "_cs_str_StartsWith": """static int _cs_str_StartsWith(const char *s, const char *x) {
+    return strncmp(s, x, strlen(x)) == 0;
+}""",
+    "_cs_str_StartsWith_c": """static int _cs_str_StartsWith_c(const char *s, char c) {
+    return s[0] != 0 && s[0] == c;
+}""",
+    "_cs_str_EndsWith": """static int _cs_str_EndsWith(const char *s, const char *x) {
+    size_t n = strlen(s);
+    size_t m = strlen(x);
+    return m <= n && memcmp(s + n - m, x, m) == 0;
+}""",
+    "_cs_str_EndsWith_c": """static int _cs_str_EndsWith_c(const char *s, char c) {
+    size_t n = strlen(s);
+    return n > 0 && s[n - 1] == c;
+}""",
+    "_cs_str_Equals": """static int _cs_str_Equals(const char *a, const char *b) {
+    return strcmp(a ? a : "", b ? b : "") == 0;
+}""",
+    "_cs_str_CompareTo": """static int _cs_str_CompareTo(const char *a, const char *b) {
+    int r = strcmp(a ? a : "", b ? b : "");
+    return r < 0 ? -1 : (r > 0 ? 1 : 0);
+}""",
+    "_cs_str_IsNullOrEmpty": """static int _cs_str_IsNullOrEmpty(const char *s) {
+    return s == 0 || s[0] == 0;
+}""",
+    "_cs_str_IsNullOrWhiteSpace": """static int _cs_str_IsNullOrWhiteSpace(const char *s) {
+    if (s == 0) return 1;
+    for (; *s; s = s + 1) {
+        if (!(*s == ' ' || (*s >= 9 && *s <= 13))) return 0;
+    }
+    return 1;
+}""",
+}
+
+#: Emitted once, before any helper, when one is used.
+_CS_STRING_HELPER_PRELUDE = """/* C# string members (ordinal), over coost */
+static void _cs_throw(const char *what) {
+    fprintf(stderr, "Unhandled exception: %s\\n", what);
+    fflush(stderr);
+    abort();
+}
+static const char *_engine_str_keep(const char *p, size_t n) {
+    char *out = _engine_str_slot(n + 1);
+    memcpy(out, p, n);
+    out[n] = 0;
+    return out;
+}"""
+
+#: Where pack() puts the helpers a pack used: after the scratch slots.
+_CS_STRING_HELPER_MARKER = "/* unity_pack:string-members */"
+
+
+def _string_helpers_c(used):
+    """The C for the helpers in `used`, or "" for none."""
+    if not used:
+        return ""
+    return "\n".join([_CS_STRING_HELPER_PRELUDE]
+                     + [_CS_STRING_HELPER_C[h] for h in sorted(used)]) + "\n"
+
+
+def _lower_string_members(text, string_idents, plan):
+    """C# string members on a string receiver, as the engine's helpers.
+
+        s.Length              ->  _cs_str_Length(s)
+        label.Substring(1, 2) ->  _cs_str_Substring_len(Player_label[i], 1, 2)
+        s.Trim().ToUpper()    ->  _cs_str_ToUpper(_cs_str_Trim(s))
+        string.IsNullOrEmpty(s) -> _cs_str_IsNullOrEmpty(s)
+
+    A receiver is a string when it is one this method knows (a local,
+    parameter, field table entry or static in `string_idents`), a literal,
+    or a helper that returns one -- so members chain. Anything else is left
+    for the stub check: an `x.Length` on an array is not ours. The helpers
+    used are recorded in the plan for pack() to emit.
+    """
+    used = plan.setdefault("_cs_str_used", set())
+    str_ret = _string_helper_names("string")
+    pat = re.compile(r"\.\s*(%s)\b" % "|".join(_CS_STRING_MEMBER_NAMES))
+    stat = re.compile(r"(?<![\w.])(?:System\s*\.\s*)?(?:string|String)\s*\.\s*"
+                      r"(%s)\s*\(" % "|".join(_CS_STRING_STATIC_NAMES))
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        m = stat.search(scan)
+        if m:
+            op = m.end() - 1
+            cl = _match_close(scan, op, "(", ")")
+            if cl is None:
+                break
+            args = cs2cpp.split_call_args(text[op + 1:cl])
+            key = ("string." + m.group(1), len(args), "")
+            if key in _CS_STRING_MEMBERS:
+                helper = _CS_STRING_MEMBERS[key][0]
+                used.add(helper)
+                text = "%s%s(%s)%s" % (text[:m.start()], helper,
+                                       ", ".join(a.strip() for a in args),
+                                       text[cl + 1:])
+                continue
+        changed = False
+        for m in pat.finditer(scan):
+            rs = _string_receiver_start(scan, m.start(), string_idents | str_ret)
+            if rs is None:
+                continue
+            member = m.group(1)
+            after = m.end()
+            k = after
+            while k < len(scan) and scan[k] in " \t":
+                k += 1
+            if k < len(scan) and scan[k] == "(":
+                cl = _match_close(scan, k, "(", ")")
+                if cl is None:
+                    continue
+                inner = text[k + 1:cl]
+                args = [a.strip() for a in cs2cpp.split_call_args(inner)] \
+                    if inner.strip() else []
+                end = cl + 1
+            else:
+                args = None
+                end = after
+            ck = "c" if args and re.match(r"^'(?:[^'\\]|\\.)'$", args[0]) else ""
+            key = (member, None if args is None else len(args), ck)
+            if key not in _CS_STRING_MEMBERS:
+                continue
+            helper = _CS_STRING_MEMBERS[key][0]
+            used.add(helper)
+            recv = text[rs:m.start()].strip()
+            text = "%s%s(%s)%s" % (text[:rs], helper,
+                                   ", ".join([recv] + (args or [])), text[end:])
+            changed = True
+            break
+        if not changed:
+            break
+    return text
+
+
+def _match_close(scan, k, o, c):
+    depth = 0
+    while k < len(scan):
+        if scan[k] == o:
+            depth += 1
+        elif scan[k] == c:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return None
+
+
+def _string_receiver_start(scan, dot, names):
+    """Where the string receiver ending just before `dot` starts, or None
+    when what is there is not known to be a string."""
+    j = dot - 1
+    while j >= 0 and scan[j] in " \t":
+        j -= 1
+    if j < 0:
+        return None
+    c = scan[j]
+    if c == '"':
+        k = j - 1
+        while k >= 0 and not (scan[k] == '"' and (k == 0 or scan[k - 1] != "\\")):
+            k -= 1
+        return k if k >= 0 else None
+    if c in ")]":
+        o = "(" if c == ")" else "["
+        depth, k = 0, j
+        while k >= 0:
+            if scan[k] == c:
+                depth += 1
+            elif scan[k] == o:
+                depth -= 1
+                if depth == 0:
+                    break
+            k -= 1
+        if k < 0:
+            return None
+        w = k
+        while w > 0 and (scan[w - 1].isalnum() or scan[w - 1] == "_"):
+            w -= 1
+        if w == k or scan[w:k] not in names:
+            return None
+        if w > 0 and scan[w - 1] == ".":
+            return None
+        return w
+    if c.isalnum() or c == "_":
+        w = j
+        while w > 0 and (scan[w - 1].isalnum() or scan[w - 1] == "_"):
+            w -= 1
+        if w > 0 and scan[w - 1] in ".>":
+            return None
+        return w if scan[w:j + 1] in names else None
+    return None
+
+
+def _own_string_locals(text, string_idents, int_idents, stores=()):
+    """Give each C# `string` owned storage: a coost `fastring`.
 
     Strings in the lowered code are `const char *`, and the engine's
     concatenation writes its results into a ring of scratch buffers. That
@@ -17324,25 +17943,27 @@ def _own_string_locals(text, string_idents, int_idents):
     kept: `string saved = "a" + hp;` pointed into a slot the next several
     concatenations reused, and printed whatever came last.
 
-    So the storage owns its bytes and everything else stays as it was:
+    So storage owns its bytes and everything else stays as it was. A
+    *store* is a string local (declared here with the packed marker), or
+    one of `stores`: a writable static (`Cls_f`) or an instance field's
+    table entry (`Cls_f[i]`, the index any expression):
 
         _cs_string s = e;   ->  fastring s; s.assign_cstr(e);
         _cs_string s;       ->  fastring s;
-        s = e;              ->  s.assign_cstr(e);
-        s += e;             ->  s.assign_cstr(_str_plus_K(s.c_str(), (e)));
-        s (any other read)  ->  s.c_str()
+        S = e;              ->  S.assign_cstr(e);
+        S += e;             ->  S.assign_cstr(_str_plus_K(S.c_str(), (e)));
+        S (any other read)  ->  S.c_str()
 
-    `assign_cstr` copies, and copes with `e` pointing into `s` itself. A
+    `assign_cstr` copies, and copes with `e` pointing into `S` itself. A
     declaration this cannot split -- one in a `for` head, or several
     declarators in one statement -- is left with its marker type, which
     the stub check reports rather than guessing.
     """
     marker = cs2cpp.PACKED_STRING_LOCAL
     scan = cs2cpp._blank(text)
-    if marker not in scan:
-        return text
-    names = sorted(set(re.findall(r"\b%s\s+(\w+)" % marker, scan)),
-                   key=len, reverse=True)
+    locals_ = set(re.findall(r"\b%s\s+(\w+)" % marker, scan))
+    stores = {n for n in stores if re.search(r"\b%s\b" % re.escape(n), scan)}
+    names = sorted(locals_ | stores, key=len, reverse=True)
     if not names:
         return text
 
@@ -17371,51 +17992,78 @@ def _own_string_locals(text, string_idents, int_idents):
             k += 1
         return -1
 
+    def index_end(k):
+        """After a name at k: past a balanced `[..]`, or k itself."""
+        j = k
+        while j < len(scan) and scan[j] in " \t":
+            j += 1
+        if j >= len(scan) or scan[j] != "[":
+            return k
+        depth = 0
+        while j < len(scan):
+            if scan[j] == "[":
+                depth += 1
+            elif scan[j] == "]":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return k
+
     alt = "|".join(re.escape(n) for n in names)
-    stmt = re.compile(
-        r"(%s\s+)?(?<![\w.>])(%s)\s*(\+=|=(?!=)|;)" % (re.escape(marker), alt))
+    head = re.compile(r"(%s\s+)?(?<![\w.>])(%s)(?![\w])" % (re.escape(marker), alt))
     out, i = [], 0
-    for m in stmt.finditer(scan):
+    for m in head.finditer(scan):
         if m.start() < i or not stmt_start(m.start()):
             continue
-        decl, name, op = m.group(1), m.group(2), m.group(3)
-        if op == ";":
+        decl, name = m.group(1), m.group(2)
+        if decl and name not in locals_:
+            continue
+        end_name = index_end(m.end()) if name in stores else m.end()
+        op = re.match(r"\s*(\+=|=(?!=)|;)", scan[end_name:])
+        if not op:
+            continue
+        opname = op.group(1)
+        store = text[m.start() + (len(decl) if decl else 0):end_name].strip()
+        after = end_name + op.end()
+        if opname == ";":
             if not decl:
                 continue                      # `s;` -- not a statement of ours
             out.append(text[i:m.start()])
             out.append("fastring %s;" % name)
-            i = m.end()
+            i = after
             continue
-        if decl is None and name not in string_idents:
-            continue
-        end = expr_end(m.end())
+        end = expr_end(after)
         if end < 0:
             continue
-        expr = text[m.end():end].strip()
+        expr = text[after:end].strip()
         out.append(text[i:m.start()])
         if decl:
             out.append("fastring %s; " % name)
-        if op == "+=":
+        if opname == "+=":
             kind = _c_expr_scalar_kind(expr, string_idents=string_idents,
                                        int_idents=int_idents)
-            out.append("%s.assign_cstr(_str_plus_%s(%s, (%s)));"
-                       % (name, kind, name, expr))
-        else:
-            out.append("%s.assign_cstr(%s);" % (name, expr))
+            expr = "_str_plus_%s(%s, (%s))" % (kind, store, expr)
+        out.append("%s.assign_cstr(%s);" % (store, expr))
         i = end + 1
     out.append(text[i:])
     text = "".join(out)
 
-    # Every other read of a string local is its C string.
+    # Every other read of a store is its C string.
     scan = cs2cpp._blank(text)
     out, i = [], 0
-    for m in re.finditer(r"(?<![\w.>])(?:%s)(?![\w])(?!\s*(?:\.|\())" % alt,
-                         scan):
+    for m in re.finditer(r"(?<![\w.>&])(?:%s)(?![\w])" % alt, scan):
+        if m.start() < i:
+            continue
         if re.search(r"\bfastring\s+$", scan[max(0, m.start() - 16):m.start()]):
             continue                          # its own declaration
+        name = scan[m.start():m.end()]
+        end = index_end(m.end()) if name in stores else m.end()
+        if re.match(r"\s*(?:\.|\()", scan[end:]):
+            continue                          # a member call on the store
         out.append(text[i:m.start()])
-        out.append("%s.c_str()" % text[m.start():m.end()])
-        i = m.end()
+        out.append("%s.c_str()" % text[m.start():end])
+        i = end
     out.append(text[i:])
     return "".join(out)
 
@@ -17428,12 +18076,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = _rewrite_csharp_float_literals(body)
+    text = _own_string_params(body, site)
+    text = _rewrite_csharp_float_literals(text)
     text = re.sub(r"(?<![\w.])true\b", "1", text)
     text = re.sub(r"(?<![\w.])false\b", "0", text)
     text = re.sub(r"\bthis\.", "", text)
     # Bare `this` is the packed instance index (Add(this), == this, …).
     text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
+    text = _string_field_tables(text, cl, plan, site)
     # `x == null` / `x != null` against the packed null (-1). This was part of
     # cs2cpp.lower_body, which the inline rewrites above replaced; the null
     # comparisons were lost with it and reached C as an undeclared `null`.
@@ -17502,6 +18152,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         strings |= (set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
                     - {prm.name for prm in params
                        if prm.type not in ("string", "String")})
+        # A string parameter is read through its owned copy by now
+        # (`_own_string_params`), and so are the locals declared here.
+        strings |= {"_cs_arg_" + n for n in strings}
+        strings |= set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", text))
         scenes = {prm.name for prm in params if prm.type.split(".")[-1] == "Scene"}
         scenes |= set(re.findall(r"(?<![\w.])Scene\s+(\w+)\s*[;=]", text))
         text = _lower_scene_manager(text, strings, scenes)
@@ -17632,7 +18286,15 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     string_idents |= set(re.findall(
         r"\b(?:string|const char \*|%s)\s+(\w+)\b"
         % cs2cpp.PACKED_STRING_LOCAL, text))
+    # Owned string storage of every class: `Cls_f` tables (read `Cls_f[i]`)
+    # and writable statics, and the statics' spelling once lowered.
+    string_idents |= _string_store_names(plan)
     int_idents = _int_idents(cl, plan, body, site)
+    # String members first: their helpers are then operands the typed
+    # concatenation and Debug.Log can classify.
+    text = _lower_string_members(text, string_idents, plan)
+    string_idents |= _string_helper_names("string")
+    int_idents |= _string_helper_names("int") | _string_helper_names("bool")
     string_idents |= {
         prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
         if prm.type in ("string", "String", "System.String")}
@@ -17905,7 +18567,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text, "Console_WriteLine", string_idents=string_idents,
         int_idents=int_idents)
     # Last: every rewrite above has read the string locals by name.
-    text = _own_string_locals(text, string_idents, int_idents)
+    text = _own_string_locals(text, string_idents, int_idents,
+                              _string_store_names(plan))
     return text
 
 
@@ -20193,6 +20856,9 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     # an error (`_report_stub`).
     plan["strict"] = bool(strict)
     engine = emit_engine(plan, analyses, used_apis)
+    helpers_c = _string_helpers_c(plan.pop("_cs_str_used", None))
+    if _CS_STRING_HELPER_MARKER in engine:
+        engine = engine.replace(_CS_STRING_HELPER_MARKER + "\n", helpers_c, 1)
     # C# string locals are coost fastrings (`_own_string_locals`). Only an
     # engine that has one needs coost: splice its string core in after the
     # C headers, for cpprust to lower with the rest.

@@ -679,7 +679,11 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
             or "ToString" in e or e.startswith("(const char")
             or e in whole
             or any(e.startswith(pre) for pre in prefixes)
-            or (re.match(r"^\w+$", e) and e in string_idents)):
+            or (re.match(r"^\w+$", e) and e in string_idents)
+            or _is_string_table_entry(e, string_idents)
+            or (re.match(r"^(\w+)\s*\(", e)
+                and re.match(r"^(\w+)", e).group(1) in string_idents
+                and _is_one_call(e))):
         return "s"
     if re.match(r"^'(?:[^'\\]|\\.)'$", e):
         return "c"
@@ -691,6 +695,23 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
     if cm and cm.group(1) in int_idents and _is_one_call(e):
         return "i"               # an accessor the engine types as integer
     return "f"
+
+
+def _is_string_table_entry(e, string_idents):
+    """`T[..]` and nothing after its bracket, `T` a known string table (an
+    instance `string` field's, in the packed engine: `Player_label[i]`)."""
+    m = re.match(r"^(\w+)\s*\[", e)
+    if not m or m.group(1) not in string_idents:
+        return False
+    depth = 0
+    for k in range(e.index("["), len(e)):
+        if e[k] == "[":
+            depth += 1
+        elif e[k] == "]":
+            depth -= 1
+            if depth == 0:
+                return k == len(e) - 1
+    return False
 
 
 def _is_one_call(e):
@@ -712,6 +733,106 @@ def _is_one_call(e):
     return False
 
 
+def _string_led_by_value(text, model, names, int_idents):
+    """`n + "x"`: a concatenation whose first operand is not a string.
+
+    C# converts it (`1 + "x"` is "1x"); the chain folding below only starts
+    from a string, so `score + " points"` was left as pointer arithmetic.
+    The value becomes a string first -- `_str_plus_i("", (score)) + ..` --
+    and the fold does the rest. Only for an operand that stands alone
+    (after `(`, `,`, `=`, `;`, `{`, `?`, `:`, `return`, or at the start):
+    `x + y + "z"` adds `x + y` first in C#, so a `y` after another `+` is
+    not this.
+    """
+    scan = _blank(text)
+    out, last = [], 0
+    for m in re.finditer(r"\+(?![+=])\s*", scan):
+        rhs = m.end()
+        if rhs >= len(scan):
+            continue
+        if not (scan[rhs] == '"' or _word_at(scan, rhs) in names):
+            continue
+        j = m.start() - 1
+        while j >= 0 and scan[j] in " \t\r\n":
+            j -= 1
+        if j < 0 or j < last:
+            continue
+        start = _operand_start(scan, j)
+        if start is None:
+            continue
+        k = start - 1
+        while k >= 0 and scan[k] in " \t\r\n":
+            k -= 1
+        # `*`, `/` and `%` bind tighter than `+`: `hp * 2 + "!"` is
+        # `(hp * 2) + "!"`, so the operand is the whole product.
+        while k >= 0 and scan[k] in "*/%":
+            k -= 1
+            while k >= 0 and scan[k] in " \t\r\n":
+                k -= 1
+            if k < 0:
+                break
+            prev = _operand_start(scan, k)
+            if prev is None:
+                break
+            start = prev
+            k = start - 1
+            while k >= 0 and scan[k] in " \t\r\n":
+                k -= 1
+        if not (k < 0 or scan[k] in "(,=;{?:" or scan[:k + 1].endswith("return")):
+            continue
+        operand = text[start:j + 1]
+        kind = scalar_kind(operand, model, string_idents=names,
+                           int_idents=int_idents)
+        if kind == "s":
+            continue                    # already a string: the fold's case
+        out.append(text[last:start])
+        out.append('%s_%s("", (%s))' % (model.string_plus, kind, operand))
+        last = j + 1
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _word_at(scan, k):
+    m = re.match(r"\w+", scan[k:])
+    return m.group(0) if m else ""
+
+
+def _operand_start(scan, j):
+    """Start of the operand ending at j: a name, number, call, subscript or
+    parenthesised expression (with any `a.b` / `a->b` path in front)."""
+    k = j
+    while True:
+        c = scan[k]
+        if c in ")]":
+            o = "(" if c == ")" else "["
+            depth = 0
+            while k >= 0:
+                if scan[k] == c:
+                    depth += 1
+                elif scan[k] == o:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k -= 1
+            if k < 0:
+                return None
+            k -= 1
+            while k >= 0 and (scan[k].isalnum() or scan[k] == "_"):
+                k -= 1
+        elif c.isalnum() or c == "_" or c == ".":
+            while k >= 0 and (scan[k].isalnum() or scan[k] in "_."):
+                k -= 1
+        else:
+            return None
+        if k >= 1 and scan[k] == ">" and scan[k - 1] == "-":
+            k -= 2
+            continue
+        if k >= 0 and scan[k] == "." and k + 1 <= j:
+            k -= 1
+            continue
+        return k + 1
+
+
 def lower_string_concat(text, model, string_idents=None, int_idents=None):
     """C# `string + value` as the engine's typed concatenation.
 
@@ -727,6 +848,7 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
     helper = model.string_plus
     whole = [c for c in model.string_calls if c.endswith(")")]
     names = frozenset(string_idents or ())
+    text = _string_led_by_value(text, model, names, int_idents)
     changed = True
     while changed:
         changed = False
@@ -774,8 +896,35 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
                 # `s = s + "x"` was left as pointer arithmetic.
                 wm = re.match(r"\w+", text[i:])
                 if wm and wm.group(0) in names:
-                    left = wm.group(0)
-                    left_end = i + len(left)
+                    left_end = i + len(wm.group(0))
+                    if text[left_end:left_end + 1] == "(":
+                        # A call known to return a string: take its args.
+                        depth = 0
+                        k = left_end
+                        while k < len(text):
+                            if text[k] == '"':
+                                k = skip_string_literal(text, k)
+                                continue
+                            if text[k] == "(":
+                                depth += 1
+                            elif text[k] == ")":
+                                depth -= 1
+                                if depth == 0:
+                                    left_end = k + 1
+                                    break
+                            k += 1
+                    elif text[left_end:left_end + 1] == "[":
+                        # A table entry, `Player_label[i]`: take the index.
+                        depth = 0
+                        for k in range(left_end, len(text)):
+                            if text[k] == "[":
+                                depth += 1
+                            elif text[k] == "]":
+                                depth -= 1
+                                if depth == 0:
+                                    left_end = k + 1
+                                    break
+                    left = text[i:left_end]
             if left is not None:
                 k = left_end
                 while k < len(text) and text[k] in " \t\n\r":
@@ -794,6 +943,13 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
                         i = rhs_end
                         changed = True
                         continue
+                if left.startswith('"'):
+                    # A literal that is not a `+` operand: step over all of
+                    # it. One character at a time, `Replace("-", "+")` read
+                    # `", "` -- between the two -- as a literal and `+`.
+                    out.append(left)
+                    i = left_end
+                    continue
             out.append(text[i])
             i += 1
         text = "".join(out)
@@ -1328,7 +1484,7 @@ def lower_bindings(text, bindings):
 #: lowered body is C++, not a C# member left behind.
 _CXX_MEMBERS = ("size|push_back|pop_back|clear|empty|begin|end|insert|erase|"
                 "find|count|at|resize|reserve|data|front|back|append|"
-                "c_str|length|substr|compare")
+                "c_str|length|substr|compare|assign_cstr")
 
 
 def residual_csharp(text, model, known_types=(), value_ctors=()):

@@ -9701,6 +9701,10 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     # required to have its star attached to the type.
     decl_re = re.compile(
         r"(?<![\w.])(const\s+)?(%s)\s*(\*\s*)?(\w+)\s*(?=[;=,)])" % alt)
+    # `T a[N]` -- an array of a class, at file scope or in a block. Its
+    # elements are objects: `a[i].m()` is a method call on `&a[i]`.
+    arr_decl_re = re.compile(
+        r"(?<![\w.])(?:const\s+)?(%s)\s+(\w+)\s*(?=\[)" % alt)
     call_re = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
     # The same chain, but not followed by `(` -- a member read or write
     # rather than a call. The call pattern is tried first, so this only
@@ -10040,6 +10044,15 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
         # containers here are built around. Recognised by the `for` that
         # opened the paren, so an ordinary argument list is untouched.
         if pdepth == 0 or (pdepth == 1 and _in_for_head(look, i)):
+            m = arr_decl_re.match(look, i)
+            if m and _prev_word(look, i) not in ("struct", "typedef", "union",
+                                                 "new"):
+                # Recorded under its own key: the name itself is not an
+                # object, and every lookup of it by name stays as it was.
+                scopes[-1][("array", m.group(2))] = m.group(1)
+                out.append(m.group(0))
+                i = m.end()
+                continue
             m = decl_re.match(look, i)
             if m and _prev_word(look, i) not in ("struct", "typedef", "union"):
                 scopes[-1][m.group(4)] = (m.group(2), bool(m.group(3)))
@@ -10442,6 +10455,24 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             # `vector &` is the one people write.
             if got is not None and chain and got[2]:
                 got = None
+            ecls = lookup(scopes, ("array", m.group(1))) if not chain else None
+            if got is None and ecls in cinfo:
+                # An element of an array of a class: an addressable object,
+                # so a method chained onto it takes `&a[i]`. File-scope
+                # arrays are how a packed engine keeps a table per class
+                # (`static fastring Player_label[N]`), and
+                # `Player_label[i].c_str()` used to reach the C unlowered.
+                ob = m.end() - 1
+                cb = _match_bracket(look, ob)
+                if cb is not None and re.match(r"\s*(?:\.|->)\s*\w+",
+                                               look[cb + 1:]):
+                    sub_expr = "%s[%s]" % (
+                        m.group(1),
+                        fix_args(text[ob + 1:cb], set(), scopes).strip())
+                    sub_expr, i = follow(sub_expr, ecls, False, cb + 1,
+                                         "[]", addressable=True)
+                    out.append(sub_expr)
+                    continue
             if got is not None and got[1] in cinfo \
                     and cinfo[got[1]]["index"] is not None:
                 ob = m.end() - 1
