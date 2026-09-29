@@ -1992,6 +1992,44 @@ class TestRuntimeApis(unittest.TestCase):
         self.assertEqual(out[0], "3,2,3,12,True,0.25")
 
     @needs_coost
+    def test_string_builder(self):
+        out = self._run(
+            "        var sb = new System.Text.StringBuilder();\n"
+            "        for (int k = 0; k < 3; k++) sb.Append(k).Append(\",\");\n"
+            "        sb.Append(true);\n"
+            "        Debug.Log(sb.ToString() + sb.Length);\n")
+        self.assertEqual(out[0], "0,1,2,True10")
+
+    @needs_coost
+    def test_json_utility_round_trip(self):
+        out = self._run(
+            "        Debug.Log(JsonUtility.ToJson(this));\n"
+            "        JsonUtility.FromJsonOverwrite(\"{\\\"hp\\\":9}\", this);\n"
+            "        Debug.Log(hp);\n")
+        # hp keeps its full width: the scene's 7 would pack it in 3 bits,
+        # and JSON writes a value no literal bounds.
+        self.assertEqual(out[:2], ['{"hp":7,"speed":1.5}', "9"])
+
+    def test_json_utility_on_an_unsupported_field_is_reported(self):
+        # A serialized List is not written yet: the method is a stub with
+        # a warning, not JSON missing the field.
+        root = os.path.join(tempfile.mkdtemp(prefix="upack-json-"), "p")
+        shutil.copytree(PROJECT, root)
+        with open(os.path.join(root, "Assets", "Scripts", "Player.cs"),
+                  "w") as f:
+            f.write("using UnityEngine;\nusing System.Collections.Generic;\n"
+                    "public class Player : MonoBehaviour {\n"
+                    "    public int hp;\n"
+                    "    public List<int> marks = new List<int>();\n"
+                    "    void Start() { Debug.Log(JsonUtility.ToJson(this)); }\n"
+                    "}\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-json-out-"))
+        self.assertIn("CS8000", err.getvalue())
+        self.assertIn("JsonUtility", err.getvalue())
+
+    @needs_coost
     def test_path_and_string_arrays(self):
         out = self._run(
             "        string[] a = new string[] { \"x\", \"y\" };\n"
