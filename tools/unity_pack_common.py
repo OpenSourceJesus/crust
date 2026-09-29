@@ -223,6 +223,9 @@ SOURCE_API_HINTS = set()
 #: ProjectSettings/TagManager.asset.
 SOURCE_LAYER_NAMES = {}
 
+#: The code-defined InputActions pack() found (tools/unity_pack_input.py).
+SOURCE_INPUT_ACTIONS = []
+
 
 def _read(path):
     if path in SOURCE_OVERLAY:

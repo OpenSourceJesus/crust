@@ -430,7 +430,7 @@ def _check_refused_api(path, text, scan):
         if m:
             _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % tname)
     # Member forms analyze maps to refused keys (Emit / Evaluate / current).
-    m = re.search(r"ParticleSystem\.(Emit)\b", scan)
+    m = None and re.search(r"ParticleSystem\.(Emit)\b", scan)
     if m:
         _raise_cs(
             path, text, m.start(1), "CS0117",
@@ -440,11 +440,6 @@ def _check_refused_api(path, text, scan):
         _raise_cs(
             path, text, m.start(1), "CS0117",
             "'AnimationCurve' does not contain a definition for 'Evaluate'")
-    m = re.search(r"(?<![\w.])Gamepad\.(current)\b", scan)
-    if m:
-        _raise_cs(
-            path, text, m.start(1), "CS0117",
-            "'Gamepad' does not contain a definition for 'current'")
     # Keyboard.current without UnityEngine.InputSystem in scope.
     has_input_system = bool(
         re.search(r"using\s+UnityEngine\.InputSystem\b", scan)
@@ -542,6 +537,10 @@ _GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
 _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
 
+# ParticleSystem: read, simulated and drawn (tools/unity_pack_particles.py).
+_PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
+import tools.unity_pack_particles as _parts
+
 
 
 # ---------------------------------------------------------------------------
@@ -611,11 +610,6 @@ _API = {
 
 # APIs that would require inventing scene components / assets we do not pack.
 _REFUSED_API = {
-    "ParticleSystem.Emit": (
-        "ParticleSystem is a Unity component — unity_pack does not invent "
-        "particle pools. Keep particles in the authored project, or drive "
-        "motion from packed MonoBehaviour fields only."
-    ),
     "AnimationCurve.Evaluate": (
         "AnimationCurve assets are not imported — unity_pack does not invent "
         "default curves. Animate with Time / Mathf on packed fields, or wait "
@@ -635,10 +629,6 @@ _REFUSED_API = {
         "Console is System.Console — add `using System;` or qualify "
         "System.Console.WriteLine. Debug.Log / print go to Player.log, not "
         "the terminal."
-    ),
-    "Gamepad.current": (
-        "Unity Input System Gamepad.current needs the Input System package "
-        "runtime — unity_pack does not invent device graphs."
     ),
     "Canvas": (
         "Scripted Canvas invent (AddComponent / typeof) is refused — author "
@@ -2276,7 +2266,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
             r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
             r"SliderJoint2D|WheelJoint2D|FrictionJoint2D|RelativeJoint2D|"
-            r"TargetJoint2D):",
+            r"TargetJoint2D|ParticleSystem):",
             block)
         if km:
             kind = km.group(1)
@@ -2617,6 +2607,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["ui_scrollrect"] = _parse_ui_scrollrect(block, file_id)
             elif _is_ui_toggle_mb(block, g):
                 rec["ui_toggle"] = _parse_ui_toggle(block, file_id)
+            elif _is_ui_togglegroup_mb(block, g):
+                rec["ui_togglegroup"] = _parse_ui_togglegroup(block, file_id)
             elif _is_ui_eventtrigger_mb(block, g):
                 rec["ui_eventtrigger"] = _parse_ui_eventtrigger(block, file_id)
             elif _is_ui_tmp_mb(block, g):
@@ -2663,6 +2655,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             }
         if kind in _JOINT2D_KINDS:
             rec["joint2d"] = _parse_joint2d(kind, block)
+        if kind == "ParticleSystem":
+            rec["particle_system"] = _parts.parse_particle_system(block)
         if kind == "Rigidbody2D":
             bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
             mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
@@ -2909,6 +2903,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         ui_scrollbar = None
         ui_scrollrect = None
         ui_toggle = None
+        ui_togglegroups = []
         ui_eventtrigger = None
         ui_tmp = None
         layout_group = None
@@ -2920,6 +2915,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         cam = None
         rb2d = None
         joints2d = []
+        psys = None
         rb3d = None
         col2d = None
         col3d = None
@@ -2967,6 +2963,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     ui_scrollrect = dict(k["ui_scrollrect"])
                 if k.get("ui_toggle"):
                     ui_toggle = dict(k["ui_toggle"])
+                if k.get("ui_togglegroup"):
+                    ui_togglegroups.append(dict(k["ui_togglegroup"]))
                 if k.get("ui_eventtrigger"):
                     ui_eventtrigger = dict(k["ui_eventtrigger"])
                 if k.get("ui_tmp"):
@@ -2992,6 +2990,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rb2d["file_id"] = k.get("file_id")
             if k.get("joint2d"):
                 joints2d.append(dict(k["joint2d"], file_id=k.get("file_id")))
+            if k.get("particle_system"):
+                psys = dict(k["particle_system"], file_id=k.get("file_id"))
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
@@ -3340,6 +3340,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "ui_scrollbar": ui_scrollbar,
             "ui_scrollrect": ui_scrollrect,
             "ui_toggle": ui_toggle,
+            "ui_togglegroups": ui_togglegroups,
             "ui_eventtrigger": ui_eventtrigger,
             "ui_tmp": ui_tmp,
             "layout_group": layout_group,
@@ -3354,6 +3355,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "freeze_rot": False, "ang_vel": 0.0, "file_id": None,
                 "auto_added": True},
             "joints2d": joints2d,
+            "particle_system": psys,
             "rigidbody": rb3d,
             "collider2d": col2d,
             "collider3d": col3d,
@@ -4487,7 +4489,7 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     known = (set(plan.get("classes") or {})
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS
-             | _JOINT2D_COMPONENTS
+             | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
              | _UI_GETCOMPONENT_TYPES
              | _TRANSFORM_GETCOMPONENT_TYPES
              | _analyzed_mb_typenames(analyses))
@@ -4690,7 +4692,7 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
         known = (
             resolved in classes
             or resolved in _PHYSICS_COMPONENTS
-            or resolved in _JOINT2D_COMPONENTS
+            or resolved in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
             or resolved in _ADDABLE_BUILTINS
             or resolved in _UI_GETCOMPONENT_TYPES
             or resolved in _TRANSFORM_GETCOMPONENT_TYPES
@@ -4899,7 +4901,7 @@ def _wrap_log_component_tostring(text, locals_ty):
 # A scriptless GO named "Button" must not become packed class Button — C has
 # no overloading, so the UI helper and the packed-class emit would collide.
 _RESERVED_PACKED_CLASS_NAMES = (
-    _ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _JOINT2D_COMPONENTS
+    _ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
     | _UI_GETCOMPONENT_TYPES | _TRANSFORM_GETCOMPONENT_TYPES | _REFUSED_ADDCOMPONENT)
 
 
@@ -5577,7 +5579,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     def _known_component(comp):
         return (comp in (plan.get("classes") or {})
                 or comp in _PHYSICS_COMPONENTS
-                or comp in _JOINT2D_COMPONENTS
+                or comp in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or comp in _ADDABLE_BUILTINS
                 or comp in _UI_GETCOMPONENT_TYPES
                 or comp in _TRANSFORM_GETCOMPONENT_TYPES
@@ -5813,6 +5815,15 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
+    # The Input System's Gamepad.current: the host's gamepad.
+    if re.search(r"(?<![\w.])Gamepad\s*\.\s*current\b", text):
+        apis.add("Gamepad.current")
+        apis.add("Vector2")
+    # The mouse wheel: the host's scroll, per frame.
+    if re.search(r"Input\s*\.\s*mouseScrollDelta|Mouse ScrollWheel|"
+                 r"Mouse\s*\.\s*current\s*\.\s*scroll", text):
+        apis.add("Input.mouseScrollDelta")
+        apis.add("Vector2")
     # A collision / trigger handler reads the other's GameObject from them.
     if re.search(r"\bOn(?:Trigger|Collision)(?:Enter|Stay|Exit)2D\s*\(", scan):
         apis.add("GameObject.SetActive")
@@ -6383,7 +6394,7 @@ def _member_init_default(cl, member_name):
 # Unity messages we emit. Awake runs once before Start (SettingsMenu.SetActive…).
 _UNITY_EMIT_MESSAGES = frozenset({
     "Awake", "Start", "Update", "FixedUpdate", "LateUpdate",
-    "OnDisable", "OnDestroy",
+    "OnEnable", "OnDisable", "OnDestroy",
     "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
     "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
     "OnJointBreak2D",
@@ -6721,7 +6732,9 @@ def _rewrite_singleton_method_calls(text, plan, cl, site, string_idents):
         inst_re = r"(?<![\w.])%s_Instance\(\)\s*\.\s*" % re.escape(oidn)
         if not re.search(inst_re, text):
             continue
-        emit_names = _reachable_emit_methods([m for _c, m in pairs])
+        emit_names = _reachable_emit_methods(
+            [m for _c, m in pairs],
+            _extra_roots(plan, ocname))
         overloaded = _overload_method_names(
             [m for _c, m in pairs
              if m["name"] in emit_names and m["name"] != "OnEnable"])
@@ -7431,7 +7444,15 @@ def _rename_shadowed_params(cl, m):
     return out
 
 
-def _reachable_emit_methods(methods):
+def _extra_roots(plan, cname):
+    """Methods the scene / the engine calls by name: Animation Events, and
+    InputAction callbacks."""
+    import tools.unity_pack_input as _inp
+    return (set((plan.get("anim_event_methods") or {}).get(cname, ()))
+            | set(_inp.ROOTS.get(cname, ())))
+
+
+def _reachable_emit_methods(methods, extra_roots=()):
     """Methods to lower: Unity messages, public API, and private callees.
 
     Editor-only helpers (e.g. UpdateCanvas only called from OnValidate) stay out.
@@ -7440,9 +7461,10 @@ def _reachable_emit_methods(methods):
     by_name = {}
     for m in methods or []:
         by_name.setdefault(m["name"], []).append(m)
-    roots = set()
+    # and what the scene calls by name: an Animation Event's function
+    roots = {n for n in extra_roots if n in by_name}
     for name, ms in by_name.items():
-        if name in ("OnEnable", "OnValidate"):
+        if name == "OnValidate":
             continue
         if name in _UNITY_EMIT_MESSAGES or any(m.get("public") for m in ms):
             roots.add(name)
@@ -7701,7 +7723,7 @@ def plan_layouts(objects, analyses, two_d=None):
             for b in c.get("bases") or []:
                 if b in analyzed:
                     referenced.add(b)
-    skip = (_ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _JOINT2D_COMPONENTS
+    skip = (_ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
             | _UI_GETCOMPONENT_TYPES
             | _UI_COMPONENT_FIELD_TYPES | _TRANSFORM_GETCOMPONENT_TYPES)
     for t in referenced:
@@ -8103,14 +8125,20 @@ def _emit_engine_anim_decls(
         p("extern const float _AnimKey_x[%d];" % nk)
         p("extern const float _AnimKey_y[%d];" % nk)
         p("extern const float _AnimKey_z[%d];" % nk)
-        for kind, tag in (("rot_keys", "Rot"), ("scale_keys", "Scale")):
-            if anim_plan.get(kind):
-                nr = len(anim_plan[kind])
-                for axis in "txyz":
-                    p("extern const float _Anim%sKey_%s[%d];" % (tag, axis, nr))
-                pre = "rkey" if tag == "Rot" else "skey"
-                p("extern const int _AnimClip_%s_begin[%d];" % (pre, nc))
-                p("extern const int _AnimClip_%s_count[%d];" % (pre, nc))
+        for sl in ("ix", "iy", "iz", "ox", "oy", "oz"):
+            p("extern const float _AnimKey_%s[%d];" % (sl, nk))
+        if anim_plan.get("binds"):
+            ntk = max(1, len(anim_plan.get("track_keys") or []))
+            ntr = max(1, len(anim_plan.get("tracks") or []))
+            nb = len(anim_plan["binds"])
+            for col in ("t", "x", "y", "z", "ix", "iy", "iz", "ox", "oy", "oz"):
+                p("extern const float _AnimTKey_%s[%d];" % (col, ntk))
+            p("extern const int _AnimTrack_begin[%d];" % ntr)
+            p("extern const int _AnimTrack_count[%d];" % ntr)
+            for col in ("track", "prop", "class", "inst"):
+                p("extern const int _AnimBind_%s[%d];" % (col, nb))
+            p("extern const int _AnimPlayer_bind_begin[%d];" % np)
+            p("extern const int _AnimPlayer_bind_count[%d];" % np)
         anim_skeys = anim_plan.get("sprite_keys") or []
         anim_sbinds = anim_plan.get("sprite_binds") or []
         if anim_skeys or anim_sbinds:
@@ -9391,6 +9419,23 @@ def _emit_engine_gameobject_tables(
             ("SphereCollider", "UnityEngine.SphereCollider")):
         if col_ty in add_types:
             _emit_simple_add(col_ty, unity_ty)
+    if want_go_tables:
+        # A GameObject's scripts told Unity's lifecycle messages: 0 active
+        # (Awake the first time, OnEnable), 1 inactive (OnDisable), 2
+        # destroyed (OnDisable, OnDestroy). Each class's Lifecycle comes
+        # with its code, after these tables.
+        for cname in sorted(class_ids):
+            p("void %s_Lifecycle(unsigned n, int msg);" % _c_ident(cname))
+        p("static void _engine_go_message(int go, int msg) {")
+        p("    int c;")
+        p("    if (go < 0 || go >= _engine_go_count) return;")
+        for cname in sorted(class_ids):
+            idn = _c_ident(cname)
+            p("    c = _engine_go_%s[go];" % idn)
+            p("    if (c >= 0) %s_Lifecycle((unsigned)c, msg);" % idn)
+        p("    (void)c;")
+        p("}")
+        p("")
 
 
 def _emit_engine_live_rect_transforms(
@@ -10405,6 +10450,18 @@ def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_liv
         p("static const int _engine_ui_sr_vbar[%d] = { %s };" % (
             nsr, ", ".join(
                 str(int(s["vbar"])) for s in ui_scrollrects)))
+        for col, cty, key in (("sens", "float", "sensitivity"),
+                              ("move", "int", "movement"),
+                              ("elast", "float", "elasticity"),
+                              ("inertia", "int", "inertia"),
+                              ("decel", "float", "deceleration")):
+            p("static const %s _engine_ui_sr_%s[%d] = { %s };" % (
+                cty, col, nsr, ", ".join(
+                    ("%sf" % repr(float(r.get(key, 0)))) if cty == "float"
+                    else str(int(r.get(key, 0))) for r in ui_scrollrects)))
+        p("/* content velocity (local units / s), and its position last frame */")
+        p("static float _engine_ui_sr_vel[%d][2];" % nsr)
+        p("static float _engine_ui_sr_last[%d][2];" % nsr)
         p("static int _engine_ui_sr_drag = -1;")
         p("static float _engine_ui_sr_drag_px;")
         p("static float _engine_ui_sr_drag_py;")
@@ -10436,15 +10493,32 @@ def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_liv
             p("    if (crh < 0.f) crh = -crh;")
             p("    if (vrw < 0.f) vrw = -vrw;")
             p("    if (vrh < 0.f) vrh = -vrh;")
+            # Unity's SetNormalizedPosition, in the viewport's local units
+            # (the content's parent; the screen rect's are scaled by the
+            # canvas): the content's min edge -- anchorMin * view +
+            # anchoredPosition - pivot * sizeDelta -- goes to -nv * hidden,
+            # whatever the content's pivot and anchors.
+            p("    _engine_ui_local_wh(cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+              " &crw, &crh);")
+            p("    _engine_ui_local_wh(vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+              " &vrw, &vrh);")
+            p("    if (crw < 0.f) crw = -crw;")
+            p("    if (crh < 0.f) crh = -crh;")
+            p("    if (vrw < 0.f) vrw = -vrw;")
+            p("    if (vrh < 0.f) vrh = -vrh;")
+            p("    (void)ccx; (void)ccy; (void)vcx; (void)vcy;")
             p("    if (axis == 0) {")
             p("        scrollable = crw - vrw;")
             p("        if (scrollable < 0.f) scrollable = 0.f;")
-            p("        _engine_rt_apos_x[cgo] = -(nv * scrollable);")
+            p("        _engine_rt_apos_x[cgo] = -(nv * scrollable)")
+            p("            - _engine_rt_amin_x[cgo] * vrw")
+            p("            + _engine_rt_pivot_x[cgo] * _engine_rt_sd_x[cgo];")
             p("    } else {")
             p("        scrollable = crh - vrh;")
             p("        if (scrollable < 0.f) scrollable = 0.f;")
-            p("        _engine_rt_apos_y[cgo] ="
-              " (1.f - nv) * scrollable;")
+            p("        _engine_rt_apos_y[cgo] = -(nv * scrollable)")
+            p("            - _engine_rt_amin_y[cgo] * vrh")
+            p("            + _engine_rt_pivot_y[cgo] * _engine_rt_sd_y[cgo];")
             p("    }")
             p("}")
             if ui_scrollbars:
@@ -10470,13 +10544,26 @@ def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_liv
                 p("    if (crh < 0.f) crh = -crh;")
                 p("    if (vrw < 0.f) vrw = -vrw;")
                 p("    if (vrh < 0.f) vrh = -vrh;")
+                # the inverse of _engine_ui_sr_apply_norm, in local units
+                p("    _engine_ui_local_wh(cgo, _engine_ui_layout_w,"
+                  " _engine_ui_layout_h, &crw, &crh);")
+                p("    _engine_ui_local_wh(vgo, _engine_ui_layout_w,"
+                  " _engine_ui_layout_h, &vrw, &vrh);")
+                p("    if (crw < 0.f) crw = -crw;")
+                p("    if (crh < 0.f) crh = -crh;")
+                p("    if (vrw < 0.f) vrw = -vrw;")
+                p("    if (vrh < 0.f) vrh = -vrh;")
+                p("    (void)ccx; (void)ccy; (void)vcx; (void)vcy;")
                 p("    _engine_ui_sb_syncing = 1;")
                 p("    hbi = _engine_ui_sr_hbar[ri];")
                 p("    if (hbi >= 0 && _engine_ui_sr_h[ri]) {")
                 p("        scrollable = crw - vrw;")
                 p("        if (scrollable < 1e-6f) nv = 0.f;")
                 p("        else {")
-                p("            nv = -_engine_rt_apos_x[cgo] / scrollable;")
+                p("            nv = -(_engine_rt_apos_x[cgo]"
+                  " + _engine_rt_amin_x[cgo] * vrw"
+                  " - _engine_rt_pivot_x[cgo] * _engine_rt_sd_x[cgo])"
+                  " / scrollable;")
                 p("            if (nv < 0.f) nv = 0.f;")
                 p("            if (nv > 1.f) nv = 1.f;")
                 p("        }")
@@ -10490,8 +10577,10 @@ def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_liv
                 p("        scrollable = crh - vrh;")
                 p("        if (scrollable < 1e-6f) nv = 1.f;")
                 p("        else {")
-                p("            nv = 1.f - (_engine_rt_apos_y[cgo]"
-                  " / scrollable);")
+                p("            nv = -(_engine_rt_apos_y[cgo]"
+                  " + _engine_rt_amin_y[cgo] * vrh"
+                  " - _engine_rt_pivot_y[cgo] * _engine_rt_sd_y[cgo])"
+                  " / scrollable;")
                 p("            if (nv < 0.f) nv = 0.f;")
                 p("            if (nv > 1.f) nv = 1.f;")
                 p("        }")
@@ -10505,54 +10594,144 @@ def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_liv
             else:
                 p("static void _engine_ui_sr_sync_bars(int ri) {"
                   " (void)ri; }")
-            p("static void _engine_ui_sr_drag_to(int ri, float px,"
-              " float py) {")
-            p("    int cgo;")
-            p("    float dx, dy, ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
-            p("    float scrollable, ax, ay;")
-            p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
-              " return;")
-            p("    cgo = _engine_ui_sr_content[ri];")
-            p("    if (cgo < 0 || cgo >= %d || !_engine_rt_has[cgo])"
-              " return;" % go_n)
-            p("    dx = px - _engine_ui_sr_drag_px;")
-            p("    dy = py - _engine_ui_sr_drag_py;")
-            p("    ax = _engine_ui_sr_drag_ax;")
-            p("    ay = _engine_ui_sr_drag_ay;")
-            p("    if (_engine_ui_sr_h[ri]) ax = ax + dx;")
-            p("    if (_engine_ui_sr_v[ri]) ay = ay + dy;")
-            p("    _engine_ui_screen_rect("
-              "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
-              " &ccx, &ccy, &crw, &crh);")
-            p("    _engine_ui_screen_rect("
-              "_engine_ui_sr_viewport[ri],"
-              " _engine_ui_layout_w, _engine_ui_layout_h,"
-              " &vcx, &vcy, &vrw, &vrh);")
-            p("    if (crw < 0.f) crw = -crw;")
-            p("    if (crh < 0.f) crh = -crh;")
-            p("    if (vrw < 0.f) vrw = -vrw;")
-            p("    if (vrh < 0.f) vrh = -vrh;")
-            p("    if (_engine_ui_sr_h[ri]) {")
-            p("        scrollable = crw - vrw;")
-            p("        if (scrollable < 0.f) scrollable = 0.f;")
-            p("        if (ax > 0.f) ax = 0.f;")
-            p("        if (ax < -scrollable) ax = -scrollable;")
-            p("        _engine_rt_apos_x[cgo] = ax;")
+            # Unity's ScrollRect, in the viewport's local units: the content's
+            # anchoredPosition range along an axis is [K - hidden, K], K =
+            # -anchorMin * view + pivot * sizeDelta (normalized 0 .. 1).
+            p("static void _engine_ui_sr_bounds(int ri, int axis, float *lo,")
+            p("    float *hi, float *view) {")
+            p("    int cgo = _engine_ui_sr_content[ri], vgo = _engine_ui_sr_viewport[ri];")
+            p("    float cw, ch, vw, vh, hidden, k;")
+            p("    _engine_ui_local_wh(cgo, _engine_ui_layout_w, _engine_ui_layout_h, &cw, &ch);")
+            p("    _engine_ui_local_wh(vgo, _engine_ui_layout_w, _engine_ui_layout_h, &vw, &vh);")
+            p("    if (cw < 0.f) cw = -cw;")
+            p("    if (ch < 0.f) ch = -ch;")
+            p("    if (vw < 0.f) vw = -vw;")
+            p("    if (vh < 0.f) vh = -vh;")
+            p("    if (axis == 0) {")
+            p("        hidden = cw - vw;")
+            p("        k = -_engine_rt_amin_x[cgo] * vw"
+              " + _engine_rt_pivot_x[cgo] * _engine_rt_sd_x[cgo];")
+            p("        *view = vw;")
+            p("    } else {")
+            p("        hidden = ch - vh;")
+            p("        k = -_engine_rt_amin_y[cgo] * vh"
+              " + _engine_rt_pivot_y[cgo] * _engine_rt_sd_y[cgo];")
+            p("        *view = vh;")
             p("    }")
-            p("    if (_engine_ui_sr_v[ri]) {")
-            p("        scrollable = crh - vrh;")
-            p("        if (scrollable < 0.f) scrollable = 0.f;")
-            p("        if (ay < 0.f) ay = 0.f;")
-            p("        if (ay > scrollable) ay = scrollable;")
-            p("        _engine_rt_apos_y[cgo] = ay;")
+            p("    if (hidden < 0.f) hidden = 0.f;")
+            p("    *lo = k - hidden;")
+            p("    *hi = k;")
+            p("}")
+            p("/* ScrollRect.RubberDelta: how far past a bound an elastic drag goes */")
+            p("static float _engine_ui_sr_rubber(float over, float view) {")
+            p("    float a = over < 0.f ? -over : over;")
+            p("    if (view < 1e-6f) return 0.f;")
+            p("    a = (1.f - 1.f / (a * 0.55f / view + 1.f)) * view;")
+            p("    return over < 0.f ? -a : a;")
+            p("}")
+            p("static float *_engine_ui_sr_pos(int ri, int axis) {")
+            p("    int cgo = _engine_ui_sr_content[ri];")
+            p("    return axis == 0 ? &_engine_rt_apos_x[cgo] : &_engine_rt_apos_y[cgo];")
+            p("}")
+            p("static void _engine_ui_sr_drag_to(int ri, float px, float py) {")
+            p("    int cgo, axis;")
+            p("    float ccx, ccy, vcx, vcy, vsw, vsh, lo, hi, view, d, target, pos;")
+            p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count) return;")
+            p("    cgo = _engine_ui_sr_content[ri];")
+            p("    if (cgo < 0 || cgo >= %d || !_engine_rt_has[cgo]) return;" % go_n)
+            p("    /* the pointer's screen delta, in the viewport's local units */")
+            p("    _engine_ui_screen_rect(_engine_ui_sr_viewport[ri], _engine_ui_layout_w,")
+            p("        _engine_ui_layout_h, &vcx, &vcy, &vsw, &vsh);")
+            p("    (void)ccx; (void)ccy; (void)vcx; (void)vcy;")
+            p("    if (vsw < 0.f) vsw = -vsw;")
+            p("    if (vsh < 0.f) vsh = -vsh;")
+            p("    for (axis = 0; axis < 2; axis = axis + 1) {")
+            p("        if (axis == 0 ? !_engine_ui_sr_h[ri] : !_engine_ui_sr_v[ri]) continue;")
+            p("        _engine_ui_sr_bounds(ri, axis, &lo, &hi, &view);")
+            p("        d = axis == 0 ? px - _engine_ui_sr_drag_px : py - _engine_ui_sr_drag_py;")
+            p("        if (axis == 0 ? vsw > 1e-6f : vsh > 1e-6f)")
+            p("            d = d * view / (axis == 0 ? vsw : vsh);")
+            p("        target = (axis == 0 ? _engine_ui_sr_drag_ax : _engine_ui_sr_drag_ay) + d;")
+            p("        pos = target;")
+            p("        if (_engine_ui_sr_move[ri] == 2) {")
+            p("            if (pos < lo) pos = lo;")
+            p("            if (pos > hi) pos = hi;")
+            p("        } else if (_engine_ui_sr_move[ri] == 1) {")
+            p("            if (pos < lo) pos = lo + _engine_ui_sr_rubber(pos - lo, view);")
+            p("            if (pos > hi) pos = hi + _engine_ui_sr_rubber(pos - hi, view);")
+            p("        }")
+            p("        *_engine_ui_sr_pos(ri, axis) = pos;")
             p("    }")
             p("    _engine_ui_sr_sync_bars(ri);")
+            p("}")
+            p("/* Mathf.SmoothDamp */")
+            p("static float _engine_ui_smooth_damp(float cur, float target, float *vel,")
+            p("    float smooth, float dt) {")
+            p("    float omega, x, e, change, temp, out;")
+            p("    if (smooth < 0.0001f) smooth = 0.0001f;")
+            p("    omega = 2.f / smooth;")
+            p("    x = omega * dt;")
+            p("    e = 1.f / (1.f + x + 0.48f * x * x + 0.235f * x * x * x);")
+            p("    change = cur - target;")
+            p("    temp = (*vel + omega * change) * dt;")
+            p("    *vel = (*vel - omega * temp) * e;")
+            p("    out = target + (change + temp) * e;")
+            p("    if ((target - cur > 0.f) == (out > target)) {")
+            p("        out = target;")
+            p("        *vel = dt > 0.f ? (out - target) / dt : 0.f;")
+            p("    }")
+            p("    return out;")
+            p("}")
+            p("/* ScrollRect.LateUpdate: while dragged, the velocity; after, inertia")
+            p("   (decelerationRate per second), an elastic content outside its")
+            p("   bounds springing back (SmoothDamp over elasticity), clamping. */")
+            p("static void _engine_ui_sr_update(float dt) {")
+            p("    int ri, axis;")
+            p("    float lo, hi, view, pos, *vel, target;")
+            p("    if (dt <= 0.f) return;")
+            p("    for (ri = 0; ri < _engine_ui_scrollrect_count; ri = ri + 1) {")
+            p("        int cgo = _engine_ui_sr_content[ri], moved = 0;")
+            p("        if (cgo < 0 || cgo >= %d || !_engine_rt_has[cgo]) continue;" % go_n)
+            p("        for (axis = 0; axis < 2; axis = axis + 1) {")
+            p("            if (axis == 0 ? !_engine_ui_sr_h[ri] : !_engine_ui_sr_v[ri]) continue;")
+            p("            _engine_ui_sr_bounds(ri, axis, &lo, &hi, &view);")
+            p("            pos = *_engine_ui_sr_pos(ri, axis);")
+            p("            vel = &_engine_ui_sr_vel[ri][axis];")
+            p("            if (_engine_ui_sr_drag == ri) {")
+            p("                float nv = (pos - _engine_ui_sr_last[ri][axis]) / dt;")
+            p("                float k = dt * 10.f;")
+            p("                if (k > 1.f) k = 1.f;")
+            p("                *vel = *vel + (nv - *vel) * k;")
+            p("            } else if (_engine_ui_sr_move[ri] == 1 && (pos < lo || pos > hi)) {")
+            p("                target = pos < lo ? lo : hi;")
+            p("                pos = _engine_ui_smooth_damp(pos, target, vel,")
+            p("                                             _engine_ui_sr_elast[ri], dt);")
+            p("                moved = 1;")
+            p("            } else if (_engine_ui_sr_inertia[ri] && *vel != 0.f) {")
+            p("                *vel = *vel * powf(_engine_ui_sr_decel[ri], dt);")
+            p("                if (*vel > -1.f && *vel < 1.f) *vel = 0.f;")
+            p("                pos = pos + *vel * dt;")
+            p("                moved = 1;")
+            p("            } else {")
+            p("                *vel = 0.f;")
+            p("            }")
+            p("            if (_engine_ui_sr_move[ri] == 2 && (pos < lo || pos > hi)) {")
+            p("                pos = pos < lo ? lo : hi;")
+            p("                *vel = 0.f;")
+            p("                moved = 1;")
+            p("            }")
+            p("            *_engine_ui_sr_pos(ri, axis) = pos;")
+            p("            _engine_ui_sr_last[ri][axis] = pos;")
+            p("        }")
+            p("        if (moved) _engine_ui_sr_sync_bars(ri);")
+            p("    }")
             p("}")
         else:
             p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
               " float nv) { (void)ri; (void)axis; (void)nv; }")
             p("static void _engine_ui_sr_sync_bars(int ri) {"
               " (void)ri; }")
+            p("static void _engine_ui_sr_update(float dt) { (void)dt; }")
             p("static void _engine_ui_sr_drag_to(int ri, float px,"
               " float py) { (void)ri; (void)px; (void)py; }")
     elif ui_scrollbars:
@@ -10624,7 +10803,14 @@ def _emit_engine_ui_toggles(go_n, p, plan, ui_toggles):
                   % (hidn, hmethod))
             else:
                 p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+        groups = plan.get("ui_toggle_groups") or []
+        p("/* ToggleGroup of each toggle (-1 none), and each group's allowSwitchOff */")
+        p("static const int _engine_ui_tg_group[%d] = { %s };" % (
+            ntg, ", ".join(str(int(t.get("group", -1))) for t in ui_toggles)))
+        p("static const int _engine_ui_tg_allow_off[%d] = { %s };" % (
+            max(1, len(groups)), ", ".join(str(int(g)) for g in groups) or "0"))
         p("static int _engine_ui_tg_press = -1;")
+        p("static int _engine_ui_tg_quiet = 0;")
         p("static void _engine_ui_tg_set(int ti, int on) {")
         p("    int go, g, j, j0, j1, barg;")
         p("    if (ti < 0 || ti >= _engine_ui_toggle_count) return;")
@@ -10632,10 +10818,11 @@ def _emit_engine_ui_toggles(go_n, p, plan, ui_toggles):
         p("    if (go < 0 || go >= %d) return;" % go_n)
         p("    on = on ? 1 : 0;")
         p("    if (Toggle_get_isOn(go) == on) return;")
-        p("    Toggle_set_isOn(go, on);")
+        p("    _Toggle_raw_set_isOn(go, on);")
         p("    g = _engine_ui_tg_graphic[ti];")
         p("    if (g >= 0 && g < %d)" % go_n)
         p("        GameObject_SetActive(g, on);")
+        p("    if (_engine_ui_tg_quiet) return; /* SetIsOnWithoutNotify */")
         p("    j0 = _engine_ui_tg_call_start[ti];")
         p("    j1 = j0 + _engine_ui_tg_call_count[ti];")
         p("    for (j = j0; j < j1; j = j + 1) {")
@@ -10661,6 +10848,50 @@ def _emit_engine_ui_toggles(go_n, p, plan, ui_toggles):
                   "(unsigned)_engine_ui_tg_call_inst[j]);"
                   % (hidn, hmethod))
         p("    }")
+        p("}")
+        # Toggle.Set with a ToggleGroup: turning one on turns the group's
+        # others off (their onValueChanged(false) first); without
+        # allowSwitchOff the one that is on cannot be clicked off.
+        p("static void _engine_ui_tg_click(int ti, int on) {")
+        p("    int g, tj;")
+        p("    if (ti < 0 || ti >= _engine_ui_toggle_count) return;")
+        p("    g = _engine_ui_tg_group[ti];")
+        p("    if (g >= 0) {")
+        p("        if (!on && !_engine_ui_tg_allow_off[g]) return;")
+        p("        if (on)")
+        p("            for (tj = 0; tj < _engine_ui_toggle_count; tj = tj + 1)")
+        p("                if (tj != ti && _engine_ui_tg_group[tj] == g)")
+        p("                    _engine_ui_tg_set(tj, 0);")
+        p("    }")
+        p("    _engine_ui_tg_set(ti, on);")
+        p("}")
+        p("/* Toggle.Set from a script: in a group without allowSwitchOff, the")
+        p("   only toggle on stays on; one turned on turns the others off. */")
+        p("static void _engine_ui_tg_script_set(int go, int v, int notify) {")
+        p("    int ti, tj, g, any;")
+        p("    for (ti = 0; ti < _engine_ui_toggle_count; ti = ti + 1)")
+        p("        if (_engine_ui_tg_go[ti] == go) break;")
+        p("    if (ti >= _engine_ui_toggle_count) {")
+        p("        _Toggle_raw_set_isOn(go, v);")
+        p("        return;")
+        p("    }")
+        p("    v = v ? 1 : 0;")
+        p("    _engine_ui_tg_quiet = !notify;")
+        p("    g = _engine_ui_tg_group[ti];")
+        p("    if (g >= 0) {")
+        p("        any = 0;")
+        p("        for (tj = 0; tj < _engine_ui_toggle_count; tj = tj + 1)")
+        p("            if (tj != ti && _engine_ui_tg_group[tj] == g"
+          " && Toggle_get_isOn(_engine_ui_tg_go[tj]))")
+        p("                any = 1;")
+        p("        if (!v && !any && !_engine_ui_tg_allow_off[g]) v = 1;")
+        p("        if (v)")
+        p("            for (tj = 0; tj < _engine_ui_toggle_count; tj = tj + 1)")
+        p("                if (tj != ti && _engine_ui_tg_group[tj] == g)")
+        p("                    _engine_ui_tg_set(tj, 0);")
+        p("    }")
+        p("    _engine_ui_tg_set(ti, v);")
+        p("    _engine_ui_tg_quiet = 0;")
         p("}")
 
 
@@ -10800,6 +11031,11 @@ def _emit_engine_ui_eventtriggers(p, plan, ui_eventtriggers, ui_sliders):
                 p("static void %s_%s(unsigned i);" % (hidn, hmethod))
         p("static int _engine_ui_et_hover[%d];" % net)
         p("static int _engine_ui_et_press = -1;")
+        p("/* a drag: begun (past the threshold), and where the press began /")
+        p("   the pointer was last frame */")
+        p("static int _engine_ui_et_dragging = 0;")
+        p("static float _engine_ui_et_px0, _engine_ui_et_py0;")
+        p("static float _engine_ui_et_pxl, _engine_ui_et_pyl;")
         p("static void _engine_ui_et_fire(int ti, int eid) {")
         p("    int e0, e1, e, j, j0, j1, op;")
         p("    if (ti < 0 || ti >= _engine_ui_et_count) return;")
@@ -11405,10 +11641,26 @@ def _emit_engine_ui(
     p("    _engine_go_active_init();")
     p("    return go >= 0 && go < %d ? _engine_go_active[go] : 0;" % go_n)
     p("}")
+    plan["_go_active_fn"] = True
+    # A change of activeInHierarchy tells the GameObject and its active
+    # descendants: OnEnable (Awake first, if never awoken) / OnDisable.
+    p("static void _engine_go_message(int go, int msg);")
+    p("static void _engine_go_hier_message(int go, int msg, int depth) {")
+    p("    int c;")
+    p("    if (go < 0 || go >= %d || depth > %d) return;" % (go_n, go_n))
+    p("    _engine_go_message(go, msg);")
+    p("    for (c = 0; c < %d; c = c + 1)" % go_n)
+    p("        if (_engine_go_parent[c] == go && _engine_go_active[c])")
+    p("            _engine_go_hier_message(c, msg, depth + 1);")
+    p("}")
     p("static void GameObject_SetActive(int go, int active) {")
+    p("    int was;")
     p("    _engine_go_active_init();")
     p("    if (go < 0 || go >= %d) return;" % go_n)
+    p("    was = _engine_go_active_in_hierarchy(go);")
     p("    _engine_go_active[go] = active ? 1 : 0;")
+    p("    if (_engine_go_active_in_hierarchy(go) != was)")
+    p("        _engine_go_hier_message(go, was ? 1 : 0, 0);")
     p("}")
     p("")
     p("static const int _engine_ui_button_count = %d;" % len(ui_buttons))
@@ -11568,6 +11820,40 @@ def _emit_engine_ui(
         p("        if (_engine_ui_sr_drag >= 0 && engine_pointer_down)")
         p("            _engine_ui_sr_drag_to("
           "_engine_ui_sr_drag, px, py);")
+        if want_live_rt:
+            # ScrollRect.OnScroll: the wheel over it (y inverted: the UI's up
+            # is the wheel's down), one axis taking the larger component,
+            # times scrollSensitivity; Clamped stays in bounds, Elastic
+            # springs back after
+            p("        if (rhit >= 0 && _engine_ui_sr_drag < 0"
+              " && (_engine_scroll_fx != 0.f || _engine_scroll_fy != 0.f)) {")
+            p("            float wx = _engine_scroll_fx, wy = -_engine_scroll_fy;")
+            p("            float lo, hi, view, *pp;")
+            p("            int ax;")
+            p("            if (_engine_ui_sr_v[rhit] && !_engine_ui_sr_h[rhit]) {")
+            p("                if ((wx < 0.f ? -wx : wx) > (wy < 0.f ? -wy : wy)) wy = wx;")
+            p("                wx = 0.f;")
+            p("            }")
+            p("            if (_engine_ui_sr_h[rhit] && !_engine_ui_sr_v[rhit]) {")
+            p("                if ((wy < 0.f ? -wy : wy) > (wx < 0.f ? -wx : wx)) wx = wy;")
+            p("                wy = 0.f;")
+            p("            }")
+            p("            for (ax = 0; ax < 2; ax = ax + 1) {")
+            p("                if (ax == 0 ? !_engine_ui_sr_h[rhit] : !_engine_ui_sr_v[rhit])"
+              " continue;")
+            p("                pp = _engine_ui_sr_pos(rhit, ax);")
+            p("                *pp = *pp + (ax == 0 ? wx : wy) * _engine_ui_sr_sens[rhit];")
+            p("                if (_engine_ui_sr_move[rhit] == 2) {")
+            p("                    _engine_ui_sr_bounds(rhit, ax, &lo, &hi, &view);")
+            p("                    if (*pp < lo) *pp = lo;")
+            p("                    if (*pp > hi) *pp = hi;")
+            p("                }")
+            p("                _engine_ui_sr_vel[rhit][ax] = 0.f;")
+            p("                _engine_ui_sr_last[rhit][ax] = *pp;")
+            p("            }")
+            p("            _engine_ui_sr_sync_bars(rhit);")
+            p("        }")
+        p("        _engine_ui_sr_update(Time_deltaTime);")
         p("        if (up_edge)")
         p("            _engine_ui_sr_drag = -1;")
         p("    }")
@@ -11617,7 +11903,7 @@ def _emit_engine_ui(
           " && thit == _engine_ui_tg_press) {")
         p("                int go = _engine_ui_tg_go["
           "_engine_ui_tg_press];")
-        p("                _engine_ui_tg_set(_engine_ui_tg_press,"
+        p("                _engine_ui_tg_click(_engine_ui_tg_press,"
           " !Toggle_get_isOn(go));")
         p("            }")
         p("            _engine_ui_tg_press = -1;")
@@ -11646,18 +11932,41 @@ def _emit_engine_ui(
         if ui_sliders:
             busy.append("_engine_ui_sl_drag < 0")
         busy_expr = (" && ".join(busy)) if busy else "1"
+        # StandaloneInputModule's order: Down + InitializePotentialDrag on
+        # press; BeginDrag once the pointer has moved past the drag
+        # threshold (10 px), then Drag each frame it moves; on release Up,
+        # Click (released over the pressed one), Drop (on the one under the
+        # pointer) and EndDrag -- the last two only after a drag began.
         p("        if (down_edge && ehit >= 0 && (%s)) {" % busy_expr)
         p("            _engine_ui_et_press = ehit;")
+        p("            _engine_ui_et_dragging = 0;")
+        p("            _engine_ui_et_px0 = px; _engine_ui_et_py0 = py;")
+        p("            _engine_ui_et_pxl = px; _engine_ui_et_pyl = py;")
         p("            _engine_ui_et_fire(ehit, 2); /* PointerDown */")
-        p("            _engine_ui_et_fire(ehit, 13); /* BeginDrag */")
+        p("            _engine_ui_et_fire(ehit, 12); /* InitializePotentialDrag */")
+        p("        } else if (_engine_ui_et_press >= 0 && !up_edge) {")
+        p("            float ddx = px - _engine_ui_et_px0, ddy = py - _engine_ui_et_py0;")
+        p("            if (!_engine_ui_et_dragging && ddx * ddx + ddy * ddy >= 100.f) {")
+        p("                _engine_ui_et_dragging = 1;")
+        p("                _engine_ui_et_fire(_engine_ui_et_press, 13); /* BeginDrag */")
+        p("            }")
+        p("            if (_engine_ui_et_dragging && (px != _engine_ui_et_pxl"
+          " || py != _engine_ui_et_pyl))")
+        p("                _engine_ui_et_fire(_engine_ui_et_press, 5); /* Drag */")
+        p("            _engine_ui_et_pxl = px; _engine_ui_et_pyl = py;")
         p("        }")
         p("        if (up_edge && _engine_ui_et_press >= 0) {")
         p("            int pr = _engine_ui_et_press;")
         p("            _engine_ui_et_fire(pr, 3); /* PointerUp */")
-        p("            _engine_ui_et_fire(pr, 14); /* EndDrag */")
         p("            if (ehit == pr)")
         p("                _engine_ui_et_fire(pr, 4); /* PointerClick */")
+        p("            if (_engine_ui_et_dragging) {")
+        p("                if (ehit >= 0)")
+        p("                    _engine_ui_et_fire(ehit, 6); /* Drop */")
+        p("                _engine_ui_et_fire(pr, 14); /* EndDrag */")
+        p("            }")
         p("            _engine_ui_et_press = -1;")
+        p("            _engine_ui_et_dragging = 0;")
         p("        }")
         p("    }")
     p("    hit = -1;")
@@ -11987,7 +12296,7 @@ def _emit_engine_get_components_in_children(
             has_map = (
                 bool(collectors)
                 or tname in _PHYSICS_COMPONENTS
-                or tname in _JOINT2D_COMPONENTS
+                or tname in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or tname in _ADDABLE_BUILTINS
                 or tname in _UI_GETCOMPONENT_TYPES
                 or tname in _TRANSFORM_GETCOMPONENT_TYPES
@@ -12527,14 +12836,15 @@ def _emit_engine_class_groups(
                   % (idn, name, idn, name))
         p("")
         emit_names = _reachable_emit_methods(
-            [m for _c, m in methods_by.get(cname, [])])
+            [m for _c, m in methods_by.get(cname, [])],
+            _extra_roots(plan, cname))
         overloaded = _overload_method_names(
             [m for _c, m in methods_by.get(cname, [])
              if m["name"] in emit_names and m["name"] != "OnEnable"])
         used_syms = set()
         # Forward-declare helpers so Start can call Do before Do's body.
         for c, m in methods_by.get(cname, []):
-            if m["name"] == "OnEnable" or m["name"] not in emit_names:
+            if m["name"] not in emit_names:
                 continue
             if cl.get("ctor_forbidden"):
                 continue
@@ -12562,8 +12872,6 @@ def _emit_engine_class_groups(
                 else:
                     p("static %s %s(unsigned i);" % (rty, sym))
         for c, m in methods_by.get(cname, []):
-            if m["name"] == "OnEnable":
-                continue
             if m["name"] not in emit_names:
                 continue
             # TypeInitializer failed — do not lower or run script methods.
@@ -12737,6 +13045,10 @@ def _emit_engine_class_groups(
             spath = _assets_rel_path(
                 cl.get("script_path") or cl.get("path") or "")
             p("void %s_FixedTick(void) { /* type init failed */ }" % idn)
+            p("void %s_LateTick(void) { /* type init failed */ }" % idn)
+            p("void %s_AwakeTick(void) { /* type init failed */ }" % idn)
+            p("void %s_StartTick(void) { /* type init failed */ }" % idn)
+            p("void %s_Lifecycle(unsigned n, int msg) { (void)n; (void)msg; }" % idn)
             p("")
             p("void %s_Tick(void) {" % idn)
             p("    int n;")
@@ -12777,23 +13089,54 @@ def _emit_engine_class_groups(
                 % idn)
         destroyed = bool(want_destroy and plan.get("go_names"))
         cap = max(1, int(cl["n"]) + _mb_pool_extra(plan, cname))
-        if has_awake or has_start:
-            p("/* Awake (1) / Start (2) done, per instance */")
-            p("static unsigned char _%s_life[%d];" % (idn, cap))
-        p("static inline void _%s_spawned(unsigned ex) {" % idn)
-        if has_awake or has_start:
-            p("    _%s_life[ex] = 0;" % idn)
+
+        def _has(name):
+            return any(m["name"] == name and not (m.get("args") or "").strip()
+                       and not m.get("static")
+                       for _c, m in methods_by.get(cname, []))
+        has_enable, has_disable, has_destroy = (
+            _has("OnEnable"), _has("OnDisable"), _has("OnDestroy"))
+        p("/* awoken (1), started (2), enabled (4): per instance */")
+        p("static unsigned char _%s_life[%d];" % (idn, cap))
+        # Unity's messages as a GameObject becomes active (Awake the first
+        # time, then OnEnable), inactive (OnDisable), or is destroyed
+        # (OnDisable if enabled, then OnDestroy). Called directly: a
+        # script's SetActive / Destroy / Instantiate runs inside its trap.
+        p("void %s_Lifecycle(unsigned n, int msg) {" % idn)
+        p("    if (msg == 0) {")
+        p("        if (_%s_life[n] & 4) return;" % idn)
+        p("        if (!(_%s_life[n] & 1)) {" % idn)
+        p("            _%s_life[n] = (unsigned char)(_%s_life[n] | 1);" % (idn, idn))
         if has_awake:
-            # Directly, not through the script trap: the spawning script
-            # is still running, and its trap is the one in force.
-            p("    _%s_life[ex] = 1;" % idn)
-            p("    %s_Awake(ex);" % idn)
-        p("    (void)ex;")
+            p("            %s_Awake(n);" % idn)
+            if plan.get("_go_active_fn") and want_go_tables:
+                # an Awake that deactivated its GameObject: no OnEnable, and
+                # not enabled (it runs when it is activated again)
+                p("            if (!_engine_go_active_in_hierarchy(_engine_go_of_%s(n)))"
+                  " return;" % idn)
+        p("        }")
+        p("        _%s_life[n] = (unsigned char)(_%s_life[n] | 4);" % (idn, idn))
+        if has_enable:
+            p("        %s_OnEnable(n);" % idn)
+        p("        return;")
+        p("    }")
+        p("    if (_%s_life[n] & 4) {" % idn)
+        p("        _%s_life[n] = (unsigned char)(_%s_life[n] & ~4);" % (idn, idn))
+        if has_disable:
+            p("        %s_OnDisable(n);" % idn)
+        p("    }")
+        if has_destroy:
+            p("    if (msg == 2 && (_%s_life[n] & 1)) %s_OnDestroy(n);" % (idn, idn))
+        p("}")
+        p("static inline void _%s_spawned(unsigned ex) {" % idn)
+        p("    _%s_life[ex] = 0;" % idn)
+        p("    %s_Lifecycle(ex, 0);" % idn)
         p("}")
         p("void %s_FixedTick(void) {" % idn)
         if has_fixed:
             p("    int n;")
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            p("        if ((_%s_life[n] & 6) != 6) continue;" % idn)
             if multi:
                 p("        if (!%s) continue;" % live)
             _call_script("FixedUpdate", "        ")
@@ -12802,14 +13145,41 @@ def _emit_engine_class_groups(
             p("    /* no FixedUpdate */")
         p("}")
         p("")
-        p("void %s_Tick(void) {" % idn)
-        if has_awake or has_start or has_update:
+        # The frame's first passes, over every class before the next:
+        # activation (Awake, OnEnable) of each object active in the
+        # hierarchy, then Start -- every Awake before any Start, every
+        # Start before any Update, as Unity has them.
+        p("void %s_AwakeTick(void) {" % idn)
+        p("    int n;")
+        p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+        p("        if (_%s_life[n] & 1) continue;" % idn)
+        if multi:
+            p("        if (!%s) continue;" % live)
+        if destroyed:
+            p("        {")
+            p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
+            p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
+            p("                continue;")
+            p("        }")
+        if plan.get("_go_active_fn") and want_go_tables:
+            # an object inactive at load wakes when it is first activated
+            p("        if (!_engine_go_active_in_hierarchy("
+              "_engine_go_of_%s((unsigned)n))) continue;" % idn)
+        if want_go_tables:
+            p("        _engine_in_script = 1;")
+            p("        if (setjmp(_engine_script_jmp) == 0)")
+            p("            %s_Lifecycle((unsigned)n, 0);" % idn)
+            p("        _engine_in_script = 0;")
+        else:
+            p("        %s_Lifecycle((unsigned)n, 0);" % idn)
+        p("    }")
+        p("}")
+        p("void %s_StartTick(void) {" % idn)
+        if has_start:
             p("    int n;")
-        for method, bit in (("Awake", 1), ("Start", 2)):
-            if not (has_awake if method == "Awake" else has_start):
-                continue
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
-            p("        if (_%s_life[n] & %d) continue;" % (idn, bit))
+            p("        if ((_%s_life[n] & 6) != 4) continue; /* enabled, not started */"
+              % idn)
             if multi:
                 p("        if (!%s) continue;" % live)
             if destroyed:
@@ -12818,16 +13188,23 @@ def _emit_engine_class_groups(
                 p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
                 p("                continue;")
                 p("        }")
-            p("        _%s_life[n] = (unsigned char)(_%s_life[n] | %d);"
-              % (idn, idn, bit))
-            _call_script(method, "        ")
+            p("        _%s_life[n] = (unsigned char)(_%s_life[n] | 2);" % (idn, idn))
+            _call_script("Start", "        ")
             p("    }")
+        else:
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1)" % idn)
+            p("        if (_%s_life[n] & 4)" % idn)
+            p("            _%s_life[n] = (unsigned char)(_%s_life[n] | 2);" % (idn, idn))
+        p("}")
+        p("void %s_Tick(void) {" % idn)
+        if has_update:
+            p("    int n;")
         if has_update:
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
-            if has_start:
-                # Start before the first Update: an object spawned during
-                # this tick starts, then updates, on the next.
-                p("        if (!(_%s_life[n] & 2)) continue;" % idn)
+            # started and enabled: an inactive object does not update, and
+            # one spawned this frame starts, then updates, on the next
+            p("        if ((_%s_life[n] & 6) != 6) continue;" % idn)
             if want_destroy and plan.get("go_names"):
                 p("        {")
                 p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
@@ -12838,8 +13215,31 @@ def _emit_engine_class_groups(
                 p("        if (!%s) continue;" % live)
             _call_script("Update", "        ")
             p("    }")
-        elif not has_awake and not has_start:
+        else:
             p("    /* no Update */")
+        p("}")
+        p("")
+        # LateUpdate: after every Update and the animation update, as in
+        # Unity's player loop (it was emitted, and never called)
+        has_late = any(m["name"] == "LateUpdate" and not (m.get("args") or "").strip()
+                       for _c, m in methods_by.get(cname, []))
+        p("void %s_LateTick(void) {" % idn)
+        if has_late:
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            p("        if ((_%s_life[n] & 6) != 6) continue;" % idn)
+            if want_destroy and plan.get("go_names"):
+                p("        {")
+                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
+                p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
+                p("                continue;")
+                p("        }")
+            if multi:
+                p("        if (!%s) continue;" % live)
+            _call_script("LateUpdate", "        ")
+            p("    }")
+        else:
+            p("    /* no LateUpdate */")
         p("}")
         p("")
 
@@ -14598,61 +14998,144 @@ def _emit_engine_physics_fixed(
         p("")
 
 
+def _emit_anim_events(anim_players, p, plan):
+    """Animation Events: each player's, fired as its time crosses them --
+    (tp, t], or past the end and from the start when a looping clip wraps;
+    an event at 0 fires on the first frame. Forward play only."""
+    evs = [(k, e) for k, pl in enumerate(anim_players) for e in pl.get("events") or []]
+    if not evs:
+        return
+    seen = set()
+    for _k, e in evs:
+        sym = _method_c_symbol(_c_ident(e["cls"]), e["function"], e["args"], False)
+        if sym in seen:
+            continue
+        seen.add(sym)
+        plist = _method_c_params(e["args"])
+        p("static void %s(unsigned i%s);" % (sym, (", " + plist) if plist else ""))
+    p("static unsigned char _anim_ev_started[%d];" % max(1, len(anim_players)))
+    p("/* forward: (tp, t], or past the end then [0, t] when it wrapped;")
+    p("   backward (a negative speed): [t, tp), or below 0 then [t, len) */")
+    p("static int _anim_crossed(float tp, float t, float te, int wrapped, int back) {")
+    p("    if (back)")
+    p("        return wrapped ? (te < tp || te >= t) : (te < tp && te >= t);")
+    p("    return wrapped ? (te > tp || te <= t) : (te > tp && te <= t);")
+    p("}")
+    p("static void _anim_events(int i, float tp, float t, int wrapped) {")
+    p("    int back = _AnimPlayer_speed[i] < 0.f;")
+    p("    if (!_anim_ev_started[i]) {")
+    p("        _anim_ev_started[i] = 1;")
+    p("        tp = back ? _AnimClip_length[_AnimPlayer_clip[i]] + 1.f : -1.f;")
+    p("    }")
+    p("    switch (i) {")
+    for k, pl in enumerate(anim_players):
+        if not pl.get("events"):
+            continue
+        p("    case %d:" % k)
+        for e in pl["events"]:
+            sym = _method_c_symbol(_c_ident(e["cls"]), e["function"], e["args"], False)
+            ty = (e["args"].split() or [""])[0] if e["args"].strip() else ""
+            arg = ""
+            if ty in ("float", "double"):
+                arg = ", %sf" % repr(float(e["float"]))
+            elif ty in ("int", "long", "short", "byte", "bool"):
+                arg = ", %d" % int(e["int"])
+            elif ty == "string":
+                arg = ", %s" % _c_string(e["string"])
+            elif e["args"].strip():
+                continue          # an AnimationEvent / Object parameter
+            p("        if (_anim_crossed(tp, t, %sf, wrapped, back)) %s((unsigned)%d%s);"
+              % (repr(float(e["time"])), sym, e["inst"], arg))
+        p("        break;")
+    p("    default: break;")
+    p("    }")
+    p("}")
+    p("")
+
+
 def _emit_anim_rot_scale(anim_plan, class_ids, p, plan):
-    """engine_animation_tick: a clip's rotation (Euler degrees -> the owner's
-    quaternion, Unity's Z then X then Y, and its 2D draw matrix) and scale
-    (localScale x, y) curves, sampled as the position is."""
-    rot = set(plan.get("anim_rot_classes") or []) & set(
-        plan.get("live_rot_classes") or [])
-    scl = set(plan.get("anim_scale_classes") or []) & set(
-        plan.get("live_scale_classes") or [])
-    if anim_plan.get("rot_keys") and rot:
-        p("        if (_AnimClip_rkey_count[ci] > 0) {")
-        p("            int rb = _AnimClip_rkey_begin[ci], rc = _AnimClip_rkey_count[ci];")
-        p("            float d = 0.00872664626f; /* degrees to half radians */")
-        p("            float hx = _anim_sample(_AnimRotKey_t, _AnimRotKey_x, rb, rc, t) * d;")
-        p("            float hy = _anim_sample(_AnimRotKey_t, _AnimRotKey_y, rb, rc, t) * d;")
-        p("            float hz = _anim_sample(_AnimRotKey_t, _AnimRotKey_z, rb, rc, t) * d;")
-        p("            float cx = cosf(hx), sx = sinf(hx), cy = cosf(hy), sy = sinf(hy);")
-        p("            float cz = cosf(hz), sz = sinf(hz);")
-        p("            /* qy * qx * qz */")
-        p("            float ax = sx * cz, ay = -sx * sz, az = cx * sz, aw = cx * cz;")
-        p("            float qx = cy * ax + sy * az, qy = cy * ay + sy * aw;")
-        p("            float qz = cy * az - sy * ax, qw = cy * aw - sy * ay;")
-        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
-        p("            switch (_AnimPlayer_owner_class[i]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            if cname not in rot:
-                continue
-            idn = _c_ident(cname)
-            p("            case %d:" % cid)
-            p("                _%s_rot_x[oi] = qx; _%s_rot_y[oi] = qy;" % (idn, idn))
-            p("                _%s_rot_z[oi] = qz; _%s_rot_w[oi] = qw;" % (idn, idn))
-            p("                _%s_rot_m00[oi] = 1.f - 2.f * (qy * qy + qz * qz);" % idn)
-            p("                _%s_rot_m01[oi] = 2.f * (qx * qy - qz * qw);" % idn)
-            p("                _%s_rot_m10[oi] = 2.f * (qx * qy + qz * qw);" % idn)
-            p("                _%s_rot_m11[oi] = 1.f - 2.f * (qx * qx + qz * qz);" % idn)
-            p("                break;")
-        p("            default: break;")
-        p("            }")
-        p("        }")
-    if anim_plan.get("scale_keys") and scl:
-        p("        if (_AnimClip_skey_count[ci] > 0) {")
-        p("            int sb = _AnimClip_skey_begin[ci], sc = _AnimClip_skey_count[ci];")
-        p("            float lx = _anim_sample(_AnimScaleKey_t, _AnimScaleKey_x, sb, sc, t);")
-        p("            float ly = _anim_sample(_AnimScaleKey_t, _AnimScaleKey_y, sb, sc, t);")
-        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
-        p("            switch (_AnimPlayer_owner_class[i]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            if cname not in scl:
-                continue
-            idn = _c_ident(cname)
-            p("            case %d:" % cid)
-            p("                _%s_scale_x[oi] = lx; _%s_scale_y[oi] = ly;" % (idn, idn))
-            p("                break;")
-        p("            default: break;")
-        p("            }")
-        p("        }")
+    """engine_animation_tick: each of the player's bindings -- a curve of its
+    clip (a child's position, or anyone's rotation / scale) on its target --
+    sampled with the tangents and written to the target's tables: position
+    through its setters, rotation (Euler degrees -> the quaternion, Unity's
+    Z then X then Y, and the 2D draw matrix) and localScale x / y."""
+    binds = anim_plan.get("binds") or []
+    if not binds:
+        return
+    by_prop = {0: set(), 1: set(), 2: set()}
+    for b in binds:
+        by_prop[b["prop"]].add(b["target_class"])
+    by_prop[1] &= set(plan.get("live_rot_classes") or [])
+    by_prop[2] &= set(plan.get("live_scale_classes") or [])
+    p("        {")
+    p("            int b0 = _AnimPlayer_bind_begin[i];")
+    p("            int bc = _AnimPlayer_bind_count[i];")
+    p("            int b;")
+    p("            for (b = 0; b < bc; b = b + 1) {")
+    p("                int bi = b0 + b, tr = _AnimBind_track[bi];")
+    p("                int tb = _AnimTrack_begin[tr], tc = _AnimTrack_count[tr];")
+    p("                unsigned ti = (unsigned)_AnimBind_inst[bi];")
+    p("                float vx = _anim_sample_h(_AnimTKey_t, _AnimTKey_x, _AnimTKey_ix,")
+    p("                                          _AnimTKey_ox, tb, tc, t);")
+    p("                float vy = _anim_sample_h(_AnimTKey_t, _AnimTKey_y, _AnimTKey_iy,")
+    p("                                          _AnimTKey_oy, tb, tc, t);")
+    p("                float vz = _anim_sample_h(_AnimTKey_t, _AnimTKey_z, _AnimTKey_iz,")
+    p("                                          _AnimTKey_oz, tb, tc, t);")
+    p("                (void)vz; (void)ti;")
+    p("                if (_AnimBind_prop[bi] == 0) {")
+    p("                    switch (_AnimBind_class[bi]) {")
+    for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+        if cname not in by_prop[0]:
+            continue
+        cl = plan["classes"][cname]
+        idn = _c_ident(cname)
+        p("                    case %d:" % cid)
+        p("                        %s_set_pos_x(ti, vx);" % idn)
+        p("                        %s_set_pos_y(ti, vy);" % idn)
+        if not cl.get("two_d"):
+            p("                        %s_set_pos_z(ti, vz);" % idn)
+        p("                        break;")
+    p("                    default: break;")
+    p("                    }")
+    p("                } else if (_AnimBind_prop[bi] == 1) {")
+    p("                    float d = 0.00872664626f; /* degrees to half radians */")
+    p("                    float cx = cosf(vx * d), sx = sinf(vx * d);")
+    p("                    float cy = cosf(vy * d), sy = sinf(vy * d);")
+    p("                    float cz = cosf(vz * d), sz = sinf(vz * d);")
+    p("                    /* qy * qx * qz */")
+    p("                    float ax = sx * cz, ay = -sx * sz, az = cx * sz, aw = cx * cz;")
+    p("                    float qx = cy * ax + sy * az, qy = cy * ay + sy * aw;")
+    p("                    float qz = cy * az - sy * ax, qw = cy * aw - sy * ay;")
+    p("                    (void)qx; (void)qy; (void)qz; (void)qw;")
+    p("                    switch (_AnimBind_class[bi]) {")
+    for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+        if cname not in by_prop[1]:
+            continue
+        idn = _c_ident(cname)
+        p("                    case %d:" % cid)
+        p("                        _%s_rot_x[ti] = qx; _%s_rot_y[ti] = qy;" % (idn, idn))
+        p("                        _%s_rot_z[ti] = qz; _%s_rot_w[ti] = qw;" % (idn, idn))
+        p("                        _%s_rot_m00[ti] = 1.f - 2.f * (qy * qy + qz * qz);" % idn)
+        p("                        _%s_rot_m01[ti] = 2.f * (qx * qy - qz * qw);" % idn)
+        p("                        _%s_rot_m10[ti] = 2.f * (qx * qy + qz * qw);" % idn)
+        p("                        _%s_rot_m11[ti] = 1.f - 2.f * (qx * qx + qz * qz);" % idn)
+        p("                        break;")
+    p("                    default: break;")
+    p("                    }")
+    p("                } else {")
+    p("                    switch (_AnimBind_class[bi]) {")
+    for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+        if cname not in by_prop[2]:
+            continue
+        idn = _c_ident(cname)
+        p("                    case %d:" % cid)
+        p("                        _%s_scale_x[ti] = vx; _%s_scale_y[ti] = vy;" % (idn, idn))
+        p("                        break;")
+    p("                    default: break;")
+    p("                    }")
+    p("                }")
+    p("            }")
+    p("        }")
 
 
 def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_anim):
@@ -14675,6 +15158,39 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
         p("            u = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.f;")
         p("            return vals[begin + i]")
         p("                + (vals[begin + i + 1] - vals[begin + i]) * u;")
+        p("        }")
+        p("    }")
+        p("    return vals[begin + count - 1];")
+        p("}")
+        p("")
+        p("/* Unity's curve evaluation: a cubic Hermite from the keys' out / in")
+        p("   tangents, scaled by the segment's length; an infinite one (a")
+        p("   \"constant\" key, +-1e30 here) holds the value to the next key. */")
+        p("static float _anim_sample_h(const float *times, const float *vals,")
+        p("                           const float *ins, const float *outs,")
+        p("                           int begin, int count, float t) {")
+        p("    int i;")
+        p("    if (count <= 0) return 0.f;")
+        p("    if (count == 1 || t <= times[begin]) return vals[begin];")
+        p("    if (t >= times[begin + count - 1]) return vals[begin + count - 1];")
+        p("    for (i = 0; i < count - 1; i = i + 1) {")
+        p("        float t0 = times[begin + i], t1 = times[begin + i + 1];")
+        p("        if (t >= t0 && t <= t1) {")
+        p("            float dt = t1 - t0, m0, m1, u, u2, u3, v0, v1;")
+        p("            v0 = vals[begin + i];")
+        p("            v1 = vals[begin + i + 1];")
+        p("            if (dt <= 0.f) return v1;")
+        p("            m0 = outs[begin + i];")
+        p("            m1 = ins[begin + i + 1];")
+        p("            if (m0 > 1e29f || m0 < -1e29f || m1 > 1e29f || m1 < -1e29f)")
+        p("                return v0;")
+        p("            u = (t - t0) / dt;")
+        p("            u2 = u * u;")
+        p("            u3 = u2 * u;")
+        p("            return (2.f * u3 - 3.f * u2 + 1.f) * v0")
+        p("                + (u3 - 2.f * u2 + u) * dt * m0")
+        p("                + (3.f * u2 - 2.f * u3) * v1")
+        p("                + (u3 - u2) * dt * m1;")
         p("        }")
         p("    }")
         p("    return vals[begin + count - 1];")
@@ -14714,22 +15230,25 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
             p("    return vals[begin + count - 1];")
             p("}")
             p("")
+        _emit_anim_events(anim_players, p, plan)
         p("static void engine_animation_tick(void) {")
         p("    int i;")
         p("    for (i = 0; i < _AnimPlayer_count; i = i + 1) {")
-        p("        int ci, kb, kc;")
-        p("        float t, len, nx, ny, nz;")
+        p("        int ci, kb, kc, wrapped;")
+        p("        float t, tp, len, nx, ny, nz;")
         p("        unsigned oi;")
         p("        if (!_AnimPlayer_playing[i]) continue;")
         p("        ci = _AnimPlayer_clip[i];")
         p("        len = _AnimClip_length[ci];")
         p("        if (len <= 0.f) continue;")
+        p("        tp = _AnimPlayer_time[i];")
+        p("        wrapped = 0;")
         p("        _AnimPlayer_time[i] = _AnimPlayer_time[i]")
         p("            + Time_deltaTime * _AnimPlayer_speed[i];")
         p("        t = _AnimPlayer_time[i];")
         p("        if (_AnimPlayer_loop[i]) {")
-        p("            while (t >= len) t = t - len;")
-        p("            while (t < 0.f) t = t + len;")
+        p("            while (t >= len) { t = t - len; wrapped = 1; }")
+        p("            while (t < 0.f) { t = t + len; wrapped = 1; }")
         p("            _AnimPlayer_time[i] = t;")
         p("        } else if (t > len) {")
         p("            t = len;")
@@ -14745,9 +15264,12 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
         p("        kc = _AnimClip_key_count[ci];")
         # Absolute localPosition only when the clip authors root PositionCurves.
         p("        if (kc > 0) {")
-        p("            nx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
-        p("            ny = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
-        p("            nz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
+        p("            nx = _anim_sample_h(_AnimKey_t, _AnimKey_x, _AnimKey_ix, _AnimKey_ox,")
+        p("                                kb, kc, t);")
+        p("            ny = _anim_sample_h(_AnimKey_t, _AnimKey_y, _AnimKey_iy, _AnimKey_oy,")
+        p("                                kb, kc, t);")
+        p("            nz = _anim_sample_h(_AnimKey_t, _AnimKey_z, _AnimKey_iz, _AnimKey_oz,")
+        p("                                kb, kc, t);")
         p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
         p("            switch (_AnimPlayer_owner_class[i]) {")
         for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
@@ -14765,6 +15287,8 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
         p("            }")
         p("        }")
         _emit_anim_rot_scale(anim_plan, class_ids, p, plan)
+        if any(pl.get("events") for pl in anim_players):
+            p("        _anim_events(i, tp, t, wrapped);")
         if anim_skeys and anim_sbinds:
             mutable = set(plan.get("sprite_draw_mutable") or [])
             p("        {")
@@ -15185,6 +15709,12 @@ def emit_engine(plan, analyses, used_apis):
     keyboard_keys = set()
     for a in analyses:
         keyboard_keys |= set(a.get("keyboard_keys") or [])
+    import tools.unity_pack_common as _cm
+    import tools.unity_pack_input as _inp
+    _ia_code, _ia_keys, _ia_hints = _inp.engine_tables(_cm.SOURCE_INPUT_ACTIONS)
+    if _cm.SOURCE_INPUT_ACTIONS:
+        keyboard_keys |= set(_ia_keys)
+    plan["keyboard_keys"] = sorted(set(plan.get("keyboard_keys") or []) | keyboard_keys)
     want_ambient = "RenderSettings.ambientLight" in used_apis or want_add_light
     want_log = bool(used_apis & {"Debug.Log", "print"})
     want_console = "Console.WriteLine" in used_apis
@@ -15520,6 +16050,49 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int engine_keyboard_connected;")
         for key in sorted(keyboard_keys):
             p("extern int engine_keyboard_%s;" % key)
+    if "Gamepad.current" in used_apis:
+        plan["want_gamepad"] = True
+        p("/* The Input System's Gamepad.current: the host's (GLFW's layout);")
+        p("   buttons 15 and 16 are the triggers past 0.5, as Unity presses them. */")
+        p("extern int engine_gamepad_connected;")
+        p("extern int engine_gamepad_button[15];")
+        p("extern float engine_gamepad_axis[6];")
+        p("static unsigned char _gp_now[17], _gp_was[17];")
+        p("static int _gp_btn(int k) {")
+        p("    if (!engine_gamepad_connected || k < 0 || k > 16) return 0;")
+        p("    if (k >= 15) return engine_gamepad_axis[k - 11] > 0.5f;")
+        p("    return engine_gamepad_button[k] != 0;")
+        p("}")
+        p("static float _gp_axis(int k) {")
+        p("    return engine_gamepad_connected && k >= 0 && k < 6"
+          " ? engine_gamepad_axis[k] : 0.f;")
+        p("}")
+        p("static int _gp_down(int k) { return _gp_now[k] && !_gp_was[k]; }")
+        p("static int _gp_up(int k) { return !_gp_now[k] && _gp_was[k]; }")
+        p("static void _engine_gamepad_latch(void) {")
+        p("    int k;")
+        p("    for (k = 0; k < 17; k = k + 1) {")
+        p("        _gp_was[k] = _gp_now[k];")
+        p("        _gp_now[k] = (unsigned char)_gp_btn(k);")
+        p("    }")
+        p("}")
+    plan["_ia_code"] = _ia_code if _cm.SOURCE_INPUT_ACTIONS else ""
+    plan["want_scroll"] = ("Input.mouseScrollDelta" in used_apis
+                           or bool(plan.get("ui_scrollrects")))
+    if plan["want_scroll"]:
+        p("/* The mouse wheel: the host's, taken each tick into this frame's. */")
+        p("extern float engine_scroll_x;")
+        p("extern float engine_scroll_y;")
+        p("static float _engine_scroll_fx, _engine_scroll_fy;")
+        p("static void _engine_scroll_latch(void) {")
+        p("    _engine_scroll_fx = engine_scroll_x;")
+        p("    _engine_scroll_fy = engine_scroll_y;")
+        p("    engine_scroll_x = 0.f;")
+        p("    engine_scroll_y = 0.f;")
+        p("}")
+    if plan.get("_ia_code"):
+        p(plan["_ia_code"])
+    _parts.emit_api(p, plan)
     if "InputManager.Using" in used_apis:
         p("extern int engine_input_using_keyboard;")
         p("extern int engine_input_using_mouse;")
@@ -15877,9 +16450,13 @@ def emit_engine(plan, analyses, used_apis):
         go_cap_d = max(1, len(go_names_d) + go_spawn_budget)
         p("/* Destroy(gameObject) — stop Update; no pool free */")
         p("static int _engine_go_destroyed[%d];" % go_cap_d)
+        if want_go_tables:
+            p("static void _engine_go_message(int go, int msg);")
         p("static void Object_Destroy(int go) {")
-        p("    if (go >= 0 && go < %d) _engine_go_destroyed[go] = 1;"
-          % go_cap_d)
+        p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;" % go_cap_d)
+        if want_go_tables:
+            p("    _engine_go_message(go, 2); /* OnDisable, OnDestroy */")
+        p("    _engine_go_destroyed[go] = 1;")
         p("}")
         p("")
     _emit_engine_debug_log(p, plan, want_log)
@@ -15962,10 +16539,28 @@ def emit_engine(plan, analyses, used_apis):
                 seed[gi] = 1 if int(tg.get("is_on") or 0) else 0
         p("static int _Toggle_isOn[%d] = { %s };" % (
             go_n, ", ".join(str(int(x)) for x in seed)))
-        p("static void Toggle_set_isOn(int go, int v) {")
+        p("static void _Toggle_raw_set_isOn(int go, int v) {")
         p("    if (go < 0 || go >= %d) return;" % go_n)
         p("    _Toggle_isOn[go] = v ? 1 : 0;")
         p("}")
+        # A script's `isOn = v` is Unity's Toggle.Set(v): the graphic, the
+        # group and onValueChanged, as a click has them;
+        # SetIsOnWithoutNotify is the same without the callbacks.
+        if plan.get("ui_toggles"):
+            p("static void _engine_ui_tg_script_set(int go, int v, int notify);")
+            p("static void Toggle_set_isOn(int go, int v) {")
+            p("    _engine_ui_tg_script_set(go, v, 1);")
+            p("}")
+            p("static void Toggle_SetIsOnWithoutNotify(int go, int v) {")
+            p("    _engine_ui_tg_script_set(go, v, 0);")
+            p("}")
+        else:
+            p("static void Toggle_set_isOn(int go, int v) {")
+            p("    _Toggle_raw_set_isOn(go, v);")
+            p("}")
+            p("static void Toggle_SetIsOnWithoutNotify(int go, int v) {")
+            p("    _Toggle_raw_set_isOn(go, v);")
+            p("}")
         p("static int Toggle_get_isOn(int go) {")
         p("    if (go < 0 || go >= %d) return 0;" % go_n)
         p("    return _Toggle_isOn[go];")
@@ -16283,6 +16878,7 @@ def emit_engine(plan, analyses, used_apis):
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
+    _parts.emit_sim(p, plan, class_ids, _c_ident, _class_has_position)
 
     # Live Transform hierarchy (m_Father): world = parent_world + local.
     # SetParent also needs these tables (mutable) even with no authored parents.
@@ -16426,12 +17022,20 @@ def emit_engine(plan, analyses, used_apis):
         p("    _engine_scene_apply_pending();")
     if want_keyboard:
         p("    _engine_keyboard_latch();")
+    if plan.get("want_scroll"):
+        p("    _engine_scroll_latch();")
+    if plan.get("want_gamepad"):
+        p("    _engine_gamepad_latch();")
+    if plan.get("_ia_code"):
+        p("    _ia_latch();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
         p("    engine_ui_tick();")
-    if want_anim and anim_players:
-        p("    engine_animation_tick();")
+    for cname in sorted(plan["classes"]):
+        p("    %s_AwakeTick();" % _c_ident(cname))
+    for cname in sorted(plan["classes"]):
+        p("    %s_StartTick();" % _c_ident(cname))
     p("    _engine_fixed_accum = _engine_fixed_accum + _dt;")
     p("    _fixed_dt = Time_fixedDeltaTime;")
     p("    if (_fixed_dt < 1e-8f) _fixed_dt = 0.02f;")
@@ -16448,6 +17052,14 @@ def emit_engine(plan, analyses, used_apis):
         p("    %s_Tick();" % _c_ident(cname))
     for fn in iface_tick_fns:
         p("    %s();" % fn)
+    # Unity's order: Update, then the animation update (its events), then
+    # LateUpdate -- the animation ran before Update, LateUpdate never
+    if want_anim and anim_players:
+        p("    engine_animation_tick();")
+    for cname in sorted(plan["classes"]):
+        p("    %s_LateTick();" % _c_ident(cname))
+    if plan.get("particles"):
+        p("    _ps_update(Time_deltaTime); /* after LateUpdate, as Unity's */")
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
     p("}")
@@ -16514,6 +17126,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    (void)id; return 0;")
     p("}")
     p("")
+    _parts.emit_collect(p, plan)
     p("int engine_collect_draws(EngineDraw *out, int max) {")
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
@@ -16526,7 +17139,9 @@ def emit_engine(plan, analyses, used_apis):
     any_sprite = _emit_engine_class_draws(
             any_sprite, class_ids, go_names, has_cam, mutable_spr, p, plan, ui_buttons,
             want_live_rt, want_ui)
-    if not any_sprite:
+    if plan.get("particles"):
+        p("    _ps_collect(out, &n, max);")
+    if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
     elif want_draw_sort:
         p("    if (n > 1)")
@@ -20128,6 +20743,98 @@ def _lower_collider_param(text, p):
     return text
 
 
+#: Gamepad controls (the Input System's names and aliases) -> the host's
+#: button index (GLFW's gamepad layout); the triggers are buttons past 0.5.
+_GAMEPAD_BUTTONS = {
+    "buttonSouth": 0, "aButton": 0, "crossButton": 0,
+    "buttonEast": 1, "bButton": 1, "circleButton": 1,
+    "buttonWest": 2, "xButton": 2, "squareButton": 2,
+    "buttonNorth": 3, "yButton": 3, "triangleButton": 3,
+    "leftShoulder": 4, "rightShoulder": 5, "selectButton": 6,
+    "startButton": 7, "leftStickButton": 9, "rightStickButton": 10,
+    "dpad.up": 11, "dpad.right": 12, "dpad.down": 13, "dpad.left": 14,
+    "leftTrigger": 15, "rightTrigger": 16,
+}
+#: Value controls -> the expression of the host's axes / buttons.
+_GAMEPAD_VALUES = {
+    "leftStick": "Vector2_make(_gp_axis(0), _gp_axis(1))",
+    "rightStick": "Vector2_make(_gp_axis(2), _gp_axis(3))",
+    "leftStick.x": "_gp_axis(0)", "leftStick.y": "_gp_axis(1)",
+    "rightStick.x": "_gp_axis(2)", "rightStick.y": "_gp_axis(3)",
+    "leftTrigger": "_gp_axis(4)", "rightTrigger": "_gp_axis(5)",
+    "dpad": "Vector2_make((float)(_gp_btn(12) - _gp_btn(14)), "
+            "(float)(_gp_btn(11) - _gp_btn(13)))",
+    "dpad.x": "(float)(_gp_btn(12) - _gp_btn(14))",
+    "dpad.y": "(float)(_gp_btn(11) - _gp_btn(13))",
+}
+
+
+def _lower_gamepad(text):
+    """The Input System's `Gamepad.current` (the host's gamepad, null when
+    none is connected): a button's `isPressed` / `wasPressedThisFrame` /
+    `wasReleasedThisFrame`, a stick / trigger / dpad's `ReadValue()`. A local
+    holding it (`var gp = Gamepad.current;`) is the connected flag, and its
+    members the device's."""
+    if "Gamepad" not in text:
+        return text
+    tail = r"(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?Gamepad\s*\.\s*current"
+    gp = r"(?<![\w.])" + tail
+    decl = r"(?<![\w.])(?:var|Gamepad)\s+(\w+)\s*=\s*" + tail + r"\s*;"
+    locals_ = re.findall(decl, cs2cpp._blank(text))
+    text = cs2cpp.code_sub(decl, lambda m: "int %s = engine_gamepad_connected;"
+                           % m.group(1), text)
+    recv = [gp] + [r"(?<![\w.])%s" % re.escape(n) for n in locals_]
+    for r in recv:
+        text = cs2cpp.code_sub(r + r"\s*(==|!=)\s*null\b",
+                               lambda m: "(%sengine_gamepad_connected)" % (
+                                   "!" if m.group(1) == "==" else ""), text)
+        names = sorted(set(_GAMEPAD_BUTTONS) | set(_GAMEPAD_VALUES), key=len,
+                       reverse=True)
+        alt = "|".join(re.escape(n).replace(r"\.", r"\s*\.\s*") for n in names)
+
+        def ctrl(m):
+            name = re.sub(r"\s+", "", m.group(1))
+            what = m.group(2)
+            if what == "ReadValue" or what.startswith("ReadValue"):
+                v = _GAMEPAD_VALUES.get(name)
+                if v is None and name in _GAMEPAD_BUTTONS:
+                    v = "(float)_gp_btn(%d)" % _GAMEPAD_BUTTONS[name]
+                return v or m.group(0)
+            k = _GAMEPAD_BUTTONS.get(name)
+            if k is None:
+                return m.group(0)
+            return {"isPressed": "_gp_btn(%d)", "wasPressedThisFrame": "_gp_down(%d)",
+                    "wasReleasedThisFrame": "_gp_up(%d)"}[what] % k
+        text = cs2cpp.code_sub(
+            r + r"\s*\.\s*(%s)\s*\.\s*(isPressed|wasPressedThisFrame|wasReleasedThisFrame|"
+            r"ReadValue\s*\(\s*\))" % alt, ctrl, text)
+    return text
+
+
+def _lower_mouse_scroll(text):
+    """The mouse wheel, this frame's (the host's, taken each tick):
+    `Input.mouseScrollDelta` (notches), `Input.GetAxis("Mouse ScrollWheel")`
+    (Unity's 0.1 a notch) and the Input System's `Mouse.current.scroll`
+    (120 a notch, as Windows reports it)."""
+    if "Scroll" not in text and "scroll" not in text:
+        return text
+    # (the axis name is a string literal: matched in the text itself)
+    text = re.sub(
+        r'(?<![\w.])Input\s*\.\s*GetAxis(?:Raw)?\s*\(\s*"Mouse ScrollWheel"\s*\)',
+        "(_engine_scroll_fy * 0.1f)", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])Input\s*\.\s*mouseScrollDelta\s*\.\s*([xy])\b",
+                           lambda m: "_engine_scroll_f%s" % m.group(1), text)
+    text = cs2cpp.code_sub(r"(?<![\w.])Input\s*\.\s*mouseScrollDelta\b",
+                           "Vector2_make(_engine_scroll_fx, _engine_scroll_fy)", text)
+    mouse = r"(?<![\w.])(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?Mouse\s*\.\s*current\s*\.\s*scroll"
+    text = cs2cpp.code_sub(mouse + r"\s*\.\s*([xy])\s*\.\s*ReadValue\s*\(\s*\)",
+                           lambda m: "(_engine_scroll_f%s * 120.f)" % m.group(1), text)
+    text = cs2cpp.code_sub(mouse + r"\s*\.\s*ReadValue\s*\(\s*\)",
+                           "Vector2_make(_engine_scroll_fx * 120.f, "
+                           "_engine_scroll_fy * 120.f)", text)
+    return text
+
+
 def _own_string_params(body, site):
     """A `string` parameter the body uses becomes an owned local.
 
@@ -20826,6 +21533,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
+    text = _lower_mouse_scroll(text)
+    # (before the null comparisons: `gp == null` is the connected flag)
+    text = _lower_gamepad(text)
     if collision2d_param:
         text = _lower_collider_param(text, collision2d_param)
     # Before `true` becomes 1: a builder's Append(true) and a bool literal
@@ -20879,12 +21589,24 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?<![\w.])base\s*\.\s*(Awake|OnEnable|OnDisable)\s*\(\s*\)\s*;?",
         lambda m: "/* base.%s */" % m.group(1), text)
+    # an InputAction callback's subscriber: this instance
+    text = cs2cpp.code_sub(r"(?<![\w.])__ia_self\b", "(int)i", text)
     # gameObject.SetActive(x) → GameObject_SetActive(this GO, x).
     if plan.get("go_names"):
         text = cs2cpp.code_sub(
             r"(?<![\w.])gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
             r"GameObject_SetActive(_engine_go_of_%s(i), (\1))" % idn,
             text)
+        # a GameObject field or local's SetActive (the name, lowered later
+        # as any field / local is)
+        gos = {f["name"] for f in cl.get("fields") or [] if f.get("ty") == "GameObject"}
+        gos |= set(re.findall(r"(?<![\w.<])GameObject\s+(\w+)\s*[=;,)]",
+                              cs2cpp._blank(text)))
+        for g in sorted(gos, key=len, reverse=True):
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?(%s)\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)"
+                % re.escape(g), lambda m: "GameObject_SetActive(%s, (%s))" % (
+                    m.group(1), m.group(2)), text)
     # InputSystem.onDeviceChange — no device-change bus in the desktop pack.
     text = cs2cpp.code_sub(
         r"InputSystem\s*\.\s*onDeviceChange\s*\+=\s*[^;]+;",
@@ -20991,6 +21713,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*localScale\s*\.\s*([xy])\b"
             r"(?!\s*[-+*/]?=[^=])",
             lambda m: "_%s_scale_%s[i]" % (_sidn, m.group(1)), text)
+    text = _parts.lower_api(text, cl, plan, _c_ident)
     text = _lower_joint2d_api(text, cl, plan, site)
     text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
@@ -21139,7 +21862,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                          _string_helper_names("bool") | {
                              "_engine_go_active_in_hierarchy",
                              "GameObject_activeSelf",
-                             "GameObject_CompareTag"} | {
+                             "GameObject_CompareTag",
+                             "_ia_enabled", "_ia_pressed", "_ia_down", "_ia_up",
+                             "_gp_btn", "_gp_down", "_gp_up",
+                             "ParticleSystem_get_isPlaying",
+                             "ParticleSystem_get_isEmitting",
+                             "ParticleSystem_get_isPaused",
+                             "ParticleSystem_get_isStopped"} | {
                              k for k, v in (plan.get("_method_ret_kinds_local")
                                             or {}).items() if v == "b"})
     text = _lower_string_concat(text, string_idents=string_idents,
@@ -21559,6 +22288,19 @@ def emit_data(plan, used_apis=None):
         p("int engine_input_using_mouse = 1;")
         p("int engine_input_using_gamepad = 0;")
         p("int engine_input_using_phone = 0;")
+    if plan.get("want_gamepad"):
+        p("/* Host: the first gamepad -- GLFW's layout: buttons A B X Y LB RB")
+        p("   Back Start Guide LThumb RThumb Up Right Down Left; axes LX LY RX")
+        p("   RY (y up, as Unity) LT RT (0..1). */")
+        p("int engine_gamepad_connected = 0;")
+        p("int engine_gamepad_button[15];")
+        p("float engine_gamepad_axis[6];")
+    if plan.get("want_scroll"):
+        p("/* Host: mouse wheel since the last frame (notches; y > 0 is")
+        p("   up / away, as Input.mouseScrollDelta); the engine takes and")
+        p("   zeroes it each tick. */")
+        p("float engine_scroll_x = 0.f;")
+        p("float engine_scroll_y = 0.f;")
     if plan.get("ui_buttons"):
         p("/* Host: screen-space pointer (origin bottom-left, y up). */")
         p("float engine_pointer_x = 0.f;")
@@ -21837,19 +22579,33 @@ def emit_data(plan, used_apis=None):
         p("const float _AnimKey_z[%d] = { %s };" % (
             len(keys),
             ", ".join("%sf" % repr(float(k["z"])) for k in keys)))
-        for kind, tag, pre in (("rot_keys", "Rot", "rkey"),
-                               ("scale_keys", "Scale", "skey")):
-            ks = anim_plan.get(kind) or []
-            if not ks:
-                continue
-            for axis in "txyz":
-                p("const float _Anim%sKey_%s[%d] = { %s };" % (
-                    tag, axis, len(ks),
-                    ", ".join("%sf" % repr(float(k[axis])) for k in ks)))
-            p("const int _AnimClip_%s_begin[%d] = { %s };" % (
-                pre, nc, ", ".join(str(int(c[pre + "_begin"])) for c in anim_clips)))
-            p("const int _AnimClip_%s_count[%d] = { %s };" % (
-                pre, nc, ", ".join(str(int(c[pre + "_count"])) for c in anim_clips)))
+        # Hermite tangents of the root position keys
+        for sl in ("ix", "iy", "iz", "ox", "oy", "oz"):
+            p("const float _AnimKey_%s[%d] = { %s };" % (
+                sl, len(keys), ", ".join(
+                    "%sf" % repr(float(k.get(sl, 0.0))) for k in keys)))
+        binds = anim_plan.get("binds") or []
+        if binds:
+            tks = anim_plan.get("track_keys") or [
+                dict.fromkeys(("t", "x", "y", "z", "ix", "iy", "iz", "ox", "oy",
+                               "oz"), 0.0)]
+            trs = anim_plan.get("tracks") or [{"begin": 0, "count": 0}]
+            for col in ("t", "x", "y", "z", "ix", "iy", "iz", "ox", "oy", "oz"):
+                p("const float _AnimTKey_%s[%d] = { %s };" % (
+                    col, len(tks), ", ".join(
+                        "%sf" % repr(float(k.get(col, 0.0))) for k in tks)))
+            p("const int _AnimTrack_begin[%d] = { %s };" % (
+                len(trs), ", ".join(str(int(t["begin"])) for t in trs)))
+            p("const int _AnimTrack_count[%d] = { %s };" % (
+                len(trs), ", ".join(str(int(t["count"])) for t in trs)))
+            for col, key in (("track", "track"), ("prop", "prop"),
+                             ("class", "target_class_id"), ("inst", "target_inst")):
+                p("const int _AnimBind_%s[%d] = { %s };" % (
+                    col, len(binds), ", ".join(str(int(b[key])) for b in binds)))
+            p("const int _AnimPlayer_bind_begin[%d] = { %s };" % (
+                n, ", ".join(str(int(pl.get("bind_begin") or 0)) for pl in anim_players)))
+            p("const int _AnimPlayer_bind_count[%d] = { %s };" % (
+                n, ", ".join(str(int(pl.get("bind_count") or 0)) for pl in anim_players)))
         anim_skeys = anim_plan.get("sprite_keys") or []
         anim_sbinds = anim_plan.get("sprite_binds") or []
         if anim_skeys or anim_sbinds:
@@ -22082,6 +22838,10 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:Rigidbody":
                     parts.append(str(_rb_field_init_index(
                         plan, o, name, "3d")))
+                elif str(kind)[4:] == "ParticleSystem":
+                    fid = (o.get("object_refs") or {}).get(name)
+                    parts.append(str(int((plan.get("ps_by_file_id") or {})
+                                         .get(str(fid), -1))))
                 elif str(kind)[4:] in _JOINT2D_COMPONENTS:
                     fid = (o.get("object_refs") or {}).get(name)
                     parts.append(str(int((plan.get("joint2d_by_file_id") or {})
@@ -23528,12 +24288,20 @@ def pack(root, outdir, *args, **kwargs):
     import tools.unity_pack_collections as _coll
     import tools.unity_pack_physics as _phys
     _layer_names = _phys.read_layer_names(root)
+    import tools.unity_pack_input as _inp
+    _common.SOURCE_INPUT_ACTIONS[:] = []
+    _inp.HANDLERS[:] = []
+    _inp.ROOTS.clear()
+    _ia_serialized = _inp.serialized_actions(root)
     _common.SOURCE_LAYER_NAMES.clear()
     _common.SOURCE_LAYER_NAMES.update(_layer_names)
     _n = [0]
     for fp in sorted(files):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
         t = _phys.desugar_layers(t, _layer_names)
+        t = _inp.desugar_input_actions(t, _common.SOURCE_INPUT_ACTIONS,
+                                       os.path.relpath(fp, root),
+                                       _ia_serialized.get(os.path.abspath(fp)))
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
@@ -23545,6 +24313,15 @@ def pack(root, outdir, *args, **kwargs):
     # An API a copied or inlined static helper uses is its caller's too:
     # the per-script scan does not see it there.
     _common.SOURCE_API_HINTS.clear()
+    if _common.SOURCE_INPUT_ACTIONS:
+        _ia_code, _ia_keys, _ia_hints = _inp.engine_tables(_common.SOURCE_INPUT_ACTIONS)
+        _common.SOURCE_API_HINTS.update(_ia_hints)
+        for act in _common.SOURCE_INPUT_ACTIONS:
+            if not act["bindings"]:
+                sys.stderr.write(
+                    "unity_pack: warning: %s: InputAction %r has no binding the pack "
+                    "can read (a serialized one is not read): it is never pressed\n"
+                    % (act["where"], act["name"]))
     if any(re.search(r"\.\s*active(?:Self|InHierarchy)\b", t)
            for t in files.values()):
         _common.SOURCE_API_HINTS.add("GameObject.SetActive")
@@ -23790,6 +24567,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["rigidbody2d"] = rb2d
     plan["rb2d_by_file_id"] = rb2d_by_fid
     _build_joint2d_table(plan)
+    _parts.build_particle_table(plan)
     # Rigidbody2D rotation: a body Box2D-Packed may turn -- not static, not
     # FreezeRotation -- turns its owner's Transform, which then keeps a live
     # rotation (drawn rotated). Unity mode; the glue locked it before.
@@ -23841,7 +24619,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     helpers_c = _string_helpers_c(_used_helpers)
     if (runtime.needs_math(runtime.closure(
             {h for h in _used_helpers if runtime.is_runtime_helper(h)}))
-            or "atan2f(" in engine) \
+            or "atan2f(" in engine or "powf(" in engine or "sqrtf(" in engine) \
             and "#include <math.h>" not in engine:
         k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
         engine = engine[:k] + "#include <math.h>\n" + engine[k:]

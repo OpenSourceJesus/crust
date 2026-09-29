@@ -601,13 +601,22 @@ UNITY_SPIN_CLIP = (
     "      - serializedVersion: 3\n        time: 0\n        value: {x: 1, y: 1, z: 1}\n"
     "      - serializedVersion: 3\n        time: 1\n        value: {x: 3, y: 3, z: 1}\n"
     "    path: \n"
+    "  m_Events:\n  - time: 0.5\n    functionName: Halfway\n    data: half\n"
+    "    floatParameter: 0\n    intParameter: 7\n    messageOptions: 0\n"
     "  m_AnimationClipSettings:\n    m_StopTime: 1\n    m_LoopTime: 1\n")
 UNITY_SPIN_SCRIPT = (
     "using UnityEngine;\n"
+    "using UnityEngine.InputSystem;\n"
     "public class SpinCheck : MonoBehaviour {\n"
     "    int frames;\n"
     "    void Update() {\n"
     "        frames++;\n"
+    "        if (frames == 1) {\n"
+    "            var gp = Gamepad.current;\n"
+    "            Debug.Log(\"anim:pad \" + (gp == null ? \"none\" : \"some\") + \" \""
+    " + Input.mouseScrollDelta.y);\n"
+    "            if (gp != null && gp.buttonSouth.wasPressedThisFrame) Debug.Log(\"south\");\n"
+    "        }\n"
     "        if (frames == 15) {\n"
     "            float z = transform.eulerAngles.z;\n"
     "            float s = transform.localScale.x;\n"
@@ -615,8 +624,143 @@ UNITY_SPIN_SCRIPT = (
     " + (s > 1.3f && s < 1.7f ? \"growing\" : \"fixed\"));\n"
     "        }\n"
     "    }\n"
+    "    void LateUpdate() { if (frames == 15) Debug.Log(\"anim:late \" + frames); }\n"
+    "    int halves;\n"
+    "    void Halfway(string what) { halves++; if (halves <= 2) Debug.Log(\"anim:event \" + what"
+    " + \" \" + frames); }\n"
     "}\n")
-UNITY_SPIN_EXPECT = ["anim:turning,growing"]
+UNITY_SPIN_EXPECT = ["anim:pad none 0", "anim:turning,growing", "anim:late 15", "anim:event half 30"]
+
+#: The lifecycle messages: an object active at load (Awake, OnEnable, Start),
+#: deactivated (OnDisable) and reactivated (OnEnable), one inactive at load
+#: that wakes when first activated (Awake, OnEnable, then Start the next
+#: frame), and a Destroy (OnDisable, OnDestroy).
+UNITY_CYCLE_SCRIPT = (
+    "using UnityEngine;\n"
+    "public class Cycle : MonoBehaviour {\n"
+    "    public int id;\n"
+    "    string L() { return id == 1 ? \"A\" : \"B\"; }\n"
+    "    void Awake() { Debug.Log(\"cycle:\" + L() + \" awake\"); }\n"
+    "    void OnEnable() { Debug.Log(\"cycle:\" + L() + \" enable\"); }\n"
+    "    void Start() { Debug.Log(\"cycle:\" + L() + \" start\"); }\n"
+    "    void OnDisable() { Debug.Log(\"cycle:\" + L() + \" disable\"); }\n"
+    "    void OnDestroy() { Debug.Log(\"cycle:\" + L() + \" destroy\"); }\n"
+    "}\n")
+UNITY_CYCLE_DRIVER = (
+    "using UnityEngine;\n"
+    "public class CycleDriver : MonoBehaviour {\n"
+    "    public GameObject a;\n"
+    "    public GameObject b;\n"
+    "    int frames;\n"
+    "    void Update() {\n"
+    "        frames++;\n"
+    "        if (frames == 3) a.SetActive(false);\n"
+    "        if (frames == 4) { a.SetActive(true); b.SetActive(true); }\n"
+    "        if (frames == 6) Destroy(a);\n"
+    "    }\n"
+    "}\n")
+UNITY_LIFE_CYCLE_EXPECT = [
+    "cycle:A awake", "cycle:A enable", "cycle:A start", "cycle:A disable",
+    "cycle:A enable", "cycle:B awake", "cycle:B enable", "cycle:B start",
+    "cycle:A disable", "cycle:A destroy"]
+
+#: Code-defined InputActions (tools/unity_pack_input.py): a button bound to
+#: a key and a gamepad button, a WASD 2DVector composite; nothing pressed.
+UNITY_ACT_SCRIPT = (
+    "using UnityEngine;\n"
+    "using UnityEngine.InputSystem;\n"
+    "public class Act : MonoBehaviour {\n"
+    "    InputAction jump;\n"
+    "    InputAction move;\n"
+    "    bool logged;\n"
+    "    void Awake() {\n"
+    "        jump = new InputAction(\"Jump\", binding: \"<Keyboard>/space\");\n"
+    "        jump.AddBinding(\"<Gamepad>/buttonSouth\");\n"
+    "        move = new InputAction(\"Move\", InputActionType.Value);\n"
+    "        move.AddCompositeBinding(\"2DVector\")\n"
+    "            .With(\"Up\", \"<Keyboard>/w\").With(\"Down\", \"<Keyboard>/s\")\n"
+    "            .With(\"Left\", \"<Keyboard>/a\").With(\"Right\", \"<Keyboard>/d\");\n"
+    "        jump.Enable();\n"
+    "        move.Enable();\n"
+    "    }\n"
+    "    void Update() {\n"
+    "        if (logged) return;\n"
+    "        logged = true;\n"
+    "        Vector2 m = move.ReadValue<Vector2>();\n"
+    "        Debug.Log(\"act:\" + jump.enabled + \",\" + jump.IsPressed() + \",\""
+    " + jump.WasPressedThisFrame() + \",\" + m.x + \",\" + m.y);\n"
+    "    }\n"
+    "}\n")
+UNITY_ACT_EXPECT = ["act:True,False,False,0,0", "act:fire 1,0"]
+
+#: An InputAction set in the Inspector (its bindings serialized in the
+#: scene, none in code) and callbacks: a method and a lambda.
+UNITY_ACT2_SCRIPT = (
+    "using UnityEngine;\n"
+    "using UnityEngine.InputSystem;\n"
+    "public class Act2 : MonoBehaviour {\n"
+    "    public InputAction fire;\n"
+    "    int presses;\n"
+    "    int releases;\n"
+    "    int frames;\n"
+    "    void OnEnable() {\n"
+    "        fire.performed += OnFire;\n"
+    "        fire.canceled += ctx => releases++;\n"
+    "        fire.Enable();\n"
+    "    }\n"
+    "    void OnDisable() { fire.performed -= OnFire; fire.Disable(); }\n"
+    "    void OnFire(InputAction.CallbackContext ctx) { if (ctx.performed) presses++; }\n"
+    "    void Update() {\n"
+    "        frames++;\n"
+    "        if (frames == 2) Debug.Log(\"act:fire \" + (fire.enabled ? 1 : 0) + \",\""
+    " + (presses + releases));\n"
+    "    }\n"
+    "}\n")
+
+#: A ParticleSystem (tools/unity_pack_particles.py): a looping emitter,
+#: 50 a second living a second; half a second in it plays with many; then
+#: Stop / Clear / Emit(7) leave seven, not emitting.
+UNITY_SPARKS_SCRIPT = (
+    "using UnityEngine;\n"
+    "public class Sparks : MonoBehaviour {\n"
+    "    ParticleSystem ps;\n"
+    "    int frames;\n"
+    "    void Start() { ps = GetComponent<ParticleSystem>(); }\n"
+    "    void Update() {\n"
+    "        frames++;\n"
+    "        if (frames == 30) Debug.Log(\"ps:\" + ps.isPlaying + \" \""
+    " + (ps.particleCount > 10 ? \"many\" : \"few\"));\n"
+    "        if (frames == 31) {\n"
+    "            ps.Stop();\n"
+    "            ps.Clear();\n"
+    "            ps.Emit(7);\n"
+    "            Debug.Log(\"ps:\" + ps.particleCount + \" \" + ps.isEmitting);\n"
+    "        }\n"
+    "    }\n"
+    "}\n")
+UNITY_SPARKS_BLOCK = (
+    "--- !u!198 &353\nParticleSystem:\n  m_GameObject: {fileID: 350}\n"
+    "  serializedVersion: 8\n  lengthInSec: 5\n  simulationSpeed: 1\n"
+    "  looping: 1\n  prewarm: 0\n  playOnAwake: 1\n  moveWithTransform: 0\n"
+    "  InitialModule:\n    serializedVersion: 3\n    enabled: 1\n"
+    "    startLifetime:\n      serializedVersion: 2\n      minMaxState: 0\n"
+    "      scalar: 1\n      minScalar: 1\n"
+    "    startSpeed:\n      serializedVersion: 2\n      minMaxState: 0\n"
+    "      scalar: 2\n      minScalar: 2\n"
+    "    startColor:\n      serializedVersion: 2\n      minMaxState: 0\n"
+    "      minColor: {r: 1, g: 1, b: 1, a: 1}\n      maxColor: {r: 1, g: 0.5, b: 0, a: 1}\n"
+    "    startSize:\n      serializedVersion: 2\n      minMaxState: 0\n"
+    "      scalar: 0.2\n      minScalar: 0.2\n"
+    "    gravityModifier:\n      serializedVersion: 2\n      minMaxState: 0\n"
+    "      scalar: 0.5\n      minScalar: 0.5\n"
+    "    maxNumParticles: 1000\n"
+    "  ShapeModule:\n    serializedVersion: 6\n    enabled: 1\n    type: 4\n"
+    "    angle: 25\n    radius:\n      value: 1\n"
+    "  EmissionModule:\n    enabled: 1\n    serializedVersion: 4\n"
+    "    rateOverTime:\n      serializedVersion: 2\n      minMaxState: 0\n"
+    "      scalar: 50\n      minScalar: 50\n"
+    "    m_BurstCount: 0\n    m_Bursts: []\n")
+UNITY_SPARKS_EXPECT = ["ps:True many", "ps:7 False"]
 
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (
@@ -1023,6 +1167,21 @@ def unity_project(root):
         _write(os.path.join(scripts, name + ".cs"), text)
         _write(os.path.join(scripts, name + ".cs.meta"),
                "guid: fea000000000000000000000000000%s\n" % guid)
+    _write(os.path.join(scripts, "Act.cs"), UNITY_ACT_SCRIPT)
+    _write(os.path.join(scripts, "Act.cs.meta"),
+           "guid: fea00000000000000000000000000019\n")
+    _write(os.path.join(scripts, "Sparks.cs"), UNITY_SPARKS_SCRIPT)
+    _write(os.path.join(scripts, "Sparks.cs.meta"),
+           "guid: fea00000000000000000000000000021\n")
+    _write(os.path.join(scripts, "Act2.cs"), UNITY_ACT2_SCRIPT)
+    _write(os.path.join(scripts, "Act2.cs.meta"),
+           "guid: fea00000000000000000000000000020\n")
+    _write(os.path.join(scripts, "Cycle.cs"), UNITY_CYCLE_SCRIPT)
+    _write(os.path.join(scripts, "Cycle.cs.meta"),
+           "guid: fea00000000000000000000000000017\n")
+    _write(os.path.join(scripts, "CycleDriver.cs"), UNITY_CYCLE_DRIVER)
+    _write(os.path.join(scripts, "CycleDriver.cs.meta"),
+           "guid: fea00000000000000000000000000018\n")
     _write(os.path.join(scripts, "SpinCheck.cs"), UNITY_SPIN_SCRIPT)
     _write(os.path.join(scripts, "SpinCheck.cs.meta"),
            "guid: fea00000000000000000000000000015\n")
@@ -1056,6 +1215,49 @@ def unity_project(root):
         "  m_Animation: {fileID: 7400000, guid: fea00000000000000000000000000016, type: 2}\n"
         "  m_PlayAutomatically: 1\n  m_WrapMode: 2\n"
         + _mb(98, 95, "fea00000000000000000000000000015"))
+    for fid, name, active in ((300, "LifeA", 1), (310, "LifeB", 0)):
+        scene.append(
+            "--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_IsActive: %d\n"
+            "  m_Component:\n  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+            "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            % (fid, name, active, fid + 1, fid + 2, fid + 1, fid)
+            + _mb(fid + 2, fid, "fea00000000000000000000000000017",
+                  "  id: %d\n" % (1 if name == "LifeA" else 2)))
+    scene.append(
+        "--- !u!1 &320\nGameObject:\n  m_Name: CycleDriver\n"
+        "  m_Component:\n  - component: {fileID: 321}\n  - component: {fileID: 322}\n"
+        "--- !u!4 &321\nTransform:\n  m_GameObject: {fileID: 320}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        + _mb(322, 320, "fea00000000000000000000000000018",
+              "  a: {fileID: 300}\n  b: {fileID: 310}\n"))
+    scene.append(
+        "--- !u!1 &330\nGameObject:\n  m_Name: Act\n"
+        "  m_Component:\n  - component: {fileID: 331}\n  - component: {fileID: 332}\n"
+        "--- !u!4 &331\nTransform:\n  m_GameObject: {fileID: 330}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        + _mb(332, 330, "fea00000000000000000000000000019"))
+    scene.append(
+        "--- !u!1 &350\nGameObject:\n  m_Name: Sparks\n"
+        "  m_Component:\n  - component: {fileID: 351}\n  - component: {fileID: 352}\n"
+        "  - component: {fileID: 353}\n"
+        "--- !u!4 &351\nTransform:\n  m_GameObject: {fileID: 350}\n"
+        "  m_LocalRotation: {x: -0.7071068, y: 0, z: 0, w: 0.7071068}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        + _mb(352, 350, "fea00000000000000000000000000021") + UNITY_SPARKS_BLOCK)
+    scene.append(
+        "--- !u!1 &340\nGameObject:\n  m_Name: Act2\n"
+        "  m_Component:\n  - component: {fileID: 341}\n  - component: {fileID: 342}\n"
+        "--- !u!4 &341\nTransform:\n  m_GameObject: {fileID: 340}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        + _mb(342, 340, "fea00000000000000000000000000020",
+              "  fire:\n    m_Name: Fire\n    m_Type: 1\n    m_ExpectedControlType: Button\n"
+              "    m_Id: 11111111-2222-3333-4444-555555555555\n    m_Processors: \n"
+              "    m_Interactions: \n    m_SingletonActionBindings:\n"
+              "    - m_Name: \n      m_Id: 66666666-7777-8888-9999-000000000000\n"
+              "      m_Path: <Keyboard>/space\n      m_Interactions: \n"
+              "      m_Processors: \n      m_Groups: \n      m_Action: Fire\n"
+              "      m_Flags: 0\n    m_Flags: 0\n"))
     scene.append(_go(90, "Co", [92]))
     scene.append(_mb(92, 90, "fea00000000000000000000000000011"))
     scene.append(_go(80, "Save", [82]))
@@ -1073,7 +1275,8 @@ def unity_project(root):
     for _n, _b, _m, e in UNITY_CHECKS:
         expect += e
     return (expect + UNITY_TAG_EXPECT + UNITY_SHOT_EXPECT + UNITY_LIFE_EXPECT
-            + UNITY_SAVE_EXPECT + UNITY_CO_EXPECT + UNITY_SPIN_EXPECT)
+            + UNITY_SAVE_EXPECT + UNITY_CO_EXPECT + UNITY_SPIN_EXPECT
+            + UNITY_LIFE_CYCLE_EXPECT + UNITY_ACT_EXPECT + UNITY_SPARKS_EXPECT)
 
 
 def godot_project(root):

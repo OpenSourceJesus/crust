@@ -32,8 +32,53 @@ __all__ = [
     '_parse_float_keyframes',
     '_parse_pptr_sprite_curves',
     '_parse_vec3_keyframes',
+    '_parse_vec3_keyframes_full',
     '_resolve_anim_child_path',
 ]
+
+
+_NUM = r"(-?Infinity|[-0-9.eE+]+)"
+_VEC = r"\{x:\s*%s,\s*y:\s*%s,\s*z:\s*%s\}" % (_NUM, _NUM, _NUM)
+
+
+def _num(v):
+    v = v.strip()
+    if v in ("Infinity", "-Infinity"):
+        # a constant ("stepped") key: held until the next one
+        return 1e30 if v[0] != "-" else -1e30
+    return float(v)
+
+
+def _parse_vec3_keyframes_full(curve_text):
+    """(t, x, y, z, in x, y, z, out x, y, z) keys of a Vector3 curve, with
+    their Hermite tangents (`inSlope` / `outSlope`; an infinite slope, Unity's
+    "constant" key, is +-1e30). A key without slopes gets the straight line's
+    (the secants to its neighbours), so it is sampled linearly as before."""
+    keys = []
+    for m in re.finditer(r"time:\s*%s\s*\n\s*value:\s*%s" % (_NUM, _VEC),
+                         curve_text):
+        rest = curve_text[m.end():]
+        nxt = re.search(r"\btime:", rest)
+        chunk = rest[:nxt.start()] if nxt else rest
+        ins = re.search(r"inSlope:\s*" + _VEC, chunk)
+        outs = re.search(r"outSlope:\s*" + _VEC, chunk)
+        keys.append([_num(m.group(1))] + [_num(m.group(k)) for k in (2, 3, 4)]
+                    + ([_num(ins.group(k)) for k in (1, 2, 3)] if ins else [None] * 3)
+                    + ([_num(outs.group(k)) for k in (1, 2, 3)] if outs else [None] * 3))
+    keys.sort(key=lambda k: k[0])
+    for i, k in enumerate(keys):
+        for a in range(3):
+            if k[4 + a] is None:        # in: the secant from the key before
+                if i > 0 and k[0] > keys[i - 1][0]:
+                    k[4 + a] = (k[1 + a] - keys[i - 1][1 + a]) / (k[0] - keys[i - 1][0])
+                else:
+                    k[4 + a] = 0.0
+            if k[7 + a] is None:        # out: the secant to the key after
+                if i + 1 < len(keys) and keys[i + 1][0] > k[0]:
+                    k[7 + a] = (keys[i + 1][1 + a] - k[1 + a]) / (keys[i + 1][0] - k[0])
+                else:
+                    k[7 + a] = 0.0
+    return [tuple(k) for k in keys]
 
 
 def _parse_vec3_keyframes(curve_text):
@@ -118,6 +163,24 @@ def _parse_animation_clip(text):
     elif wrap:
         do_loop = 0
 
+    def _vec3_tracks(section_name):
+        """Every curve of a Vector3 section: its path and full keys."""
+        out = []
+        sm = re.search(
+            r"(?ms)^  %s:\s*\n(.*?)(?=^  m_[A-Z]|\Z)" % section_name, text)
+        if not sm or sm.group(1).strip().startswith("[]"):
+            return out
+        for cm in re.finditer(
+                r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)", sm.group(1)):
+            block = cm.group(1)
+            pm = re.search(r"(?m)^\s+path:\s*(.*)$", block)
+            path = pm.group(1) if pm else ""
+            keys = _parse_vec3_keyframes_full(block)
+            if keys:
+                out.append({"path": "" if _curve_path_is_root(path)
+                            else path.strip().strip('"'), "keys": keys})
+        return out
+
     def _root_vec3_curves(section_name):
         out = []
         # Each list entry: "- curve:" … "path: …"
@@ -145,6 +208,15 @@ def _parse_animation_clip(text):
     euler = _root_vec3_curves("m_EulerCurves")
     scale = _root_vec3_curves("m_ScaleCurves")
     sprite_curves = _parse_pptr_sprite_curves(text)
+    # every Vector3 curve, the root's and its children's: 0 position,
+    # 1 rotation (Euler degrees), 2 scale
+    tracks = []
+    for prop, sec in ((0, "m_PositionCurves"), (1, "m_EulerCurves"),
+                      (2, "m_ScaleCurves")):
+        for tr in _vec3_tracks(sec):
+            tracks.append(dict(tr, prop=prop))
+    pos_full = [k for tr in tracks if tr["prop"] == 0 and not tr["path"]
+                for k in tr["keys"]]
     length = float(stop.group(1)) if stop else 0.0
     if length <= 0.0:
         for keys in (pos, euler, scale):
@@ -163,8 +235,50 @@ def _parse_animation_clip(text):
         "pos_keys": pos,
         "euler_keys": euler,
         "scale_keys": scale,
+        "pos_full": pos_full,
+        "tracks": tracks,
+        "events": _parse_animation_events(text),
         "sprite_curves": sprite_curves,
     }
+
+
+def _parse_animation_events(text):
+    """m_Events: [{time, function, float, int, string}] (Animation Events)."""
+    sm = re.search(r"(?ms)^  m_Events:\s*\n(.*?)(?=^  m_[A-Z]|\Z)", text)
+    if not sm or sm.group(1).strip().startswith("[]"):
+        return []
+    out = []
+    for em in re.finditer(r"(?ms)^  - time:\s*([0-9.eE+-]+)\s*\n(.*?)(?=^  - time:|\Z)",
+                          sm.group(1)):
+        body = em.group(2)
+
+        def f(key, conv, default):
+            m = re.search(r"(?m)^\s+%s:[ \t]*(.*)$" % key, body)
+            try:
+                return conv(m.group(1).strip()) if m else default
+            except ValueError:
+                return default
+        fn = f("functionName", str, "")
+        if fn:
+            out.append({"time": float(em.group(1)), "function": fn,
+                        "float": f("floatParameter", float, 0.0),
+                        "int": f("intParameter", int, 0),
+                        "string": f("data", lambda v: v.strip("'\""), "")})
+    return sorted(out, key=lambda e: e["time"])
+
+
+def _script_method_args(cl, name):
+    """The parameter list of the class's one instance method `name` (from
+    its script, as the pack reads it), or None: none, or overloaded."""
+    try:
+        src = cs2cpp._blank(_read(cl.get("script_path") or ""))
+    except (IOError, OSError):
+        return None
+    hits = re.findall(r"(?<![\w.])(?!static\b)(?:void|IEnumerator)\s+%s\s*\(([^()]*)\)"
+                      % re.escape(name), src)
+    if len(hits) != 1 or re.search(r"\bstatic\s+void\s+%s\s*\(" % re.escape(name), src):
+        return None
+    return hits[0].strip()
 
 
 def _parse_animator_controller_default_clip(text):
@@ -221,6 +335,24 @@ def _anim_sprite_guids(objects):
     return out
 
 
+def _fill_linear_slopes(keys, clip_list):
+    """Root position keys without tangents (a key tuple of four): the
+    secants, so they are sampled linearly as before."""
+    for c in clip_list:
+        b, n = c["key_begin"], c["key_count"]
+        for i in range(b, b + n):
+            k = keys[i]
+            if "ix" in k:
+                continue
+            for a in "xyz":
+                prev = keys[i - 1] if i > b else None
+                nxt = keys[i + 1] if i + 1 < b + n else None
+                k["i" + a] = ((k[a] - prev[a]) / (k["t"] - prev["t"])
+                              if prev and k["t"] > prev["t"] else 0.0)
+                k["o" + a] = ((nxt[a] - k[a]) / (nxt["t"] - k["t"])
+                              if nxt and nxt["t"] > k["t"] else 0.0)
+
+
 def _resolve_anim_child_path(owner, path, plan):
     """Unity curve path under Animator owner → (class, inst, obj) or None."""
     path = (path or "").strip().strip('"')
@@ -275,8 +407,9 @@ def _build_animation_tables(plan):
             "pos_keys": pos,
             # rotation (Euler degrees, sampled in Euler space as Unity's Euler
             # curves are) and scale: they were parsed, then dropped
-            "euler_keys": list(clip.get("euler_keys") or []),
-            "scale_keys": list(clip.get("scale_keys") or []),
+            "pos_full": list(clip.get("pos_full") or []),
+            "tracks": list(clip.get("tracks") or []),
+            "events": list(clip.get("events") or []),
             "sprite_curves": list(clip.get("sprite_curves") or []),
             "key_begin": 0,
             "key_count": len(pos),
@@ -316,25 +449,92 @@ def _build_animation_tables(plan):
                 "sprite_bind_count": 0,
             })
 
+    def key_row(k):
+        t, x, y, z = k[:4]
+        row = {"t": t, "x": x, "y": y, "z": z}
+        if len(k) >= 10:
+            row.update(ix=k[4], iy=k[5], iz=k[6], ox=k[7], oy=k[8], oz=k[9])
+        return row
     keys = []
     for c in clip_list:
         c["key_begin"] = len(keys)
-        for t, x, y, z in c["pos_keys"]:
-            keys.append({"t": t, "x": x, "y": y, "z": z})
+        full = c.get("pos_full") or []
+        src = full if len(full) == len(c["pos_keys"]) else c["pos_keys"]
+        for k in src:
+            keys.append(key_row(k))
         c["key_count"] = len(c["pos_keys"])
-    rot_keys, scale_keys = [], []
+    _fill_linear_slopes(keys, clip_list)
+    # Tracks (every curve but the root's position, which keeps its own
+    # path) and each player's bindings of them to their targets: its own
+    # Transform, or the child the curve's path names.
+    tkeys, tracks = [], []
     for c in clip_list:
-        for field, table, name in (("euler_keys", rot_keys, "rkey"),
-                                   ("scale_keys", scale_keys, "skey")):
-            c[name + "_begin"] = len(table)
-            for t, x, y, z in c[field]:
-                table.append({"t": t, "x": x, "y": y, "z": z})
-            c[name + "_count"] = len(c[field])
-    # the owners they turn / scale keep live rotation / scale tables
-    plan["anim_rot_classes"] = sorted({pl["owner_class"] for pl in players
-                                       if clip_list[pl["clip"]]["euler_keys"]})
-    plan["anim_scale_classes"] = sorted({pl["owner_class"] for pl in players
-                                         if clip_list[pl["clip"]]["scale_keys"]})
+        c["track_ids"] = []
+        for tr in c.get("tracks") or []:
+            if tr["prop"] == 0 and not tr["path"]:
+                continue
+            c["track_ids"].append(len(tracks))
+            tracks.append({"begin": len(tkeys), "count": len(tr["keys"]),
+                           "prop": tr["prop"], "path": tr["path"]})
+            tkeys.extend(key_row(k) for k in tr["keys"])
+    from tools.unity_pack import _class_has_position  # (imports this module)
+    binds = []
+    rot_cls, scale_cls = set(), set()
+    for pl in players:
+        pl["bind_begin"] = len(binds)
+        owner = pl.get("owner_obj")
+        for ti in clip_list[pl["clip"]].get("track_ids") or []:
+            tr = tracks[ti]
+            if tr["path"]:
+                hit = _resolve_anim_child_path(owner, tr["path"], plan)
+                if not hit:
+                    continue
+                tc, tinst, _to = hit
+            else:
+                tc, tinst = pl["owner_class"], pl["owner_inst"]
+            tcl = plan["classes"].get(tc) or {}
+            if tr["prop"] == 0 and (tcl.get("static")
+                                    or not _class_has_position(tcl)):
+                sys.stderr.write(
+                    "unity_pack: warning: animated position of %r (%s) is not "
+                    "moved: its class is packed static\n" % (tr["path"], tc))
+                continue
+            (rot_cls if tr["prop"] == 1 else scale_cls if tr["prop"] == 2
+             else set()).add(tc)
+            binds.append({"track": ti, "prop": tr["prop"],
+                          "target_class": tc,
+                          "target_class_id": int(class_ids[tc]),
+                          "target_inst": int(tinst)})
+        pl["bind_count"] = len(binds) - pl["bind_begin"]
+    # Animation Events: the GameObject's scripts with a method of that name
+    # (SendMessage), called with the event's parameter when it takes one
+    by_go = {}
+    for cname, cl in plan["classes"].items():
+        for k, o in enumerate(cl.get("instances") or []):
+            if o.get("go_index") is not None:
+                by_go.setdefault(int(o["go_index"]), []).append((cname, k))
+    methods_by = plan.get("_methods_by") or {}
+    for pl in players:
+        pl["events"] = []
+        owner = pl.get("owner_obj") or {}
+        targets = by_go.get(owner.get("go_index"), []) \
+            if owner.get("go_index") is not None else \
+            [(pl["owner_class"], pl["owner_inst"])]
+        for ev in clip_list[pl["clip"]].get("events") or []:
+            for cname, k in targets:
+                args = _script_method_args(plan["classes"][cname], ev["function"])
+                if args is None:
+                    continue
+                pl["events"].append(dict(ev, cls=cname,
+                                         class_id=int(class_ids[cname]),
+                                         inst=int(k), args=args))
+    plan["anim_event_methods"] = {}
+    for pl in players:
+        for e in pl.get("events") or []:
+            plan["anim_event_methods"].setdefault(e["cls"], set()).add(e["function"])
+    # the Transforms they turn / scale keep live rotation / scale tables
+    plan["anim_rot_classes"] = sorted(rot_cls)
+    plan["anim_scale_classes"] = sorted(scale_cls)
 
     sprite_keys = []
     sprite_binds = []
@@ -397,8 +597,9 @@ def _build_animation_tables(plan):
     return {
         "clips": clip_list,
         "keys": keys,
-        "rot_keys": rot_keys,
-        "scale_keys": scale_keys,
+        "track_keys": tkeys,
+        "tracks": tracks,
+        "binds": binds,
         "players": players,
         "sprite_keys": sprite_keys,
         "sprite_binds": sprite_binds,

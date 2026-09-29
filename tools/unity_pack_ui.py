@@ -75,6 +75,8 @@ __all__ = [
     '_is_ui_slider_mb',
     '_is_ui_tmp_mb',
     '_is_ui_toggle_mb',
+    '_is_ui_togglegroup_mb',
+    '_parse_ui_togglegroup',
     '_layout_group_calc_along_axis',
     '_link_scrollrects_scrollbars',
     '_load_tmp_font_asset',
@@ -141,12 +143,19 @@ def _find_canvas_scaler(objects):
     return fallback
 
 
+def _ui_num(block, key, default):
+    m = re.search(r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
+    return float(m.group(1)) if m else float(default)
+
+
 def _canvas_scaler_scale_factor(pixel_w, pixel_h, scaler):
     """Unity CanvasScaler.scaleFactor for the given pixel rect.
 
-    Disabled / missing scaler → 1. Constant Physical Size is not modeled
-    (returns 1). Scale With Screen Size matches Unity's log2 lerp /
-    Expand / Shrink screen-match modes.
+    Disabled / missing scaler → 1. Scale With Screen Size matches Unity's
+    log2 lerp / Expand / Shrink screen-match modes. Constant Physical Size is
+    Unity's DPI / the unit's DPI; a packed player's screen DPI is unknown
+    when it is packed, so it is the scaler's fallback DPI (Unity's own
+    choice for a screen that reports none).
     """
     if not scaler or not int(scaler.get("enabled", 1)):
         return 1.0
@@ -176,6 +185,11 @@ def _canvas_scaler_scale_factor(pixel_w, pixel_h, scaler):
         log_w = math.log(pw / rw) / math.log(2.0)
         log_h = math.log(ph / rh) / math.log(2.0)
         return 2.0 ** (log_w * (1.0 - match) + log_h * match)
+    if mode == 2:  # Constant Physical Size
+        dpi = float(scaler.get("fallback_dpi") or 96.0)
+        target = {0: 2.54, 1: 25.4, 2: 1.0, 3: 72.0, 4: 6.0}.get(
+            int(scaler.get("physical_unit", 3)), 72.0)
+        return dpi / target
     return 1.0
 
 
@@ -459,6 +473,12 @@ def _parse_ui_scrollrect(block, file_id=None):
         "vertical": _i("m_Vertical", 1),
         "hbar_mb_id": _fid("m_HorizontalScrollbar"),
         "vbar_mb_id": _fid("m_VerticalScrollbar"),
+        # 0 Unrestricted, 1 Elastic, 2 Clamped; Unity's defaults
+        "sensitivity": _ui_num(block, "m_ScrollSensitivity", 1.0),
+        "movement": _i("m_MovementType", 1),
+        "elasticity": _ui_num(block, "m_Elasticity", 0.1),
+        "inertia": _i("m_Inertia", 1),
+        "deceleration": _ui_num(block, "m_DecelerationRate", 0.135),
         "mb_file_id": file_id,
     }
 
@@ -526,9 +546,26 @@ def _parse_ui_toggle(block, file_id=None):
         "interactable": interactable,
         "is_on": _i("m_IsOn", 1),
         "graphic_id": graphic,
+        # its ToggleGroup component (0: none)
+        "group_id": _fid("m_Group"),
         "on_value_changed": calls,
         "mb_file_id": file_id,
     }
+
+
+def _is_ui_togglegroup_mb(block, guid):
+    """True for UnityEngine.UI.ToggleGroup (m_AllowSwitchOff, no m_IsOn)."""
+    if re.search(r"(?m)^\s+m_EditorClassIdentifier:.*\bToggleGroup\s*$", block):
+        return True
+    return bool(re.search(r"(?m)^\s+m_AllowSwitchOff:\s*\d", block)
+                and not re.search(r"(?m)^\s+m_IsOn:", block))
+
+
+def _parse_ui_togglegroup(block, file_id=None):
+    m = re.search(r"(?m)^\s+m_AllowSwitchOff:\s*(\d)", block)
+    return {"mb_file_id": file_id,
+            "allow_switch_off": int(m.group(1)) if m else 0,
+            "enabled": _mb_enabled(block)}
 
 
 def _is_ui_eventtrigger_mb(block, guid):
@@ -668,6 +705,10 @@ def _parse_canvas_scaler(block):
         # 0 Match Width Or Height, 1 Expand, 2 Shrink
         "screen_match_mode": _parse_pad_int(block, "m_ScreenMatchMode", 0),
         "match": float(match.group(1)) if match else 0.0,
+        # Constant Physical Size: 0 Centimeters, 1 Millimeters, 2 Inches,
+        # 3 Points, 4 Picas; the DPI when the screen's is unknown
+        "physical_unit": _parse_pad_int(block, "m_PhysicalUnit", 3),
+        "fallback_dpi": _ui_num(block, "m_FallbackScreenDPI", 96.0),
     }
 
 
@@ -2304,6 +2345,11 @@ def _build_ui_scrollrects(plan, analyses=None):
                 "vertical": int(sr.get("vertical", 1)),
                 "hbar": int(hbar) if hbar is not None else -1,
                 "vbar": int(vbar) if vbar is not None else -1,
+                "sensitivity": float(sr.get("sensitivity", 1.0)),
+                "movement": int(sr.get("movement", 1)),
+                "elasticity": float(sr.get("elasticity", 0.1)),
+                "inertia": int(sr.get("inertia", 1)),
+                "deceleration": float(sr.get("deceleration", 0.135)),
             })
     return rects
 
@@ -2348,7 +2394,35 @@ def _build_ui_toggles(plan, analyses=None):
                 "is_on": int(tg.get("is_on") or 0),
                 "graphic_go": int(graphic_go),
                 "calls": calls,
+                "group_id": str(tg.get("group_id") or 0),
             })
+    # ToggleGroups: a toggle's group by its m_Group (the group component's
+    # fileID); -1 for none, or a group that is not in the scene / enabled
+    groups = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            for g in o.get("ui_togglegroups") or []:
+                if int(g.get("enabled", 1)):
+                    groups[str(g.get("mb_file_id"))] = int(
+                        g.get("allow_switch_off") or 0)
+    order = sorted(groups)
+    plan["ui_toggle_groups"] = [groups[k] for k in order]
+    for t in toggles:
+        gid = t.pop("group_id")
+        t["group"] = order.index(gid) if gid in groups else -1
+    # ToggleGroup.EnsureValidState, at start: at most one toggle on, and
+    # without allowSwitchOff exactly one (the first, when none is)
+    active = plan.get("go_active")
+    for g, allow_off in enumerate(plan["ui_toggle_groups"]):
+        members = [t for t in toggles if t["group"] == g]
+        on = [t for t in members if t["is_on"]]
+        if not on and not allow_off and members:
+            on = [members[0]]
+        for t in members:
+            t["is_on"] = 1 if on and t is on[0] else 0
+            gg = t.get("graphic_go", -1)
+            if active and 0 <= gg < len(active):
+                active[gg] = t["is_on"]
     return toggles
 
 
@@ -2383,7 +2457,9 @@ def _build_ui_eventtriggers(plan, analyses=None):
                 sl_by_mb[mid] = si
             for mid2 in o.get("mb_ids") or []:
                 sl_by_mb[str(mid2)] = si
-    supported = frozenset({0, 1, 2, 3, 4, 13, 14})
+    # Enter, Exit, Down, Up, Click, Drag, Drop, InitializePotentialDrag,
+    # BeginDrag, EndDrag
+    supported = frozenset({0, 1, 2, 3, 4, 5, 6, 12, 13, 14})
     triggers = []
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
@@ -2514,6 +2590,12 @@ def _rewrite_toggle_is_on(text):
     """
     # Allow calls inside the index (IndexOf(x)) but not `;` / newlines / `]`.
     idx = r"([^\]\n;]*)"
+    text = cs2cpp.code_sub(
+        r"(\w+)\s*\[%s\]\s*\.\s*SetIsOnWithoutNotify\s*\(([^;]+)\)\s*;" % idx,
+        r"Toggle_SetIsOnWithoutNotify(\1[\2], (\3));", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(\w+)\s*\.\s*SetIsOnWithoutNotify\s*\(([^;]+)\)\s*;",
+        r"Toggle_SetIsOnWithoutNotify(\1, (\2));", text)
     text = cs2cpp.code_sub(
         r"(\w+)\s*\[%s\]\s*\.\s*isOn\s*=\s*([^;]+);" % idx,
         r"Toggle_set_isOn(\1[\2], (\3));",
