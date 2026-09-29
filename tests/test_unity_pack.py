@@ -2155,6 +2155,57 @@ class TestRuntimeApis(unittest.TestCase):
         self.assertEqual(out[0], "9,True")
 
     @needs_coost
+    def test_stack_queue_hashset(self):
+        # Refused before (_REFUSED_BCL_TYPES); Lists at the source level now.
+        out = self._run(
+            "        var st = new System.Collections.Generic.Stack<int>();\n"
+            "        st.Push(1); st.Push(2); st.Push(3);\n"
+            "        int top = st.Pop();\n"
+            "        string order = \"\";\n"
+            "        foreach (int v in st) order += v;\n"
+            "        var q = new System.Collections.Generic.Queue<string>();\n"
+            "        q.Enqueue(\"a\"); q.Enqueue(\"b\");\n"
+            "        var h = new System.Collections.Generic.HashSet<int>();\n"
+            "        h.Add(5); h.Add(5);\n"
+            "        bool again = h.Add(5);\n"
+            "        Debug.Log(top + order + \",\" + q.Dequeue() + q.Peek()"
+            " + \",\" + h.Count + again);\n")
+        self.assertEqual(out[0], "321,ab,1False")
+
+    @needs_coost
+    def test_list_members_and_list_of_string(self):
+        # RemoveAt / Insert / Contains / IndexOf / Remove stubbed a packed
+        # List; a List<string> could not take a literal.
+        out = self._run(
+            "        var xs = new System.Collections.Generic.List<string>();\n"
+            "        xs.Add(\"a\"); xs.Add(\"c\"); xs.Insert(1, \"b\");\n"
+            "        xs.RemoveAt(0);\n"
+            "        bool had = xs.Remove(\"c\");\n"
+            "        string all = \"\";\n"
+            "        foreach (string x in xs) all += x;\n"
+            "        Debug.Log(all + xs.IndexOf(\"b\") + xs.Contains(\"z\") + had);\n")
+        self.assertEqual(out[0], "b0FalseTrue")
+
+    @needs_coost
+    def test_multidimensional_arrays(self):
+        out = self._run(
+            "        int[,] m = new int[2, 3];\n"
+            "        for (int x = 0; x < 2; x++) for (int y = 0; y < 3; y++)"
+            " m[x, y] = x * 10 + y;\n"
+            "        int sum = 0;\n"
+            "        foreach (int v in m) sum += v;\n"
+            "        Debug.Log(m[1, 2] + \",\" + m.GetLength(1) + \",\" + m.Length"
+            " + \",\" + sum);\n")
+        self.assertEqual(out[0], "12,3,6,36")
+
+    @needs_coost
+    def test_get_type_typeof_nameof(self):
+        out = self._run(
+            "        Debug.Log(GetType().Name + \",\" + typeof(Player).Name + \",\""
+            " + (GetType() == typeof(Player)) + \",\" + nameof(hp));\n")
+        self.assertEqual(out[0], "Player,Player,True,hp")
+
+    @needs_coost
     def test_path_and_string_arrays(self):
         out = self._run(
             "        string[] a = new string[] { \"x\", \"y\" };\n"
