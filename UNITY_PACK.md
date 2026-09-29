@@ -405,8 +405,9 @@ rather than printed wrongly.
 `parts.Length` is its size, `parts[i]` an owned string (read, written, a
 member receiver); `foreach (string p in parts)` -- or over
 `s.Split(' ')` directly -- is an index loop with `p` an owned local, on
-the same lines; `string.Join(sep, parts)` joins one. A `string[]` field,
-`new string[n]` and a `List<string>` are not packed yet.
+the same lines; `string.Join(sep, parts)` joins one. `new string[n]` and
+the initializer forms are in *Runtime* below. A `string[]` field and a
+`List<string>` are not packed yet.
 
 **Null.** A fastring has no null distinct from empty, so a string that is
 null reads as "": `s == null` is `string.IsNullOrEmpty(s)`, `s != null`
@@ -427,6 +428,51 @@ compiler.) The checkout's files are part of the pack's input fingerprint.
 
 `TestOwnedStrings` packs, builds and runs each case, and so does
 `tools/unity_pack_features.py` (below).
+
+## Runtime: `Mathf`, `Random`, `Parse`, `Path`, `Directory`, `File` reads
+
+Common .NET and Unity static APIs are one table,
+`tools/unity_pack_runtime.py`: each C# spelling maps to an engine helper,
+its C (in the subset cpprust lowers) and its result type, so the typed
+concatenation and `Debug.Log` format a result as they format anything else.
+Only the helpers a pack uses are emitted, with the ones they call.
+
+| C# | |
+|----|--|
+| `Mathf.Sqrt`, `Pow`, `Floor`, `Ceil`, `Round`, `FloorToInt`, `CeilToInt`, `RoundToInt`, `Tan`, `Asin`, `Acos`, `Atan`, `Atan2`, `Exp`, `Log` (1 or 2 args), `Log10`, `Clamp01`, `InverseLerp`, `LerpUnclamped`, `MoveTowards`, `Repeat`, `PingPong`, `DeltaAngle`, `SmoothStep`, `Approximately` | as Unity; `Round` halves to even, as .NET does |
+| `Mathf.PI`, `Deg2Rad`, `Rad2Deg`, `Epsilon`, `Infinity`, `NegativeInfinity` | constants |
+| `Random.Range(a, b)`, `Random.value`, `Random.InitState(seed)` | int `Range` excludes `b`, float includes it; both ints picks the int one |
+| `int.Parse`, `float.Parse`, `double.Parse`, `int.TryParse(s, out n)`, `float.TryParse(s, out int f)` | an `out` declaration is hoisted before its statement |
+| `Path.Combine` (2+ args), `GetFileName`, `GetExtension`, `GetFileNameWithoutExtension`, `GetDirectoryName` | `/` separators |
+| `Directory.Exists`, `Directory.CreateDirectory` | |
+| `File.ReadAllText`, `File.ReadAllLines` | a UTF-8 BOM is dropped; lines split on `\n`, a `\r` before it dropped |
+| `Time.realtimeSinceStartup`, `Time.unscaledTime` | `Time.time` (below) |
+| `s.GetHashCode()` on a string | deterministic FNV-1a |
+
+Where the packed engine differs from .NET: `float.Parse` reads the
+invariant culture (`.` decimal point); `Random` is a seeded xorshift32
+(Unity seeds from the clock), so a run repeats unless the script calls
+`Random.InitState`; `realtimeSinceStartup` is the engine's time, since it
+has no time scale and reads no clock; a string's hash is not .NET's
+(which is randomized per process anyway), so only equality of hashes
+means anything. Input `Parse` rejects, a file `ReadAllText` cannot open,
+or a directory `CreateDirectory` cannot make aborts with the .NET
+exception's name, as an unhandled exception ends the process. The
+helpers keep to what crust's own C front end has -- no `strtod` (the
+decimal reader is the runtime's), no `EOF`, and nothing POSIX outside
+`#ifndef CRUST_NO_POSIX_MKDIR` (without it, `Directory` falls back to
+`fopen`).
+
+**Bools print as C# prints them.** `"alive " + alive` is `alive True`
+and `Debug.Log(ok)` prints `False`; the engine printed 1 and 0. A bool
+next to a binary `+` can only be in a concatenation, so a bool variable,
+field, or helper result there becomes `(b ? "True" : "False")`. A
+conditional takes its branches' type in a concatenation, so
+`"x" + (ok ? "in" : "out")` is a string, not a float.
+
+**`new string[n]`**, `new string[] { .. }`, `new[] { .. }` and `{ .. }`
+make a `string[]` of that size (C#'s nulls read as ""), then write each
+initializer element.
 
 ## Fast feature check: `tools/unity_pack_features.py`
 
