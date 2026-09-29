@@ -532,6 +532,17 @@ Assign to a local first, or return `Cls *`.
 (A subscript is fine either way: `v[i].size()` works, because a dereference
 *is* addressable.)
 
+An element of an **array of a class** is an object too, at file scope or in
+a block: `T a[N];` is recorded, and `a[i].m(x)` is `T_m(&a[i], x)`, the
+index any expression. A packed engine keeps a table per class this way
+(`static fastring Player_label[N]`).
+
+**Not yet:** the elements are not constructed or destroyed. At file scope C
+has no static constructors, so there is nowhere to run them; in a block the
+loop is not written yet. That is sound for a class whose constructor leaves
+it all zeroes -- what static storage already is -- and not for one that
+allocates or sets a field to something else.
+
 ### Method overloading
 
 Methods overload by argument count, exactly as constructors do: one `f`

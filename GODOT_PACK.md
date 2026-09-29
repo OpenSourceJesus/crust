@@ -40,7 +40,9 @@ and typed values across lines — `Vector2(..)`, `ExtResource("..")`,
   rule — or its name when it has none.
 * Values the scene sets for the script's `[Export]` members are the
   object's fields. Numbers, bools and strings are packed; a `NodePath`, a
-  `Vector2` or a resource is refused at its scene line.
+  `Vector2` or a resource is refused at its scene line. A `string` export
+  is owned storage the script can assign, and C# string members work on
+  it (see *Strings* in [UNITY_PACK.md](UNITY_PACK.md)).
 
 Global positions are baked at import; the parent chain is not yet a runtime
 hierarchy, so a script moving a parent does not move its children.

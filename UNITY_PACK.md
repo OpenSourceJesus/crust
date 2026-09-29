@@ -279,7 +279,7 @@ Bit-packed struct fields and GLSL unpacking are a later step; this slice
 is the layout + upload path only. GPU alignment (std140 / `--soa-vec4`),
 SSBO stubs, and culling order of attack are in [UNITY_PACK_GPU.md](UNITY_PACK_GPU.md).
 
-## Strings: owned locals, and coost
+## Strings: owned storage, members, and coost
 
 A C# `string` in a script body is a `const char *` in the packed engine, and
 a concatenation (`"hp=" + hp`) is a typed call, `_str_plus_i(..)`, whose
@@ -311,13 +311,55 @@ cut short), and there are sixteen. A concatenation may start from a string
 variable (`s + "x"` was pointer arithmetic), and an integer operand is
 formatted as one: an `int` field, local or parameter, or a packed integer
 field's accessor (`Player_get_hp(i)`), where it used to print through `%g`
-(`1000000` as `1e+06`). The same typing picks `Debug_Log_i`.
+(`1000000` as `1e+06`). The same typing picks `Debug_Log_i`. A
+concatenation may also start from a value (`hp + " hp"`), when that value
+stands alone -- after `(`, `,`, `=` and the like; `x + y + "z"` adds `x + y`
+first in C#, and is not lowered as a concatenation yet.
 
 A declaration that cannot be split -- in a `for` head, or several
 declarators in one statement -- keeps its marker type (`_cs_string`), and the
-method is reported as a stub rather than guessed at. `string` *parameters*
-and fields are not owned yet: a parameter the method reassigns still points
-into a slot, and a writable `string` field is not packed at all.
+method is reported as a stub rather than guessed at.
+
+**Parameters.** A `string` parameter the body uses is copied into an owned
+local on entry (`_cs_arg_<name>`, the uses renamed; the declaration shares
+the body's first line, so no line moves). A caller may pass a
+concatenation's result, which the callee's own concatenations would reuse
+while the parameter still pointed at it.
+
+**Fields.** An instance `string` field is not in the instance struct -- it
+used to be read as a handle to a class named `string`, and never declared.
+It is a table of owned strings beside the instance array, as long as it
+(`static fastring Player_label[N]`), and `label` in a method is
+`Player_label[i]`; `other.label`, through a handle field, local or
+parameter of that class, is `Other_label[other]`. Each row is seeded at
+the first tick, before any `Start`, with the value it was authored with --
+the scene's (`label: hello`, `'two words'`, `"escaped\n"`), else the
+field's initializer -- and again when its scene is reloaded; `Instantiate`
+copies it from the original. A writable `static string` is an owned
+`fastring` too (it was a `const char[]`, which could not be assigned); a
+`const` one stays a literal. A Godot
+`[Export] string` is the same field, its value from the `.tscn`.
+
+**Members.** On any string -- a local, field, static, parameter, literal,
+or the result of another member, so they chain (`s.Trim().ToUpper()`):
+
+| C# | |
+|----|--|
+| `Length`, `IndexOf(x)`, `IndexOf(x, start)`, `LastIndexOf(x)`, `CompareTo(x)` | `int` (`x` a string or a char) |
+| `Contains(x)`, `StartsWith(x)`, `EndsWith(x)`, `Equals(x)` | `bool` |
+| `Substring(a)`, `Substring(a, n)`, `ToUpper()`, `ToLower()`, `Trim()`, `TrimStart()`, `TrimEnd()`, `Replace(a, b)`, `ToString()` | a string |
+| `string.IsNullOrEmpty(s)`, `string.IsNullOrWhiteSpace(s)`, `string.Equals(a, b)`, `string.Compare(a, b)` | |
+
+Each is an engine helper taking the receiver as `const char *`; one that
+returns a string writes it to a scratch slot, like a concatenation. The
+searching is coost's (`str::memmem`, `str::memrmem`), and case, trim and
+replace go through a `fastring`. Only the helpers a pack uses are emitted.
+They are ordinal -- .NET's defaults for `ToUpper`, `StartsWith` and
+`CompareTo` are culture-sensitive, which for ASCII is the same -- and an
+argument .NET rejects (`Substring` past the end, an empty `Replace`)
+aborts with the exception's name, as an unhandled one ends the process.
+Not yet: `Split`, `string.Join`, `string.Format` and `$"..."`, which need
+`string[]` or format parsing, and `s == null` on a string.
 
 **Where coost comes from.** Only an engine that has a `string` local needs
 coost, and it is found the way Box2D-Packed is: `--coost PATH`, `$COOST_ROOT`,
@@ -331,7 +373,30 @@ path for the engine: cpprust decides every simple `#if` in a file it splices
 into, and the engine's `#ifndef CRUST_NO_POSIX_MKDIR` belongs to the
 compiler.) The checkout's files are part of the pack's input fingerprint.
 
-`TestOwnedStrings` packs, builds and runs each case.
+`TestOwnedStrings` packs, builds and runs each case, and so does
+`tools/unity_pack_features.py` (below).
+
+## Fast feature check: `tools/unity_pack_features.py`
+
+The full suite packs a few hundred projects and takes most of a quarter
+hour. For the features being added now there is a fast check: it packs one
+Unity project, one Godot project and -- with a Box2D-Packed checkout -- one
+physics scene, each holding every feature under test, builds and runs them,
+and compares what they print with what C# prints. About half a minute.
+
+```
+python3 tools/unity_pack_features.py              # unity, godot, box2d
+python3 tools/unity_pack_features.py godot -v     # one project, every line
+python3 tools/unity_pack_features.py --keep       # keep the packed projects
+```
+
+Each check is a C# method of its own, called from `Start`, printing lines
+that begin with its name. A method the packer could not lower is emitted
+empty (warning CS8000) and prints nothing, so it cannot pass by accident;
+its warning is shown with the failure. Adding a check is adding an entry
+to `UNITY_CHECKS` / `GODOT_CHECKS`: the method body and the lines C# would
+print. It needs a C compiler and a coost checkout; the Box2D project is
+skipped, and says so, without Box2D-Packed.
 
 ## Animation, input, lighting, camera, physics
 
@@ -454,7 +519,7 @@ cs2cpp's families before its own Unity API rewrites:
 | `x == null` / `!= null` | `lower_body` | `-1`, the missing-object index |
 | `true` / `false` | `lower_body` | `1` / `0` |
 | `this.x`, bare `this` | `lower_body` | `x`, `i` — an object is its index |
-| `string` locals | `lower_local_types`, then unity_pack's `_own_string_locals` | a coost `fastring` each (see [Strings](#strings-owned-locals-and-coost)) |
+| `string` locals | `lower_local_types`, then unity_pack's `_own_string_locals` | a coost `fastring` each (see [Strings](#strings-owned-storage-members-and-coost)) |
 | `byte[]`, `.Length`, `[i]` | `lower_byte_arrays` | `ByteArray`, `.length`, `.data[i]` |
 | `"s" + x` | `lower_string_concat`, `scalar_kind` | `_str_plus_i/f/c/s(..)` |
 | `List<T>`, `Dictionary<K,V>`, `SortedList` | `lower_packed_collections`, from a `PackedClass` per class | `std::vector` / `std::map`; `Add`, `Clear`, `Count`, `ContainsKey`, `Remove`; `Other.list` as `Other_list`; an instance field aliased to its slot, `&items = Owner_items[i]` |
