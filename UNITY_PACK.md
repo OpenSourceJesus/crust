@@ -499,6 +499,103 @@ reported rather than writing JSON without it.
 make a `string[]` of that size (C#'s nulls read as ""), then write each
 initializer element.
 
+**Clock.** `Stopwatch` (`StartNew`, `new Stopwatch()`, `Start`, `Stop`,
+`Reset`, `Restart`, `ElapsedMilliseconds`, `Elapsed.TotalSeconds` /
+`TotalMilliseconds`, `IsRunning`) and `DateTime.Now` / `UtcNow` (`Year`,
+`Month`, `Day`, `Hour`, `Minute`, `Second`, `Millisecond`, `DayOfYear`,
+`ToString()` and `ToString(format)` with .NET's custom tokens `yyyy yy MM M
+dd d HH H hh h mm m ss s fff ff f tt`, quoted text and `\x`) read
+`clock_gettime` / `localtime_r`: the player is built with gcc. They sit
+behind `#ifndef CRUST_NO_POSIX_MKDIR` like the file helpers, so the pack's
+validation through crust's own C front end (no `<time.h>`) still passes;
+there the clock reads 0. A stopwatch or a date is a local here: kept in a
+field, passed to a method, or subtracted (a `TimeSpan`), it is not lowered,
+and the method is reported. `DateTime.ToString()` is the invariant
+culture's general form, `MM/dd/yyyy HH:mm:ss`, not the machine's culture.
+
+## Static helper classes and extension methods
+
+A `static class` has no instances, so there is nothing to pack it as;
+until now any call into one (`Util.Twice(hp)`) left the calling method a
+stub. They are rewritten at the source level first
+(`tools/unity_pack_extensions.py`), and the analysis and the lowering read
+the rewritten text (`SOURCE_OVERLAY` in `unity_pack_common`):
+
+* a C# 14 extension block -- `extension (GameObject go) { .. }` -- becomes
+  classic static members, the receiver their first parameter; an extension
+  property `P` becomes a method `get_P(this T x)`;
+* an extension call `x.M(a)`, `x.M<T>(a)` or `x.P` becomes the static call
+  `Cls.M(x, a)`, `Cls.M<T>(x, a)`, `Cls.get_P(x)` (a method of the
+  project's own classes with the same name shadows it);
+* a static method whose body is one `return expr;` (or `=> expr`) is
+  inlined where it is called, as before; any other one, and every generic
+  one, is copied into the calling class as a private static method --
+  `Util__Twice`, or `UnityExtensions__GetOrAddComponent__Badge` for each
+  type argument, `T` substituted -- with its calls to its siblings, its
+  class's consts and its own extension calls rewritten the same way, and
+  what it calls copied too.
+
+```csharp
+public static class UnityExtensions {
+    extension (GameObject go) {
+        public bool IsActiveInHierarchy => go.activeInHierarchy;
+        public T GetOrAddComponent<T>() where T : Component {
+            T component = go.GetComponent<T>();
+            if (component == null) component = go.AddComponent<T>();
+            return component;
+        }
+    }
+}
+// in a MonoBehaviour:
+Badge b = gameObject.GetOrAddComponent<Badge>();  // packs, adds once
+```
+
+Extension methods on Unity value types work the same way: `Vector2` is a
+parameter and return type the engine has (its C struct), so
+
+```csharp
+public static Vector2 SetZ(this Vector2 v, float z) { return new Vector2(v.x, z); }
+public static void Example2(this float f) { }
+// a.SetZ(5f), aim.SetZ(-1f) on a packed Vector2 field, speed.Example2()
+```
+
+pack and run. The packer's own `SetX` / `SetZ` inside a
+`t.SetWorldScale(..)` argument stay its own; everywhere else a project's
+`SetX` / `SetY` / `SetZ` are its extension methods. `GetWorldRect`,
+`SetWorldScale` and a static array's `Add` / `Remove` are always the
+packer's.
+
+Each copy goes on its own line after the class's last one, so the class's
+lines -- and the diagnostics pointing at them -- stay where the author
+wrote them; only another top-level type later in the same file moves. A
+method that reads or writes a non-const static field of its class is not
+copied (each class would get its own copy of shared state), and its calls
+are left for the stub check; so is a generic call whose type arguments are
+inferred rather than written (`x.M()` for `M<T>(this T x)`). An API a
+helper uses counts for the classes that call it (`SOURCE_API_HINTS`).
+
+## Methods that return values, and other objects' fields
+
+A MonoBehaviour's methods emitted as `static void`, and one returning a
+value was a stub. A method may now return `int` (and the other integer
+types), `bool`, `float`, `double`, `string`, `Vector2`, a packed component
+or a `GameObject` (their index), and take a `Vector2` parameter (it was
+passed as an `int`, a handle); the type has a C value, and anything else --
+a coroutine's `IEnumerator`, a `Vector2`, a collection -- keeps the stub.
+A returned string is copied to a scratch slot (`_cs_str_ret`), so an owned
+local's text is not freed under the caller. Calls are typed where they are
+used: `"x" + Score()` formats an integer, `"ok " + Alive()` a bool. Static
+methods are forward-declared like instance ones.
+
+A field of a packed object reached through a local or parameter of its
+class (`Badge b = ..; b.n = 9;`) reads and writes its slot
+(`Badge_AT(b).n`), as a handle field's does. `go.AddComponent<T>()` on a
+`GameObject` variable adds to that GameObject (it added to this one).
+`gameObject.activeSelf` / `activeInHierarchy` -- this object's or a
+variable's -- read the engine's active tables. A comparison or logical
+expression in a concatenation prints as a bool (`"ok " + (n >= 0)` is `ok
+True`), and `s[k]` on a string is a `char`.
+
 ## Fast feature check: `tools/unity_pack_features.py`
 
 The full suite packs a few hundred projects and takes most of a quarter
