@@ -199,6 +199,25 @@ int main(void) { S a(4); a.p[0] = 'x'; a.n = 1; S b = a.clone();
 """)
 
 
+class TestCopyOfPointerParameter(Base):
+    def test_copy_constructs_from_star_param(self):
+        # `S c(*p)` with `p` a pointer parameter picked the one-argument
+        # constructor: only pointer *locals* were resolved through `*`.
+        self.assertRuns("""
+#include <stdlib.h>
+class S {
+public:
+    int *p;
+    S() { p = (int *)malloc(4); *p = 0; }
+    S(int v) { p = (int *)malloc(4); *p = v + 100; }
+    S(const S &o) { p = (int *)malloc(4); *p = *o.p; }
+    ~S() { free(p); }
+};
+static int dup(const S *q) { S c(*q); return *c.p; }
+int main(void) { S a(1); *a.p = 7; return dup(&a) == 7 ? 0 : 1; }
+""")
+
+
 class TestStaticConstQualified(Base):
     def test_qualified_use_outside_the_class(self):
         self.assertRuns("""
@@ -388,6 +407,53 @@ int main(void) {
                 outs.append(f.read())
         self.assertIn("\nint str_find(str *this, char c, size_t pos) {", outs[0])
         self.assertIn("\nint str_count(const char *s, char c);", outs[1].replace("char* s", "char *s"))
+        rc, _w = self.run_c(outs)
+        self.assertEqual(rc, 0)
+
+    def test_implicit_members_after_an_out_of_line_one_stay_static(self):
+        # `Holder` gets an implicit copy constructor and assignment from its
+        # `Buf` member. They are emitted after the member loop, and used to
+        # inherit the out-of-line flag of the last member -- so both units
+        # defined `Holder_copy` externally and the link failed.
+        hdr = """
+#include <stdlib.h>
+class Buf {
+  public:
+    int *p;
+    Buf() { p = (int *)malloc(4); *p = 0; }
+    Buf(const Buf &o) { p = (int *)malloc(4); *p = *o.p; }
+    ~Buf() { free(p); }
+    void operator=(const Buf &o) { *p = *o.p; }
+};
+class Holder {
+  public:
+    Buf b;
+    int get();
+};
+"""
+        a = """#include "h.h"
+int Holder::get() { return *b.p; }
+int copy_a(Holder *h) { Holder c(*h); return c.get(); }
+"""
+        b = """#include "h.h"
+int copy_a(Holder *h);
+int main(void) { Holder h; *h.b.p = 4; Holder k(h); k = h;
+                 return (copy_a(&h) == 4 && k.get() == 4) ? 0 : 1; }
+"""
+        for name, text in (("h.h", hdr), ("a.cpp", a), ("b.cpp", b)):
+            with open(os.path.join(self.tmp, name), "w") as f:
+                f.write(text)
+        outs = []
+        for name in ("a.cpp", "b.cpp"):
+            c = os.path.join(self.tmp, name[:-4] + ".out.c")
+            r = subprocess.run([sys.executable, CPPRUST,
+                                os.path.join(self.tmp, name), "-o", c,
+                                "--no-clang"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(c) as f:
+                outs.append(f.read())
+        for out in outs:
+            self.assertIn("static void Holder_copy(", out)
         rc, _w = self.run_c(outs)
         self.assertEqual(rc, 0)
 
