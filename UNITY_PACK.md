@@ -596,6 +596,57 @@ variable's -- read the engine's active tables. A comparison or logical
 expression in a concatenation prints as a bool (`"ok " + (n >= 0)` is `ok
 True`), and `s[k]` on a string is a `char`.
 
+## Collections: Stack, Queue, HashSet, List members, `T[,]`
+
+`Stack<T>`, `Queue<T>` and `HashSet<T>` were refused; they are rewritten at
+the source level (`tools/unity_pack_collections.py`, in the same overlay as
+the extension methods) into the `List<T>` the packer lowers -- so locals,
+instance fields, statics and every element type the list lowering has work
+for them too:
+
+| C# | as a List |
+|----|-----------|
+| `s.Push(x)`, `q.Enqueue(x)` | `Add` |
+| `s.Peek()`, `q.Peek()` | `s[s.Count - 1]`, `q[0]` |
+| `s.Pop()`, `q.Dequeue()` | hoisted before the statement: an emptiness check (.NET's `InvalidOperationException`), the element into a temporary, `RemoveAt` |
+| `foreach` over a `Stack` | top first, as .NET |
+| `h.Add(x)` | `if (!h.Contains(x)) h.Add(x)`; as a value, hoisted with its bool |
+| `h.UnionWith(o)`, `IntersectWith`, `ExceptWith` | loops |
+
+A take hoisted from inside a `while` / `for` header would run once, not
+each time round, and is left for the stub check; one in an `if` / `switch`
+condition is hoisted before it. A `HashSet` keeps insertion order (.NET's
+until an element is removed) and its `Contains` is linear; a `Dequeue`
+moves the rest down.
+
+The packed `List` had only `Add`, `Clear`, `Count`, indexing and a field's
+`foreach`. It now has `RemoveAt` and `Insert` (index-checked, .NET's
+`ArgumentOutOfRangeException`), `Contains`, `IndexOf` and `Remove` (a
+search helper per element type), and `foreach` over a local (an index
+loop). A `List<string>` is a vector of owned coost `fastring`s, as a
+`string[]` is -- it could not take a literal before; a `Dictionary`'s string
+keys and values are unchanged.
+
+**Multidimensional arrays.** `T[,]` and `T[,,]` of `int`, `float`, `bool` or
+`string` are a `List<T>` (row-major, as .NET lays them out) and an `int`
+per dimension: `new T[a, b]` stores the dimensions and fills in
+`default(T)`, `g[x, y]` is the flat index through a helper that checks each
+one (`IndexOutOfRangeException`), and `GetLength(k)`, `Length`, `Rank` and
+`foreach` work. A field's initializer is filled at the start of `Awake`
+(one is made if the class has none); its dimension fields go after the
+class's last line. An array literal (`{ {1, 2}, .. }`) or a `T[,]`
+parameter is left for the stub check.
+
+## `GetType`, `typeof`, `is`, `nameof`
+
+A packed object's class is known when packing -- `this`, or a handle
+field, local or parameter of a packed class -- so these are constants:
+`GetType().Name` (and `.FullName`, `.ToString()`) and `x.GetType().Name`
+are the class's name, `typeof(T).Name` is `"T"`, `GetType() == typeof(T)`
+is decided, `x is T` for an `x` declared a `T` is `x != null`, and
+`nameof(x)` is `"x"`. A type used any other way -- reflection, a `Type`
+kept in a variable -- is left as written, and the method is reported.
+
 ## Fast feature check: `tools/unity_pack_features.py`
 
 The full suite packs a few hundred projects and takes most of a quarter
