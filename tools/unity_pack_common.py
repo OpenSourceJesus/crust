@@ -208,7 +208,22 @@ def player_display(root):
     return width, height, fullscreen, (1 if native else 0), maximized
 
 
+#: path -> text a pack reads instead of the file: C# rewritten at the
+#: source level (tools/unity_pack_extensions.py). Set and cleared by pack().
+SOURCE_OVERLAY = {}
+
+#: API names a pack must emit because a static helper class uses them (its
+#: body is inlined or copied into a caller the per-script scan read
+#: without them). Set by pack().
+SOURCE_API_HINTS = set()
+
+
 def _read(path):
+    if path in SOURCE_OVERLAY:
+        return SOURCE_OVERLAY[path]
+    ap = os.path.abspath(path)
+    if ap in SOURCE_OVERLAY:
+        return SOURCE_OVERLAY[ap]
     with open(path) as f:
         return f.read()
 

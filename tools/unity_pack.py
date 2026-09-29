@@ -4694,7 +4694,7 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
     return text
 
 
-def _rewrite_addcomponent(text, plan, this_class):
+def _rewrite_addcomponent(text, plan, this_class, go_vars=()):
     """Lower gameObject.AddComponent<T>() / AddComponent<T>() to C helpers.
 
     Also ``audioSource.gameObject.AddComponent<T>()`` (component → owner GO).
@@ -4719,6 +4719,26 @@ def _rewrite_addcomponent(text, plan, this_class):
         if recv in as_fields or locals_ty.get(recv) == "AudioSource":
             return "_AudioSource_owner_go[%s]" % recv
         return go_expr
+
+    # `go.AddComponent<T>()` on a GameObject variable -- a parameter or a
+    # local -- adds to that GameObject, not this one.
+    gos = set(go_vars) | set(re.findall(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?GameObject\s+(\w+)\s*[=;]",
+        cs2cpp._blank(text)))
+    gos -= {"this", "gameObject"}
+    if gos:
+        def repl_var(m):
+            if m.group(1):
+                locals_ty[m.group(1)] = m.group(4)
+            return "%sGameObject_AddComponent_%s(%s)" % (
+                ("int %s = " % m.group(1)) if m.group(1) else "",
+                _c_ident(m.group(4)), m.group(3))
+        text = cs2cpp.code_sub(
+            r"(?:(?:(?:UnityEngine\.)?\w+)\s+(\w+)\s*=\s*)?"
+            r"(?<![\w.])((%s))\s*\.\s*AddComponent\s*<\s*"
+            r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)"
+            % "|".join(re.escape(g) for g in sorted(gos)),
+            repl_var, text)
 
     # AudioSource asrc = musicSource.gameObject.AddComponent<AudioSource>();
     def repl_typed_go(m):
@@ -5714,6 +5734,9 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![\w.])(?:this\s*\.\s*)?gameObject\s*\.\s*SetActive\s*\(",
                  scan):
         apis.add("GameObject.SetActive")
+    # Reading activeSelf / activeInHierarchy needs the same active tables.
+    if re.search(r"\.\s*active(?:Self|InHierarchy)\b", scan):
+        apis.add("GameObject.SetActive")
     # transform.parent.gameObject.SetActive / anyRecv.gameObject.SetActive
     if re.search(r"\.\s*gameObject\s*\.\s*SetActive\s*\(", scan):
         apis.add("GameObject.SetActive")
@@ -5875,9 +5898,14 @@ def analyze_script(path, text=None, shallow=False):
             r"productName)\s*\+",
             scan):
         apis.add("string.+")
+    # A method returning a string copies it to a scratch slot.
+    if re.search(r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|"
+                 r"override|virtual)\s+)*string\s+\w+\s*\(", scan):
+        apis.add("string.+")
     # StringBuilder appends formatted values from the scratch slots, and
     # JsonUtility's text is built the same way.
-    if re.search(r"\bStringBuilder\b|\bJsonUtility\b", scan):
+    if re.search(r"\bStringBuilder\b|\bJsonUtility\b|\bStopwatch\b|"
+                 r"\bDateTime\b", scan):
         apis.add("string.+")
     if re.search(r"\bJsonUtility\s*\.\s*FromJsonOverwrite\b", scan):
         apis.add("JsonUtility.FromJsonOverwrite")
@@ -6283,6 +6311,9 @@ def _param_c_ty(ty):
     if ty in ("byte", "sbyte", "short", "ushort", "int", "uint", "long",
               "ulong", "bool", "char"):
         return "int"
+    if ty == "Vector2":
+        # The engine's value struct -- it fell to `int` below, a handle.
+        return "Vector2"
     # MonoBehaviour / component / enum handles → packed index.
     return "int"
 
@@ -6436,6 +6467,52 @@ def _fill_defaults_after(text, sym, params):
         pos = end
     out.append(text[pos:])
     return "".join(out)
+
+
+def _ret_c_ty(ret, plan):
+    """C return type for a C# method's, or None when the packed engine has
+    no value for it (a coroutine's IEnumerator, a Vector2, a collection):
+    such a method stays a stub. "void" for void."""
+    t = (ret or "void").strip()
+    base = t.split(".")[-1]
+    if base == "void":
+        return "void"
+    if base in ("float", "double"):
+        return "float"
+    if base == "string":
+        return "const char *"
+    if base in ("byte", "sbyte", "short", "ushort", "int", "uint", "bool",
+                "char"):
+        return "int"
+    if base in (plan.get("classes") or {}) or base in (
+            "GameObject", "Transform"):
+        return "int"                      # a packed index / GameObject
+    if base == "Vector2":
+        return "Vector2"                  # the engine's value struct
+    return None
+
+
+def _method_ret_kinds(plan):
+    """{C symbol: "s" / "i" / "b" / "f"} for every method that returns a
+    value, so a call is typed where it is used (`"x" + Score()`)."""
+    got = plan.get("_method_ret_kinds_cache")
+    if got is not None:
+        return got
+    got = {}
+    for cname, pairs in (plan.get("_methods_by") or {}).items():
+        idn = _c_ident(cname)
+        for _c, m in pairs:
+            base = (m.get("ret") or "void").strip().split(".")[-1]
+            if _ret_c_ty(base, plan) in (None, "void"):
+                continue
+            kind = ("s" if base == "string" else "b" if base == "bool"
+                    else "f" if base in ("float", "double")
+                    else "v" if base == "Vector2" else "i")
+            for ov in (False, True):
+                got[_method_c_symbol(idn, m["name"], m.get("args") or "",
+                                     ov)] = kind
+    plan["_method_ret_kinds_cache"] = got
+    return got
 
 
 def _method_c_params(args_str):
@@ -6627,10 +6704,10 @@ def _static_helper_methods():
             if not fn.endswith(".cs"):
                 continue
             try:
-                with open(os.path.join(dp, fn), encoding="utf-8",
-                          errors="replace") as f:
-                    text = f.read()
-            except OSError:
+                # Through `_read`: the source overlay's text, extension
+                # methods already plain static ones.
+                text = _read(os.path.join(dp, fn))
+            except (OSError, UnicodeDecodeError):
                 continue
             if "static" not in text:
                 continue
@@ -6687,7 +6764,15 @@ def _bind_params(text, params_str, args):
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*GetHashCode\s*\(\s*\)" % re.escape(prm.name),
                 hash_of, text)
-    names = {p.name: "(%s)" % v for p, v in zip(prms, vals)}
+    # A plain name (or literal) is bound as itself: `go.activeInHierarchy`
+    # with `go` bound to `gameObject` is `gameObject.activeInHierarchy`,
+    # which the member lowering reads -- `(gameObject).activeInHierarchy`
+    # it did not.
+    names = {p.name: (v.strip() if re.match(
+                          r'^(?:[A-Za-z_]\w*|"(?:[^"\\]|\\.)*"|\d+(?:\.\d+)?[fF]?)$',
+                          v.strip())
+                      else "(%s)" % v)
+             for p, v in zip(prms, vals)}
     return cs2cpp.code_sub(
         r"(?<![\w.])(%s)\b" % "|".join(re.escape(n) for n in names),
         lambda m: names[m.group(1)], text)
@@ -7365,7 +7450,16 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
                     "(only `i` / coll).")
         if hit:
             return hit
-    return cs2cpp.residual_csharp(body, _PACKED_STRINGS, known_types,
+    # A parameter of one of the engine's value types (`Vector2 p`) is a C
+    # struct in the signature: `p.x` is its member, as a local's would be.
+    # Declared here only for the check, which reads declarations from the
+    # body it is given.
+    pre = ""
+    for prm in cs2cpp.parse_params(args_str or ""):
+        t = prm.type.split(".")[-1]
+        if t in known_types and _param_c_ty(t) == t:
+            pre += "%s %s; " % (t, prm.name)
+    return cs2cpp.residual_csharp(pre + body, _PACKED_STRINGS, known_types,
                                   _UNITY_VALUE_CTORS)
 
 
@@ -11184,6 +11278,10 @@ def _emit_engine_ui(
           % go_n)
         p("    _engine_go_scene[go] = -1;")
         p("}")
+    p("static int GameObject_activeSelf(int go) {")
+    p("    _engine_go_active_init();")
+    p("    return go >= 0 && go < %d ? _engine_go_active[go] : 0;" % go_n)
+    p("}")
     p("static void GameObject_SetActive(int go, int active) {")
     p("    _engine_go_active_init();")
     p("    if (go < 0 || go >= %d) return;" % go_n)
@@ -12318,11 +12416,10 @@ def _emit_engine_class_groups(
                 continue
             if m["name"] in _UNITY_EMIT_MESSAGES:
                 continue
-            if m.get("static"):
-                continue
             sym = _method_c_symbol(
                 idn, m["name"], m.get("args") or "",
                 m["name"] in overloaded)
+            rty = _ret_c_ty(m.get("ret"), plan) or "void"
             coll_param = None
             if m["name"] in _COLLISION2D_MSGS:
                 coll_param = _collision2d_arg_name(m.get("args") or "")
@@ -12330,12 +12427,16 @@ def _emit_engine_class_groups(
                     continue
                 p("static void %s(unsigned i, int %s);"
                   % (sym, coll_param))
+            elif m.get("static"):
+                # A static one too: a call may come before its body.
+                plist = _method_c_params(m.get("args") or "")
+                p("static %s %s(%s);" % (rty, sym, plist or "void"))
             else:
                 plist = _method_c_params(m.get("args") or "")
                 if plist:
-                    p("static void %s(unsigned i, %s);" % (sym, plist))
+                    p("static %s %s(unsigned i, %s);" % (rty, sym, plist))
                 else:
-                    p("static void %s(unsigned i);" % sym)
+                    p("static %s %s(unsigned i);" % (rty, sym))
         for c, m in methods_by.get(cname, []):
             if m["name"] == "OnEnable":
                 continue
@@ -12381,21 +12482,23 @@ def _emit_engine_class_groups(
             used_syms.add(sym)
             if not m.get("static") and not (m.get("args") or "").strip():
                 emitted_syms.setdefault((cname, m["name"]), sym)
+            rty = _ret_c_ty(m.get("ret"), plan)
             if coll_param:
                 p("static void %s(unsigned i, int %s) {"
                   % (sym, coll_param))
             elif m.get("static"):
                 plist = _method_c_params(m.get("args") or "")
-                p("static void %s(%s) {" % (
-                    sym, plist if plist else "void"))
+                p("static %s %s(%s) {" % (
+                    rty or "void", sym, plist if plist else "void"))
                 # Static bodies may still touch instance fields via bare names.
                 p("    unsigned i = 0;")
             else:
                 plist = _method_c_params(m.get("args") or "")
                 if plist:
-                    p("static void %s(unsigned i, %s) {" % (sym, plist))
+                    p("static %s %s(unsigned i, %s) {" % (rty or "void", sym,
+                                                          plist))
                 else:
-                    p("static void %s(unsigned i) {" % sym)
+                    p("static %s %s(unsigned i) {" % (rty or "void", sym))
             # Methods that still contain unlowered C# become stubs (Unity
             # messages included — empty body beats crust parse failures).
             emitted = set()
@@ -12414,11 +12517,24 @@ def _emit_engine_class_groups(
             if why is None:
                 ret_cs = (m.get("ret") or "void").strip()
                 ret_base = ret_cs.split(".")[-1]
-                if ret_base and ret_base != "void":
+                if rty is None or (coll_param and rty != "void"):
                     why = (
-                        "non-void return type (methods emit as static void)",
+                        "return type the packed engine has no value for",
                         ret_cs,
                     )
+                elif rty != "void":
+                    if not re.search(r"(?<![\w])return\b", body):
+                        why = ("value-returning method with no return",
+                               ret_cs)
+                    elif rty == "const char *":
+                        # A returned string is copied to a scratch slot: an
+                        # owned local's text is freed as the method returns.
+                        plan.setdefault("_cs_str_used", set()).add(
+                            "_cs_str_ret")
+                        body = cs2cpp.code_sub(
+                            r"(?<![\w])return\s+([^;]+);",
+                            lambda mm: "return _cs_str_ret(%s);"
+                            % mm.group(1).strip(), body)
                 elif re.search(r"(?m)^\s*return\s+[^;\s]", body):
                     why = (
                         "valued return in void method emit",
@@ -12456,6 +12572,12 @@ def _emit_engine_class_groups(
                         p("    " + s.rstrip(";").rstrip() + ";")
                 p("    /* unlowered C# (GetComponentsInChildren / T[] / "
                   "leftover Instantiate / lambda / Type.Method) — stub */")
+                # A stub of a value-returning method still returns one.
+                if rty and rty != "void":
+                    p("    return %s;" % (
+                        '""' if rty == "const char *"
+                        else "Vector2_make(0.f, 0.f)" if rty == "Vector2"
+                        else "0"))
             else:
                 for line in body.split("\n"):
                     if line.strip():
@@ -17901,6 +18023,34 @@ def _format_bool_literals(text):
     return "".join(out)
 
 
+def _mark_string_chars(text, string_idents, tables):
+    """`s[k]` on a string local, parameter or static is a `char` in C#, and
+    is cast so: `((char)s[k])`. The concatenation typing reads a `name[..]`
+    of a string table (`Player_label[i]`, `parts[i]`) as a string, and read
+    this as one too -- printing a character through `%s`."""
+    names = {n for n in string_idents if re.match(r"^[A-Za-z_]\w*$", n)} \
+        - set(tables)
+    if not names:
+        return text
+    scan = cs2cpp._blank(text)
+    out, last = [], 0
+    for m in re.finditer(r"(?<![\w.>&])(%s)\s*\[" % "|".join(
+            re.escape(n) for n in sorted(names, key=len, reverse=True)), scan):
+        if m.start() < last:
+            continue
+        cb = _match_close(scan, m.end() - 1, "[", "]")
+        if cb is None:
+            continue
+        after = scan[cb + 1:].lstrip()
+        if after.startswith("=") and not after.startswith("=="):
+            continue                      # a write: not ours
+        out.append(text[last:m.start()])
+        out.append("((char)%s)" % text[m.start():cb + 1])
+        last = cb + 1
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _bool_names(cl, body, site):
     """Names holding a bool in this method: `bool` locals and parameters,
     and the class's bool fields -- by their C# name and, once lowered, their
@@ -17918,6 +18068,50 @@ def _bool_names(cl, body, site):
     return out
 
 
+def _format_bool_comparisons(text):
+    """`"ok " + (n >= 0)` is "ok True" in C#: a parenthesized comparison or
+    logical expression next to a binary `+` is a bool, and prints as one.
+    A conditional (`?:`) is not one, whatever its condition."""
+    scan = cs2cpp._blank(text)
+    out, last = [], 0
+    k = 0
+    while k < len(scan):
+        if scan[k] != "(" or k < last:
+            k += 1
+            continue
+        # a grouping paren, not a call's
+        if re.search(r"[\w\]]\s*$", scan[:k]):
+            k += 1
+            continue
+        cb = _match_close(scan, k, "(", ")")
+        if cb is None:
+            break
+        inner = scan[k + 1:cb]
+        depth, top = 0, []
+        for ch in inner:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            top.append(ch if depth == 0 else " ")
+        top = "".join(top)
+        before = scan[:k].rstrip()
+        after = scan[cb + 1:].lstrip()
+        adjacent = (before.endswith("+") and not before.endswith("++")) or (
+            after.startswith("+") and not after.startswith(("++", "+=")))
+        if (adjacent and "?" not in top
+                and re.search(r"==|!=|<=|>=|&&|\|\||(?<![<>=])[<>](?![<>=])|^\s*!",
+                              top)):
+            out.append(text[last:k])
+            out.append('(%s ? "True" : "False")' % text[k:cb + 1])
+            last = cb + 1
+            k = cb + 1
+            continue
+        k += 1
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _format_bools(text, names, calls):
     """A bool as C# formats it: `"alive " + alive` is "alive True", and
     `Debug.Log(ok)` prints "False" -- the engine printed 1 and 0.
@@ -17928,6 +18122,7 @@ def _format_bools(text, names, calls):
     the typed concatenation reads as a string. `names` are bool variables
     and accessors, `calls` helpers returning one.
     """
+    text = _format_bool_comparisons(text)
     if not names and not calls:
         return text
     alts = []
@@ -17951,9 +18146,16 @@ def _format_bools(text, names, calls):
             if cl_ is None:
                 continue
             end = cl_ + 1
+        # Grouping parentheses are the operand's own (an inlined helper's
+        # body comes back in them): look past them.
+        k0, k1 = m.start(), end
+        while k0 > 0 and scan[k0 - 1] == "(" and k1 < len(scan) \
+                and scan[k1] == ")" and not re.search(r"[\w\]]\s*$",
+                                                     scan[:k0 - 1]):
+            k0, k1 = k0 - 1, k1 + 1
         # Also `(b ? .. : ..)` wrapped already, or a `!b`: only a bare one.
-        before = scan[:m.start()].rstrip()
-        after = scan[end:].lstrip()
+        before = scan[:k0].rstrip()
+        after = scan[k1:].lstrip()
         prev_plus = before.endswith("+") and not before.endswith("++")
         next_plus = after.startswith("+") and not after.startswith(("++", "+="))
         in_log = bool(log.search(before)) and after.startswith(")")
@@ -18375,6 +18577,60 @@ def _float_idents(cl, body, site):
     return out
 
 
+def _lower_go_active_reads(text, cl, site):
+    """`gameObject.activeSelf` / `.activeInHierarchy` -- this object's, or a
+    GameObject variable's -- as the engine's active tables read them."""
+    own = "_engine_go_of_%s(i)" % _c_ident(cl["name"])
+    gos = {prm.name for prm in cs2cpp.parse_params(
+        (site or {}).get("args") or "")
+        if prm.type.split(".")[-1] == "GameObject"}
+    gos |= set(re.findall(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?GameObject\s+(\w+)\s*[=;]",
+        cs2cpp._blank(text)))
+
+    def rep(m):
+        recv = m.group(1)
+        go = own if recv in ("gameObject", "this.gameObject") else recv
+        if m.group(2) == "activeInHierarchy":
+            return "_engine_go_active_in_hierarchy(%s)" % go
+        return "GameObject_activeSelf(%s)" % go
+    alt = ["(?:this\\s*\\.\\s*)?gameObject"] + [re.escape(g) for g in sorted(gos)]
+    return cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\s*\.\s*(activeSelf|activeInHierarchy)\b"
+        % "|".join(alt), rep, text)
+
+
+def _local_handle_fields(text, cl, plan, site):
+    """A packed object's field through a local or parameter of its class:
+    `Badge b = ..; b.n = 9;` is `Badge_AT(b).n = 9;`, as a handle field's
+    is (`lower_packed_fields`). It was left as C#, and the method stubbed.
+    Before the locals' class types become `int`: those types are how the
+    receivers are known. String fields are their tables already."""
+    classes = plan.get("classes") or {}
+    holds = {}
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in classes:
+            holds[prm.name] = prm.type
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[=;]",
+                         cs2cpp._blank(text)):
+        if m.group(1) in classes:
+            holds[m.group(2)] = m.group(1)
+    for recv, other in sorted(holds.items()):
+        members = [mm[0] for mm in classes[other].get("members") or ()
+                   if not str(mm[3]).startswith(("go", "idx:"))
+                   and mm[3] != "f16"]
+        if not members:
+            continue
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*(%s)(?![\w(])" % (
+                re.escape(recv),
+                "|".join(re.escape(n) for n in sorted(members, key=len,
+                                                      reverse=True))),
+            lambda m, r=recv, o=_c_ident(other): "%s_AT(%s).%s" % (
+                o, r, m.group(1)), text)
+    return text
+
+
 def _lower_string_nulls(text, cl, plan, site):
     """`s == null` on a C# string. A fastring has no null distinct from
     empty, so a string that is null reads as "": `s == null` is
@@ -18753,6 +19009,10 @@ _CS_STRING_HELPER_C["_cs_str_Join"] = """static const char *_cs_str_Join(const c
     return _engine_str_keep(t.data(), t.size());
 }"""
 
+_CS_STRING_HELPER_C["_cs_str_ret"] = """static const char *_cs_str_ret(const char *s) {
+    return _engine_str_keep(s ? s : "", strlen(s ? s : ""));
+}"""
+
 #: Numeric format helpers (`{0:F2}`, `x.ToString("D4")`): strings, in a
 #: scratch slot like every other string result.
 _CS_FORMAT_HELPERS = {"_cs_fmt_F", "_cs_fmt_D"}
@@ -18977,7 +19237,25 @@ def _own_string_locals(text, string_idents, int_idents, stores=(),
         j = k - 1
         while j >= 0 and scan[j] in " \t\r\n":
             j -= 1
-        return j < 0 or scan[j] in ";{}"
+        if j < 0 or scan[j] in ";{}":
+            return True
+        # The body of a brace-less `for (..)`, `if (..)`, `while (..)`,
+        # `foreach (..)`, or of `else` / `do`.
+        if re.search(r"(?<![\w])(?:else|do)$", scan[:j + 1]):
+            return True
+        if scan[j] == ")":
+            depth, o = 0, j
+            while o >= 0:
+                if scan[o] == ")":
+                    depth += 1
+                elif scan[o] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                o -= 1
+            return bool(re.search(r"(?<![\w])(?:for|foreach|if|while|using|"
+                                  r"lock)\s*$", scan[:max(o, 0)]))
+        return False
 
     def expr_end(k):
         """Index of the `;` ending the expression at k, or -1 (a top-level
@@ -19090,6 +19368,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Before `true` becomes 1: a builder's Append(true) and a bool literal
     # in a concatenation print as C# prints them.
     text = _lower_string_builders(text)
+    text = runtime.lower_clock(text, plan.setdefault("_cs_str_used", set()),
+                               cs2cpp._blank, _match_close)
     text = _format_bool_literals(text)
     text = _rewrite_csharp_float_literals(text)
     text = re.sub(r"(?<![\w.])true\b", "1", text)
@@ -19098,6 +19378,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Bare `this` is the packed instance index (Add(this), == this, …).
     text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
     text = _string_field_tables(text, cl, plan, site)
+    text = _local_handle_fields(text, cl, plan, site)
+    text = _lower_go_active_reads(text, cl, site)
     text = _lower_string_nulls(text, cl, plan, site)
     text = _lower_string_formats(text, cl, plan, site)
     text, string_arrays = _lower_string_arrays(
@@ -19154,6 +19436,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         before = text
         text = _inline_static_getters(text, cl, plan)
         text = _inline_static_helpers(text, plan)
+        # An inlined helper's body may read a GameObject's active state.
+        text = _lower_go_active_reads(text, cl, site)
         if text == before:
             break
     # Boolean.GetHashCode is 1 / 0 and Int32.GetHashCode the value itself
@@ -19249,7 +19533,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_local_types(text, _packed_model(plan))
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
-    text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
+    text, add_locals = _rewrite_addcomponent(
+        text, plan, cl["name"],
+        go_vars={prm.name for prm in cs2cpp.parse_params(
+            (site or {}).get("args") or "")
+            if prm.type.split(".")[-1] == "GameObject"})
     text = _rewrite_instantiate(text, plan, cl["name"])
     text = _rewrite_new_packed_class(text, plan)
     text = _rewrite_getcomponentsinchildren(text, plan, cl["name"])
@@ -19319,17 +19607,35 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # `string[]` locals: an element is a string (`parts[i]`).
     string_idents |= string_arrays
     string_idents |= plan.get("_json_string_fns") or set()
+    _rk = dict(_method_ret_kinds(plan))
+    # Before the calls are renamed: this class's methods by their C# names.
+    for _c, _m in (plan.get("_methods_by") or {}).get(cl.get("name"), []):
+        _b = (_m.get("ret") or "void").strip().split(".")[-1]
+        if _ret_c_ty(_b, plan) not in (None, "void"):
+            _rk[_m["name"]] = ("s" if _b == "string" else "b" if _b == "bool"
+                               else "f" if _b in ("float", "double")
+                               else "v" if _b == "Vector2" else "i")
+    plan["_method_ret_kinds_local"] = _rk
+    string_idents |= {k for k, v in _rk.items() if v == "s"}
     int_idents = _int_idents(cl, plan, body, site)
     # String members first: their helpers are then operands the typed
     # concatenation and Debug.Log can classify.
     text = _lower_string_members(text, string_idents, plan)
     string_idents |= _string_helper_names("string")
     int_idents |= _string_helper_names("int") | _string_helper_names("bool")
+    int_idents |= {k for k, v in (plan.get("_method_ret_kinds_local")
+                                  or {}).items() if v in ("i", "b")}
     string_idents |= {
         prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
         if prm.type in ("string", "String", "System.String")}
+    text = _mark_string_chars(text, string_idents, string_arrays
+                              | _string_store_names(plan))
     text = _format_bools(text, _bool_names(cl, body, site),
-                         _string_helper_names("bool"))
+                         _string_helper_names("bool") | {
+                             "_engine_go_active_in_hierarchy",
+                             "GameObject_activeSelf"} | {
+                             k for k, v in (plan.get("_method_ret_kinds_local")
+                                            or {}).items() if v == "b"})
     text = _lower_string_concat(text, string_idents=string_idents,
                                 int_idents=int_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
@@ -19598,6 +19904,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_typed_call_name(
         text, "Console_WriteLine", string_idents=string_idents,
         int_idents=int_idents)
+    # A `gameObject` no rewrite above took -- passed as a value, to a
+    # helper copied in from a static class -- is this object's GameObject.
+    text = cs2cpp.code_sub(r"(?<![\w.>])(?:this\s*\.\s*)?gameObject(?![\w])",
+                           "_engine_go_of_%s(i)" % idn, text)
     # Last: every rewrite above has read the string locals by name.
     text = _own_string_locals(text, string_idents, int_idents,
                               _string_store_names(plan) | string_arrays,
@@ -21644,7 +21954,48 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
     return old == cpp_text
 
 
-def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
+def pack(root, outdir, *args, **kwargs):
+    """Pack a Unity (or Godot) project. See `_pack_impl`.
+
+    Static helper classes and extension methods are rewritten at the source
+    level first (tools/unity_pack_extensions.py): the analysis and the
+    lowering read the rewritten text through `SOURCE_OVERLAY`, and every
+    original line stays on its line, so diagnostics point at the author's.
+    """
+    import tools.unity_pack_common as _common
+    import tools.unity_pack_extensions as _ext
+    files = {}
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d not in (
+            "Library", "Temp", "Logs", "obj", "Packages", ".godot", ".git")]
+        for fn in fns:
+            if fn.endswith(".cs"):
+                fp = os.path.join(dp, fn)
+                try:
+                    with open(fp) as f:
+                        files[fp] = f.read()
+                except (OSError, UnicodeDecodeError):
+                    pass
+    overlay = _ext.desugar_project(files) if files else {}
+    # An API a copied or inlined static helper uses is its caller's too:
+    # the per-script scan does not see it there.
+    _common.SOURCE_API_HINTS.clear()
+    if any(re.search(r"\.\s*active(?:Self|InHierarchy)\b", t)
+           for t in files.values()):
+        _common.SOURCE_API_HINTS.add("GameObject.SetActive")
+    _STATIC_HELPERS.pop(root, None)
+    saved = dict(_common.SOURCE_OVERLAY)
+    for fp, text in overlay.items():
+        _common.SOURCE_OVERLAY[fp] = text
+        _common.SOURCE_OVERLAY[os.path.abspath(fp)] = text
+    try:
+        return _pack_impl(root, outdir, *args, **kwargs)
+    finally:
+        _common.SOURCE_OVERLAY.clear()
+        _common.SOURCE_OVERLAY.update(saved)
+
+
+def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
          gpu_handles=False, physics_inject=False, box2d_root=None,
          coost_root=None):
     """Pack the Unity-subset project at *root* into *outdir*.
@@ -21888,6 +22239,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     # A method the translator cannot lower is a warning, or with `strict`
     # an error (`_report_stub`).
     plan["strict"] = bool(strict)
+    import tools.unity_pack_common as _common
+    used_apis = set(used_apis) | _common.SOURCE_API_HINTS
     engine = emit_engine(plan, analyses, used_apis)
     _used_helpers = plan.pop("_cs_str_used", None) or set()
     helpers_c = _string_helpers_c(_used_helpers)

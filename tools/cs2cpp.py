@@ -649,6 +649,24 @@ def _parse_plus_rhs(text, i):
     return start, i
 
 
+def _top_level_plus(e):
+    """`e` split on its top-level binary `+` (not `++`, `+=`, unary)."""
+    scan = _blank(e)
+    parts, depth, last = [], 0, 0
+    for k, ch in enumerate(scan):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif (ch == "+" and depth == 0 and scan[k + 1:k + 2] not in ("+", "=")
+              and (k == 0 or scan[k - 1] != "+") and scan[:k].strip()
+              and scan[:k].rstrip()[-1] not in "(,=+-*/%<>!&|?:"):
+            parts.append(e[last:k].strip())
+            last = k + 1
+    parts.append(e[last:].strip())
+    return parts
+
+
 def _top_level_ternary(e):
     """The two branches of `c ? a : b` at the top level of `e`, or None."""
     scan = _blank(e)
@@ -690,6 +708,16 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
         if not inner:
             break
         e = inner
+    # `a + b` with a string on either side is a string (an inlined helper's
+    # `(s.ToUpper() + "!")`).
+    parts = _top_level_plus(e)
+    if len(parts) > 1 and any(
+            scalar_kind(x, model, string_idents, int_idents) == "s"
+            for x in parts):
+        return "s"
+    # A character from a string (`s[3]`), cast as unity_pack marks it.
+    if re.match(r"^\(\s*char\s*\)", e):
+        return "c"
     # `c ? a : b` has its branches' type: a string if either is one.
     tern = _top_level_ternary(e)
     if tern is not None:
@@ -916,6 +944,10 @@ def _operand_start(scan, j):
         elif c.isalnum() or c == "_" or c == ".":
             while k >= 0 and (scan[k].isalnum() or scan[k] in "_."):
                 k -= 1
+            # `f(x).n`, `a[i].n`: the member of a call's or an element's
+            # result -- the operand runs on through the brackets.
+            if k >= 0 and scan[k] in ")]" and scan[k + 1:k + 2] == ".":
+                continue
         else:
             return None
         if k >= 1 and scan[k] == ">" and scan[k - 1] == "-":
@@ -982,6 +1014,25 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
                 j = skip_string_literal(text, i)
                 left = text[i:j]
                 left_end = j
+            elif text[i] == "(" and not re.search(r"[\w\]]\s*$", text[:i]):
+                # A parenthesized string -- `(ok ? "True" : "False")` --
+                # starts a chain too.
+                depth, k = 0, i
+                while k < len(text):
+                    if text[k] == '"':
+                        k = skip_string_literal(text, k)
+                        continue
+                    if text[k] == "(":
+                        depth += 1
+                    elif text[k] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    k += 1
+                if k < len(text) and scalar_kind(
+                        text[i:k + 1], model, names, int_idents) == "s":
+                    left = text[i:k + 1]
+                    left_end = k + 1
             elif names and (text[i].isalpha() or text[i] == "_") and (
                     i == 0 or not (text[i - 1].isalnum()
                                    or text[i - 1] in "_.>")):

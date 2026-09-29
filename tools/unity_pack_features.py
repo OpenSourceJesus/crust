@@ -206,6 +206,58 @@ UNITY_CHECKS = [
      "", ["builder:0,1,2,True!1.5|14", "builder:init/x/7-y",
           "builder:0"]),
 
+    ("returns",
+     'Debug.Log("returns:" + Score(3) + "," + Alive() + "," + Half(5) + "," + Label(hp));\n'
+     'string kept = Label(1);\n'
+     'for (int k = 0; k < 20; k++) { string t = "tmp-" + k; }\n'
+     'Debug.Log("returns:" + kept);\n',
+     '    int Score(int n) { int s = n * 10; return s + hp; }\n'
+     '    bool Alive() { return hp > 0; }\n'
+     '    float Half(int v) { return v / 2f; }\n'
+     '    string Label(int n) {\n'
+     '        string s = "L";\n'
+     '        for (int k = 0; k < n; k++) s += k;\n'
+     '        return s + "/" + n;\n'
+     '    }\n',
+     ["returns:37,True,2.5,L0123456/7", "returns:L0/1"]),
+
+    ("helpers",
+     'Debug.Log("helpers:" + Util.Twice(hp) + "," + Util.Plus(hp, 1) + ","'
+     ' + hp.Tripled() + "," + "hey".Shout() + "," + tag.label.Shout());\n',
+     "", ["helpers:114,8,21,HEY!,ALPHA!"]),
+
+    ("ext_block",
+     'Badge b1 = gameObject.GetOrAddComponent<Badge>();\n'
+     'b1.n = 9;\n'
+     'Badge b2 = gameObject.GetOrAddComponent<Badge>();\n'
+     'Debug.Log("ext_block:" + b2.n + "," + gameObject.IsActiveInHierarchy);\n',
+     "", ["ext_block:9,True"]),
+
+    ("clock",
+     'var sw = System.Diagnostics.Stopwatch.StartNew();\n'
+     'float spin = 0f;\n'
+     'for (int k = 0; k < 3000000; k++) spin = spin + k * 0.5f;\n'
+     'sw.Stop();\n'
+     'long ms = sw.ElapsedMilliseconds;\n'
+     'bool sane = sw.Elapsed.TotalSeconds >= 0 && !sw.IsRunning && spin > 0;\n'
+     'DateTime now = DateTime.Now;\n'
+     'bool dsane = now.Year >= 2024 && now.Month >= 1 && now.Month <= 12;\n'
+     'string stamp = DateTime.UtcNow.ToString("yyyy-MM-dd\'T\'HH:mm");\n'
+     'Debug.Log("clock:" + sane + "," + dsane + "," + stamp.Length + "," + stamp[10]'
+     ' + "," + now.ToString().Length);\n',
+     "", ["clock:True,True,16,T,19"]),
+
+    ("vec_ext",
+     'Vector2 a = new Vector2(1f, 2f);\n'
+     'Vector2 b = a.SetZ(5f);\n'
+     'Vector2 c = aim.SetZ(-1f);\n'
+     'Vector2 d = Mid(a, b);\n'
+     'b.x.Example2();\n'
+     'Debug.Log("vec_ext:" + b.x + "," + b.y + "," + c.x + "," + c.y + "," + d.y);\n',
+     '    public Vector2 aim = new Vector2(3f, 4f);\n'
+     '    Vector2 Mid(Vector2 p, Vector2 q) { return new Vector2((p.x + q.x) / 2f, (p.y + q.y) / 2f); }\n',
+     ["vec_ext:1,5,3,-1,3.5"]),
+
     ("self_assign",
      'string a = "x";\n'
      'string b = a;\n'
@@ -367,6 +419,62 @@ UNITY_SAVE_EXPECT = [
     'json:{"hp":42,"speed":1.5,"alive":true,"title":"n\u00e9w","v":{"x":1.5,"y":-2.0}}9',
 ]
 
+#: Static helper classes and extension methods (tools/unity_pack_extensions.py):
+#: a block-bodied helper calling a sibling and a const, a one-line one the
+#: packer inlines, a classic `this` extension, and the C# 14 block form --
+#: an extension property and a generic method.
+UNITY_UTIL_SCRIPT = (
+    "using UnityEngine;\n"
+    "public static class Util {\n"
+    "    const int Bonus = 100;\n"
+    "    public static int Twice(int x) { int y = x * 2; return Add(y, Bonus); }\n"
+    "    public static int Add(int a, int b) { int s = a + b; return s; }\n"
+    "    public static int Plus(int x, int n) => x + n;\n"
+    "    public static string Shout(this string s) {\n"
+    "        string t = s.ToUpper();\n"
+    "        return t + \"!\";\n"
+    "    }\n"
+    "    public static int Tripled(this int x) => x * 3;\n"
+    "}\n")
+UNITY_EXT_SCRIPT = (
+    "using UnityEngine;\n"
+    "public static class UnityExtensions\n"
+    "{\n"
+    "    extension (GameObject go)\n"
+    "    {\n"
+    "        public bool IsActiveInHierarchy => go.activeInHierarchy;\n"
+    "\n"
+    "        public T GetOrAddComponent<T>() where T : Component\n"
+    "        {\n"
+    "            T component = go.GetComponent<T>();\n"
+    "            if (component == null)\n"
+    "            {\n"
+    "                component = go.AddComponent<T>();\n"
+    "            }\n"
+    "            return component;\n"
+    "        }\n"
+    "    }\n"
+    "}\n")
+UNITY_VEXT_SCRIPT = (
+    "using UnityEngine;\n"
+    "public static class VectorExtensions\n"
+    "{\n"
+    "    public static Vector2 SetZ (this Vector2 v, float z)\n"
+    "    {\n"
+    "        return new Vector2(v.x, z);\n"
+    "    }\n"
+    "\n"
+    "    public static void Example2 (this float f)\n"
+    "    {\n"
+    "    }\n"
+    "}\n")
+UNITY_BADGE_SCRIPT = (
+    "using UnityEngine;\n"
+    "[MaxInstances(2)]\n"
+    "public class Badge : MonoBehaviour {\n"
+    "    public int n = 5;\n"
+    "}\n")
+
 #: The Tag class: its label comes from the scene, one line per instance.
 UNITY_TAG_SCRIPT = (
     "using UnityEngine;\n"
@@ -454,7 +562,7 @@ def _write(path, text):
 
 def unity_project(root):
     player = ["using UnityEngine;\n", "using System.IO;\n",
-              "using System.Text;\n",
+              "using System.Text;\n", "using System;\n",
               "public class Player : MonoBehaviour {\n",
               "    public int hp;\n",
               "    public Tag tag;\n"]
@@ -478,6 +586,13 @@ def unity_project(root):
     _write(os.path.join(scripts, "Shot.cs"), UNITY_SHOT_SCRIPT)
     _write(os.path.join(scripts, "Shot.cs.meta"),
            "guid: feat0000000000000000000000000004\n")
+    for name, text, guid in (("Util", UNITY_UTIL_SCRIPT, "07"),
+                             ("UnityExtensions", UNITY_EXT_SCRIPT, "08"),
+                             ("Badge", UNITY_BADGE_SCRIPT, "09"),
+                             ("VectorExtensions", UNITY_VEXT_SCRIPT, "10")):
+        _write(os.path.join(scripts, name + ".cs"), text)
+        _write(os.path.join(scripts, name + ".cs.meta"),
+               "guid: feat00000000000000000000000000%s\n" % guid)
     _write(os.path.join(scripts, "Save.cs"), UNITY_SAVE_SCRIPT)
     _write(os.path.join(scripts, "Save.cs.meta"),
            "guid: feat0000000000000000000000000006\n")
@@ -576,7 +691,9 @@ def _asan_player(out):
     """The same player, rebuilt from its C with ASan and UBSan."""
     exe = os.path.join(out, "asan_player")
     srcs = [os.path.join(out, n) for n in ("engine.c", "data.c", "main.c")]
-    r = subprocess.run(["gcc", "-std=gnu11", "-g", "-w",
+    # -O1: like the Makefile's build, drop the static UI helpers a headless
+    # player never calls (they name host-only symbols).
+    r = subprocess.run(["gcc", "-std=gnu11", "-g", "-O1", "-w",
                         "-fsanitize=address,undefined",
                         "-fno-sanitize-recover=undefined"] + srcs
                        + ["-o", exe, "-lm"], capture_output=True, text=True)

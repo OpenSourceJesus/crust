@@ -531,6 +531,133 @@ _h("_cs_json_r", "void",
    "    return _engine_str_keep(t.data(), t.size());\n"
    "}", deps=("_cs_read_decimal",))
 
+# -- Clock: Stopwatch, DateTime.Now ------------------------------------------
+# The player is built with gcc: <time.h> is there. Behind the POSIX guard
+# like the file helpers, so the pack's validation through crust's own C
+# front end (which has no <time.h>) still passes; there the clock reads 0.
+
+_h("_engine_clock", "void",
+   "#ifndef CRUST_NO_POSIX_MKDIR\n#include <time.h>\n#endif\n"
+   "/* Monotonic seconds, for Stopwatch. */\n"
+   "static double _engine_clock_s(void) {\n"
+   "#ifndef CRUST_NO_POSIX_MKDIR\n"
+   "    struct timespec ts;\n"
+   "    clock_gettime(CLOCK_MONOTONIC, &ts);\n"
+   "    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;\n"
+   "#else\n"
+   "    return 0.0;\n"
+   "#endif\n}\n"
+   "/* Wall-clock seconds since the epoch, for DateTime.Now. */\n"
+   "static double _engine_wall_s(void) {\n"
+   "#ifndef CRUST_NO_POSIX_MKDIR\n"
+   "    struct timespec ts;\n"
+   "    clock_gettime(CLOCK_REALTIME, &ts);\n"
+   "    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;\n"
+   "#else\n"
+   "    return 0.0;\n"
+   "#endif\n}")
+_h("_cs_stopwatch", "void",
+   "typedef struct { double start; double acc; int running; } _cs_stopwatch;\n"
+   "static _cs_stopwatch _cs_sw_new(int run) {\n"
+   "    _cs_stopwatch w;\n"
+   "    w.acc = 0.0; w.running = run; w.start = run ? _engine_clock_s() : 0.0;\n"
+   "    return w;\n}\n"
+   "static double _cs_sw_elapsed(_cs_stopwatch *w) {\n"
+   "    return w->acc + (w->running ? _engine_clock_s() - w->start : 0.0);\n}\n"
+   "static void _cs_sw_start(_cs_stopwatch *w) {\n"
+   "    if (!w->running) { w->start = _engine_clock_s(); w->running = 1; }\n}\n"
+   "static void _cs_sw_stop(_cs_stopwatch *w) {\n"
+   "    if (w->running) { w->acc = _cs_sw_elapsed(w); w->running = 0; }\n}\n"
+   "static void _cs_sw_reset(_cs_stopwatch *w) { w->acc = 0.0; w->running = 0; }\n"
+   "static void _cs_sw_restart(_cs_stopwatch *w) {\n"
+   "    w->acc = 0.0; w->start = _engine_clock_s(); w->running = 1;\n}\n"
+   "static int _cs_sw_ms(_cs_stopwatch *w) { return (int)(_cs_sw_elapsed(w) * 1000.0); }\n"
+   "static float _cs_sw_s(_cs_stopwatch *w) { return (float)_cs_sw_elapsed(w); }\n"
+   "static float _cs_sw_total_ms(_cs_stopwatch *w) {\n"
+   "    return (float)(_cs_sw_elapsed(w) * 1000.0);\n}\n"
+   "static int _cs_sw_running(_cs_stopwatch *w) { return w->running; }",
+   deps=("_engine_clock",))
+_h("_cs_datetime", "void",
+   "/* DateTime: seconds since the epoch, and whether it is UTC. */\n"
+   "typedef struct { double t; int utc; } _cs_datetime;\n"
+   "static _cs_datetime _cs_dt_now(void) {\n"
+   "    _cs_datetime d; d.t = _engine_wall_s(); d.utc = 0; return d;\n}\n"
+   "static _cs_datetime _cs_dt_utcnow(void) {\n"
+   "    _cs_datetime d; d.t = _engine_wall_s(); d.utc = 1; return d;\n}\n"
+   "/* 0 year, 1 month, 2 day, 3 hour, 4 minute, 5 second, 6 millisecond,\n"
+   "   7 day of year, 8 day of week (0 Sunday) */\n"
+   "static int _cs_dt_part(_cs_datetime d, int which) {\n"
+   "#ifndef CRUST_NO_POSIX_MKDIR\n"
+   "    time_t s = (time_t)d.t;\n"
+   "    struct tm tmv;\n"
+   "    if (d.utc) gmtime_r(&s, &tmv); else localtime_r(&s, &tmv);\n"
+   "    if (which == 0) return tmv.tm_year + 1900;\n"
+   "    if (which == 1) return tmv.tm_mon + 1;\n"
+   "    if (which == 2) return tmv.tm_mday;\n"
+   "    if (which == 3) return tmv.tm_hour;\n"
+   "    if (which == 4) return tmv.tm_min;\n"
+   "    if (which == 5) return tmv.tm_sec;\n"
+   "    if (which == 6) return (int)((d.t - (double)s) * 1000.0);\n"
+   "    if (which == 7) return tmv.tm_yday + 1;\n"
+   "    return tmv.tm_wday;\n"
+   "#else\n"
+   "    (void)d; (void)which;\n"
+   "    return 0;\n"
+   "#endif\n}\n"
+   "/* .NET custom date format: yyyy yy MM M dd d HH H hh h mm m ss s fff ff f\n"
+   "   tt, 'quoted' text, \\\\x; anything else as written. */\n"
+   "static const char *_cs_dt_format(_cs_datetime d, const char *f) {\n"
+   "    fastring t;\n"
+   "    char b[16];\n"
+   "    int n;\n"
+   "    while (*f) {\n"
+   "        char c = *f;\n"
+   "        n = 1;\n"
+   "        while (f[n] == c) n = n + 1;\n"
+   "        if (c == 'y') {\n"
+   "            if (n <= 2) snprintf(b, sizeof b, \"%02d\", _cs_dt_part(d, 0) % 100);\n"
+   "            else snprintf(b, sizeof b, \"%04d\", _cs_dt_part(d, 0));\n"
+   "            t.append_cstr(b);\n"
+   "        } else if (c == 'M' || c == 'd' || c == 'H' || c == 'm' || c == 's'\n"
+   "                   || c == 'h') {\n"
+   "            int v = c == 'M' ? _cs_dt_part(d, 1) : c == 'd' ? _cs_dt_part(d, 2)\n"
+   "                : c == 'm' ? _cs_dt_part(d, 4) : c == 's' ? _cs_dt_part(d, 5)\n"
+   "                : _cs_dt_part(d, 3);\n"
+   "            if (c == 'h') { v = v % 12; if (v == 0) v = 12; }\n"
+   "            snprintf(b, sizeof b, n >= 2 ? \"%02d\" : \"%d\", v);\n"
+   "            t.append_cstr(b);\n"
+   "        } else if (c == 'f') {\n"
+   "            int ms = _cs_dt_part(d, 6);\n"
+   "            if (n >= 3) snprintf(b, sizeof b, \"%03d\", ms);\n"
+   "            else if (n == 2) snprintf(b, sizeof b, \"%02d\", ms / 10);\n"
+   "            else snprintf(b, sizeof b, \"%d\", ms / 100);\n"
+   "            t.append_cstr(b);\n"
+   "        } else if (c == 't') {\n"
+   "            t.append_cstr(_cs_dt_part(d, 3) < 12 ? (n >= 2 ? \"AM\" : \"A\")\n"
+   "                                                : (n >= 2 ? \"PM\" : \"P\"));\n"
+   "        } else if (c == '\\'' || c == '\"') {\n"
+   "            n = 1;\n"
+   "            while (f[n] && f[n] != c) { t.append_char(f[n]); n = n + 1; }\n"
+   "            if (f[n]) n = n + 1;\n"
+   "        } else if (c == '\\\\' && f[1]) {\n"
+   "            t.append_char(f[1]);\n"
+   "            n = 2;\n"
+   "        } else {\n"
+   "            int k;\n"
+   "            for (k = 0; k < n; k = k + 1) t.append_char(c);\n"
+   "        }\n"
+   "        f = f + n;\n"
+   "    }\n"
+   "    return _engine_str_keep(t.data(), t.size());\n}",
+   deps=("_engine_clock",))
+
+# The helpers a script's calls become, with their result kinds.
+for _n, _k in (("_cs_sw_ms", "int"), ("_cs_sw_s", "float"),
+               ("_cs_sw_total_ms", "float"), ("_cs_sw_running", "bool"),
+               ("_cs_dt_part", "int"), ("_cs_dt_format", "string")):
+    _M[_n] = ("", _k, (("_cs_stopwatch",) if _n.startswith("_cs_sw")
+                        else ("_cs_datetime",)), False)
+
 # -- string.GetHashCode -----------------------------------------------------
 
 _h("_cs_str_GetHashCode", "int",
@@ -544,6 +671,105 @@ _h("_cs_str_GetHashCode", "int",
 
 def helper_c(name):
     return _M[name][0]
+
+
+_SW_T = r"(?:System\s*\.\s*Diagnostics\s*\.\s*)?Stopwatch"
+_DT_T = r"(?:System\s*\.\s*)?DateTime"
+_DT_PARTS = {"Year": 0, "Month": 1, "Day": 2, "Hour": 3, "Minute": 4,
+             "Second": 5, "Millisecond": 6, "DayOfYear": 7}
+
+
+def lower_clock(text, used, blank, match_close):
+    """`Stopwatch` and `DateTime.Now` / `UtcNow`, in a method body (C#).
+
+        var sw = Stopwatch.StartNew();   ->  _cs_stopwatch sw = _cs_sw_new(1);
+        sw.Stop();  sw.ElapsedMilliseconds  ->  _cs_sw_stop(&sw);  _cs_sw_ms(&sw)
+        sw.Elapsed.TotalSeconds          ->  _cs_sw_s(&sw)
+        DateTime t = DateTime.Now;       ->  _cs_datetime t = _cs_dt_now();
+        t.Year  DateTime.Now.Hour        ->  _cs_dt_part(t, 0)  _cs_dt_part(_cs_dt_now(), 3)
+        t.ToString("yyyy-MM-dd")         ->  _cs_dt_format(t, "yyyy-MM-dd")
+        t.ToString()                     ->  the invariant culture's general
+                                             form, "MM/dd/yyyy HH:mm:ss"
+
+    A stopwatch or date kept in a field, passed to a method, or subtracted
+    (a TimeSpan) is not lowered, and the method is reported.
+    """
+    class _Groups(object):
+        """A match on the blanked copy, its groups read from the text."""
+
+        def __init__(self, m, t):
+            self.m, self.t = m, t
+
+        def group(self, k=0):
+            a, b = self.m.span(k)
+            return None if a < 0 else self.t[a:b]
+
+    def sub(pat, fn):
+        nonlocal text
+        scan = blank(text)
+        out, last = [], 0
+        for m in re.finditer(pat, scan):
+            out.append(text[last:m.start()])
+            out.append(fn(_Groups(m, text)))
+            last = m.end()
+        out.append(text[last:])
+        text = "".join(out)
+
+    sws, dts = set(), set()
+    # declarations
+    def sw_decl(m):
+        sws.add(m.group(1))
+        used.add("_cs_stopwatch")
+        return "_cs_stopwatch %s = _cs_sw_new(%d)" % (
+            m.group(1), 1 if m.group(2) else 0)
+    sub(r"(?<![\w.])(?:var|%s)\s+(\w+)\s*=\s*(?:%s\s*\.\s*(StartNew)\s*\(\s*\)"
+        r"|new\s+%s\s*\(\s*\))" % (_SW_T, _SW_T, _SW_T), sw_decl)
+
+    def dt_decl(m):
+        dts.add(m.group(1))
+        return "_cs_datetime %s = %s" % (m.group(1), m.group(2))
+    sub(r"(?<![\w.])(?:var|%s)\s+(\w+)\s*=\s*(%s\s*\.\s*(?:Now|UtcNow)\b)"
+        % (_DT_T, _DT_T), dt_decl)
+    # DateTime.Now / UtcNow
+    def dt_now(m):
+        used.add("_cs_datetime")
+        return "_cs_dt_%s()" % ("utcnow" if m.group(1) == "UtcNow" else "now")
+    sub(r"(?<![\w.])%s\s*\.\s*(Now|UtcNow)\b" % _DT_T, dt_now)
+    # stopwatch members
+    if sws:
+        alt = "|".join(re.escape(n) for n in sorted(sws))
+        calls = {"Start": "_cs_sw_start", "Stop": "_cs_sw_stop",
+                 "Reset": "_cs_sw_reset", "Restart": "_cs_sw_restart"}
+        sub(r"(?<![\w.])(%s)\s*\.\s*(Start|Stop|Reset|Restart)\s*\(\s*\)" % alt,
+            lambda m: "%s(&%s)" % (calls[m.group(2)], m.group(1)))
+        props = {"ElapsedMilliseconds": "_cs_sw_ms", "IsRunning": "_cs_sw_running",
+                 "Elapsed.TotalSeconds": "_cs_sw_s",
+                 "Elapsed.TotalMilliseconds": "_cs_sw_total_ms"}
+
+        def sw_prop(m):
+            h = props[re.sub(r"\s", "", m.group(2))]
+            used.add(h)
+            return "%s(&%s)" % (h, m.group(1))
+        sub(r"(?<![\w.])(%s)\s*\.\s*(ElapsedMilliseconds|IsRunning|"
+            r"Elapsed\s*\.\s*TotalSeconds|Elapsed\s*\.\s*TotalMilliseconds)\b"
+            % alt, sw_prop)
+    # date members, on a date local or a Now / UtcNow
+    recv = r"(_cs_dt_(?:now|utcnow)\s*\(\s*\)%s)" % (
+        ("|" + "|".join(r"(?<![\w.])" + re.escape(n) for n in sorted(dts)))
+        if dts else "")
+
+    def dt_part(m):
+        used.add("_cs_dt_part")
+        return "_cs_dt_part(%s, %d)" % (m.group(1), _DT_PARTS[m.group(2)])
+    sub(recv + r"\s*\.\s*(%s)\b" % "|".join(_DT_PARTS), dt_part)
+
+    def dt_fmt(m):
+        used.add("_cs_dt_format")
+        arg = m.group(2).strip()
+        return "_cs_dt_format(%s, %s)" % (
+            m.group(1), arg if arg else '"MM/dd/yyyy HH:mm:ss"')
+    sub(recv + r'\s*\.\s*ToString\s*\(\s*("(?:[^"\\]|\\.)*"|)\s*\)', dt_fmt)
+    return text
 
 
 def helper_kind(name):
@@ -570,7 +796,8 @@ def closure(used):
         seen.add(n)
         for d in _M[n][2]:
             visit(d)
-        order.append(n)
+        if _M[n][0]:                     # a name-only entry has no C
+            order.append(n)
     for n in sorted(used):
         visit(n)
     return order
