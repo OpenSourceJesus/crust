@@ -836,16 +836,126 @@ breaks.
 A Rigidbody2D's authored `m_GravityScale: 0` is kept; it was read as the
 default, 1.
 
+**Frame order.** A frame runs as Unity's player loop does: the fixed
+steps (FixedUpdate, physics), every `Update`, the animation update (its
+curves and Animation Events), then every `LateUpdate`. The animation update
+ran before `Update`, and `LateUpdate` -- emitted -- was never called (a
+camera following in LateUpdate did not move).
+
+**Lifecycle.** Each script instance keeps Unity's lifecycle: awoken,
+started, enabled. A frame's first passes, over every class before the next,
+send each object active in the hierarchy `Awake` (once) then `OnEnable`,
+then `Start` -- every Awake before any Start, every Start before any
+Update. `SetActive` that changes an object's activeInHierarchy sends it and
+its active descendants `OnEnable` (with `Awake` first, if it never woke) or
+`OnDisable`; an object inactive at load wakes when it is first activated
+(it woke at load), and an `Awake` that deactivates its own object leaves it
+disabled. `Destroy` sends `OnDisable` then `OnDestroy`; `Instantiate`,
+`Awake` and `OnEnable` at once. An object that is not enabled runs no
+`Update` / `FixedUpdate` / `LateUpdate` (an inactive one updated). Before,
+`OnEnable` was never emitted and `OnDisable` / `OnDestroy` never sent. A
+GameObject field or local's `SetActive(..)` is lowered too (it was left).
+
+**Animation Events.** A clip's `m_Events` call, as its time crosses them,
+the method of that name on the animated GameObject's scripts (Unity's
+SendMessage): with no parameter, or the event's float / int / string when
+the method takes one (an `AnimationEvent` / `Object` parameter is not
+passed: that event is skipped). A looping clip's events fire again each
+loop; one at 0 fires on the first frame; played backwards (a negative
+speed) they fire as its time falls past them. The handler is kept even
+when nothing else calls it.
+
+**uGUI.** CanvasScaler's *Constant Physical Size* is Unity's: the screen
+DPI over the unit's (centimetres 2.54, millimetres 25.4, inches 1, points
+72, picas 6); a packed player's DPI is not known when it is packed, so it is
+the scaler's `m_FallbackScreenDPI` (96), as Unity uses for a screen that
+reports none -- it was a scale of 1. **ToggleGroup**: a toggle's `m_Group`
+makes it a radio button -- turning one on turns the group's others off,
+their `onValueChanged(false)` first, and without `m_AllowSwitchOff` the one
+that is on cannot be clicked off. A script's `isOn = v` is Unity's
+`Toggle.Set` -- the checkmark, the group and `onValueChanged`, as a click
+(it set the value alone: the checkmark stayed); `SetIsOnWithoutNotify(v)`
+the same without the callbacks. At start the group is made valid, as
+`ToggleGroup.EnsureValidState` does: at most one toggle on, and without
+allowSwitchOff exactly one (the first, when none is). **ScrollRect**: the normalized position is Unity's
+`SetNormalizedPosition` in the viewport's local units -- the content's min
+edge at `-value * hidden`, whatever its pivot and anchors; it assumed a
+top-left content and mixed the canvas-scaled screen sizes into
+`anchoredPosition`. The mouse wheel over it scrolls it, as `OnScroll` does
+(`scrollSensitivity`; Clamped stays in bounds). Dragging is the same: the pointer's delta in the
+viewport's units, and the content's bounds whatever its pivot. The
+`movementType` is read -- Unrestricted, Elastic (past a bound the drag
+stretches by Unity's RubberDelta, and on release SmoothDamps back over
+`elasticity`) and Clamped -- and `inertia` keeps a released content moving,
+its velocity falling by `decelerationRate` a second. **EventTrigger**: the input module's order -- Down and
+InitializePotentialDrag on press; BeginDrag only once the pointer has moved
+10 px (it came on press), then Drag each frame it moves; on release Up,
+Click, Drop (on the one under the pointer) and EndDrag, the last two only
+after a drag began (EndDrag came before Click, on every release).
+
+**Input.** The host reports the mouse wheel (`engine_scroll_x / _y`,
+notches since the last frame, y > 0 away; the example GLFW hosts' scroll
+callback): `Input.mouseScrollDelta`, `Input.GetAxis("Mouse ScrollWheel")`
+(0.1 a notch) and `Mouse.current.scroll` (120 a notch, as Windows reports
+it -- Unity's varies by platform). And the first gamepad
+(`engine_gamepad_connected / _button[15] / _axis[6]`, GLFW's layout):
+`Gamepad.current` -- null when none -- its buttons (Unity's names and
+aliases: buttonSouth / aButton / crossButton ..; the triggers press past
+0.5) `isPressed` / `wasPressedThisFrame` / `wasReleasedThisFrame`, its sticks,
+triggers and dpad `ReadValue()`; `var gp = Gamepad.current; if (gp == null)
+..` works (it was refused).
+
+**InputAction** (tools/unity_pack_input.py): an action's bindings are
+resolved when the project is packed -- the code's (`new InputAction(binding:
+..)`, `AddBinding`, `AddCompositeBinding("2DVector" / "1DAxis").With(..)`),
+or, for none, the Inspector's (the scene's `m_SingletonActionBindings`) --
+into the engine's tables, evaluated each frame over the keyboard, gamepad
+and wheel: `Enable` / `Disable`, `ReadValue<float / Vector2>()` (the most
+actuated binding; a 2D composite's normalized digital vector),
+`IsPressed()`, `WasPressedThisFrame()`, `WasReleasedThisFrame()`,
+`triggered` (0.5, the default press point). `started` / `performed` /
+`canceled += handler` (a method taking the CallbackContext, or a lambda;
+`-=` too) fire before Update -- a button's as it is pressed / released, a
+value's as it becomes actuated / changes / rests -- with the context's
+`ReadValue<T>()`, `ReadValueAsButton()` and phase. An action with no binding
+the pack can read is reported. Interactions, processors, action assets and
+PlayerInput are not read. (A multi-name field declaration, `int a, b;`,
+still declares the first name alone.)
+
+**ParticleSystem** (tools/unity_pack_particles.py): the component's main,
+emission and shape modules are read -- lifetime, speed, size and color (a
+constant, or random between two; a curve's scalar), gravity modifier,
+duration, looping, play on awake, simulation space and speed, rate over
+time and bursts, a cone along the emitter's +Z (as its rotation turns it) or
+a sphere / circle -- and simulated after LateUpdate, the particles drawn as
+squares of their color (the draw list's `tex -2`, a white texel in the
+example hosts). Scripts: `Play`, `Stop` (stops emitting; the particles live
+on), `Pause`, `Clear`, `Emit(n)`, `isPlaying`, `isEmitting`, `isPaused`,
+`isStopped`, `particleCount`, on a field (serialized or GetComponent's), a
+local or `GetComponent<ParticleSystem>()`. The other modules (over-lifetime
+curves, noise, collision, sub-emitters, trails) and the renderer's material
+are not read; `AddComponent<ParticleSystem>` stays refused.
+
 **Authored zeros.** A value authored as 0 is kept where 0 is not the
 default: a Rigidbody2D's `m_GravityScale`, an Animation / Animator's speed
 (a paused one), a Slider's `m_MaxValue` (a -1..0 slider) and a
 Scrollbar's `m_Size` were read as missing and given the default.
 
 **Animated rotation and scale.** An AnimationClip's `m_EulerCurves` and
-`m_ScaleCurves` on the root drive the owner's rotation (Euler degrees,
-sampled in Euler space as Unity's Euler curves are, turned into the
-quaternion in Unity's Z-X-Y order) and localScale x / y; they were parsed
-and dropped, only `m_PositionCurves` animating. The owner keeps live
+`m_ScaleCurves` drive rotation (Euler degrees, sampled in Euler space as
+Unity's Euler curves are, turned into the quaternion in Unity's Z-X-Y
+order) and localScale x / y; they were parsed and dropped, only the root's
+`m_PositionCurves` animating. Every curve but the root's position is a
+*track*, and each player binds its clip's tracks to their targets when it
+is packed: its own Transform, or the child the curve's `path` names -- so a
+child's position, rotation and scale animate too (a child whose class is
+packed static keeps its position, with a warning).
+
+**Curve tangents.** Keys are evaluated as Unity evaluates them: a cubic
+Hermite from each key's `outSlope` and the next key's `inSlope`, scaled by
+the segment's length (eased motion, overshoot); an infinite slope -- a
+"constant" key -- holds the value until the next key. A key without slopes
+gets the straight line's, so it is sampled linearly, as before. The owner keeps live
 rotation / scale tables, and `transform.eulerAngles.z` and
 `transform.localScale.x / y` read them. A clip that is not looping and is
 played backwards (a negative speed) now stops at its start.
