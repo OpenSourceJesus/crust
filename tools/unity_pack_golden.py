@@ -19,8 +19,9 @@ what makes a check take seconds rather than an hour). A case that failed
 keeps its error message instead, and is replayed with validation on, since
 that may be where it failed.
 
-Committed: `tests/unity_golden/corpus.json`. Full outputs are cached in
-`$TMPDIR/unity_golden_cache` for diffs. A project under
+The corpus, `tests/unity_golden/corpus.json`, is not in git: record it on
+the code you start from, before a change, and check against it after. Full
+outputs are cached in `$TMPDIR/unity_golden_cache` for diffs. A project under
 `examples/unity_pack/SystemsScene` -- whose scene is not in the repository
 -- is recorded to `local.json` beside the cache instead, and checked when
 present.
@@ -202,7 +203,7 @@ def record():
     os.makedirs(CACHE, exist_ok=True)
     # Without the local projects (SystemsScene's scene is not in the
     # repository) their tests skip and record nothing: keep what an earlier
-    # recording stored rather than wiping it. And say that the committed
+    # recording stored rather than wiping it. And say that the recorded
     # cases those tests make after packing SystemsScene are missing too.
     have_local = any(os.path.isfile(os.path.join(r, "Assets", "Scenes",
                                                  "Systems.unity"))
@@ -231,6 +232,12 @@ def _cache(cid, outs):
 
 def check(verbose=False, only=None):
     """Re-pack every case; report any whose output changed."""
+    if not os.path.isfile(CORPUS):
+        sys.stderr.write(
+            "no corpus at %s: it is not in git. Run `record` on the code "
+            "you start from, then `check` after changing it.\n"
+            % os.path.relpath(CORPUS, ROOT))
+        return 2
     corpus = json.load(open(CORPUS))
     if os.path.isfile(LOCAL):
         corpus.update(json.load(open(LOCAL)))
