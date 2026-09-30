@@ -731,6 +731,98 @@ class TestGodot(unittest.TestCase):
                       engine)
 
 
+    def test_spawning_passes_the_pipeline(self):
+        """PackedScene templates, Instantiate and AddChild stay in the crust
+        subset: packed through cpprust + crust. (Their behaviour is tested
+        in tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        t = fast.TestSpawning("test_refusals")
+        d = t._gun(scene=fast.GUN_SCENE + (
+            '\n[node name="Launcher" type="Node2D" parent="."]\n'
+            'script = ExtResource("s_Launcher")\n'),
+            scripts={"Launcher.cs": fast.LAUNCHER_CS})
+        self.addCleanup(t.doCleanups)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True)
+        self.assertIn("Bullet", plan["godot_spawn"])
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("static void _godot_add_child(int pc, unsigned pi,",
+                      engine)
+        self.assertIn("int _Bullet_spr_row[", engine)
+
+
+    @needs_box2d
+    def test_spawned_physics_passes_the_pipeline(self):
+        """A spawned scene's physics body -- its pool of dormant rows, the
+        clone's Rigidbody2D row reset, AddChild making it global -- stays
+        in the crust subset: cpprust + crust. (Its behaviour is tested in
+        tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        root = self._copy()
+        with open(os.path.join(root, "ball.tscn"), "w") as f:
+            f.write('[gd_scene format=3]\n'
+                    '[ext_resource type="Script" path="res://scripts/Ball.cs" '
+                    'id="2"]\n'
+                    '[sub_resource type="CircleShape2D" id="c"]\n'
+                    'radius = 10.0\n'
+                    '[node name="Ball" type="RigidBody2D"]\n'
+                    'script = ExtResource("2")\n'
+                    '[node name="Shape" type="CollisionShape2D" parent="."]\n'
+                    'shape = SubResource("c")\n')
+        with open(os.path.join(root, "scripts", "Ball.cs"), "w") as f:
+            f.write("using Godot;\npublic partial class Ball : RigidBody2D "
+                    "{\n    public int Hp = 1;\n}\n")
+        with open(os.path.join(root, "scripts", "Dropper.cs"), "w") as f:
+            f.write("using Godot;\npublic partial class Dropper : Node2D {\n"
+                    "    public override void _Ready() {\n"
+                    "        Ball b = GD.Load<PackedScene>(\"res://ball.tscn\")"
+                    ".Instantiate<Ball>();\n"
+                    "        AddChild(b);\n    }\n}\n")
+        self._edit(os.path.join(root, "main.tscn"), "[node name=\"Main\"",
+                   "[ext_resource type=\"Script\" "
+                   "path=\"res://scripts/Dropper.cs\" id=\"dr\"]\n\n"
+                   "[node name=\"Main\"")
+        with open(os.path.join(root, "main.tscn"), "a") as f:
+            f.write('\n[node name="Dropper" type="Node2D" parent="."]\n'
+                    'script = ExtResource("dr")\n')
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(root, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertEqual(plan["godot_pooled"], ["Ball"])
+        self.assertEqual(sum(1 for r in plan["rigidbody2d"]
+                             if r["owner_class"] == "Ball"),
+                         1 + fast.godot.DEFAULT_SPAWN_BUDGET)
+
+
+    def test_spawned_wiring_passes_the_pipeline(self):
+        """A spawned scene's Timers, its internal connections (a table
+        each), a reference to its own Timer and an absolute path stay in
+        the crust subset: cpprust + crust. (Their behaviour is tested in
+        tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        t = fast.TestSpawning("test_refusals")
+        d = fast.project(t, fast.SPAWN_MINES_SCENE,
+                         scripts=fast.SPAWN_MINES_SCRIPTS,
+                         subs='[ext_resource type="PackedScene" '
+                              'path="res://mine.tscn" id="mn"]\n\n')
+        self.addCleanup(t.doCleanups)
+        with open(os.path.join(d, "mine.tscn"), "w") as f:
+            f.write(fast.SPAWN_MINE_TSCN)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True)
+        self.assertEqual([(c["from_class"], c["signal"], c["to_class"])
+                          for c in plan["godot_conns"]],
+                         [("Mine", "Exploded", "Sound"),
+                          ("Fuse", "timeout", "Mine")])
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("static int _godot_conn_0[", engine)
+        self.assertIn("_godot_timer_fresh[", engine)
+
+
 class TestBuildSettingsAndActive(unittest.TestCase):
     """EditorBuildSettings first-enabled scene + authored m_IsActive."""
 
