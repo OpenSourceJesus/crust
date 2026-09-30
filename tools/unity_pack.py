@@ -6330,7 +6330,9 @@ def _fields_in(body, bscan, body_abs=0):
     bscan = _blank_method_bodies(bscan)
     out = []
     for m in re.finditer(
-            r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+            # A line's first member, or one after another's `;` on the same
+            # line (method bodies are blanked, so no `for (..; ..)`).
+            r"(?m)(?:^|(?<=;))[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:const[ \t]+)?(?:readonly[ \t]+)?"
             # Types may be generics: Dictionary<int, int> / List<Foo>, or T[].
             r"([\w.]+(?:\s*<[^>;{\n]+>)?(?:\s*\[\s*\])?)[ \t]+(\w+)[ \t]*(=|;)",
@@ -13259,6 +13261,123 @@ def _emit_engine_class_groups(
         p("")
 
 
+def _emit_godot_global_helpers(class_ids, p, plan):
+    """Godot's GlobalPosition of a node that may have a parent: read through
+    the parents (_engine_world_pos), and assigned as the local position
+    that puts it there -- the parent's world taken away and its rotation /
+    scale inverted."""
+    bases = _godot_bases(plan)
+    pos = [(cid, _c_ident(cname)) for cname, cid in sorted(
+        class_ids.items(), key=lambda kv: kv[1])
+        if _class_has_position(plan["classes"][cname])]
+    for ax in "xy":
+        p("static float _godot_g%s(int c, unsigned i) {" % ax)
+        p("    float x, y, z;")
+        p("    _engine_world_pos(c, i, &x, &y, &z, 0);")
+        p("    return %s;" % ax)
+        p("}")
+    p("static void _godot_set_global(int c, unsigned i, float wx, float wy) {")
+    p("    int pc = -1;")
+    p("    unsigned pi = 0u;")
+    p("    float lx = wx, ly = wy;")
+    if bases:
+        p("    const float *b = 0;")
+    p("    switch (c) {")
+    for cid, idn in pos:
+        p("    case %d:" % cid)
+        p("        pc = _%s_xf_parent_class[i];" % idn)
+        p("        pi = _%s_xf_parent_inst[i];" % idn)
+        if bases:
+            p("        b = _%s_xf_basis[i];" % idn)
+        p("        break;")
+    p("    default: return;")
+    p("    }")
+    p("    if (pc >= 0) {")
+    p("        float px, py, pz, dx, dy;")
+    p("        _engine_world_pos(pc, pi, &px, &py, &pz, 0);")
+    p("        dx = wx - px;")
+    p("        dy = wy - py;")
+    p("        lx = dx;")
+    p("        ly = dy;")
+    if bases:
+        p("        if (b) {")
+        p("            float det = b[0] * b[3] - b[1] * b[2];")
+        p("            if (det != 0.f) {")
+        p("                lx = (b[3] * dx - b[1] * dy) / det;")
+        p("                ly = (b[0] * dy - b[2] * dx) / det;")
+        p("            }")
+        p("        }")
+    p("    }")
+    p("    switch (c) {")
+    for cid, idn in pos:
+        p("    case %d: %s_set_pos_x(i, lx); %s_set_pos_y(i, ly); break;"
+          % (cid, idn, idn))
+    p("    default: break;")
+    p("    }")
+    p("}")
+    p("")
+
+
+def _godot_new_vector_assign(text, target, lower):
+    """`<target> = new Vector2(A, B);` (target a regex) as `lower(A, B)`."""
+    out, last = [], 0
+    scan = cs2cpp._blank(text)
+    for m in re.finditer(r"(%s)\s*=\s*new\s+Vector[23]\s*\(" % target, scan):
+        if m.start() < last:
+            continue
+        close = _match_close(scan, m.end() - 1, "(", ")")
+        if close is None:
+            continue
+        args = cs2cpp.split_call_args(text[m.end():close])
+        sm = re.match(r"\s*;", scan[close + 1:])
+        if len(args) < 2 or not sm:
+            continue
+        out.append(text[last:m.start()])
+        out.append(lower(m, args[0].strip(), args[1].strip()))
+        last = close + 1 + sm.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _godot_free_tree(plan, cap):
+    """(first child, next sibling) per GameObject of a Godot pack's scene
+    tree (godot_tree_parent), the children in reverse order; None without
+    children."""
+    by_id, parent_of, order = {}, {}, []
+    for cname, cl in sorted(plan["classes"].items()):
+        for o in cl.get("instances") or []:
+            gi = o.get("go_index")
+            if gi is None or int(gi) >= cap:
+                continue
+            gi = int(gi)
+            if o.get("xf_id"):
+                by_id[o["xf_id"]] = gi
+            if o.get("godot_tree_parent"):
+                parent_of[gi] = o["godot_tree_parent"]
+            order.append((tuple(o.get("godot_tree_index") or (0, 0)), gi))
+    first = [-1] * cap
+    sib = [-1] * cap
+    # tree order, so reversing it frees the last child first
+    for _path, gi in sorted(order):
+        pgo = by_id.get(parent_of.get(gi))
+        if pgo is None:
+            continue
+        sib[gi] = first[pgo]
+        first[pgo] = gi
+    if all(v < 0 for v in first):
+        return None
+    return first, sib
+
+
+def _godot_bases(plan):
+    """Whether a Godot child's parent is rotated or scaled (its local
+    position is then in the parent's frame)."""
+    return bool(plan.get("godot")) and any(
+        tuple(o.get("godot_parent_basis") or (1.0, 0.0, 0.0, 1.0))
+        != (1.0, 0.0, 0.0, 1.0)
+        for cl in plan["classes"].values() for o in cl.get("instances") or [])
+
+
 def _emit_engine_world_positions(
         class_ids, p, plan, want_get_sibling, want_go_tables, want_set_parent):
     """emit_engine: World positions through Transform parents."""
@@ -13279,6 +13398,15 @@ def _emit_engine_world_positions(
             while len(pcs) < n:
                 pcs.append("-1")
                 pis.append("0")
+            if _godot_bases(plan):
+                # Godot: the parent's global rotation and scale, which a
+                # child's local position is in (godot_parent_basis)
+                bs = [o.get("godot_parent_basis") or (1.0, 0.0, 0.0, 1.0)
+                      for o in cl["instances"]]
+                bs += [(1.0, 0.0, 0.0, 1.0)] * (n - len(bs))
+                p("static const float _%s_xf_basis[%d][4] = { %s };" % (
+                    idn, n, ", ".join("{ %s }" % ", ".join(
+                        "%sf" % repr(float(v)) for v in b) for b in bs)))
             if want_set_parent:
                 p("static int _%s_xf_parent_class[%d] = { %s };"
                   % (idn, n, ", ".join(pcs)))
@@ -13297,6 +13425,8 @@ def _emit_engine_world_positions(
         p("    float lx = 0.f, ly = 0.f, lz = 0.f;")
         p("    int pc = -1;")
         p("    unsigned pi = 0u;")
+        if _godot_bases(plan):
+            p("    const float *b = 0;")
         p("    if (depth > 64) { *x = 0.f; *y = 0.f; *z = 0.f; return; }")
         p("    switch (class_id) {")
         for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
@@ -13313,6 +13443,8 @@ def _emit_engine_world_positions(
                 p("        lz = %s_get_pos_z(inst);" % idn)
             p("        pc = _%s_xf_parent_class[inst];" % idn)
             p("        pi = _%s_xf_parent_inst[inst];" % idn)
+            if _godot_bases(plan):
+                p("        b = _%s_xf_basis[inst];" % idn)
             p("        break;")
         p("    default:")
         p("        *x = 0.f; *y = 0.f; *z = 0.f;")
@@ -13322,12 +13454,21 @@ def _emit_engine_world_positions(
         p("    {")
         p("        float px, py, pz;")
         p("        _engine_world_pos(pc, pi, &px, &py, &pz, depth + 1);")
+        if _godot_bases(plan):
+            p("        if (b) { /* Godot: local is in the parent's frame */")
+            p("            *x = px + b[0] * lx + b[1] * ly;")
+            p("            *y = py + b[2] * lx + b[3] * ly;")
+            p("            *z = pz + lz;")
+            p("            return;")
+            p("        }")
         p("        *x = px + lx;")
         p("        *y = py + ly;")
         p("        *z = pz + lz;")
         p("    }")
         p("}")
         p("")
+        if plan.get("godot"):
+            _emit_godot_global_helpers(class_ids, p, plan)
 
         if want_set_parent and want_go_tables:
             go_n = max(1, len(plan.get("go_names") or []))
@@ -14920,6 +15061,14 @@ def _emit_engine_box2d_exports(
                 p("    (void)p0x; (void)p0y; (void)p1x; (void)p1y;")
             p("}")
             p("")
+        # A destroyed GameObject's bodies leave the simulation (Destroy,
+        # Godot's QueueFree): the glue's live gate disables them. They
+        # stayed, and were still hit.
+        plan["_live_destroy"] = bool(
+            plan.get("_want_destroy") and plan.get("_go_of_fn")
+            and (plan.get("collider2d") or plan.get("rigidbody2d")))
+        if plan["_live_destroy"]:
+            plan["physics2d_live"] = True
         if plan.get("physics2d_live"):
             p("/* Whether a body's GameObject is in the simulation (active, in a")
             p(" * loaded scene); the glue disables the bodies that are not. */")
@@ -14931,16 +15080,22 @@ def _emit_engine_box2d_exports(
             p("    default: return -1;")
             p("    }")
             p("}")
+            live = []
+            if _multi_scene(plan):
+                live.append("_engine_go_active_in_hierarchy(go)")
+            if plan.get("_live_destroy"):
+                live.append("!_engine_go_destroyed[go]")
+            live = " && ".join(live) or "1"
             p("int engine_rb2d_live(int rb) {")
             p("    int go = _engine_owner_go(_Rigidbody2D_owner_class[rb],")
             p("                              (unsigned)_Rigidbody2D_owner_inst[rb]);")
-            p("    return go < 0 || _engine_go_active_in_hierarchy(go);")
+            p("    return go < 0 || (%s);" % live)
             p("}")
             p("int engine_col2d_live(int ci) {")
             if want_col2d and col2d_list:
                 p("    int go = _engine_owner_go(_Collider2D_owner_class[ci],")
                 p("                              (unsigned)_Collider2D_owner_inst[ci]);")
-                p("    return go < 0 || _engine_go_active_in_hierarchy(go);")
+                p("    return go < 0 || (%s);" % live)
             else:
                 p("    return ci >= 0;")
             p("}")
@@ -15349,8 +15504,9 @@ def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_ani
 
 def _emit_engine_class_draws(
         any_sprite, class_ids, go_names, has_cam, mutable_spr, p, plan, ui_buttons,
-        want_live_rt, want_ui):
-    """emit_engine: Per-class sprite draws."""
+        want_live_rt, want_ui, want_destroy=False):
+    """emit_engine: Per-class sprite draws. A destroyed GameObject's sprite
+    is not drawn (Destroy, Godot's QueueFree)."""
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         if not _class_has_position(cl):
@@ -15394,6 +15550,19 @@ def _emit_engine_class_draws(
                 for _i, sp in spr_idx))
             p("        static const float _spr_m11[] = { %s };" % ", ".join(
                 "%sf" % repr(float(sp.get("m11", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
+        # A draw centred off its object's origin (Godot's Sprite2D offset /
+        # centered): a constant world offset, rotation and scale being
+        # fixed where it is used.
+        use_off = any(float(sp.get("draw_off_x") or 0.0)
+                      or float(sp.get("draw_off_y") or 0.0)
+                      for _i, sp in spr_idx)
+        if use_off:
+            p("        static const float _spr_ox[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("draw_off_x") or 0.0))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_oy[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("draw_off_y") or 0.0))
                 for _i, sp in spr_idx))
         p("        static const int _spr_layer[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
@@ -15475,6 +15644,9 @@ def _emit_engine_class_draws(
         p("        int k;")
         p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
         p("            unsigned i = _spr_i[k];")
+        if want_destroy and plan.get("_go_of_fn"):
+            p("            if (_engine_go_destroyed[_engine_go_of_%s(i)])" % idn)
+            p("                continue;")
         if want_ui:
             p("            if (_spr_go[k] >= 0) {")
             p("                if (!_engine_go_active_in_hierarchy(_spr_go[k]))")
@@ -15510,6 +15682,9 @@ def _emit_engine_class_draws(
                     p(ind + "}")
                 p(ind + "out[n].x = %s_get_pos_x(i);" % idn)
                 p(ind + "out[n].y = %s_get_pos_y(i);" % idn)
+            if use_off:
+                p(ind + "out[n].x = out[n].x + _spr_ox[k];")
+                p(ind + "out[n].y = out[n].y + _spr_oy[k];")
             if use_mut:
                 p(ind + "out[n].half_w = _%s_draw_hw[i];" % idn)
                 p(ind + "out[n].half_h = _%s_draw_hh[i];" % idn)
@@ -15790,6 +15965,7 @@ def emit_engine(plan, analyses, used_apis):
                or authored_inactive or _plan_has_ui_draws(plan)
                or _multi_scene(plan))
     plan["physics2d_live"] = _multi_scene(plan)
+    plan["_want_destroy"] = bool(want_destroy)
     rt_apis = (
         "rectTransform.anchoredPosition" in used_apis
         or "rectTransform.sizeDelta" in used_apis)
@@ -16098,6 +16274,8 @@ def emit_engine(plan, analyses, used_apis):
         p("        _gp_now[k] = (unsigned char)_gp_btn(k);")
         p("    }")
         p("}")
+    if plan.get("godot_input"):
+        _godot.emit_input(p, plan)
     plan["_ia_code"] = _ia_code if _cm.SOURCE_INPUT_ACTIONS else ""
     plan["want_scroll"] = ("Input.mouseScrollDelta" in used_apis
                            or bool(plan.get("ui_scrollrects")))
@@ -16175,6 +16353,9 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const int _Collider2D_count;")
         p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h */" % nc)
         p("extern const int _Collider2D_is_trigger[%d];" % nc)
+        if plan.get("physics2d_layers"):
+            p("extern const unsigned _Collider2D_layer_bits[%d];" % nc)
+            p("extern const unsigned _Collider2D_mask_bits[%d];" % nc)
         p("extern const int _Collider2D_layer[%d];" % nc)
         p("extern const int _Collider2D_body_type[%d]; /* 0 dyn 1 kin 2 static */"
           % nc)
@@ -16483,8 +16664,25 @@ def emit_engine(plan, analyses, used_apis):
         p("static int _engine_go_destroyed[%d];" % go_cap_d)
         if want_go_tables:
             p("static void _engine_go_message(int go, int msg);")
+        tree = _godot_free_tree(plan, go_cap_d) if plan.get("godot") else None
+        if tree:
+            # Godot's queue_free frees the node's subtree: its children
+            # first, in reverse order (_propagate_exit_tree)
+            first, sib = tree
+            p("static const int _godot_go_child[%d] = { %s };" % (
+                go_cap_d, ", ".join(str(v) for v in first)))
+            p("static const int _godot_go_sib[%d] = { %s };" % (
+                go_cap_d, ", ".join(str(v) for v in sib)))
         p("static void Object_Destroy(int go) {")
         p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;" % go_cap_d)
+        if tree:
+            p("    {")
+            p("        int c = _godot_go_child[go];")
+            p("        while (c >= 0) {")
+            p("            Object_Destroy(c);")
+            p("            c = _godot_go_sib[c];")
+            p("        }")
+            p("    }")
         if want_go_tables:
             p("    _engine_go_message(go, 2); /* OnDisable, OnDestroy */")
         p("    _engine_go_destroyed[go] = 1;")
@@ -16906,9 +17104,42 @@ def emit_engine(plan, analyses, used_apis):
                     c["properties"])
     if plan.get("godot_signals"):
         _godot.emit_signal_decls(p)
+    if plan.get("godot"):
+        # A node reference reads another class's position (_handle_positions)
+        # wherever the classes are emitted: their getters, before them all.
+        for cname, gcl in sorted(plan["classes"].items()):
+            if not _class_has_position(gcl):
+                continue
+            dims = gcl.get("soa_dims") or (2 if gcl.get("two_d") else 3)
+            for ax in "xyz"[:dims]:
+                p("static float %s_get_pos_%s(unsigned i);" % (
+                    _c_ident(cname), ax))
+                p("static void %s_set_pos_%s(unsigned i, float v);" % (
+                    _c_ident(cname), ax))
+        if plan.get("has_transform_parents"):
+            # a node's global position through its parents (world helpers)
+            p("static float _godot_gx(int c, unsigned i);")
+            p("static float _godot_gy(int c, unsigned i);")
+            p("static void _godot_set_global(int c, unsigned i, float wx,"
+              " float wy);")
+        # A node's Name: its node's, fixed (godot_pack's OwnName / GodotName).
+        for cname, gcl in sorted(plan["classes"].items()):
+            names = [o.get("name") or "" for o in gcl.get("instances") or []]
+            p("static const char *GodotNodeName_%s(unsigned i) {" % _c_ident(
+                cname))
+            p("    static const char *const n[%d] = { %s };" % (
+                max(1, len(names)), ", ".join(_c_string(x) for x in names)
+                or '""'))
+            p("    return i < %du ? n[i] : \"\";" % len(names))
+            p("}")
+    if plan.get("godot_custom"):
+        plan["_godot_destroy"] = bool(want_destroy and plan.get("go_names"))
+        _godot.emit_custom_decls(p, plan, _c_ident)
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
+    if plan.get("godot_custom"):
+        _godot.emit_custom_dispatch(p, plan, _c_ident, want_go_tables)
     _parts.emit_sim(p, plan, class_ids, _c_ident, _class_has_position)
 
     # Live Transform hierarchy (m_Father): world = parent_world + local.
@@ -16943,9 +17174,37 @@ def emit_engine(plan, analyses, used_apis):
         p("    _engine_world_pos(Camera_main_xf_parent_class,")
         p("                     Camera_main_xf_parent_inst,")
         p("                     &px, &py, &pz, 0);")
-        p("    Camera_main_pos_x = px + Camera_main_local_x;")
-        p("    Camera_main_pos_y = py + Camera_main_local_y;")
-        p("    Camera_main_pos_z = pz + Camera_main_local_z;")
+        gv = cam.get("godot_view")
+        if gv:
+            # Camera2D::get_camera_transform: the screen rect anchored at the
+            # camera node, clamped to the limits, then moved by offset.
+            hw, hh = gv["half"]
+            lim = gv["limits"]
+            p("    {")
+            p("        float x0 = px + Camera_main_local_x%s;"
+              % (" - %sf" % repr(float(hw)) if gv["drag_center"] else ""))
+            p("        float y0 = py + Camera_main_local_y%s;"
+              % (" - %sf" % repr(float(hh)) if gv["drag_center"] else ""))
+            p("        if (x0 < %sf) x0 = %sf;" % (repr(float(lim[0])),
+                                                  repr(float(lim[0]))))
+            p("        if (x0 + %sf > %sf) x0 = %sf;" % (
+                repr(2.0 * hw), repr(float(lim[2])),
+                repr(float(lim[2]) - 2.0 * hw)))
+            p("        if (y0 < %sf) y0 = %sf;" % (repr(float(lim[1])),
+                                                  repr(float(lim[1]))))
+            p("        if (y0 + %sf > %sf) y0 = %sf;" % (
+                repr(2.0 * hh), repr(float(lim[3])),
+                repr(float(lim[3]) - 2.0 * hh)))
+            p("        Camera_main_pos_x = x0 + %sf;"
+              % repr(float(gv["offset"][0]) + hw))
+            p("        Camera_main_pos_y = y0 + %sf;"
+              % repr(float(gv["offset"][1]) + hh))
+            p("    }")
+            p("    (void)pz;")
+        else:
+            p("    Camera_main_pos_x = px + Camera_main_local_x;")
+            p("    Camera_main_pos_y = py + Camera_main_local_y;")
+            p("    Camera_main_pos_z = pz + Camera_main_local_z;")
         p("}")
         p("")
 
@@ -17059,6 +17318,8 @@ def emit_engine(plan, analyses, used_apis):
         p("    _engine_gamepad_latch();")
     if plan.get("_ia_code"):
         p("    _ia_latch();")
+    if plan.get("godot_input"):
+        p("    _godot_input_latch();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
@@ -17081,6 +17342,10 @@ def emit_engine(plan, analyses, used_apis):
     p("    }")
     for cname in sorted(plan["classes"]):
         p("    %s_Tick();" % _c_ident(cname))
+    if (plan.get("godot_custom") or {}).get("timers"):
+        # Godot ticks a Timer in tree order with the _process calls; it is
+        # most often after the scripts it serves (a child, a later sibling).
+        p("    _godot_timers_tick(_dt); /* idle Timers, after _Process */")
     for fn in iface_tick_fns:
         p("    %s();" % fn)
     # Unity's order: Update, then the animation update (its events), then
@@ -17172,7 +17437,7 @@ def emit_engine(plan, analyses, used_apis):
     go_names = plan.get("go_names") or []
     any_sprite = _emit_engine_class_draws(
             any_sprite, class_ids, go_names, has_cam, mutable_spr, p, plan, ui_buttons,
-            want_live_rt, want_ui)
+            want_live_rt, want_ui, want_destroy)
     if plan.get("particles"):
         p("    _ps_collect(out, &n, max);")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
@@ -20579,6 +20844,106 @@ def _lower_go_active_reads(text, cl, site):
     return text
 
 
+def _handle_method_calls(text, plan, holds):
+    """`other.Do(a)` through a reference to another packed object -- a
+    field, a local or a parameter of its class (*holds*: name -> class) --
+    is that class's instance method on it: `Other_Do(other, a)`. It was
+    `Other_AT(..).Do(a)`, which C has no member for. `other` is left for
+    the field / local lowering after."""
+    by = plan.get("_methods_by") or {}
+    for recv, other in sorted(holds.items()):
+        names = {m["name"] for _c, m in by.get(other, [])
+                 if m.get("name") and not m.get("static")}
+        if not names:
+            continue
+        pat = r"(?<![\w.])(?:this\s*\.\s*)?(%s)\s*\.\s*(%s)\s*\(\s*(\)?)" % (
+            re.escape(recv), "|".join(re.escape(n) for n in sorted(
+                names, key=len, reverse=True)))
+        text = cs2cpp.code_sub(
+            pat, lambda m, o=_c_ident(other): "%s_%s(%s%s" % (
+                o, m.group(2), m.group(1), ")" if m.group(3) else ", "),
+            text)
+    return text
+
+
+def _reference_holds(text, cl, plan, site):
+    """{name: class} of the references to other packed objects a method
+    can see: its class's fields of their types, its parameters and its
+    locals."""
+    classes = plan.get("classes") or {}
+    holds = {}
+    for name, _ty, _bits, kind in cl.get("members") or ():
+        other = str(kind).split(":", 1)[1] if str(kind).startswith(
+            "idx:") else None
+        if other in classes:
+            holds[name] = other
+    for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
+        if prm.type in classes:
+            holds[prm.name] = prm.type
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[=;]",
+                         cs2cpp._blank(text)):
+        if m.group(1) in classes:
+            holds[m.group(2)] = m.group(1)
+    return holds
+
+
+def _handle_positions(text, plan, holds):
+    """`other.transform.position.x` (or `localPosition`) read through a
+    reference to another packed object -- a field, local or parameter of
+    its class -- is that object's position getter: `Other_get_pos_x(other)`
+    (a 2D class's z is 0). Writes, and whole-vector reads, are left."""
+    classes = plan.get("classes") or {}
+    for recv, other in sorted(holds.items()):
+        ocl = classes.get(other)
+        if not ocl or not _class_has_position(ocl):
+            continue
+        two_d = (ocl.get("soa_dims") or (2 if ocl.get("two_d") else 3)) == 2
+
+        def rep(m, o=_c_ident(other), r=recv, flat=two_d):
+            if m.group(1) == "z" and flat:
+                return "0.f"
+            return "%s_get_pos_%s(%s)" % (o, m.group(1), r)
+        world = bool(plan.get("godot") and plan.get("has_transform_parents"))
+        ocid = sorted(classes).index(other)
+        # `ref.transform.<member> = new Vector2(A, B);`: its setters, or
+        # for the global position under parents, the inverse
+        rq = re.escape(recv)
+        text = _godot_new_vector_assign(
+            text, r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
+            r"(?:position|localPosition)" % rq,
+            lambda m, a, b, o=_c_ident(other), r=recv, w=world, c=ocid: (
+                "_godot_set_global(%d, %s, %s, %s);" % (c, r, a, b)
+                if w and re.search(r"\bposition$", m.group(1))
+                else "%s_set_pos_x(%s, %s); %s_set_pos_y(%s, %s);" % (
+                    o, r, a, o, r, b)))
+        if world:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
+                r"position\s*\.\s*([xy])\b(?!\s*[-+*/]?=(?!=))" % rq,
+                lambda m, r=recv, c=ocid: "_godot_g%s(%d, %s)" % (
+                    m.group(1), c, r), text)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
+            r"(?:position|localPosition)\s*\.\s*([xyz])\b"
+            r"(?!\s*[-+*/]?=(?!=))" % re.escape(recv), rep, text)
+        # A component assigned: the object's position setter.
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
+            r"(?:position|localPosition)\s*\.\s*([xyz])\s*=(?!=)\s*"
+            r"([^;]*);" % re.escape(recv),
+            lambda m, o=_c_ident(other), r=recv, flat=two_d: (
+                "(void)(%s);" % m.group(2) if m.group(1) == "z" and flat
+                else "%s_set_pos_%s(%s, %s);" % (o, m.group(1), r,
+                                                  m.group(2))), text)
+    for recv, other in sorted(holds.items()):
+        if other in classes:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*GodotName\b"
+                % re.escape(recv),
+                "GodotNodeName_%s(%s)" % (_c_ident(other), recv), text)
+    return text
+
+
 def _local_handle_fields(text, cl, plan, site):
     """A packed object's field through a local or parameter of its class:
     `Badge b = ..; b.n = 9;` is `Badge_AT(b).n = 9;`, as a handle field's
@@ -20594,6 +20959,8 @@ def _local_handle_fields(text, cl, plan, site):
                          cs2cpp._blank(text)):
         if m.group(1) in classes:
             holds[m.group(2)] = m.group(1)
+    text = _handle_method_calls(text, plan, holds)
+    text = _handle_positions(text, plan, holds)
     for recv, other in sorted(holds.items()):
         members = [mm[0] for mm in classes[other].get("members") or ()
                    if not str(mm[3]).startswith(("go", "idx:"))
@@ -21586,6 +21953,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
+    # Another object's position through a reference, before this object's
+    # own `transform.position` is lowered (which would take its receiver).
+    text = _handle_positions(text, plan, _reference_holds(text, cl, plan,
+                                                          site))
     text = _lower_mouse_scroll(text)
     if "__sprite_fx(" in text:
         idn_fx = _c_ident(cl["name"])
@@ -21836,6 +22207,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     if plan.get("godot"):
         # The node a Godot signal passes (godot_pack.BINDINGS).
         text = cs2cpp.lower_bindings(text, _godot.BINDINGS)
+        text = _godot.lower_emits(text, idn)
     # Layout is bake-time; authored ForceUpdateCanvases is intentionally a no-op.
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.)?Canvas\s*\.\s*ForceUpdateCanvases\s*\(\s*\)\s*;?",
@@ -21928,7 +22300,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                              "ParticleSystem_get_isPlaying",
                              "ParticleSystem_get_isEmitting",
                              "ParticleSystem_get_isPaused",
-                             "ParticleSystem_get_isStopped"} | {
+                             "ParticleSystem_get_isStopped"}
+                         | (_godot.BOOL_CALLS if plan.get("godot") else set())
+                         | {
                              k for k, v in (plan.get("_method_ret_kinds_local")
                                             or {}).items() if v == "b"})
     text = _lower_string_concat(text, string_idents=string_idents,
@@ -21943,6 +22317,17 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
     text = cs2cpp.lower_bindings(text, _UNITY_API_RECT)
     text = _rewrite_rect_members(text)
+    if plan.get("godot") and plan.get("has_transform_parents") \
+            and _class_has_position(cl):
+        # Godot's GlobalPosition under a parent: composed / inverted
+        cid = sorted(plan["classes"]).index(cl["name"])
+        text = _godot_new_vector_assign(
+            text, r"(?<![\w.])transform\s*\.\s*position",
+            lambda m, a, b: "_godot_set_global(%d, i, %s, %s);" % (cid, a, b))
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])transform\s*\.\s*position\s*\.\s*([xy])\b"
+            r"(?!\s*[-+*/]?=(?!=))",
+            lambda m: "_godot_g%s(%d, i)" % (m.group(1), cid), text)
     text = cs2cpp.code_sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = cs2cpp.code_sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
     text = cs2cpp.code_sub(r"transform\.position\.z",
@@ -22139,6 +22524,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 or other not in plan["classes"]):
             continue
         handle_fields[name] = _c_ident(other)
+    field_holds = {
+        n: kind.split(":", 1)[1] for n, _t, _b, kind in cl["members"]
+        if str(kind).startswith("idx:")
+        and _c_ident(kind.split(":", 1)[1]) in handle_fields.values()
+        and n in handle_fields}
+    text = _handle_method_calls(text, plan, field_holds)
+    text = _handle_positions(text, plan, field_holds)
     text = cs2cpp.lower_packed_fields(
         text, idn, members, class_const_names, handle_fields,
         _packed_model(plan))
@@ -22332,6 +22724,8 @@ def emit_data(plan, used_apis=None):
         p("float Camera_main_background_g = %sf;" % repr(float(cam["bg_g"])))
         p("float Camera_main_background_b = %sf;" % repr(float(cam["bg_b"])))
         p("int Camera_main_orthographic = %d;" % int(cam["orthographic"]))
+        if cam.get("godot_view"):
+            p("int Camera_main_y_down = 1; /* Godot: world y down the screen */")
     if want_input:
         p("float engine_input_axis_Horizontal = 0.f;")
         p("float engine_input_axis_Vertical = 0.f;")
@@ -22510,6 +22904,13 @@ def emit_data(plan, used_apis=None):
                 str(v) for v in _collider2d_layers(plan, col2d_list)) or "0"))
         p("const int _Collider2D_is_trigger[%d] = { %s };" % (
             n, ", ".join(str(int(c["is_trigger"])) for c in col2d_list)))
+        if plan.get("physics2d_layers"):
+            # Godot's collision_layer / collision_mask, 32 bits each
+            for col in ("layer", "mask"):
+                p("const unsigned _Collider2D_%s_bits[%d] = { %s };" % (
+                    col, n, ", ".join("%du" % (int(c["godot_" + col])
+                                               & 0xffffffff)
+                                      for c in col2d_list)))
         p("const int _Collider2D_body_type[%d] = { %s };" % (
             n, ", ".join(str(int(c["body_type"])) for c in col2d_list)))
         p("const int _Collider2D_owner_class[%d] = { %s };" % (
@@ -23341,11 +23742,12 @@ def _load_scenes_lights_cameras(root, assets):
     """
     _godot.GODOT_ROOT[0] = None
     if _godot.is_godot_project(root):
-        objects, scene_names = _godot.load_godot_scenes(root)
+        cameras = []
+        objects, scene_names = _godot.load_godot_scenes(root, cameras)
         _load_scenes_lights_cameras.scenes = scene_names
         _load_scenes_lights_cameras.ui_layout = _godot.godot_screen_size(root)
-        _progress("scene objects=%d" % len(objects))
-        return objects, [], [], []
+        _progress("scene objects=%d cameras=%d" % (len(objects), len(cameras)))
+        return objects, [], cameras, []
     guids = _guid_map(root, asset_guids=assets)
     objects = []
     lights = []
@@ -24133,6 +24535,9 @@ def _write_scene_cache(outdir, assets_fp, objects, lights, cameras, hierarchy,
             continue
         if sp.get("builtin") or sp.get("source") in ("ui", "ui_tmp"):
             continue
+        # Godot sprites are cropped at import and have no .meta guid.
+        if sp.get("godot"):
+            continue
         if not sp.get("sprite_guid"):
             continue
         saved.append((sp, sp.pop("tex_rgba")))
@@ -24600,6 +25005,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["data_path"] = os.path.join(os.path.abspath(root), "Assets")
     plan["persistent_data_path"] = unity_persistent_data_path(company, product)
     sw, sh, sfs, snative, smax = player_display(root)
+    if _godot.is_godot_project(root):
+        sw, sh = _godot.godot_window_size(root)
     plan["screen_width"] = sw
     plan["screen_height"] = sh
     plan["screen_fullscreen"] = sfs
@@ -24615,9 +25022,17 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["ui_layout_width"] = max(1, int(ulw))
     plan["ui_layout_height"] = max(1, int(ulh))
     _seed_camera_script_view(plan, objects)
+    gview = (plan.get("camera") or {}).get("godot_view")
+    if gview:
+        # Godot's view: the viewport's size over the zoom, whatever the
+        # window's shape (letterboxed, as stretch aspect "keep").
+        plan["camera_aspect"] = gview["half"][0] / gview["half"][1]
+        plan["camera_rect"] = (0.0, 0.0, 1.0, 1.0)
     go_names, go_comps = _build_go_tables(plan)
     if plan.get("godot"):
         plan["godot_signals"] = _godot.resolve_signals(plan)
+        plan["godot_input"] = _godot.input_plan()
+        plan["godot_custom"] = _godot.resolve_custom_signals(plan)
     ui_gc = set()
     for a in analyses:
         ui_gc |= set(a.get("getcomponent_types") or [])
@@ -24681,6 +25096,11 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     if "transform.SetParent" in used_apis:
         plan["has_transform_parents"] = True
     plan["collider2d"] = _build_collider2d_tables(plan)
+    # Godot's collision layers: filtered in Box2D-Packed's Godot mode and
+    # (areas) in the signal dispatch, when any is not layer 1 / mask 1.
+    plan["physics2d_layers"] = bool(plan.get("godot")) and any(
+        (c.get("godot_layer", 1), c.get("godot_mask", 1)) != (1, 1)
+        for c in plan["collider2d"])
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
     # a clip's rotation / scale curves need their owners' live tables
@@ -24800,6 +25220,12 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
                 "Box2D-Packed checkout that reports manifolds; update %s"
                 % os.path.dirname(b2u.__file__))
         if plan.get("godot"):
+            if plan.get("physics2d_layers") and not hasattr(
+                    b2u, "_with_godot_layers"):
+                raise PackError(
+                    "collision layers need a Box2D-Packed checkout with "
+                    "Godot's layer filter; update %s"
+                    % os.path.dirname(b2u.__file__))
             if "godot" not in getattr(b2u, "MODES", ()):
                 raise PackError(
                     "this Box2D-Packed checkout (%s) has no Godot mode; "

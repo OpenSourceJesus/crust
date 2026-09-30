@@ -412,6 +412,9 @@ def _build_collider2d_tables(plan):
                                     else 0.0),
                 "friction_combine": int(c.get("friction_combine") or 0),
                 "bounce_combine": int(c.get("bounce_combine") or 0),
+                # Godot's collision_layer / collision_mask (godot_pack)
+                "godot_layer": int(c.get("godot_layer", 1)),
+                "godot_mask": int(c.get("godot_mask", 1)),
             })
     return cols
 
