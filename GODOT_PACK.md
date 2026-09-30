@@ -264,11 +264,11 @@ res://scripts/Player.cs(17,38): error CS8000: `GetNode` (Godot API) is not packe
 res://coin.tscn:6: error: GDScript is not packed yet (res://scripts/coin.gd); unity_pack reads Godot C# scripts
 ```
 
-Refused where used: `GetTree` / `GetChild` / `AddChild`,
+Refused where used: `GetTree` (but for `GetTree().Root.AddChild`) / `GetChild`,
 `Connect`, `Input` beyond the actions above, `_Input`,
 `Rotation` / `Scale` / `Transform`, `Velocity` / `MoveAndSlide`, `Visible` /
-`Modulate`, `PackedScene`, `Godot.Collections`, and `GD` members other than
-`Print`. A member the script declares itself (a field named `Scale`) is its
+`Modulate`, `ResourceLoader` but for a scene's load, `Godot.Collections`, and `GD`
+members other than the print family, `Str` and `Load<PackedScene>`. A member the script declares itself (a field named `Scale`) is its
 own.
 
 ## Physics: Box2D-Packed's Godot mode
@@ -419,6 +419,86 @@ assigned (`_p.Position.X = 3`, C#'s CS1612), a Timer's `Timeout +=` on a
 reference (connect it in the scene), `WaitTime +=`. A reference to a node
 that is freed still names it.
 
+## Spawning: PackedScene.Instantiate and AddChild
+
+```csharp
+[Export] public PackedScene BulletScene;            // the scene sets it
+...
+Bullet b = BulletScene.Instantiate<Bullet>();       // or (Bullet)s.Instantiate(),
+b.Position = new Vector2(0, 8);                     //    s.Instantiate() as Bullet
+AddChild(b);
+```
+
+Every scene a script can spawn -- an `[Export] PackedScene` the scene sets,
+a literal `GD.Load<PackedScene>("res://..")` / `ResourceLoader.Load` (in a
+field's initializer, a local, or inline:
+`GD.Load<PackedScene>("res://b.tscn").Instantiate<Bullet>()`) -- is packed
+as a template: its nodes, dormant from the start (not processed, drawn or
+simulated). Scenes the templates spawn are templates too. A spawn is the
+subset's `Instantiate` (*Instance caps* in UNITY_PACK.md): a clone of the
+template's root into a free row of its class, its fields as the template
+sets them, `_EnterTree` then, `_Ready` at the next frame, before its first
+`_Process` -- a node added during a frame is processed from the next, as in
+Godot. It is drawn as its template is, and a clone's `Name` is its
+template node's.
+
+The whole scene is spawned: each of its nodes is cloned, under the clone of
+its parent, positioned and drawn as the scene has it (a sprite child, a
+grandchild ..), and a reference from one of its scripts to a node of its
+own scene (`GetNode<Sprite2D>("Look")`) is that node's clone. If a node's
+class is full, the nodes already cloned are freed and `Instantiate`
+returns null. The scene tree is live: a spawned node is its parent's child
+-- `QueueFree` on the parent frees it too -- and a freed node's row, when
+the next spawn takes it, leaves its old parent.
+
+A spawned scene's root may be a physics body -- a `RigidBody2D`,
+`StaticBody2D` or `Area2D` and its CollisionShape2Ds. A body's rows (its
+collider, its Rigidbody2D, its Box2D body) are fixed when the project is
+packed, so its class has a pool of dormant copies, as many as may be live
+at once (`[MaxInstances(N)]`, else 64), each with its own body, which
+Box2D-Packed's live gate keeps disabled until a spawn takes it: a spawn
+takes a freed copy, its body enabled at the clone's position with the
+template's velocity, never the last life's. `AddChild` makes a body's
+position global -- it is simulated in the world, as in Godot, where a body
+does not follow its parent -- and its children follow it. A placed Area2D
+sees spawned bodies and areas, and a spawned one is seen: their
+signals are the placed nodes' as ever. A spawned body's own physics
+signals -- its script's `BodyEntered += OnHit`, or its scene connecting it
+to itself -- are each pool copy's own.
+
+A spawned scene's Timers are its own: pooled as a body is (their rows are
+the timers' table), each spawn's Timer as the scene sets it -- `autostart`,
+`wait_time`, `one_shot` -- and processed from the frame after it is added,
+as Godot processes a node added during a frame. Its connections -- a
+Timer's `timeout`, a script's `[Signal]`, from one of its nodes to another
+-- are the spawn's own: a table per connection, filled when it is spawned,
+read by the signal's dispatch. A reference from one of its scripts to its
+own Timer (`GetNode<Timer>("Fuse")`) is the spawn's Timer; an absolute path
+(`GetNode<Score>("/root/Main/Score")`) is the main scene's node.
+
+`AddChild(b)` puts it under this node, `ref.AddChild(b)` under a node
+reference, `GetParent().AddChild(b)` under this node's parent, and
+`GetTree().Root.AddChild(b)` / `GetTree().CurrentScene.AddChild(b)` at the
+top: its `Position` is local to its parent from then on, in the parent's
+global rotation and scale -- and its scene's nodes in theirs -- through the
+runtime hierarchy.
+
+A spawned class keeps at most `[MaxInstances(N)]` live (the project's own
+attribute, as in a Unity pack), else 64 beside its template; a freed
+clone's row is the next spawn's. When they are all live, the spawn clips:
+`Instantiate` returns null, as a Unity pack's does.
+
+Refused where written: a scene spawned other than into a local (`T b =
+s.Instantiate<T>()`, then `AddChild(b)`), a local of another type than the
+scene's root, an `AddChild` of something else or with more arguments, a
+scene set to no scene on the nodes running the script, a scene that
+spawns itself, a relative path above a spawned scene's root (`..` from
+it: its parent is known only when it is added -- an absolute path is
+packed). Refused at the scene's line, until they are packed: a physics body
+below a spawned scene's root, and a spawned body's physics signal to
+another node than itself. A `SpriteEffects2D` effect set on a spawned node reaches
+its own sprite, not yet its spawned children's.
+
 ## Checked against real Godot
 
 The scene reader and the physics rules were checked against Godot 4.7.2
@@ -453,4 +533,5 @@ the injected build against the standard one.
 
 Camera2D smoothing and drag margins, mouse input, signals other than
 the physics ones, timeouts and the scripts' own, process order by tree,
-GDScript.
+a body below a spawned scene's root, a spawned body's physics signals to
+another node, GDScript.
