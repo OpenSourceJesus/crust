@@ -537,11 +537,39 @@ a block: `T a[N];` is recorded, and `a[i].m(x)` is `T_m(&a[i], x)`, the
 index any expression. A packed engine keeps a table per class this way
 (`static fastring Player_label[N]`).
 
-**Not yet:** the elements are not constructed or destroyed. At file scope C
-has no static constructors, so there is nowhere to run them; in a block the
-loop is not written yet. That is sound for a class whose constructor leaves
-it all zeroes -- what static storage already is -- and not for one that
-allocates or sets a field to something else.
+In a block the elements are constructed and destroyed as C++ does it:
+default-constructed in index order after the declaration, and destroyed in
+reverse index order on every way out of the scope -- the end of the block,
+`return`, `break` and `continue` alike:
+
+```cpp
+tcp::Conn c[50];              /* 50 constructor calls, in a loop */
+c[i].connect(host, port, ms);
+                              /* 50 destructor calls, last element first */
+```
+
+Assigning to an element follows the rules for assigning to a local:
+`a[i] = x` calls `operator=` with the element named once (so `a[i++] = x`
+increments once), `a[i] = f()` moves the result in after destroying the old
+value, and a class with neither constructor, destructor nor `operator=` is
+plain data and keeps its struct copy.
+
+**Refused**, because each would need an element constructed some way other
+than by its default constructor: an initializer (`T a[2] = {..}`), more than
+one dimension, several arrays in one declaration, and a class with no
+default constructor. So is an owning class that has no `operator=` on the
+left of an element assignment, and an array **member** of a class with a
+constructor, destructor or copy -- its elements would need constructing in
+every constructor and copying in the implicit copy, none of which is written
+yet. Before these were refused they passed through as plain C: stack garbage
+that was never destroyed, a destructor that released whatever the garbage
+named, and a struct copy that freed one buffer twice.
+
+**Not yet:** at file scope C has no static constructors, so there is nowhere
+to run them, and the elements are left alone as a scalar there is. That is
+sound for a class whose constructor leaves it all zeroes -- what static
+storage already is -- and not for one that allocates or sets a field to
+something else.
 
 ### Method overloading
 
@@ -1899,6 +1927,11 @@ rather than stripped where it is found. `co::system_allocator` calls
 stripped early, the bare name resolved against the enclosing class and
 became `this->co_free(p)` in a function with no `this`.
 
+Only in code and `#define` bodies: string and character literals, and
+comments, are left alone. The rewrite used to run over the raw text, so
+`"::1"` lowered to `"1"` -- a server told to listen on `"::"` listened on
+IPv4 without a word.
+
 ### Functional-style casts
 
 `int(x)` and `uint64_t(1)` -- a type written like a call -- become `((T)(x))`.
@@ -1912,7 +1945,12 @@ parameter list -- `int (*g)(int) = ..` declares a function pointer.
 ### Constructor calls in a return
 
 `return Cls(a, b);` becomes a named local and a return of it, which is the
-form the ordinary initialiser lowering already handles. For an *owning*
+form the ordinary initialiser lowering already handles -- inside a block of
+its own, `{ Cls t = Cls(a, b); return t; }`, so that it is still one
+statement after `if (c)`, `else` or a loop head. Written as two statements,
+the `if` guarded only the declaration, and the temporary joined the
+enclosing scope, where later exits destroyed it without its branch ever
+having constructed it. For an *owning*
 class this is still refused -- a returned local is moved out, and an
 expression has nothing to move from.
 
