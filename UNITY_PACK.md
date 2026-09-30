@@ -395,7 +395,10 @@ aborts with the exception's name, as an unhandled one ends the process.
 | `hp.ToString()` (an int or float the method knows) | `"" + (hp)` |
 
 A hole with no spec is a concatenation operand, formatted as its type is;
-`{{` and `}}` are braces. Alignment (`{0,5}`), `N0`, `X` and a format that
+`{{` and `}}` are braces. A hole may hold a string literal of its own
+(`$"label={Label("bob", 7)}"`): the interpolated string ends at its closing
+quote, not at the first quote inside a hole (cpprust's `_blank_strings`,
+cs2cpp's `_skip_literal`). Alignment (`{0,5}`), `N0`, `X` and a format that
 is not a literal are left as written, so the method is reported as a stub
 rather than printed wrongly.
 
@@ -408,6 +411,14 @@ member receiver); `foreach (string p in parts)` -- or over
 the same lines; `string.Join(sep, parts)` joins one. `new string[n]` and
 the initializer forms are in *Runtime* below. A `string[]` field and a
 `List<string>` are not packed yet.
+
+**Equality.** `a == b` and `a != b` on strings compare their text, as C#
+does -- `_cs_str_Equals`, from the typed expression pass
+(`tools/unity_pack_vectors.py`) that also lowers Vector2 operators: an
+operand is a string when it is a literal, a string local, field or
+parameter, a `.c_str()`, a concatenation or a call the engine says returns
+one. They compared pointers, true only when the compiler happened to merge
+two literals.
 
 **Null.** A fastring has no null distinct from empty, so a string that is
 null reads as "": `s == null` is `string.IsNullOrEmpty(s)`, `s != null`

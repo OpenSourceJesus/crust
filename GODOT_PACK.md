@@ -64,6 +64,31 @@ Its methods are GodotSharp's (`Core/Vector2.cs`): `Length`,
 `Left`, `Right`. Any other `Vector2.X` is refused where it is written, and
 so is a method given the wrong number of arguments.
 
+### Strings
+
+A C# `string` is what it is in a Unity pack (*Strings* in
+[UNITY_PACK.md](UNITY_PACK.md)): a local, a field, a parameter or an
+`[Export] string` owns its text as a [coost](https://github.com/crustos/coost)
+`fastring`, so a pack whose scripts keep a string needs a coost checkout
+(`--coost PATH`, `$COOST_ROOT`, or `coost` beside this repository).
+Concatenation is typed (`"hp " + hp`), `$"..."` and `string.Format` are
+read at pack time, `==` / `!=` compare the text, and the .NET members work
+(`Length`, `ToUpper`, `Contains`, `Replace`, `Split`, `string.Join` ...).
+And Godot's own:
+
+| Godot | packed |
+|-------|--------|
+| `GD.Print(a, b, ..)` | its arguments concatenated, and a newline |
+| `GD.PrintS(..)` / `GD.PrintT(..)` | separated by a space / a tab |
+| `GD.PrintRaw(..)` | no newline |
+| `GD.PrintErr(..)` | on stderr |
+| `GD.Str(a, b, ..)` | the concatenation, a string |
+| `Name` (this node's, or through a reference) | the node's name, a string |
+| `StringName` | a string |
+| a `[Signal]` with a `string` parameter | passed to the handler, which keeps its own copy |
+
+Other `GD` members are refused where they are written.
+
 ### The runtime hierarchy
 
 The parent chain is live. A 2D node under a 2D node object is that node's
@@ -345,7 +370,7 @@ EmitSignalHit(7, 2.5f, false);               // the generated form
 
 Each emission calls its connections at once, in connection order, with its
 arguments; a freed sender or receiver is skipped. A signal's parameters are
-`int`, `float` or `bool`, and a handler takes the signal's types. A
+`int`, `float`, `bool` or `string`, and a handler takes the signal's types. A
 `Timer` (a node, or one a script derives from) is Godot's: `wait_time`,
 `one_shot`, `autostart`; each frame `time_left -= delta`, and below 0 it
 sends `timeout` and starts over from what is left (`+= wait_time`), or stops
@@ -353,7 +378,7 @@ when one-shot. Timers tick after the scripts' `_Process` in a frame -- Godot
 ticks one in tree order with the `_process` calls, and it is most often a
 child or later sibling of the script it serves.
 
-Refused where written: another parameter type, `EmitSignal` of a signal the
+Refused where written: another parameter type (a node, a vector ..), `EmitSignal` of a signal the
 script does not declare or with the wrong number of arguments, a signal
 name that is not `SignalName.X` or a literal, a handler whose parameters are
 not the signal's, a deferred connection, a physics-process Timer,
