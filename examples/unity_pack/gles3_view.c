@@ -21,6 +21,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "gles3_render.h"
+#ifdef BATCH
+#include <stddef.h>
+#include "gles3_batch.h"
+#endif
 
 float Camera_main_pos_x __attribute__((weak)) = 0.f;
 float Camera_main_pos_y __attribute__((weak)) = 0.f;
@@ -170,14 +174,30 @@ int main(int argc, char **argv)
         return 1;
     if (!init_fbo())
         return 1;
+#ifdef BATCH
+    /* -DBATCH: the 2D GPU path (a --gpu-batch pack): one instanced draw */
+    if (!g3_init() || !gb_init())
+#else
     if (!g3_init())
+#endif
         return 1;
 
     /* Let the player drift so it separates from the origin coin cluster. */
     for (t = 0; t < TICKS_BEFORE_DRAW; t++)
         engine_tick();
 
+#ifdef BATCH
+    ndraw = gb_draw(WIDTH, HEIGHT);
+    printf("batch: %d sprites in %d draw call(s), %ld bytes up\n", ndraw,
+           gb_draw_calls, gb_uploaded_bytes);
+    /* the same frame again: nothing moved, nothing uploaded */
+    gb_draw(WIDTH, HEIGHT);
+    printf("batch again: %ld bytes up\n", gb_uploaded_bytes);
+    if (gb_gpu_sort)
+        printf("gpu sort: on, %d compute pass(es) this frame\n", gb_sort_passes);
+#else
     ndraw = g3_draw(WIDTH, HEIGHT);
+#endif
     if (ndraw < 1) {
         printf("engine_collect_draws returned %d\n", ndraw);
         return 1;

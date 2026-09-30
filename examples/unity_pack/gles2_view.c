@@ -344,6 +344,11 @@ static int upload_textures(void)
     return 1;
 }
 
+#ifdef BATCH
+/* -DBATCH: the 2D GPU path on GLES2 (a --gpu-batch pack) */
+#include "gles2_batch.h"
+#endif
+
 static int draw_scene(GLuint prog)
 {
     EngineDraw draws[MAX_DRAWS];
@@ -388,6 +393,15 @@ static int draw_scene(GLuint prog)
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
+#ifdef BATCH
+    (void)i; (void)stride;
+    {
+        int drawn = gb2_draw(draws, ndraw);
+        printf("batch: %d sprites in %d draw call(s)\n", drawn, gb2_draw_calls);
+    }
+    glFinish();
+    return 1;
+#endif
     glUseProgram(prog);
     glActiveTexture(GL_TEXTURE0);
     glUniform1i(u_tex_loc, 0);
@@ -485,6 +499,12 @@ int main(int argc, char **argv)
         printf("texture upload failed\n");
         return 1;
     }
+#ifdef BATCH
+    if (!gb2_init()) {
+        printf("batch init failed\n");
+        return 1;
+    }
+#endif
 
     /* Let the player drift so it separates from the origin coin cluster. */
     for (t = 0; t < TICKS_BEFORE_DRAW; t++)
