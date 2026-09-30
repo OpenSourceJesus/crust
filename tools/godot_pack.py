@@ -38,6 +38,7 @@ tables, the scripts and the physics world alike. See GODOT_PACK.md.
 from __future__ import annotations
 
 import math
+import copy
 import os
 import re
 import sys
@@ -69,6 +70,9 @@ __all__ = [
     "input_map",
     "input_plan",
     "emit_input",
+    "spawn_classes",
+    "spawn_templates",
+    "DEFAULT_SPAWN_BUDGET",
     "export_types",
     "godot_ref_id",
     "node_ref_sites",
@@ -837,6 +841,9 @@ def node_ref_sites(path, text):
             _refuse(path, text, m.start(), m.group(1))
         arg = text[m.end():close].strip()
         call, ty = m.group(1), m.group(2)
+        if call == "GetParent" and not ty and not arg and re.match(
+                r"\s*\.\s*AddChild\s*\(", scan[close + 1:]):
+            continue          # GetParent().AddChild(b): _lower_spawning's
         if not ty:
             _refuse(path, text, m.start(), call,
                     "%s<T>(..) with the node's type is packed (T: a script's "
@@ -986,8 +993,25 @@ def _node_refs(root, objects, obj_of, scene_index):
         if _is_timer(node):
             o.setdefault("godot_timer_refs", {})["__timer_self"] = (
                 scene_index, node.path)
+        spawned = (_FIRST_TEMPLATE[0] is not None
+                   and scene_index >= _FIRST_TEMPLATE[0])
         for field, ty, npath, nullable, where in refs:
-            target = _find_node(root, node, npath)
+            target_scene = scene_index
+            if spawned and npath.startswith("/") and _MAIN_ROOT[0]:
+                # a spawned scene's absolute path: the main scene's node
+                target = _find_node(_MAIN_ROOT[0], node, npath)
+                target_scene = 0
+            else:
+                target = _find_node(root, node, npath)
+                if target is None and spawned and _escapes(node, npath):
+                    msg = ("\"%s\" from `%s` is above its spawned scene's "
+                           "root, whose parent is known only when it is "
+                           "added: not packed yet (an absolute path, "
+                           "/root/Main/.., is)" % (npath, node.name))
+                    if where[0] == "site":
+                        _refuse(node.script, text, where[1], "GetNode", msg)
+                    raise PackError("%s:%d: error: %s" % (
+                        godot_display_path(where[1][0]), where[1][1], msg))
 
             def err(msg):
                 if where[0] == "site":
@@ -1005,7 +1029,7 @@ def _node_refs(root, objects, obj_of, scene_index):
                 if not _is_timer(target):
                     err("\"%s\" is a %s, not a Timer" % (npath, target.type))
                 o.setdefault("godot_timer_refs", {})[field] = (
-                    scene_index, target.path)
+                    target_scene, target.path)
                 continue
             tcls = _script_class(target.script) if target.script else None
             if tcls != ty:
@@ -1029,7 +1053,22 @@ def _node_refs(root, objects, obj_of, scene_index):
                 o.setdefault("godot_ref_classes", {})[field] = objects[
                     obj_of[target]]["class"]
             o.setdefault("object_refs", {})[field] = godot_ref_id(
-                scene_index, target)
+                target_scene, target)
+
+
+def _escapes(node, npath):
+    """Whether relative *npath* climbs above its scene's root."""
+    if npath.startswith("/") or npath.startswith("%"):
+        return False
+    cur = node
+    for seg in [x for x in npath.split("/") if x and x != "."]:
+        if seg == "..":
+            if cur.parent is None:
+                return True
+            cur = cur.parent
+        else:
+            cur = next((c for c in cur.children if c.name == seg), cur)
+    return False
 
 
 def scene_objects(proj, scene_path, scene_index=0, cameras=None):
@@ -1092,6 +1131,7 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
             local_rot = (0.0, 0.0, math.sin(lr / 2), math.cos(lr / 2))
             local_scale = (ls[0], ls[1], 1.0)
         fields = {}
+        spawn_refs = {}
         if node.script:
             cls = _script_class(node.script)
             if node.script not in exports:
@@ -1101,6 +1141,12 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
                     if isinstance(props[k], GdCall) \
                             and props[k].name == "NodePath":
                         continue      # a node reference (_node_refs)
+                    if isinstance(props[k], dict) \
+                            and props[k].get("_type") == "PackedScene":
+                        # a scene to spawn: a template's index, once the
+                        # templates are loaded (load_godot_scenes)
+                        spawn_refs[k] = props[k]["_path"]
+                        continue
                     fields[k] = _field_value(props[k], node, k, cls)
         else:
             cls = node.instance_of or node.name
@@ -1120,7 +1166,13 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
             "scene": scene_index,
             "godot_type": t,
             "godot_path": node.path,
+            "godot_where": (node.scene, node.line),
             "godot_groups": list(node.groups),
+            "godot_scene_refs": spawn_refs,
+            # its global rotation and scale: a spawned child's frame
+            "godot_global_basis": ((xf2[node][0][0], xf2[node][0][1],
+                                    xf2[node][1][0], xf2[node][1][1])
+                                   if node in xf2 else (1.0, 0.0, 0.0, 1.0)),
         })
     drop = _fold_physics(proj, root, objects, obj_of, xf2)
     _link_hierarchy(root, objects, obj_of, xf2, scene_index, drop)
@@ -2592,6 +2644,218 @@ def emit_signal_dispatch(p, plan, col2d_list, c_ident, go_checks,
     p("")
 
 
+# ---------------------------------------------------------------------------
+# Spawning: PackedScene templates
+# ---------------------------------------------------------------------------
+
+#: The main scene's node tree, and the first template's scene index: a
+#: spawned scene's absolute paths (`/root/Main/..`) are the main scene's.
+_MAIN_ROOT = [None]
+_FIRST_TEMPLATE = [None]
+
+#: {(script, field): the classes the scenes an `[Export] PackedScene` field
+#: is set to spawn} (load_godot_scenes fills it).
+_SPAWN_FIELDS = [{}]
+
+#: The project's PackedScene templates (load_godot_scenes fills it):
+#: {scene path: {"class": the root's class, "index": its instance index}}.
+_TEMPLATES = [{}]
+
+_SCENE_LOAD_RE = re.compile(
+    r'(?:\bGD|\bResourceLoader)\s*\.\s*Load\s*<\s*(?:Godot\s*\.\s*)?'
+    r'PackedScene\s*>\s*\(\s*"([^"]*)"\s*\)'
+    r'|\(\s*(?:Godot\s*\.\s*)?PackedScene\s*\)\s*(?:GD|ResourceLoader)'
+    r'\s*\.\s*Load\s*\(\s*"([^"]*)"\s*\)'
+    r'|(?:\bGD|\bResourceLoader)\s*\.\s*Load\s*\(\s*"([^"]*)"\s*\)\s*as\s+'
+    r'(?:Godot\s*\.\s*)?PackedScene\b')
+
+
+def script_scene_loads(text):
+    """[(offset, res path)] of a script's `GD.Load<PackedScene>("res://..")`
+    (and ResourceLoader's, a cast, an `as`): a scene to spawn, by a literal
+    path."""
+    out = []
+    for m in _SCENE_LOAD_RE.finditer(text):
+        path = m.group(1) or m.group(2) or m.group(3)
+        out.append((m.start(), m.end(), path))
+    return out
+
+
+def _load_templates(proj, objects, first_index):
+    """Every scene a script can spawn -- an `[Export] PackedScene`'s, a
+    literal `GD.Load<PackedScene>` -- as template objects: its nodes,
+    dormant (`godot_template`: not processed, drawn nor simulated), each
+    spawn a copy of its root. Scenes its templates spawn are loaded too.
+    Sets `_TEMPLATES` and each export's value (the template root's index)."""
+    _TEMPLATES[0] = {}
+    loaded = {}
+    order = []
+
+    def wanted(objs):
+        for o in objs:
+            for path in (o.get("godot_scene_refs") or {}).values():
+                yield path
+            if o.get("script"):
+                text = _read(o["script"])
+                for start, _e, rp in script_scene_loads(text):
+                    try:
+                        yield proj.resolve(rp)
+                    except PackError:
+                        line = text.count("\n", 0, start) + 1
+                        raise PackError("%s:%d: error: no scene %s" % (
+                            godot_display_path(o["script"]), line, rp))
+
+    queue = [(path, None) for path in wanted(objects)]
+    while queue:
+        path, by = queue.pop(0)
+        if path in loaded:
+            continue
+        _progress("  template %s" % godot_display_path(path))
+        tobjs = scene_objects(proj, path, first_index + len(order), None)
+        _check_template(path, tobjs)
+        for o in tobjs:
+            o["godot_template"] = path
+        loaded[path] = tobjs
+        order.append(path)
+        objects.extend(tobjs)
+        for more in wanted(tobjs):
+            if more == path:
+                raise PackError(
+                    "%s: error: `%s` spawns its own scene, which is not "
+                    "packed yet" % (godot_display_path(path),
+                                    tobjs[0]["name"]))
+            queue.append((more, path))
+    # A spawned physics body's rows -- its collider, its Rigidbody2D, its
+    # Box2D body -- are fixed when the project is packed: a pool of dormant
+    # copies of it, as many as may be live at once, which a spawn takes
+    # (and a freed one gives back). After every template, so the templates'
+    # indices are unchanged.
+    for t in order:
+        tobjs = loaded[t]
+        root = tobjs[0]
+        n = _max_instances(root.get("script")) or DEFAULT_SPAWN_BUDGET
+        for node in tobjs:
+            # a body (the root) and a Timer: rows fixed at pack time
+            if not (node.get("collider2d") or node.get("rigidbody2d")
+                    or node.get("godot_timer")):
+                continue
+            for k in range(n):
+                c = copy.deepcopy(node)
+                c["godot_pool"] = t
+                c["godot_path"] = "%s#%d" % (node["godot_path"], k)
+                c["xf_id"] = "%s#%d" % (node.get("xf_id"), k)
+                c["mb_ids"] = ["%s#%d" % (m, k)
+                               for m in node.get("mb_ids") or []]
+                for key in ("father_id", "godot_tree_parent", "object_refs",
+                            "godot_parent_basis", "godot_custom",
+                            "godot_timer_refs"):
+                    c.pop(key, None)
+                # its own physics signals (a spawned body's handler is its
+                # own script's): wired to itself
+                for sg in c.get("godot_signals") or []:
+                    sg["target"] = (c.get("scene", 0), c["godot_path"])
+                objects.append(c)
+    # a template root's index in its class: the objects of that class
+    # before it (the plan lists a class's instances in object order)
+    seen = {}
+    row = {}
+    for o in objects:
+        k = seen.get(o["class"], 0)
+        seen[o["class"]] = k + 1
+        row[id(o)] = k
+    for t in order:
+        tobjs = loaded[t]
+        by_id = {}
+        for j, o in enumerate(tobjs):
+            if o.get("xf_id"):
+                by_id[o["xf_id"]] = j
+        nodes = []
+        for j, o in enumerate(tobjs):
+            parent = by_id.get(o.get("godot_tree_parent"), -1)
+            # a reference to another node of this scene: the clone's
+            refs = {f: by_id[tid] for f, tid in (o.get("object_refs")
+                                                 or {}).items()
+                    if tid in by_id}
+            by_path = {x["godot_path"]: q for q, x in enumerate(tobjs)}
+            conns = [{"signal": g["signal"], "to": by_path[g["target"][1]],
+                      "method": g["method"]}
+                     for g in o.get("godot_custom") or []
+                     if g["target"][1] in by_path]
+            timer_refs = {f: by_path[tgt[1]] for f, tgt in (
+                o.get("godot_timer_refs") or {}).items()
+                if tgt[0] == o.get("scene") and tgt[1] in by_path}
+            nodes.append({"class": o["class"], "index": row[id(o)],
+                          "parent": parent, "refs": refs,
+                          "name": o["name"], "conns": conns,
+                          "timer_refs": timer_refs})
+        _TEMPLATES[0][t] = {"class": tobjs[0]["class"],
+                            "index": row[id(tobjs[0])],
+                            "name": tobjs[0]["name"], "nodes": nodes,
+                            "path": t}
+    _SPAWN_FIELDS[0] = {}
+    for o in objects:
+        for field, path in (o.get("godot_scene_refs") or {}).items():
+            o["fields"][field] = _TEMPLATES[0][path]["index"]
+            _SPAWN_FIELDS[0].setdefault((o.get("script"), field), set()).add(
+                _TEMPLATES[0][path]["class"])
+
+
+#: A spawned class's spare instances when it names no `[MaxInstances(N)]`.
+DEFAULT_SPAWN_BUDGET = 64
+
+
+def spawn_classes():
+    """{class: {"name": a spawned node's name}} of the classes a spawn
+    clones: every node of every template."""
+    out = {}
+    for t in _TEMPLATES[0].values():
+        for nd in t["nodes"]:
+            out.setdefault(nd["class"], {"name": nd["name"]})
+    return out
+
+
+def spawn_templates():
+    """The templates, in a fixed order: [{"class", "index", "nodes"}] --
+    nodes in tree order, each {"class", "index" (its template row),
+    "parent" (a node's position, -1 the root), "refs" {field: node}}."""
+    return [_TEMPLATES[0][k] for k in sorted(_TEMPLATES[0])]
+
+
+def _max_instances(script):
+    """A script class's `[MaxInstances(N)]` (the project's own attribute,
+    as unity_pack reads it), or None."""
+    if not script:
+        return None
+    m = re.search(r"\[\s*MaxInstances\s*\(\s*(\d+)\s*\)\s*\]",
+                  _read(script))
+    return int(m.group(1)) if m else None
+
+
+def _check_template(path, tobjs):
+    """What spawning packs yet: a scene whose physics body, if any, is its
+    root, and whose physics signals go to that body's own script."""
+    def at(o):
+        fpath, line = o.get("godot_where") or (path, 1)
+        return "%s:%d" % (godot_display_path(fpath), line)
+    if not tobjs:
+        raise PackError("%s:1: error: an empty scene cannot be spawned"
+                        % godot_display_path(path))
+    for o in tobjs[1:]:
+        if o.get("collider2d") or o.get("rigidbody2d"):
+            raise PackError(
+                "%s: error: `%s` is a physics body below a spawned scene's "
+                "root, which is not packed yet (a body as the root is)" % (
+                    at(o), o["name"]))
+    for o in tobjs:
+        for sg in o.get("godot_signals") or []:
+            if sg["target"][1] != o["godot_path"]:
+                raise PackError(
+                    "%s: error: `%s` is a spawned body whose %s goes to "
+                    "another node; a spawned body's physics signals to its "
+                    "own script are packed, not yet to another node" % (
+                        at(o), o["name"], sg["signal"]))
+
+
 def load_godot_scenes(root, cameras=None):
     """(objects, scene list) for the project's main scene(s). The scenes'
     current Camera2Ds -- else the viewport's own view -- are appended to
@@ -2607,6 +2871,9 @@ def load_godot_scenes(root, cameras=None):
         _progress("  scene %d/%d %s" % (si + 1, len(scenes),
                                         godot_display_path(p)))
         objects.extend(scene_objects(proj, p, si, cameras))
+    _MAIN_ROOT[0] = _load_tree(proj, scenes[0])
+    _FIRST_TEMPLATE[0] = len(scenes)
+    _load_templates(proj, objects, len(scenes))
     _order_sprites(objects)
     if cameras is not None and not cameras:
         cameras.append(viewport_camera(proj.root))
@@ -2640,7 +2907,6 @@ _LIFECYCLE = {
 _REFUSED = [
     (r"\bGetChildren?\s*[<(]", "GetChild"),
     (r"\bGetTree\s*\(", "GetTree"),
-    (r"\bAddChild\s*\(", "AddChild"),
     (r"\bConnect\s*\(", "Connect"),
     (r"(?:\boverride\s+void\s+)?\b_(?:Unhandled)?(?:Key|Shortcut)?Input\s*\(",
      "_Input"),
@@ -2653,7 +2919,7 @@ _REFUSED = [
      "CanvasItem"),
     (r"\bGD\s*\.\s*(?!(?:Print|PrintS|PrintT|PrintRaw|PrintErr|Str)\b)\w+",
      "GD"),
-    (r"\bPackedScene\b|\bResourceLoader\b|\bInstantiate\s*[<(]", "PackedScene"),
+    (r"\bResourceLoader\b", "ResourceLoader"),
     (r"\bGodot\s*\.\s*Collections\b", "Godot.Collections"),
 ]
 
@@ -2697,6 +2963,7 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
     """
     project_types = set(project_types)
     scan = cs2cpp._blank(text)
+    text, scan = _lower_spawning(path, text, scan)
     # A member the script declares itself is its own, not Godot's.
     declared = set(re.findall(
         r"\b[\w.]+(?:\s*<[^>]*>)?(?:\s*\[\s*\])?\??\s+(\w+)\s*[;=({]", scan))
@@ -3341,6 +3608,138 @@ def _statement_end_plain(scan, k):
     return k
 
 
+def _template_of(res_path):
+    """The template of scene *res_path* (`res://..`), or None."""
+    if not GODOT_ROOT[0] or not res_path.startswith("res://"):
+        return None
+    ap = os.path.join(GODOT_ROOT[0], *res_path[len("res://"):].split("/"))
+    return _TEMPLATES[0].get(ap)
+
+
+def _lower_spawning(path, text, scan):
+    """PackedScene spawning, as the subset's Instantiate and godot_pack's
+    GodotTree: a scene is its template root's index (an int); `T b =
+    scene.Instantiate<T>()` (or `(T)scene.Instantiate()`, `.. as T`) is
+    `T b = Instantiate(scene)`, a clone of the template's root; AddChild
+    puts a node under this one, a reference, GetParent(), or the scene's
+    root. Returns (text, scan)."""
+    if not re.search(r"\bPackedScene\b|\bInstantiate\b|\bAddChild\b", scan):
+        return text, scan
+    edits = []
+    local_class = {}          # a local set from a literal load -> class
+    # literal loads: the template root's index
+    for start, end, rp in script_scene_loads(text):
+        t = _template_of(rp)
+        if t is None:
+            _refuse(path, text, start, "GD.Load",
+                    "no scene %s is spawned from here" % rp)
+        lm = re.search(r"(?:\bvar|\bPackedScene)\s+(\w+)\s*=\s*$",
+                       scan[:start])
+        # (a local of the scene only when the load is all its value -- not
+        # `var d = GD.Load<PackedScene>(..).Instantiate<T>()`)
+        if lm and re.match(r"\s*;", scan[end:]):
+            local_class[lm.group(1)] = t["class"]
+            edits.append((lm.start(), lm.start() + len(lm.group(0))
+                          - len(lm.group(0).lstrip()) + (
+                              3 if lm.group(0).lstrip().startswith("var")
+                              else 11), "int"))
+        edits.append((start, end, str(t["index"])))
+    for m in re.finditer(r"(?<![\w.])(?:Godot\s*\.\s*)?PackedScene"
+                         r"(?=\s*\??\s+\w+\s*[;=,)])", scan):
+        edits.append((m.start(), m.end(), _pad("int", m.end() - m.start())))
+    if edits:
+        text = _apply(text, edits)
+        scan = cs2cpp._blank(text)
+        edits = []
+
+    def spawns(recv, at):
+        """The classes the scene *recv* spawns."""
+        recv = re.sub(r"^this\s*\.\s*", "", recv.strip())
+        if recv in local_class:
+            return {local_class[recv]}
+        if recv.isdigit():
+            return {t["class"] for t in _TEMPLATES[0].values()
+                    if t["index"] == int(recv)}
+        got = _SPAWN_FIELDS[0].get((path, recv))
+        if not got:
+            _refuse(path, text, at, "Instantiate",
+                    "`%s` is set to no scene on the nodes running this "
+                    "script (an [Export] PackedScene the scene sets, or "
+                    "GD.Load<PackedScene>(\"res://..\"))" % recv)
+        return got
+
+    recv = r"((?:this\s*\.\s*)?\w+)"
+    forms = [
+        # T b = s.Instantiate<T>();   var b = s.Instantiate<T>();
+        re.compile(r"(?<![\w.])(?:var|(\w+))\s+(\w+)\s*=\s*" + recv +
+                   r"\s*\.\s*Instantiate\s*<\s*(\w+)\s*>\s*\(\s*\)"),
+        # T b = (T)s.Instantiate();
+        re.compile(r"(?<![\w.])(?:var|(\w+))\s+(\w+)\s*=\s*\(\s*(\w+)\s*\)"
+                   r"\s*" + recv + r"\s*\.\s*Instantiate\s*\(\s*\)"),
+        # T b = s.Instantiate() as T;
+        re.compile(r"(?<![\w.])(?:var|(\w+))\s+(\w+)\s*=\s*" + recv +
+                   r"\s*\.\s*Instantiate\s*\(\s*\)\s*as\s+(\w+)"),
+    ]
+    done = []
+    for k, f in enumerate(forms):
+        for m in f.finditer(scan):
+            if k == 1:
+                decl, name, ty, src = (m.group(1), m.group(2), m.group(3),
+                                       m.group(4))
+            else:
+                decl, name, src, ty = (m.group(1), m.group(2), m.group(3),
+                                       m.group(4))
+            if decl and decl != ty:
+                _refuse(path, text, m.start(), "Instantiate",
+                        "`%s %s` is given a %s" % (decl, name, ty))
+            got = spawns(src, m.start())
+            if ty not in got:
+                _refuse(path, text, m.start(), "Instantiate",
+                        "`%s` spawns %s, not a %s" % (
+                            src, " or ".join(sorted(got)), ty))
+            edits.append((m.start(), m.end(), "%s %s = Instantiate(%s)" % (
+                ty, name, src)))
+            done.append(m.start())
+    for m in re.finditer(r"\bInstantiate\b", scan):
+        if not any(d <= m.start() <= d + 400 for d in done):
+            _refuse(path, text, m.start(), "Instantiate",
+                    "a scene is spawned into a local: `T b = "
+                    "scene.Instantiate<T>();` (or `(T)scene.Instantiate()`, "
+                    "`scene.Instantiate() as T`), then AddChild(b)")
+    # AddChild(child): under this node, a reference, GetParent(), the root
+    for m in re.finditer(r"(?:(\.)\s*)?\bAddChild\s*\(", scan):
+        close = _close_paren(scan, m.end() - 1)
+        args = [a.strip() for a in cs2cpp.split_call_args(
+            text[m.end():close])] if close is not None else []
+        if len(args) != 1 or not re.fullmatch(r"\w+", args[0]):
+            _refuse(path, text, m.start(), "AddChild",
+                    "AddChild takes a spawned node's local (AddChild(b))")
+        child = args[0]
+        if not m.group(1):
+            start = m.start()
+            if re.search(r"(?<![\w.])this\s*\.\s*$", scan[:start]):
+                start = re.search(r"this\s*\.\s*$", scan[:start]).start()
+            edits.append((start, close + 1,
+                          "GodotTree.Add(this, %s)" % child))
+            continue
+        rs = _receiver_start(scan, m.start(1))
+        recv_text = text[rs:m.start(1)].strip() if rs is not None else ""
+        compact = re.sub(r"\s+", "", recv_text)
+        if compact == "GetParent()":
+            new = "GodotTree.AddToParent(this, %s)" % child
+        elif compact in ("GetTree().Root", "GetTree().CurrentScene"):
+            new = "GodotTree.AddToRoot(%s)" % child
+        elif recv_text:
+            new = "GodotTree.Add(%s, %s)" % (recv_text, child)
+        else:
+            _refuse(path, text, m.start(), "AddChild")
+        edits.append((rs, close + 1, new))
+    if edits:
+        text = _apply(text, edits)
+        scan = cs2cpp._blank(text)
+    return text, scan
+
+
 def _lower_custom_signals(path, text, scan, edits, custom_handlers):
     """A script's own [Signal]s: the delegate declarations go, each
     `EmitSignal(SignalName.Hit, ..)` / `EmitSignal("Hit", ..)` /
@@ -3466,6 +3865,8 @@ def emit_custom_decls(p, plan, c_ident):
             for _c, _i, t in timers)))
         p("static int _godot_timer_on[%d] = { %s };" % (n, ", ".join(
             str(t["autostart"]) for _c, _i, t in timers)))
+        p("/* a spawned Timer is processed from the frame after it is added */")
+        p("static int _godot_timer_fresh[%d];" % n)
     p("static int _godot_timer_ok(int t) { return t >= 0 && t < %d; }"
       % len(timers))
     arr = bool(timers)
@@ -3545,7 +3946,24 @@ def emit_custom_dispatch(p, plan, c_ident, want_go_tables):
                 by_inst.setdefault(e["from_inst"], []).append(e)
         for k in range(len(types)):
             p("    (void)a%d;" % k)
-        if not by_inst:
+        dyn = [(ck, c) for ck, c in enumerate(plan.get("godot_conns") or [])
+               if c["from_class"] == cname and c["signal"] == sig]
+        for ck, c in dyn:
+            # a spawned scene's connection: its receiver, when spawned
+            p("    if (i < %du && _godot_conn_%d[i] >= 0) {" % (c["cap"], ck))
+            p("        unsigned to = (unsigned)_godot_conn_%d[i];" % ck)
+            call = "%s_%s(to%s);" % (c_ident(c["to_class"]), c["method"], args)
+            if plan.get("_godot_destroy"):
+                p("        if (!_engine_go_destroyed[_engine_go_of_%s(to)]) {"
+                  % c_ident(c["to_class"]))
+                for line in guard(call):
+                    p("            " + line)
+                p("        }")
+            else:
+                for line in guard(call):
+                    p("        " + line)
+            p("    }")
+        if not by_inst and not dyn:
             p("    (void)i;")
         else:
             p("    switch (i) {")
@@ -3576,7 +3994,9 @@ def emit_custom_dispatch(p, plan, c_ident, want_go_tables):
         p("static void _godot_timers_tick(float dt) {")
         for k, (cname, inst, _t) in enumerate(timers):
             live = alive(cname, inst)
-            p("    if (_godot_timer_on[%d] && !_godot_timer_paused[%d]%s) {"
+            p("    if (_godot_timer_fresh[%d]) {" % k)
+            p("        _godot_timer_fresh[%d] = 0;" % k)
+            p("    } else if (_godot_timer_on[%d] && !_godot_timer_paused[%d]%s) {"
               % (k, k, (" && " + live) if live else ""))
             p("        _godot_timer_left[%d] = _godot_timer_left[%d] - dt;"
               % (k, k))
@@ -3706,6 +4126,10 @@ def analyze_scripts(root, objects, analyze_script):
             a["apis"] = set(a["apis"]) | {"GodotPrint"}
         analyses.append(a)
     moved = _REFS[0]["pos_written"]
+    if _TEMPLATES[0] and analyses:
+        # a template is dormant (destroyed from the start), and a spawn
+        # reuses a freed row: the subset's Destroy
+        analyses[0]["apis"] = set(analyses[0]["apis"]) | {"Object.Destroy"}
     for a in analyses:
         if any(c["name"] in moved for c in a.get("classes") or ()):
             a["writes_pos"] = True

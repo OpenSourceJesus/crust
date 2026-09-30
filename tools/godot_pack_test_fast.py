@@ -20,7 +20,8 @@ input actions, Timers and the scripts' own signals, node references
 (GetNode, exported node fields, Timer control), collision layers, the
 runtime hierarchy, Vector2 arithmetic and methods, the 2D GPU path
 (--gpu-batch: the batch shader's frame, the sprite effects), strings (coost
-fastrings, with a coost checkout), a freed node's body leaving the world (with a
+fastrings, with a coost checkout), spawning (PackedScene.Instantiate and
+AddChild), a freed node's body leaving the world (with a
 Box2D-Packed checkout: its library is built once a run, about 10 s), and
 the resource reader's inline objects.
 
@@ -2022,6 +2023,573 @@ class TestStrings(unittest.TestCase):
         self.assertIn("signal Said's parameter `Node2D who`: int, float, "
                       "bool and string parameters are packed",
                       refusal(self, d))
+
+
+# ---------------------------------------------------------------------------
+# Spawning: PackedScene.Instantiate and AddChild
+# ---------------------------------------------------------------------------
+
+BULLET_CS = """using Godot;
+
+public partial class Bullet : Sprite2D
+{
+    public int Speed = 10;
+
+    public override void _Process(double delta)
+    {
+        Position = new Vector2(Position.X + Speed, Position.Y);
+        if (Position.X > 60) { QueueFree(); }
+    }
+}
+"""
+
+BULLET_TSCN = """[gd_scene format=3]
+[ext_resource type="Texture2D" path="res://tb.png" id="1"]
+[ext_resource type="Script" path="res://Bullet.cs" id="2"]
+[node name="Bullet" type="Sprite2D"]
+texture = ExtResource("1")
+script = ExtResource("2")
+"""
+
+GUN_CS = """using Godot;
+
+public partial class Gun : Node2D
+{
+    [Export] public PackedScene BulletScene;
+    private int _frame;
+
+    public override void _Process(double delta)
+    {
+        _frame = _frame + 1;
+        if (_frame % 2 == 1)
+        {
+            Bullet b = BulletScene.Instantiate<Bullet>();
+            b.Position = new Vector2(0, _frame);
+            b.Speed = 20;
+            AddChild(b);
+        }
+    }
+}
+"""
+
+LAUNCHER_CS = """using Godot;
+
+public partial class Launcher : Node2D
+{
+    private PackedScene _s = GD.Load<PackedScene>("res://bullet.tscn");
+
+    public override void _Ready()
+    {
+        var a = (Bullet)_s.Instantiate();
+        a.Speed = 0;
+        a.Position = new Vector2(1, 0);
+        AddChild(a);
+        Bullet c = _s.Instantiate() as Bullet;
+        c.Speed = 0;
+        c.Position = new Vector2(5, 5);
+        GetParent().AddChild(c);
+        var d = GD.Load<PackedScene>("res://bullet.tscn").Instantiate<Bullet>();
+        d.Speed = 0;
+        d.Position = new Vector2(7, 7);
+        GetTree().Root.AddChild(d);
+        GD.Print(a.Name, " ", c.Speed, " ", d.Position.X);
+    }
+}
+"""
+
+SPAWN_DRAWS = r"""
+#include <stdio.h>
+#include "engine_draw.h"
+extern float Time_deltaTime;
+int main(void) {
+    EngineDraw b[256]; int f, n = 0, k, maxn = 0;
+    Time_deltaTime = 1.f / 60.f;
+    for (f = 1; f <= FRAMES; f++) {
+        engine_tick();
+        n = engine_collect_draws(b, 256);
+        if (n > maxn) maxn = n;
+        if (f <= 5) {
+            printf("f%d:", f);
+            for (k = 0; k < n; k++) printf(" (%g,%g)", b[k].x, b[k].y);
+            printf("\n");
+        }
+    }
+    printf("max=%d\n", maxn);
+    return 0;
+}
+"""
+
+
+def _spawn_project(test, scene, scripts, extra_files=None):
+    d = project(test, scene, scripts=scripts)
+    files = {"bullet.tscn": BULLET_TSCN}
+    files.update(extra_files or {})
+    for name, text in files.items():
+        with open(os.path.join(d, name), "w") as f:
+            f.write(text)
+    return d
+
+
+GUN_SCENE = ('[node name="Gun" type="Node2D" parent="."]\n'
+             'position = Vector2(100, 0)\nscript = ExtResource("s_Gun")\n'
+             'BulletScene = ExtResource("b")\n')
+GUN_SUBS = ('[ext_resource type="PackedScene" path="res://bullet.tscn" '
+            'id="b"]\n\n')
+
+
+SPAWN_MINES_SCRIPTS = {
+    'Mine.cs': 'using Godot;\n\n[MaxInstances(2)]\npublic partial class Mine : Node2D\n{\n    [Signal] public delegate void ExplodedEventHandler(int power);\n\n    private Timer _fuse;\n    private Score _score;\n    private int _n;\n\n    public override void _Ready()\n    {\n        _fuse = GetNode<Timer>("Fuse");\n        _score = GetNode<Score>("/root/Main/Score");\n        GD.Print("mine at ", Position.X, " fuse ", _fuse.TimeLeft);\n    }\n\n    public override void _Process(double delta)\n    {\n        _n = _n + 1;\n    }\n\n    private void OnFuse()\n    {\n        GD.Print("fuse of mine at ", Position.X, " after ", _n, " frames");\n        EmitSignal(SignalName.Exploded, 5);\n        _score.Add(1);\n        QueueFree();\n    }\n}\n',
+    'Sound.cs': 'using Godot;\n\npublic partial class Sound : Node\n{\n    private void OnExploded(int power)\n    {\n        GD.Print("boom ", power, " from ", Name);\n    }\n}\n',
+    'Score.cs': 'using Godot;\n\npublic partial class Score : Node\n{\n    public int Total;\n\n    public void Add(int n)\n    {\n        Total = Total + n;\n        GD.Print("score ", Total);\n    }\n}\n',
+    'Layer.cs': 'using Godot;\n\npublic partial class Layer : Node2D\n{\n    [Export] public PackedScene MineScene;\n    private int _f;\n\n    public override void _Process(double delta)\n    {\n        _f = _f + 1;\n        if (_f == 1 || _f == 4)\n        {\n            Mine m = MineScene.Instantiate<Mine>();\n            m.Position = new Vector2(_f * 10, 0);\n            AddChild(m);\n        }\n    }\n}\n',
+    'MaxInstances.cs': 'using System;\n[AttributeUsage(AttributeTargets.Class)]\npublic class MaxInstances : Attribute { public MaxInstances(int n) { } }\n',
+}
+
+SPAWN_MINE_TSCN = '[gd_scene format=3]\n[ext_resource type="Texture2D" path="res://tb.png" id="1"]\n[ext_resource type="Script" path="res://Mine.cs" id="2"]\n[ext_resource type="Script" path="res://Sound.cs" id="3"]\n[node name="Mine" type="Node2D"]\nscript = ExtResource("2")\n[node name="Look" type="Sprite2D" parent="."]\ntexture = ExtResource("1")\n[node name="Fuse" type="Timer" parent="."]\nwait_time = 0.06\none_shot = true\nautostart = true\n[node name="Sound" type="Node" parent="."]\nscript = ExtResource("3")\n[connection signal="timeout" from="Fuse" to="." method="OnFuse"]\n[connection signal="Exploded" from="." to="Sound" method="OnExploded"]\n'
+
+SPAWN_MINES_SCENE = (
+    '[node name="Score" type="Node" parent="."]\n'
+    'script = ExtResource("s_Score")\n\n'
+    '[node name="Layer" type="Node2D" parent="."]\n'
+    'script = ExtResource("s_Layer")\n'
+    'MineScene = ExtResource("mn")\n')
+
+SPAWN_MINES_DRIVE = '#include <stdio.h>\n#include "engine_draw.h"\nextern float Time_deltaTime;\nint main(void) {\n    EngineDraw b[16]; int f, n;\n    Time_deltaTime = 1.f / 60.f;\n    for (f = 1; f <= 10; f++) {\n        printf("-- f%d\\n", f);\n        engine_tick();\n        n = engine_collect_draws(b, 16);\n        printf("   draws %d\\n", n);\n    }\n    return 0;\n}\n'
+
+
+class TestSpawning(unittest.TestCase):
+
+    def _gun(self, scene=GUN_SCENE, scripts=None, extra=None):
+        all_scripts = {"Bullet.cs": BULLET_CS, "Gun.cs": GUN_CS}
+        all_scripts.update(scripts or {})
+        d = project(self, scene, scripts=all_scripts, subs=GUN_SUBS)
+        files = {"bullet.tscn": BULLET_TSCN}
+        files.update(extra or {})
+        for name, text in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+        return d
+
+    @needs_cc
+    def test_a_gun_fires_bullets(self):
+        out = pack(self, self._gun())
+        lines = run_c(self, out, SPAWN_DRAWS.replace("FRAMES", "400"))
+        self.assertEqual(lines, [
+            # a bullet at the gun (100, 0) + its local (0, frame); it moves
+            # from the next frame, 20 a frame in the gun's frame, and frees
+            # itself past local x 60
+            "f1: (100,1)",
+            "f2: (120,1)",
+            "f3: (140,1) (100,3)",
+            "f4: (160,1) (120,3)",
+            "f5: (140,3) (100,5)",
+            # 200 bullets fired: a freed one's slot is taken by the next
+            "max=2",
+        ])
+
+    @needs_cc
+    def test_forms_and_parents(self):
+        """(T)s.Instantiate(), s.Instantiate() as T, a GD.Load'ed scene, and
+        AddChild under this node, its parent, and the root."""
+        scene = ('[node name="Holder" type="Node2D" parent="."]\n'
+                 'scale = Vector2(2, 2)\n\n'
+                 '[node name="Launcher" type="Node2D" parent="Holder"]\n'
+                 'position = Vector2(10, 0)\n'
+                 'script = ExtResource("s_Launcher")\n')
+        out = pack(self, self._gun(scene=scene,
+                                   scripts={"Launcher.cs": LAUNCHER_CS}))
+        lines = run_c(self, out, SPAWN_DRAWS.replace("FRAMES", "1"))
+        self.assertEqual(lines[0], "Bullet 0 7")   # a clone's name: its root's
+        # a under Launcher (world (20, 0), scaled 2): (20 + 2 x 1, 0); c
+        # under Holder: 2 x (5, 5); d under the root: (7, 7) -- each drawn
+        # scaled as its parent is
+        self.assertEqual(sorted(lines[1].split()[1:]),
+                         ["(10,10)", "(22,0)", "(7,7)"])
+
+    @needs_cc
+    def test_a_whole_scene_is_spawned(self):
+        """A spawned scene's child nodes are clones too, under the clone of
+        their parent: they follow it (in its parent's scale), a reference
+        to one is the clone's, and freeing the root frees them."""
+        ship_tscn = """[gd_scene format=3]
+[ext_resource type="Texture2D" path="res://tb.png" id="1"]
+[ext_resource type="Script" path="res://Ship.cs" id="2"]
+[node name="Ship" type="Node2D"]
+script = ExtResource("2")
+[node name="Look" type="Sprite2D" parent="."]
+position = Vector2(3, 0)
+texture = ExtResource("1")
+[node name="Dot" type="Sprite2D" parent="Look"]
+position = Vector2(0, 1)
+texture = ExtResource("1")
+"""
+        ship_cs = """using Godot;
+
+public partial class Ship : Node2D
+{
+    private Sprite2D _look;
+    private int _n;
+
+    public override void _Ready()
+    {
+        _look = GetNode<Sprite2D>("Look");
+    }
+
+    public override void _Process(double delta)
+    {
+        _n = _n + 1;
+        _look.Position = new Vector2(3 + _n, 0);
+        if (_n == 3) { QueueFree(); }
+    }
+}
+"""
+        dock_cs = """using Godot;
+
+public partial class Dock : Node2D
+{
+    [Export] public PackedScene ShipScene;
+    private int _f;
+
+    public override void _Process(double delta)
+    {
+        _f = _f + 1;
+        if (_f == 1)
+        {
+            Ship s = ShipScene.Instantiate<Ship>();
+            s.Position = new Vector2(0, 5);
+            AddChild(s);
+        }
+    }
+}
+"""
+        d = project(self, (
+            '[node name="Holder" type="Node2D" parent="."]\n'
+            'scale = Vector2(2, 2)\n\n'
+            '[node name="Dock" type="Node2D" parent="Holder"]\n'
+            'position = Vector2(10, 0)\nscript = ExtResource("s_Dock")\n'
+            'ShipScene = ExtResource("sh")\n'),
+            scripts={"Ship.cs": ship_cs, "Dock.cs": dock_cs},
+            subs='[ext_resource type="PackedScene" path="res://ship.tscn" '
+                 'id="sh"]\n\n')
+        with open(os.path.join(d, "ship.tscn"), "w") as f:
+            f.write(ship_tscn)
+        out = pack(self, d)
+        self.assertEqual(run_c(self, out, SPAWN_DRAWS.replace("FRAMES", "5")),
+                         [
+            # the ship at the dock (20, 0) + 2 x (0, 5); Look at + 2 x
+            # (3, 0), Dot at + 2 x (0, 1) under it, both drawn scaled 2
+            "f1: (26,10) (26,12)",
+            # _Ready finds Look -- the clone's -- and moves it a unit a
+            # frame, and Dot with it
+            "f2: (28,10) (28,12)",
+            "f3: (30,10) (30,12)",
+            # the ship frees itself, and its children go with it
+            "f4:",
+            "f5:",
+            "max=2",
+        ])
+
+    @needs_box2d
+    def test_spawned_bodies_and_areas(self):
+        """A spawned RigidBody2D falls and rests as a placed one does; its
+        rows are a pool of dormant copies ([MaxInstances(2)]), reused -- a
+        reused body starts afresh; a spawned Area2D is seen by a placed
+        one, and a placed Area2D sees spawned bodies."""
+        ball_tscn = """[gd_scene format=3]
+[ext_resource type="Texture2D" path="res://tb.png" id="1"]
+[ext_resource type="Script" path="res://Ball.cs" id="2"]
+[sub_resource type="CircleShape2D" id="c"]
+radius = 10.0
+[node name="Ball" type="RigidBody2D"]
+lock_rotation = true
+script = ExtResource("2")
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("c")
+[node name="Look" type="Sprite2D" parent="."]
+position = Vector2(0, -12)
+texture = ExtResource("1")
+"""
+        shot_tscn = """[gd_scene format=3]
+[ext_resource type="Script" path="res://Shot.cs" id="2"]
+[sub_resource type="CircleShape2D" id="c"]
+radius = 2.0
+[node name="Shot" type="Area2D"]
+script = ExtResource("2")
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("c")
+"""
+        ball_cs = """using Godot;
+
+[MaxInstances(2)]
+public partial class Ball : RigidBody2D
+{
+    private int _n;
+
+    public override void _PhysicsProcess(double delta)
+    {
+        _n = _n + 1;
+        if (_n == 50) { GD.Print(Name, " at ", Position.X, " y=", Position.Y); }
+        if (_n == 60) { QueueFree(); }
+    }
+}
+"""
+        shot_cs = """using Godot;
+
+public partial class Shot : Area2D
+{
+    public override void _PhysicsProcess(double delta)
+    {
+        Position = new Vector2(Position.X + 5, Position.Y);
+    }
+}
+"""
+        dropper_cs = """using Godot;
+
+public partial class Dropper : Node2D
+{
+    [Export] public PackedScene BallScene;
+    [Export] public PackedScene ShotScene;
+    private int _f;
+
+    public override void _PhysicsProcess(double delta)
+    {
+        _f = _f + 1;
+        if (_f % 30 == 1)
+        {
+            Ball b = BallScene.Instantiate<Ball>();
+            b.Position = new Vector2(_f, 0);
+            AddChild(b);
+        }
+        if (_f == 2)
+        {
+            Shot s = ShotScene.Instantiate<Shot>();
+            s.Position = new Vector2(-100, 100);
+            GetTree().Root.AddChild(s);
+        }
+    }
+
+    private void OnZone(Node2D body)
+    {
+        GD.Print("zone ", body.Name);
+    }
+
+    private void OnTarget(Area2D area)
+    {
+        GD.Print("target hit by ", area.Name);
+    }
+}
+"""
+        scene = """[node name="Floor" type="StaticBody2D" parent="."]
+position = Vector2(0, 200)
+
+[node name="Shape" type="CollisionShape2D" parent="Floor"]
+shape = SubResource("floor")
+
+[node name="Zone" type="Area2D" parent="."]
+position = Vector2(0, 175)
+
+[node name="Shape" type="CollisionShape2D" parent="Zone"]
+shape = SubResource("zone")
+
+[node name="Target" type="Area2D" parent="."]
+position = Vector2(60, 100)
+
+[node name="Shape" type="CollisionShape2D" parent="Target"]
+shape = SubResource("target")
+
+[node name="Dropper" type="Node2D" parent="."]
+position = Vector2(100, 0)
+script = ExtResource("s_Dropper")
+BallScene = ExtResource("b")
+ShotScene = ExtResource("sh")
+
+[connection signal="body_entered" from="Zone" to="Dropper" method="OnZone"]
+[connection signal="area_entered" from="Target" to="Dropper" method="OnTarget"]
+"""
+        subs = ('[ext_resource type="PackedScene" path="res://ball.tscn" '
+                'id="b"]\n'
+                '[ext_resource type="PackedScene" path="res://shot.tscn" '
+                'id="sh"]\n'
+                '[sub_resource type="RectangleShape2D" id="floor"]\n'
+                'size = Vector2(1000, 20)\n'
+                '[sub_resource type="RectangleShape2D" id="zone"]\n'
+                'size = Vector2(1000, 20)\n'
+                '[sub_resource type="RectangleShape2D" id="target"]\n'
+                'size = Vector2(10, 10)\n\n')
+        scripts = {"Ball.cs": ball_cs, "Shot.cs": shot_cs,
+                   "Dropper.cs": dropper_cs,
+                   "MaxInstances.cs": "using System;\n"
+                   "[AttributeUsage(AttributeTargets.Class)]\n"
+                   "public class MaxInstances : Attribute "
+                   "{ public MaxInstances(int n) { } }\n"}
+        d = project(self, scene, scripts=scripts, subs=subs)
+        for name, text in (("ball.tscn", ball_tscn),
+                           ("shot.tscn", shot_tscn)):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+        out = pack_physics(self, d)
+        lines = run_physics(self, out, SPAWN_DRAWS.replace("FRAMES", "160")
+                            .replace("if (f <= 5)", "if (0)"))
+        self.assertEqual(lines, [
+            # the shot, at the root (-100, 100), 5 px a step: at the target
+            # (55..65) on its 31st step
+            "target hit by Shot",
+            # each ball at the dropper (100, 0) + its local (frame, 0):
+            # falls and rests on the floor (its top 190, radius 10), and
+            # the zone (165..185) sees it
+            "zone Ball", "Ball at 101 y=180.015",
+            "zone Ball", "Ball at 131 y=180.015",
+            "zone Ball", "Ball at 161 y=180.015",
+            "zone Ball", "Ball at 191 y=180.015",
+            "zone Ball",
+            # six balls spawned, two at once: the pool of 2, reused; each
+            # drawn (its Look) with the shot's none
+            "max=2",
+        ])
+
+    @needs_cc
+    def test_spawned_timers_signals_and_absolute_paths(self):
+        """A spawned scene's Timer (its own, from the frame after it is
+        added), its connections (to its own nodes), a reference to its own
+        Timer, and an absolute path to the main scene."""
+        d = project(self, SPAWN_MINES_SCENE, scripts=SPAWN_MINES_SCRIPTS,
+                    subs='[ext_resource type="PackedScene" '
+                         'path="res://mine.tscn" id="mn"]\n\n')
+        with open(os.path.join(d, "mine.tscn"), "w") as f:
+            f.write(SPAWN_MINE_TSCN)
+        out = pack(self, d)
+        self.assertEqual(run_c(self, out, SPAWN_MINES_DRIVE), [
+            "-- f1", "   draws 1",
+            # the first mine's _Ready: its own Fuse, not started yet
+            "-- f2", "mine at 10 fuse 0.06", "   draws 1",
+            "-- f3", "   draws 1",
+            "-- f4", "   draws 2",
+            # its Fuse (0.06 s, from f2) times out at f5: OnFuse -- its own
+            # Sound hears Exploded, the main scene's Score counts it --
+            # and it is freed with its children
+            "-- f5", "mine at 40 fuse 0.06",
+            "fuse of mine at 10 after 4 frames", "boom 5 from Sound",
+            "score 1", "   draws 1",
+            "-- f6", "   draws 1",
+            "-- f7", "   draws 1",
+            # the second, spawned at f4, has its own Timer and wiring
+            "-- f8", "fuse of mine at 40 after 4 frames", "boom 5 from Sound",
+            "score 2", "   draws 0",
+            "-- f9", "   draws 0",
+            "-- f10", "   draws 0",
+        ])
+
+    @needs_box2d
+    def test_a_spawned_body_hears_its_own_signals(self):
+        """A spawned Area2D's own BodyEntered (its script's `+=`) is wired
+        to itself, each pool copy to its own handler."""
+        shot_tscn = """[gd_scene format=3]
+[ext_resource type="Script" path="res://Shot.cs" id="2"]
+[sub_resource type="CircleShape2D" id="c"]
+radius = 2.0
+[node name="Shot" type="Area2D"]
+script = ExtResource("2")
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("c")
+"""
+        shot_cs = """using Godot;
+
+[MaxInstances(2)]
+public partial class Shot : Area2D
+{
+    public override void _Ready()
+    {
+        BodyEntered += OnBody;
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        Position = new Vector2(Position.X + 10, Position.Y);
+    }
+
+    private void OnBody(Node2D body)
+    {
+        GD.Print("shot at y ", Position.Y, " hit ", body.Name);
+        QueueFree();
+    }
+}
+"""
+        gun_cs = """using Godot;
+
+public partial class Turret : Node2D
+{
+    [Export] public PackedScene ShotScene;
+    private int _f;
+
+    public override void _PhysicsProcess(double delta)
+    {
+        _f = _f + 1;
+        if (_f % 10 == 1 && _f < 60)
+        {
+            Shot s = ShotScene.Instantiate<Shot>();
+            s.Position = new Vector2(0, _f);
+            AddChild(s);
+        }
+    }
+}
+"""
+        scene = ('[node name="Wall" type="StaticBody2D" parent="."]\n'
+                 'position = Vector2(100, 0)\n\n'
+                 '[node name="Shape" type="CollisionShape2D" parent="Wall"]\n'
+                 'shape = SubResource("wall")\n\n'
+                 '[node name="Turret" type="Node2D" parent="."]\n'
+                 'script = ExtResource("s_Turret")\n'
+                 'ShotScene = ExtResource("sh")\n')
+        subs = ('[ext_resource type="PackedScene" path="res://shot.tscn" '
+                'id="sh"]\n'
+                '[sub_resource type="RectangleShape2D" id="wall"]\n'
+                'size = Vector2(10, 400)\n\n')
+        d = project(self, scene, subs=subs, scripts={
+            "Shot.cs": shot_cs, "Turret.cs": gun_cs,
+            "MaxInstances.cs": SPAWN_MINES_SCRIPTS["MaxInstances.cs"]})
+        with open(os.path.join(d, "shot.tscn"), "w") as f:
+            f.write(shot_tscn)
+        out = pack_physics(self, d)
+        lines = run_physics(self, out, SPAWN_DRAWS.replace("FRAMES", "120")
+                            .replace("if (f <= 5)", "if (0)"))
+        # six shots, 10 frames apart, each hits the wall (x 95) on its own
+        # 10th step and frees itself: two at once at most, the pool reused
+        self.assertEqual(lines, ["shot at y %d hit Wall" % y
+                                 for y in (1, 11, 21, 31, 41, 51)]
+                         + ["max=0"])
+
+    def test_refusals(self):
+        # a path above the spawned scene's root: its parent is known only
+        # when it is added
+        self.assertIn('"../.." from `Bullet` is above its spawned '
+                      "scene's root", refusal(
+                          self, self._gun(scripts={"Bullet.cs": BULLET_CS
+                                                   .replace(
+                              "public int Speed = 10;",
+                              "public int Speed = 10;\n    private Gun _g;\n"
+                              "    public override void _Ready() { _g = "
+                              "GetNode<Gun>(\"../..\"); }")})))
+        nested = BULLET_TSCN + (
+            '[sub_resource type="CircleShape2D" id="c"]\n'
+            '[node name="Hit" type="Area2D" parent="."]\n'
+            '[node name="S" type="CollisionShape2D" parent="Hit"]\n'
+            'shape = SubResource("c")\n')
+        self.assertIn("`Hit` is a physics body below a spawned scene's root, "
+                      "which is not packed yet",
+                      refusal(self, self._gun(extra={"bullet.tscn": nested})))
+        cases = [
+            ("Bullet b = BulletScene.Instantiate<Bullet>();",
+             "AddChild(BulletScene.Instantiate<Bullet>());",
+             "error CS8000: a scene is spawned into a local"),
+            ("Bullet b = BulletScene.Instantiate<Bullet>();",
+             "Gun b = BulletScene.Instantiate<Gun>();",
+             "error CS8000: `BulletScene` spawns Bullet, not a Gun"),
+            ("AddChild(b);", "AddChild(b, true);",
+             "error CS8000: AddChild takes a spawned node's local"),
+        ]
+        for old, new, want in cases:
+            self.assertIn(want, refusal(self, self._gun(scripts={
+                "Gun.cs": GUN_CS.replace(old, new)})))
 
 
 if __name__ == "__main__":

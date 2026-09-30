@@ -7807,6 +7807,14 @@ def plan_layouts(objects, analyses, two_d=None):
         for c in a.get("classes") or []:
             if c.get("max_instances") is not None:
                 max_inst[c["name"]] = c
+    # A Godot template's row is dormant, not a live instance: it raises a
+    # [MaxInstances(N)] class's rows by one each, N still the live cap.
+    for cname, insts in by_class.items():
+        tmpl = sum(1 for o in insts
+                   if o.get("godot_template") and not o.get("godot_pool"))
+        if tmpl and max_inst.get(cname) is not None:
+            max_inst[cname] = dict(max_inst[cname], max_instances=int(
+                max_inst[cname]["max_instances"]) + tmpl)
     widths = dict((cname, _class_index_width(cname, len(insts), spawn,
                                               max_inst.get(cname)))
                   for cname, insts in by_class.items())
@@ -12170,7 +12178,12 @@ def _emit_engine_instantiate(
               % idn)
             p("    int ex, go;")
             p("    if (src < 0 || src >= _%s_inst_count) return -1;" % idn)
-            reuse = (cl.get("max_instances") is not None and want_destroy)
+            # (a Godot spawned class reuses a freed clone's slot too: its
+            # budget is a count of live nodes, as [MaxInstances]'s)
+            reuse = ((cl.get("max_instances") is not None
+                      or cname in (plan.get("godot_spawn") or {}))
+                     and want_destroy)
+            pooled = False
             if reuse:
                 # `[MaxInstances(N)]` caps *live* instances: once the array
                 # is full, a destroyed one's slot -- instance and GameObject
@@ -12179,11 +12192,21 @@ def _emit_engine_instantiate(
                 go_full = ("_engine_go_count >= _engine_go_cap"
                            if go_spawn_budget
                            else "_engine_go_count >= %d" % go_cap_i)
+                pooled = cname in (plan.get("godot_pooled") or ())
                 p("    ex = -1;")
                 p("    go = -1;")
-                p("    if (_%s_inst_count >= %d || %s) {" % (idn, cap, go_full))
+                # (a Godot pooled class's rows are all its pool: a spawn
+                # takes a freed one, never a new row)
+                p("    if (%s) {" % ("1" if pooled else "_%s_inst_count >= %d "
+                                   "|| %s" % (idn, cap, go_full)))
                 p("        int _k;")
                 p("        for (_k = 0; _k < _%s_inst_count; _k = _k + 1) {" % idn)
+                for _ti in sorted({nd["index"]
+                                   for t in plan.get("godot_templates") or []
+                                   for nd in t["nodes"]
+                                   if nd["class"] == cname}):
+                    # (a Godot template's row is dormant, not free)
+                    p("            if (_k == %d) continue;" % _ti)
                 p("            int _g = _engine_%s_go_of[_k];" % idn)
                 p("            if (_g >= 0 && _g < %d && _engine_go_destroyed[_g]) {"
                   % go_cap_i)
@@ -12193,10 +12216,13 @@ def _emit_engine_instantiate(
                 p("            }")
                 p("        }")
                 p("        if (ex < 0) return -1;")
-                p("    } else {")
-                p("        go = _engine_go_count;")
-                p("        _engine_go_count = _engine_go_count + 1;")
-                p("    }")
+                if pooled:
+                    p("    }")
+                else:
+                    p("    } else {")
+                    p("        go = _engine_go_count;")
+                    p("        _engine_go_count = _engine_go_count + 1;")
+                    p("    }")
             else:
                 p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
                 if go_spawn_budget:
@@ -12221,7 +12247,9 @@ def _emit_engine_instantiate(
             if want_destroy:
                 p("    if (go >= 0 && go < %d)" % go_cap_i)
                 p("        _engine_go_destroyed[go] = 0;")
-            if reuse:
+            if pooled:
+                pass              # the scan above took a freed pool row
+            elif reuse:
                 p("    if (ex < 0) {")
                 p("        ex = _%s_inst_count;" % idn)
                 p("        _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
@@ -12230,6 +12258,7 @@ def _emit_engine_instantiate(
                 p("    ex = _%s_inst_count;" % idn)
                 p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
             p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
+
             if _has_side_tables(cl):
                 p("    _%s_clone_side((unsigned)ex, (unsigned)src);" % idn)
             _emit_reset_unserialized(p, cl, idn)
@@ -12263,6 +12292,9 @@ def _emit_engine_instantiate(
                 p("    (void)parent_go;")
             # Awake now, Start before its first Update: Unity's order for
             # an instantiated object. Its fields and parent are in place.
+            if cname in (plan.get("godot_spawn") or {}):
+                p("    _godot_on_clone(%d, (unsigned)ex, (unsigned)src);"
+                  % sorted(plan["classes"]).index(cname))
             p("    _%s_spawned((unsigned)ex);" % idn)
             p("    return ex;")
             p("}")
@@ -12861,34 +12893,8 @@ def _emit_engine_class_groups(
              if m["name"] in emit_names and m["name"] != "OnEnable"])
         used_syms = set()
         # Forward-declare helpers so Start can call Do before Do's body.
-        for c, m in methods_by.get(cname, []):
-            if m["name"] not in emit_names:
-                continue
-            if cl.get("ctor_forbidden"):
-                continue
-            if m["name"] in _UNITY_EMIT_MESSAGES:
-                continue
-            sym = _method_c_symbol(
-                idn, m["name"], m.get("args") or "",
-                m["name"] in overloaded)
-            rty = _ret_c_ty(m.get("ret"), plan) or "void"
-            coll_param = None
-            if m["name"] in _COLLISION2D_MSGS:
-                coll_param = _collision2d_arg_name(m.get("args") or "")
-                if not coll_param:
-                    continue
-                p("static void %s(unsigned i, int %s);"
-                  % (sym, coll_param))
-            elif m.get("static"):
-                # A static one too: a call may come before its body.
-                plist = _method_c_params(m.get("args") or "")
-                p("static %s %s(%s);" % (rty, sym, plist or "void"))
-            else:
-                plist = _method_c_params(m.get("args") or "")
-                if plist:
-                    p("static %s %s(unsigned i, %s);" % (rty, sym, plist))
-                else:
-                    p("static %s %s(unsigned i);" % (rty, sym))
+        _method_prototypes(cl, cname, methods_by, plan, emit_names,
+                           overloaded, p)
         for c, m in methods_by.get(cname, []):
             if m["name"] not in emit_names:
                 continue
@@ -13319,6 +13325,413 @@ def _emit_godot_global_helpers(class_ids, p, plan):
     p("")
 
 
+def _method_prototypes(cl, cname, methods_by, plan, emit_names, overloaded,
+                       p):
+    """A class's methods' prototypes (its forward declarations: a call may
+    come before a body)."""
+    idn = _c_ident(cname)
+    for c, m in methods_by.get(cname, []):
+        if m["name"] not in emit_names:
+            continue
+        if cl.get("ctor_forbidden"):
+            continue
+        if m["name"] in _UNITY_EMIT_MESSAGES:
+            continue
+        sym = _method_c_symbol(
+            idn, m["name"], m.get("args") or "",
+            m["name"] in overloaded)
+        rty = _ret_c_ty(m.get("ret"), plan) or "void"
+        if m["name"] in _COLLISION2D_MSGS:
+            coll_param = _collision2d_arg_name(m.get("args") or "")
+            if not coll_param:
+                continue
+            p("static void %s(unsigned i, int %s);" % (sym, coll_param))
+        elif m.get("static"):
+            # A static one too: a call may come before its body.
+            plist = _method_c_params(m.get("args") or "")
+            p("static %s %s(%s);" % (rty, sym, plist or "void"))
+        else:
+            plist = _method_c_params(m.get("args") or "")
+            if plist:
+                p("static %s %s(unsigned i, %s);" % (rty, sym, plist))
+            else:
+                p("static %s %s(unsigned i);" % (rty, sym))
+
+
+def _godot_local_basis(o):
+    """An object's own rotation and scale, as a 2x2 (a, b, c, d)."""
+    rz = (o.get("local_rot") or (0.0, 0.0, 0.0, 1.0))
+    ang = 2.0 * math.atan2(rz[2], rz[3])
+    sx, sy = (o.get("local_scale") or (1.0, 1.0, 1.0))[:2]
+    c, s_ = math.cos(ang), math.sin(ang)
+    return (c * sx, -s_ * sy, s_ * sx, c * sy)
+
+
+def _godot_sprite_rows(cl):
+    """[(instance, sprite)] a class's draw rows (_emit_engine_class_draws)."""
+    return [(i, o["sprite"]) for i, o in enumerate(cl["instances"])
+            if o.get("sprite") and o["sprite"].get("enabled", 1)
+            and "tex_id" in o["sprite"]]
+
+
+def _emit_godot_spawn_decls(p, plan):
+    """Before the class groups: a spawned scene's connections (a table
+    each, its sender row -> its receiver row, -1 none) and the timers' rows
+    by instance, which the signal dispatch and the clone code use."""
+    for k, c in enumerate(plan.get("godot_conns") or []):
+        cl = plan["classes"][c["from_class"]]
+        c["cap"] = max(1, cl["n"] + _mb_pool_extra(plan, c["from_class"]))
+        p("/* a spawned %s.%s -> its %s.%s */" % (
+            c["from_class"], c["signal"], c["to_class"], c["method"]))
+        p("static int _godot_conn_%d[%d] = { %s };" % (
+            k, c["cap"], ", ".join(["-1"] * c["cap"])))
+    timers = (plan.get("godot_custom") or {}).get("timers") or []
+    by_class = {}
+    for slot, (cname, inst, _t) in enumerate(timers):
+        by_class.setdefault(cname, {})[inst] = slot
+    for cname, slots in sorted(by_class.items()):
+        if cname not in (plan.get("godot_spawn") or {}):
+            continue
+        n = max(1, plan["classes"][cname]["n"])
+        p("static const int _%s_timer_slot[%d] = { %s };" % (
+            _c_ident(cname), n, ", ".join(str(slots.get(i, -1))
+                                          for i in range(n))))
+    if timers:
+        p("static const int _godot_timer_auto[%d] = { %s };" % (
+            len(timers), ", ".join(str(t["autostart"]) for _c, _i, t in
+                                   timers)))
+    p("")
+
+
+def _emit_godot_spawn(class_ids, p, plan):
+    """Godot's PackedScene spawning. A clone's rows: its template's sprite
+    row, frames, and no parent until AddChild. The scene tree: a GameObject
+    joins its parent's children (freed with it), and a reused one leaves
+    its old parent first. AddChild: under a node, its position local to it,
+    its subtree's frames re-derived. And a function per template: its
+    nodes cloned and linked as the scene has them."""
+    order = sorted(plan["classes"])
+    pos = [(cid, _c_ident(cname), cname) for cname, cid in sorted(
+        class_ids.items(), key=lambda kv: kv[1])
+        if _class_has_position(plan["classes"][cname])]
+    spawn = plan["godot_spawn"]
+    for cname in sorted(spawn):
+        cl = plan["classes"].get(cname)
+        if not cl or not _class_has_position(cl):
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"] + _mb_pool_extra(plan, cname))
+        rows = {i: k for k, (i, _sp) in enumerate(_godot_sprite_rows(cl))}
+        p("/* %s's draw row per instance (-1: none); a clone's is its "
+          "template's */" % cname)
+        p("static int _%s_spr_row[%d] = { %s };" % (idn, n, ", ".join(
+            str(rows.get(i, -1)) for i in range(n))))
+    # rows by class: a frame's row, a GameObject
+    for kind in ("gbasis", "xf_basis", "lbasis"):
+        p("static float *_godot_%s(int c, unsigned i) {" % kind)
+        p("    switch (c) {")
+        for cid, idn, cname in pos:
+            p("    case %d: return _%s_%s[i];" % (cid, idn, kind))
+        p("    default: return 0;")
+        p("    }")
+        p("}")
+    p("static int _godot_go(int c, unsigned i) {")
+    p("    switch (c) {")
+    for cname in order:
+        if plan.get("_go_of_fn"):
+            p("    case %d: return _engine_go_of_%s(i);"
+              % (order.index(cname), _c_ident(cname)))
+    p("    default: return -1;")
+    p("    }")
+    p("}")
+    p("static void _godot_tree_unlink(int go) {")
+    p("    int par, c, prev;")
+    p("    if (go < 0) return;")
+    p("    par = _godot_go_parent[go];")
+    p("    if (par >= 0) {")
+    p("        prev = -1;")
+    p("        c = _godot_go_child[par];")
+    p("        while (c >= 0 && c != go) { prev = c; c = _godot_go_sib[c]; }")
+    p("        if (c == go) {")
+    p("            if (prev < 0) _godot_go_child[par] = _godot_go_sib[go];")
+    p("            else _godot_go_sib[prev] = _godot_go_sib[go];")
+    p("        }")
+    p("    }")
+    p("    _godot_go_parent[go] = -1;")
+    p("    _godot_go_sib[go] = -1;")
+    p("}")
+    p("/* a child joins last (Godot adds a node after its siblings) */")
+    p("static void _godot_tree_link(int go, int par) {")
+    p("    int c;")
+    p("    if (go < 0 || par < 0) return;")
+    p("    _godot_go_parent[go] = par;")
+    p("    _godot_go_sib[go] = -1;")
+    p("    c = _godot_go_child[par];")
+    p("    if (c < 0) { _godot_go_child[par] = go; return; }")
+    p("    while (_godot_go_sib[c] >= 0) c = _godot_go_sib[c];")
+    p("    _godot_go_sib[c] = go;")
+    p("}")
+    timer_classes = {cname for cname, _i, _t in (
+        (plan.get("godot_custom") or {}).get("timers") or [])
+        if cname in (plan.get("godot_pooled") or ())}
+    # a pooled body's Rigidbody2D row per instance (-1 none)
+    rb_rows = {}
+    for cname in plan.get("godot_pooled") or ():
+        rbrow = {r["owner_inst"]: k for k, r in enumerate(
+            plan.get("rigidbody2d") or []) if r["owner_class"] == cname}
+        if rbrow:
+            n = max(1, plan["classes"][cname]["n"])
+            rb_rows[cname] = rbrow
+            p("static const int _%s_rb_row[%d] = { %s };" % (
+                _c_ident(cname), n, ", ".join(
+                    str(rbrow.get(i, -1)) for i in range(n))))
+    p("/* Instantiate: a clone of a template has its row and frames, no parent")
+    p("   until AddChild, and no children until its scene's are linked */")
+    p("static void _godot_on_clone(int c, unsigned ex, unsigned src) {")
+    p("    int a, go;")
+    p("    go = _godot_go(c, ex);")
+    p("    if (go >= 0) {")
+    p("        _godot_tree_unlink(go);")
+    p("        _godot_go_child[go] = -1;")
+    p("        _godot_go_cls[go] = c;")
+    p("        _godot_go_inst[go] = ex;")
+    p("    }")
+    p("    switch (c) {")
+    posnames = {cname for _c, _i, cname in pos}
+    for cname in order:
+        if cname in spawn and cname not in posnames:
+            # a node without a position (a Timer): its rows only
+            idn = _c_ident(cname)
+            p("    case %d:" % order.index(cname))
+            for k, c in enumerate(plan.get("godot_conns") or []):
+                if c["from_class"] == cname:
+                    p("        if (ex < %du) _godot_conn_%d[ex] = -1;"
+                      % (c["cap"], k))
+            if cname in timer_classes:
+                n = max(1, plan["classes"][cname]["n"])
+                p("        if (ex < %du && src < %du) {" % (n, n))
+                p("            int te = _%s_timer_slot[ex], "
+                  "ts = _%s_timer_slot[src];" % (idn, idn))
+                p("            if (te >= 0 && ts >= 0) {")
+                p("                _godot_timer_fresh[te] = 1;")
+                p("                _godot_timer_wait[te] = "
+                  "_godot_timer_wait[ts];")
+                p("                _godot_timer_one_shot[te] = "
+                  "_godot_timer_one_shot[ts];")
+                p("                _godot_timer_paused[te] = 0;")
+                p("                _godot_timer_on[te] = "
+                  "_godot_timer_auto[ts];")
+                p("                _godot_timer_left[te] = "
+                  "_godot_timer_auto[ts] ? _godot_timer_wait[ts] : -1.f;")
+                p("            }")
+                p("        }")
+            p("        break;")
+    for cid, idn, cname in pos:
+        if cname not in spawn:
+            continue
+        p("    case %d:" % cid)
+        p("        _%s_xf_parent_class[ex] = -1;" % idn)
+        p("        _%s_xf_parent_inst[ex] = 0u;" % idn)
+        p("        for (a = 0; a < 4; a = a + 1) {")
+        p("            _%s_gbasis[ex][a] = _%s_lbasis[src][a];" % (idn, idn))
+        p("            _%s_lbasis[ex][a] = _%s_lbasis[src][a];" % (idn, idn))
+        p("            _%s_xf_basis[ex][a] = a == 0 || a == 3 ? 1.f : 0.f;"
+          % idn)
+        p("        }")
+        if _godot_sprite_rows(plan["classes"][cname]):
+            p("        _%s_spr_row[ex] = _%s_spr_row[src];" % (idn, idn))
+        for k, c in enumerate(plan.get("godot_conns") or []):
+            if c["from_class"] == cname:
+                p("        if (ex < %du) _godot_conn_%d[ex] = -1;"
+                  % (c["cap"], k))
+        if cname in timer_classes:
+            n = max(1, plan["classes"][cname]["n"])
+            p("        /* a Timer as its template is: autostart, wait_time,")
+            p("           one_shot, not paused */")
+            p("        if (ex < %du && src < %du) {" % (n, n))
+            p("            int te = _%s_timer_slot[ex], ts = _%s_timer_slot[src];"
+              % (idn, idn))
+            p("            if (te >= 0 && ts >= 0) {")
+            p("                _godot_timer_fresh[te] = 1;")
+            p("                _godot_timer_wait[te] = _godot_timer_wait[ts];")
+            p("                _godot_timer_one_shot[te] = "
+              "_godot_timer_one_shot[ts];")
+            p("                _godot_timer_paused[te] = 0;")
+            p("                _godot_timer_on[te] = _godot_timer_auto[ts];")
+            p("                _godot_timer_left[te] = _godot_timer_auto[ts]"
+              " ? _godot_timer_wait[ts] : -1.f;")
+            p("            }")
+            p("        }")
+        if cname in rb_rows:
+            n = max(1, plan["classes"][cname]["n"])
+            p("        /* its Rigidbody2D row as its template's: a reused body")
+            p("           does not keep its last life's velocity */")
+            p("        if (ex < %du && src < %du) {" % (n, n))
+            p("            int re = _%s_rb_row[ex], rs = _%s_rb_row[src];"
+              % (idn, idn))
+            p("            if (re >= 0 && rs >= 0) {")
+            for f in ("vel_x", "vel_y", "gravity_scale", "linear_damping",
+                      "mass", "body_type"):
+                p("                _Rigidbody2D_%s[re] = _Rigidbody2D_%s[rs];"
+                  % (f, f))
+            p("            }")
+            p("        }")
+        p("        break;")
+    p("    default: break;")
+    p("    }")
+    p("    (void)a;")
+    p("}")
+    p("/* a node's frame, and its subtree's, from its parent's */")
+    p("static void _godot_rebasis(int go, int depth) {")
+    p("    int c, a;")
+    p("    float *pg, *xb, *lb, *gb;")
+    p("    if (go < 0 || depth > 64) return;")
+    p("    pg = _godot_gbasis(_godot_go_cls[go], _godot_go_inst[go]);")
+    p("    c = _godot_go_child[go];")
+    p("    while (c >= 0) {")
+    p("        xb = _godot_xf_basis(_godot_go_cls[c], _godot_go_inst[c]);")
+    p("        lb = _godot_lbasis(_godot_go_cls[c], _godot_go_inst[c]);")
+    p("        gb = _godot_gbasis(_godot_go_cls[c], _godot_go_inst[c]);")
+    p("        if (pg && xb && lb && gb) {")
+    p("            for (a = 0; a < 4; a = a + 1) xb[a] = pg[a];")
+    p("            gb[0] = pg[0] * lb[0] + pg[1] * lb[2];")
+    p("            gb[1] = pg[0] * lb[1] + pg[1] * lb[3];")
+    p("            gb[2] = pg[2] * lb[0] + pg[3] * lb[2];")
+    p("            gb[3] = pg[2] * lb[1] + pg[3] * lb[3];")
+    p("        }")
+    p("        _godot_rebasis(c, depth + 1);")
+    p("        c = _godot_go_sib[c];")
+    p("    }")
+    p("}")
+    p("/* AddChild: node (cc, ci) under (pc, pi), last of its children; its")
+    p("   position is local to it, in the parent's global rotation and scale */")
+    p("static void _godot_add_child(int pc, unsigned pi, int cc, unsigned ci) {")
+    p("    float one[4];")
+    p("    float *pg, *xb, *lb, *gb;")
+    p("    int a, go;")
+    p("    one[0] = 1.f; one[1] = 0.f; one[2] = 0.f; one[3] = 1.f;")
+    p("    pg = pc >= 0 ? _godot_gbasis(pc, pi) : 0;")
+    p("    if (!pg) pg = one;")
+    bodies = [(cid, idn) for cid, idn, cname in pos
+              if cname in (plan.get("godot_pooled") or ())]
+    if bodies:
+        p("    /* a physics body is simulated in the world: its position is")
+        p("       made global now, and it has no transform parent (it stays")
+        p("       its parent's child in the tree) */")
+        p("    switch (cc) {")
+        for cid, idn in bodies:
+            p("    case %d: {" % cid)
+            p("        float px = 0.f, py = 0.f, pz = 0.f;")
+            p("        float lx = %s_get_pos_x(ci), ly = %s_get_pos_y(ci);"
+              % (idn, idn))
+            p("        if (pc >= 0) _engine_world_pos(pc, pi, &px, &py, &pz, 0);")
+            p("        %s_set_pos_x(ci, px + pg[0] * lx + pg[1] * ly);" % idn)
+            p("        %s_set_pos_y(ci, py + pg[2] * lx + pg[3] * ly);" % idn)
+            p("        lb = _godot_lbasis(cc, ci);")
+            p("        gb = _godot_gbasis(cc, ci);")
+            p("        if (lb && gb) {")
+            p("            gb[0] = pg[0] * lb[0] + pg[1] * lb[2];")
+            p("            gb[1] = pg[0] * lb[1] + pg[1] * lb[3];")
+            p("            gb[2] = pg[2] * lb[0] + pg[3] * lb[2];")
+            p("            gb[3] = pg[2] * lb[1] + pg[3] * lb[3];")
+            p("        }")
+            p("        go = _godot_go(cc, ci);")
+            p("        _godot_tree_unlink(go);")
+            p("        if (pc >= 0) _godot_tree_link(go, _godot_go(pc, pi));")
+            p("        _godot_rebasis(go, 0);")
+            p("        return;")
+            p("    }")
+        p("    default: break;")
+        p("    }")
+    p("    switch (cc) {")
+    for cid, idn, cname in pos:
+        p("    case %d:" % cid)
+        p("        _%s_xf_parent_class[ci] = pc;" % idn)
+        p("        _%s_xf_parent_inst[ci] = pi;" % idn)
+        p("        break;")
+    p("    default: break;")
+    p("    }")
+    p("    xb = _godot_xf_basis(cc, ci);")
+    p("    lb = _godot_lbasis(cc, ci);")
+    p("    gb = _godot_gbasis(cc, ci);")
+    p("    if (xb && lb && gb) {")
+    p("        for (a = 0; a < 4; a = a + 1) xb[a] = pg[a];")
+    p("        gb[0] = pg[0] * lb[0] + pg[1] * lb[2];")
+    p("        gb[1] = pg[0] * lb[1] + pg[1] * lb[3];")
+    p("        gb[2] = pg[2] * lb[0] + pg[3] * lb[2];")
+    p("        gb[3] = pg[2] * lb[1] + pg[3] * lb[3];")
+    p("    }")
+    p("    go = _godot_go(cc, ci);")
+    p("    _godot_tree_unlink(go);")
+    p("    if (pc >= 0) _godot_tree_link(go, _godot_go(pc, pi));")
+    p("    _godot_rebasis(go, 0);")
+    p("}")
+    p("/* GetParent().AddChild: under this node's parent */")
+    p("static void _godot_add_child_to_parent(int sc, unsigned si, int cc,"
+      " unsigned ci) {")
+    p("    int pc = -1;")
+    p("    unsigned pi = 0u;")
+    p("    switch (sc) {")
+    for cid, idn, cname in pos:
+        p("    case %d: pc = _%s_xf_parent_class[si]; "
+          "pi = _%s_xf_parent_inst[si]; break;" % (cid, idn, idn))
+    p("    default: break;")
+    p("    }")
+    p("    _godot_add_child(pc, pi, cc, ci);")
+    p("}")
+    # one function per template: its nodes cloned, linked as the scene
+    # has them; its internal references are the clones'
+    temps = plan.get("godot_templates") or []
+    by_root = {}
+    for k, t in enumerate(temps):
+        nodes = t["nodes"]
+        idns = [_c_ident(nd["class"]) for nd in nodes]
+        p("/* %s */" % _godot.godot_display_path(t["path"]))
+        p("static int _godot_spawn_t%d(void) {" % k)
+        p("    int n[%d];" % len(nodes))
+        for j, nd in enumerate(nodes):
+            p("    n[%d] = Object_Instantiate_%s(%d, -1);" % (
+                j, idns[j], nd["index"]))
+            if j == 0:
+                p("    if (n[0] < 0) return -1;")
+            else:
+                p("    if (n[%d] < 0) {" % j)
+                p("        Object_Destroy(_godot_go(%d, (unsigned)n[0]));"
+                  % order.index(nodes[0]["class"]))
+                p("        return -1;")
+                p("    }")
+                par = nd["parent"] if nd["parent"] >= 0 else 0
+                p("    _godot_add_child(%d, (unsigned)n[%d], %d, (unsigned)n[%d]);"
+                  % (order.index(nodes[par]["class"]), par,
+                     order.index(nd["class"]), j))
+        for j, nd in enumerate(nodes):
+            for field, target in sorted(nd["refs"].items()):
+                p("    %s_AT(n[%d]).%s = n[%d];" % (idns[j], j, field, target))
+            for field, target in sorted((nd.get("timer_refs") or {}).items()):
+                # a reference to its scene's Timer: the clone's timer
+                p("    %s_AT(n[%d]).%s = _%s_timer_slot[n[%d]];" % (
+                    idns[j], j, field, idns[target], target))
+        for ck, c in enumerate(plan.get("godot_conns") or []):
+            if c["t"] == k:
+                p("    _godot_conn_%d[n[%d]] = n[%d];" % (ck, c["from"],
+                                                          c["to"]))
+        p("    return n[0];")
+        p("}")
+        by_root.setdefault(nodes[0]["class"], []).append((nodes[0]["index"], k))
+    for cname, entries in sorted(by_root.items()):
+        idn = _c_ident(cname)
+        p("/* %s.Instantiate: a scene's template spawns its whole scene */"
+          % cname)
+        p("static int _godot_spawn_%s(int src) {" % idn)
+        p("    switch (src) {")
+        for index, k in entries:
+            p("    case %d: return _godot_spawn_t%d();" % (index, k))
+        p("    default: return Object_Instantiate_%s(src, -1);" % idn)
+        p("    }")
+        p("}")
+    p("")
+
+
 def _godot_new_vector_assign(text, target, lower):
     """`<target> = new Vector2(A, B);` (target a regex) as `lower(A, B)`."""
     out, last = [], 0
@@ -13358,6 +13771,7 @@ def _godot_free_tree(plan, cap):
             order.append((tuple(o.get("godot_tree_index") or (0, 0)), gi))
     first = [-1] * cap
     sib = [-1] * cap
+    parent = [-1] * cap
     # tree order, so reversing it frees the last child first
     for _path, gi in sorted(order):
         pgo = by_id.get(parent_of.get(gi))
@@ -13365,14 +13779,19 @@ def _godot_free_tree(plan, cap):
             continue
         sib[gi] = first[pgo]
         first[pgo] = gi
-    if all(v < 0 for v in first):
+        parent[gi] = pgo
+    if all(v < 0 for v in first) and not plan.get("godot_spawn"):
         return None
+    _godot_free_tree.parents = parent
     return first, sib
 
 
 def _godot_bases(plan):
     """Whether a Godot child's parent is rotated or scaled (its local
-    position is then in the parent's frame)."""
+    position is then in the parent's frame) -- or may be: a clone is added
+    under any node at runtime."""
+    if plan.get("godot_spawn"):
+        return True
     return bool(plan.get("godot")) and any(
         tuple(o.get("godot_parent_basis") or (1.0, 0.0, 0.0, 1.0))
         != (1.0, 0.0, 0.0, 1.0)
@@ -13399,16 +13818,34 @@ def _emit_engine_world_positions(
             while len(pcs) < n:
                 pcs.append("-1")
                 pis.append("0")
+            spawn = bool(plan.get("godot_spawn"))
             if _godot_bases(plan):
                 # Godot: the parent's global rotation and scale, which a
                 # child's local position is in (godot_parent_basis)
                 bs = [o.get("godot_parent_basis") or (1.0, 0.0, 0.0, 1.0)
                       for o in cl["instances"]]
                 bs += [(1.0, 0.0, 0.0, 1.0)] * (n - len(bs))
-                p("static const float _%s_xf_basis[%d][4] = { %s };" % (
+                p("static %sfloat _%s_xf_basis[%d][4] = { %s };" % (
+                    "" if spawn else "const ", idn, n, ", ".join(
+                        "{ %s }" % ", ".join("%sf" % repr(float(v))
+                                             for v in b) for b in bs)))
+            if spawn:
+                # its own global rotation and scale: a spawned child's
+                # frame, when one is added under it (a clone copies its
+                # template's)
+                gb = [o.get("godot_global_basis") or (1.0, 0.0, 0.0, 1.0)
+                      for o in cl["instances"]]
+                gb += [(1.0, 0.0, 0.0, 1.0)] * (n - len(gb))
+                p("static float _%s_gbasis[%d][4] = { %s };" % (
                     idn, n, ", ".join("{ %s }" % ", ".join(
-                        "%sf" % repr(float(v)) for v in b) for b in bs)))
-            if want_set_parent:
+                        "%sf" % repr(float(v)) for v in b) for b in gb)))
+                # its own rotation and scale (a clone's, its template's)
+                lb = [_godot_local_basis(o) for o in cl["instances"]]
+                lb += [(1.0, 0.0, 0.0, 1.0)] * (n - len(lb))
+                p("static float _%s_lbasis[%d][4] = { %s };" % (
+                    idn, n, ", ".join("{ %s }" % ", ".join(
+                        "%sf" % repr(float(v)) for v in b) for b in lb)))
+            if want_set_parent or spawn:
                 p("static int _%s_xf_parent_class[%d] = { %s };"
                   % (idn, n, ", ".join(pcs)))
                 p("static unsigned _%s_xf_parent_inst[%d] = { %s };"
@@ -13470,6 +13907,8 @@ def _emit_engine_world_positions(
         p("")
         if plan.get("godot"):
             _emit_godot_global_helpers(class_ids, p, plan)
+            if plan.get("godot_spawn"):
+                _emit_godot_spawn(class_ids, p, plan)
 
         if want_set_parent and want_go_tables:
             go_n = max(1, len(plan.get("go_names") or []))
@@ -15642,9 +16081,19 @@ def _emit_engine_class_draws(
             if ui_buttons:
                 p("        static const int _spr_btn[] = { %s };" % ", ".join(
                     btn_vals))
-        p("        int k;")
-        p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
-        p("            unsigned i = _spr_i[k];")
+        if cname in (plan.get("godot_spawn") or {}):
+            # a spawned class: every live instance, its draw row its own
+            # (a clone's is its template's; -1 none)
+            p("        unsigned i;")
+            p("        for (i = 0; i < (unsigned)_%s_inst_count && n < max;"
+              " i = i + 1) {" % idn)
+            p("            int k = _%s_spr_row[i];" % idn)
+            p("            if (k < 0) continue;")
+        else:
+            p("        int k;")
+            p("        for (k = 0; k < %d && n < max; k = k + 1) {"
+              % len(spr_idx))
+            p("            unsigned i = _spr_i[k];")
         if want_destroy and plan.get("_go_of_fn"):
             p("            if (_engine_go_destroyed[_engine_go_of_%s(i)])" % idn)
             p("                continue;")
@@ -16469,7 +16918,9 @@ def emit_engine(plan, analyses, used_apis):
         mb_budget = _mb_pool_extra(plan, cname)
         cap = cl["n"] + mb_budget
         p("extern %s _%s_inst_array[%d];" % (idn, idn, max(1, cap)))
-        if mb_budget:
+        # (a Godot pooled class spawns into its own rows: its count is
+        # written by the clone code, though never past them)
+        if mb_budget or cname in (plan.get("godot_pooled") or ()):
             p("extern int _%s_inst_count;" % idn)
         else:
             p("extern const int _%s_inst_count;" % idn)
@@ -16665,7 +17116,20 @@ def emit_engine(plan, analyses, used_apis):
         go_names_d = plan.get("go_names") or []
         go_cap_d = max(1, len(go_names_d) + go_spawn_budget)
         p("/* Destroy(gameObject) — stop Update; no pool free */")
-        p("static int _engine_go_destroyed[%d];" % go_cap_d)
+        # A Godot template (a PackedScene's nodes) is dormant from the
+        # start: a clone of it is what lives
+        dormant = sorted({int(o["go_index"])
+                          for cl in plan["classes"].values()
+                          for o in cl.get("instances") or []
+                          if o.get("godot_template")
+                          and o.get("go_index") is not None
+                          and int(o["go_index"]) < go_cap_d})
+        if dormant:
+            p("static int _engine_go_destroyed[%d] = { %s };" % (
+                go_cap_d, ", ".join("1" if g in dormant else "0"
+                                    for g in range(dormant[-1] + 1))))
+        else:
+            p("static int _engine_go_destroyed[%d];" % go_cap_d)
         if want_go_tables:
             p("static void _engine_go_message(int go, int msg);")
         tree = _godot_free_tree(plan, go_cap_d) if plan.get("godot") else None
@@ -16673,10 +17137,29 @@ def emit_engine(plan, analyses, used_apis):
             # Godot's queue_free frees the node's subtree: its children
             # first, in reverse order (_propagate_exit_tree)
             first, sib = tree
-            p("static const int _godot_go_child[%d] = { %s };" % (
-                go_cap_d, ", ".join(str(v) for v in first)))
-            p("static const int _godot_go_sib[%d] = { %s };" % (
-                go_cap_d, ", ".join(str(v) for v in sib)))
+            live = "" if plan.get("godot_spawn") else "const "
+            p("static %sint _godot_go_child[%d] = { %s };" % (
+                live, go_cap_d, ", ".join(str(v) for v in first)))
+            p("static %sint _godot_go_sib[%d] = { %s };" % (
+                live, go_cap_d, ", ".join(str(v) for v in sib)))
+            if plan.get("godot_spawn"):
+                # a spawned scene's nodes join the tree, and leave it when
+                # their row is reused: each GameObject's parent, and its row
+                par = _godot_free_tree.parents
+                order = sorted(plan["classes"])
+                gcls, ginst = [-1] * go_cap_d, [0] * go_cap_d
+                for cname, gcl in plan["classes"].items():
+                    for k, o in enumerate(gcl.get("instances") or []):
+                        gi = o.get("go_index")
+                        if gi is not None and int(gi) < go_cap_d:
+                            gcls[int(gi)] = order.index(cname)
+                            ginst[int(gi)] = k
+                p("static int _godot_go_parent[%d] = { %s };" % (
+                    go_cap_d, ", ".join(str(v) for v in par)))
+                p("static int _godot_go_cls[%d] = { %s };" % (
+                    go_cap_d, ", ".join(str(v) for v in gcls)))
+                p("static unsigned _godot_go_inst[%d] = { %s };" % (
+                    go_cap_d, ", ".join("%du" % v for v in ginst)))
         p("static void Object_Destroy(int go) {")
         p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;" % go_cap_d)
         if tree:
@@ -16807,6 +17290,16 @@ def emit_engine(plan, analyses, used_apis):
             want_screen_to_world, want_set_parent, want_transform_find,
             want_transform_parent, want_ui)
 
+    if plan.get("godot_spawn"):
+        # Godot spawning's helpers (defined with the world positions)
+        p("static void _godot_on_clone(int c, unsigned ex, unsigned src);")
+        p("static void _godot_add_child(int pc, unsigned pi, int cc,"
+          " unsigned ci);")
+        p("static void _godot_add_child_to_parent(int sc, unsigned si, int cc,"
+          " unsigned ci);")
+        for _root in sorted({t["nodes"][0]["class"]
+                             for t in plan.get("godot_templates") or []}):
+            p("static int _godot_spawn_%s(int src);" % _c_ident(_root))
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
     _emit_engine_instantiate(
             add_budget, go_spawn_budget, inst_budget, p, plan, want_destroy,
@@ -17144,11 +17637,27 @@ def emit_engine(plan, analyses, used_apis):
             p("    static const char *const n[%d] = { %s };" % (
                 max(1, len(names)), ", ".join(_c_string(x) for x in names)
                 or '""'))
-            p("    return i < %du ? n[i] : \"\";" % len(names))
+            clone_name = ((plan.get("godot_spawn") or {}).get(cname)
+                          or {}).get("name", "")
+            p("    return i < %du ? n[i] : %s;" % (
+                len(names), _c_string(clone_name)))
             p("}")
+    if plan.get("godot"):
+        # a script calls another class's method through a node reference:
+        # every class's prototypes, before any class's bodies
+        for cname, pcl in sorted(plan["classes"].items()):
+            names = _reachable_emit_methods(
+                [m for _c, m in methods_by.get(cname, [])],
+                _extra_roots(plan, cname))
+            over = _overload_method_names(
+                [m for _c, m in methods_by.get(cname, [])
+                 if m["name"] in names and m["name"] != "OnEnable"])
+            _method_prototypes(pcl, cname, methods_by, plan, names, over, p)
     if plan.get("godot_custom"):
         plan["_godot_destroy"] = bool(want_destroy and plan.get("go_names"))
         _godot.emit_custom_decls(p, plan, _c_ident)
+        if plan.get("godot_spawn"):
+            _emit_godot_spawn_decls(p, plan)
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
@@ -20908,6 +21417,51 @@ def _reference_holds(text, cl, plan, site):
     return holds
 
 
+def _lower_godot_tree(text, cl, plan, site):
+    """godot_pack's AddChild forms, now that the references' classes are
+    known: `GodotTree.Add(parent, child)` -> `_godot_add_child(..)`,
+    `GodotTree.AddToParent(this, child)` (GetParent().AddChild) and
+    `GodotTree.AddToRoot(child)` (the scene's root: no parent)."""
+    holds = _reference_holds(text, cl, plan, site)
+    order = sorted(plan["classes"])
+    own = order.index(cl["name"])
+
+    def node(expr):
+        expr = expr.strip()
+        if expr in ("this", "i"):
+            return own, "i"
+        if expr in holds:
+            return order.index(holds[expr]), expr
+        return None
+
+    out, last = [], 0
+    for m in re.finditer(r"GodotTree\.(Add|AddToParent|AddToRoot)\s*\(",
+                         text):
+        if m.start() < last:
+            continue
+        close = _match_close(cs2cpp._blank(text), m.end() - 1, "(", ")")
+        if close is None:
+            continue
+        args = _split_call_args(text[m.end():close])
+        kids = node(args[-1]) if args else None
+        par = node(args[0]) if len(args) == 2 else None
+        if kids is None or (len(args) == 2 and par is None):
+            continue            # left for the stub detector to report
+        if m.group(1) == "Add":
+            call = "_godot_add_child(%d, %s, %d, %s)" % (
+                par[0], par[1], kids[0], kids[1])
+        elif m.group(1) == "AddToParent":
+            call = "_godot_add_child_to_parent(%d, %s, %d, %s)" % (
+                par[0], par[1], kids[0], kids[1])
+        else:
+            call = "_godot_add_child(-1, 0u, %d, %s)" % (kids[0], kids[1])
+        out.append(text[last:m.start()])
+        out.append(call)
+        last = close + 1
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _handle_positions(text, plan, holds):
     """`other.transform.position.x` (or `localPosition`) read through a
     reference to another packed object -- a field, local or parameter of
@@ -21978,6 +22532,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # own `transform.position` is lowered (which would take its receiver).
     text = _handle_positions(text, plan, _reference_holds(text, cl, plan,
                                                           site))
+    if plan.get("godot_spawn") and "GodotTree." in text:
+        text = _lower_godot_tree(text, cl, plan, site)
     text = _lower_mouse_scroll(text)
     if "__sprite_fx(" in text:
         idn_fx = _c_ident(cl["name"])
@@ -22217,6 +22773,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             (site or {}).get("args") or "")
             if prm.type.split(".")[-1] == "GameObject"})
     text = _rewrite_instantiate(text, plan, cl["name"])
+    if plan.get("godot_templates"):
+        # a Godot scene's root: its template's whole scene is spawned
+        for _root in {t["nodes"][0]["class"]
+                      for t in plan["godot_templates"]}:
+            _ri = _c_ident(_root)
+            text = cs2cpp.code_sub(
+                r"(?<![\w])Object_Instantiate_%s\s*\(((?:[^()]|\([^()]*"
+                r"(?:\([^()]*\)[^()]*)*\))*?),\s*-1\s*\)" % re.escape(_ri),
+                lambda m, r=_ri: "_godot_spawn_%s(%s)" % (r, m.group(1)),
+                text)
     text = _rewrite_new_packed_class(text, plan)
     text = _rewrite_getcomponentsinchildren(text, plan, cl["name"])
     text = _rewrite_audiosource_api(text, cl, add_locals=add_locals)
@@ -23299,7 +23865,7 @@ def emit_data(plan, used_apis=None):
         idn = _c_ident(cname)
         mb_budget = _mb_pool_extra(plan, cname)
         cap = max(1, cl["n"] + mb_budget)
-        if mb_budget:
+        if mb_budget or cname in (plan.get("godot_pooled") or ()):
             p("int _%s_inst_count = %d;" % (idn, cl["n"]))
         else:
             p("const int _%s_inst_count = %d;" % (idn, cl["n"]))
@@ -24997,6 +25563,35 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
         plan["addcomponent_budget"]["Rigidbody2D"] = int(
             plan["addcomponent_budget"].get("Rigidbody2D") or 0) + _jadd
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
+    if plan.get("godot"):
+        # Godot's PackedScene.Instantiate: a template root's class spawns,
+        # [MaxInstances(N)] or a default number of spare rows
+        plan["godot_spawn"] = _godot.spawn_classes()
+        plan["godot_templates"] = _godot.spawn_templates()
+        # connections within a spawned scene: their ends are known only
+        # when it is spawned (a table per connection, by sender row)
+        plan["godot_conns"] = [
+            {"t": ti, "from": j, "to": c["to"], "signal": c["signal"],
+             "method": c["method"], "from_class": nd["class"],
+             "to_class": t["nodes"][c["to"]]["class"]}
+            for ti, t in enumerate(plan["godot_templates"])
+            for j, nd in enumerate(t["nodes"]) for c in nd.get("conns") or []]
+        # a spawned body's class: its rows are the pool's dormant copies
+        # (godot_pack), so a spawn takes a freed one -- never a spare row,
+        # which would have no collider or Box2D body
+        plan["godot_pooled"] = sorted(
+            cname for cname, gcl in plan["classes"].items()
+            if any(o.get("godot_pool") for o in gcl.get("instances") or []))
+        for _pc in plan["godot_pooled"]:
+            plan["classes"][_pc]["max_instances"] = int(
+                plan["classes"][_pc]["n"])
+            plan["instantiate_budget"][_pc] = max(
+                1, int(plan["instantiate_budget"].get(_pc) or 0))
+        for _sc in plan["godot_spawn"]:
+            if _sc in plan["classes"]:
+                plan["instantiate_budget"][_sc] = max(
+                    int(plan["instantiate_budget"].get(_sc) or 0),
+                    _godot.DEFAULT_SPAWN_BUDGET)
     plan["new_budget"] = _new_budget(analyses, plan)
     # Each clone takes a GameObject too: a `[MaxInstances(N)]` class's share
     # of the pool is what fills it to N, not the one spare per call site.
@@ -25143,6 +25738,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["audioclip_guids"] = clip_guids
     _resolve_go_field_refs(plan)
     _attach_transform_parents(plan)
+    if plan.get("godot_spawn"):
+        # a clone is added under a node at runtime (AddChild)
+        plan["has_transform_parents"] = True
     if "transform.SetParent" in used_apis:
         plan["has_transform_parents"] = True
     plan["collider2d"] = _build_collider2d_tables(plan)
