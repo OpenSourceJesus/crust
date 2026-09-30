@@ -2444,6 +2444,11 @@ BINDINGS = [
 ] + [cs2cpp.Binding("GodotInput." + n, "GodotInput_" + n) for n in (
     "Pressed", "JustPressed", "JustReleased", "Strength", "RawStrength",
     "Axis", "Vector", "JoyAxis")] + [
+    cs2cpp.Binding("GodotVec." + n, "GodotVec_" + n) for n in (
+        "Length", "LengthSquared", "Normalized", "Angle", "Abs",
+        "IsZeroApprox", "Dot", "Cross", "DistanceTo", "DistanceSquaredTo",
+        "AngleTo", "DirectionTo", "IsEqualApprox", "Rotated", "LimitLength",
+        "Lerp", "MoveToward")] + [
     cs2cpp.Binding("GodotTimer." + n, "GodotTimer_" + n) for n in (
         "Start", "Stop", "IsStopped", "TimeLeft", "WaitTime", "OneShot",
         "Paused", "SetWaitTime", "SetOneShot", "SetPaused")]
@@ -2453,7 +2458,8 @@ BINDINGS = [
 BOOL_CALLS = frozenset((
     "GodotSignals_IsA", "GodotSignals_InGroup",
     "GodotInput_Pressed", "GodotInput_JustPressed", "GodotInput_JustReleased",
-    "GodotTimer_IsStopped", "GodotTimer_OneShot", "GodotTimer_Paused"))
+    "GodotTimer_IsStopped", "GodotTimer_OneShot", "GodotTimer_Paused",
+    "GodotVec_IsZeroApprox", "GodotVec_IsEqualApprox"))
 
 
 #: Calls that return a string, for string concatenation (which may run
@@ -2703,6 +2709,17 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
 
     if _INPUT[0] is None and GODOT_ROOT[0]:
         _INPUT[0] = _InputPlan(GODOT_ROOT[0])
+    # SpriteEffects2D (the GPU path's effect byte): this node is its
+    # gameObject, then Unity's desugaring (tools/unity_pack_gpu2d.py)
+    # (unity_pack's pack() may have desugared the project's files already:
+    # `__sprite_fx(this, ..)`)
+    if "SpriteEffect" in text or "__sprite_fx" in text:
+        import tools.unity_pack_gpu2d as _gfx
+        text = re.sub(r"((?:SpriteEffects2D\s*\.\s*(?:Set|Clear)|"
+                      r"(?<![\w.])__sprite_fx)\s*\(\s*)this\b(?!\s*\.)",
+                      r"\1gameObject", text)
+        text = _gfx.desugar_effects(text)
+        scan = cs2cpp._blank(text)
     # Input first, as its own pass: its calls sit inside others (GD.Print).
     edits = []
     _lower_input(path, text, scan, edits)
@@ -2711,6 +2728,8 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
         scan = cs2cpp._blank(text)
     text, scan = _lower_node_refs(path, text, scan)
     text, scan = _lower_ref_members(path, text, scan)
+    text, scan = _lower_own_position_vectors(path, text, scan)
+    text, scan = _lower_vector_members(path, text, scan)
     edits = []
     # `BodyEntered += OnBodyEntered;` is wiring, which godot_pack resolved.
     for _sig, _method, s0, s1 in script_signal_connections(path, text):
@@ -2833,7 +2852,8 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
               "Up": "new Vector%d(0, -1%s)", "Down": "new Vector%d(0, 1%s)",
               "Left": "new Vector%d(-1, 0%s)",
               "Right": "new Vector%d(1, 0%s)"}
-    for m in re.finditer(r"\bVector([23])\s*\.\s*(Zero|One|Up|Down|Left|Right)\b",
+    # (Vector2's constants are _lower_vector_members'; these are Vector3's)
+    for m in re.finditer(r"\bVector(3)\s*\.\s*(Zero|One|Up|Down|Left|Right)\b",
                          scan):
         d = int(m.group(1))
         tpl = consts[m.group(2)]
@@ -2851,6 +2871,23 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
                          scan):
         s = m.start(2)
         edits.append((s, s + 1, m.group(2).lower()))
+    # ... and of a vector that is not a name: `new Vector2(..).Y`, a
+    # GodotVec / GodotInput.Vector result, `(a + b).X`
+    for m in re.finditer(r"\)\s*\.\s*([XY])\b(?!\s*\()", scan):
+        depth, q = 0, m.start()
+        while q >= 0:
+            if scan[q] == ")":
+                depth += 1
+            elif scan[q] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            q -= 1
+        head = scan[:q].rstrip() if q >= 0 else ""
+        if (not re.search(r"[\w.>\]]$", head)
+                or re.search(r"(?:new\s+Vector2|GodotVec\s*\.\s*\w+|"
+                             r"GodotInput\s*\.\s*Vector)$", head)):
+            edits.append((m.start(1), m.start(1) + 1, m.group(1).lower()))
     text = _apply(text, edits)
     return _lower_signal_params(path, text, handler_params)
 
@@ -3083,6 +3120,169 @@ def _lower_ref_members(path, text, scan):
             edits.append((m.start(), m.end(), "GodotSignals.OwnName()"))
     if edits:
         text = _apply(text, edits)
+        scan = cs2cpp._blank(text)
+    return text, scan
+
+
+def _lower_own_position_vectors(path, text, scan):
+    """This node's `Position` / `GlobalPosition` as a whole vector: read, it
+    is `new Vector2(P.X, P.Y)`; assigned any vector expression (or `+=`,
+    `-=`, `*=`, `/=`), the value goes through a temporary whose components
+    are set -- what the lowering's position setters take. (Vector2
+    arithmetic itself is unity_pack_vectors'.) `P = new Vector2(x, y);` is
+    left as it is."""
+    if {"Position", "GlobalPosition"} & _declared_names(scan):
+        return text, scan
+    pat = r"(?<![.\w])(?:this\s*\.\s*)?(Position|GlobalPosition)\b"
+    edits = []
+    for m in re.finditer(pat, scan):
+        after = scan[m.end():]
+        if re.match(r"\s*\.\s*[XYZ]\b", after) or re.match(
+                r"\s*[-+*/]?=(?!=)", after):
+            continue
+        edits.append((m.start(), m.end(), "new Vector2(%s.X, %s.Y)" % (
+            m.group(1), m.group(1))))
+    if edits:
+        text = _apply(text, edits)
+        scan = cs2cpp._blank(text)
+    edits = []
+    serial = 0
+    for m in re.finditer(pat, scan):
+        am = re.match(r"\s*([-+*/]?)=(?!=)", scan[m.end():])
+        if not am:
+            continue
+        end = _statement_end_plain(scan, m.end() + am.end())
+        expr = text[m.end() + am.end():end].strip()
+        op, prop = am.group(1), m.group(1)
+        if not op and re.fullmatch(r"new\s+Vector2\s*\(.*\)", expr, re.S) \
+                and _close_paren(scan, m.end() + am.end()
+                                 + scan[m.end() + am.end():].index("(")) \
+                == end - 1 - (len(scan[m.end() + am.end():end])
+                              - len(scan[m.end() + am.end():end].rstrip())):
+            continue
+        var = "__tp%d" % serial
+        serial += 1
+        value = expr if not op else "new Vector2(%s.X, %s.Y) %s (%s)" % (
+            prop, prop, op, expr)
+        semi = end + 1 if end < len(scan) and scan[end] == ";" else end
+        edits.append((m.start(), semi,
+                      "{ Vector2 %s = %s; %s = new Vector2(%s.X, %s.Y); }"
+                      % (var, value, prop, var, var)))
+    if edits:
+        text = _apply(text, edits)
+        scan = cs2cpp._blank(text)
+    return text, scan
+
+
+#: Godot's Vector2 methods packed: name -> (arguments, a default for a
+#: missing last one). GodotSharp's semantics, in unity_pack_vectors.
+_VECTOR2_METHODS = {
+    "Length": (0, None), "LengthSquared": (0, None), "Normalized": (0, None),
+    "Angle": (0, None), "Abs": (0, None), "IsZeroApprox": (0, None),
+    "Dot": (1, None), "Cross": (1, None), "DistanceTo": (1, None),
+    "DistanceSquaredTo": (1, None), "AngleTo": (1, None),
+    "DirectionTo": (1, None), "IsEqualApprox": (1, None),
+    "Rotated": (1, None), "LimitLength": (1, "1.0f"),
+    "Lerp": (2, None), "MoveToward": (2, None),
+}
+_VECTOR2_CONSTANTS = {"Zero": (0, 0), "One": (1, 1), "Up": (0, -1),
+                      "Down": (0, 1), "Left": (-1, 0), "Right": (1, 0)}
+#: Types whose static methods share names with Vector2's.
+_NOT_VECTOR_RECEIVERS = frozenset(("Mathf", "Math", "GD", "Godot", "GodotVec"))
+
+
+def _receiver_start(scan, dot):
+    """The start of the postfix chain ending just before *dot* (the `.` of
+    `recv.Method(`): names, `.`, `(..)` / `[..]` groups, a leading `new T`."""
+    k = dot
+    while True:
+        j = k
+        while j > 0 and scan[j - 1].isspace():
+            j -= 1
+        if j == 0:
+            return None if j == k else j
+        c = scan[j - 1]
+        if c in ")]":
+            op = "(" if c == ")" else "["
+            depth = 0
+            q = j - 1
+            while q >= 0:
+                if scan[q] in ")]":
+                    depth += 1
+                elif scan[q] in "([":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                q -= 1
+            if q < 0 or scan[q] != op:
+                return None
+            k = q
+            continue
+        m = re.search(r"[A-Za-z_]\w*$", scan[:j])
+        if m:
+            k = m.start()
+            nm = re.search(r"new\s+$", scan[:k])
+            if nm:
+                return nm.start()
+            q = k
+            while q > 0 and scan[q - 1].isspace():
+                q -= 1
+            if q > 0 and scan[q - 1] == ".":
+                k = q - 1
+                continue
+            return k
+        return None if k == dot else k
+
+
+def _lower_vector_members(path, text, scan):
+    """Godot's Vector2 constants and methods: `Vector2.Up` is
+    `new Vector2(0, -1)`, `v.Normalized()` is `GodotVec.Normalized(v)` (the
+    engine's GodotVec_Normalized) -- whatever the receiver, a name, a call,
+    `(a - b)`, `_p.Position`. Returns (text, scan)."""
+    edits = []
+    for m in re.finditer(r"(?<![\w.])(?:Godot\s*\.\s*)?Vector2\s*\.\s*(\w+)\b"
+                         r"(?!\s*\()", scan):
+        if m.group(1) in _VECTOR2_CONSTANTS:
+            x, y = _VECTOR2_CONSTANTS[m.group(1)]
+            edits.append((m.start(), m.end(), "new Vector2(%d, %d)" % (x, y)))
+        elif m.group(1) not in ("X", "Y"):
+            _refuse(path, text, m.start(), "Vector2.%s" % m.group(1))
+    if edits:
+        text = _apply(text, edits)
+        scan = cs2cpp._blank(text)
+    # innermost first: a receiver may itself hold a call (a.Normalized()
+    # .Rotated(t)), so rewrite one call a pass until none is left
+    names = "|".join(sorted(_VECTOR2_METHODS, key=len, reverse=True))
+    for _guard in range(200):
+        best = None
+        for m in re.finditer(r"\.\s*(%s)\s*\(" % names, scan):
+            start = _receiver_start(scan, m.start())
+            if start is None:
+                continue
+            recv = text[start:m.start()].strip()
+            if recv in _NOT_VECTOR_RECEIVERS:
+                continue
+            close = _close_paren(scan, m.end() - 1)
+            if close is None:
+                continue
+            best = (start, m, close, recv)
+            break
+        if best is None:
+            break
+        start, m, close, recv = best
+        name = m.group(1)
+        want, dflt = _VECTOR2_METHODS[name]
+        args = [a.strip() for a in cs2cpp.split_call_args(
+            text[m.end():close]) if a.strip()]
+        if dflt is not None and len(args) == want - 1:
+            args.append(dflt)
+        if len(args) != want:
+            _refuse(path, text, m.start(), "Vector2.%s" % name,
+                    "Vector2.%s takes %d argument(s)" % (name, want))
+        new = "GodotVec.%s(%s)" % (name, ", ".join([recv] + args))
+        text = text[:start] + _pad(new, close + 1 - start) + text[close + 1:] \
+            if len(new) <= close + 1 - start else \
+            text[:start] + new + text[close + 1:]
         scan = cs2cpp._blank(text)
     return text, scan
 
@@ -3534,7 +3734,8 @@ def main(argv=None):
     if project is None or not is_godot_project(project):
         sys.stderr.write(
             "usage: godot_pack.py <godot project> [-o DIR] [--force] "
-            "[--strict] [--physics-inject] [--box2d PATH] [--coost PATH]\n"
+            "[--strict] [--physics-inject] [--box2d PATH] [--coost PATH] "
+            "[--gpu-batch]\n"
             "  (a directory holding project.godot)\n")
         return 2
     import tools.unity_pack as unity_pack

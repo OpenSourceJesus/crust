@@ -597,15 +597,34 @@ def desugar_effects(text):
     return text
 
 
-def emit_effects(p, go_cap):
-    """engine.c: the per-GameObject effect tables and their setter."""
+def emit_effects(p, go_cap, subtree=None):
+    """engine.c: the per-GameObject effect tables and their setter. With
+    *subtree* -- (first child, next sibling) per GameObject, a Godot pack's
+    scene tree -- setting a node's effect sets its subtree's: a Godot node's
+    sprites are its children, as its modulate is theirs."""
     cap = max(1, int(go_cap))
     p("/* 2D effects, per GameObject: 1 flash, 2 grayscale, 3 hue shift,")
     p("   4 dissolve, 5 outline; the parameter a byte */")
     p("static unsigned char _engine_go_fx[%d], _engine_go_fx_arg[%d];" % (cap, cap))
+    if subtree:
+        first, sib = subtree
+        first = (list(first) + [-1] * cap)[:cap]
+        sib = (list(sib) + [-1] * cap)[:cap]
+        p("static const int _engine_fx_child[%d] = { %s };" % (
+            cap, ", ".join(str(v) for v in first)))
+        p("static const int _engine_fx_sib[%d] = { %s };" % (
+            cap, ", ".join(str(v) for v in sib)))
     p("void engine_set_sprite_effect(int go, int effect, float amount) {")
     p("    int a;")
     p("    if (go < 0 || go >= %d) return;" % cap)
+    if subtree:
+        p("    {")
+        p("        int c = _engine_fx_child[go];")
+        p("        while (c >= 0) {")
+        p("            engine_set_sprite_effect(c, effect, amount);")
+        p("            c = _engine_fx_sib[c];")
+        p("        }")
+        p("    }")
     p("    a = effect == 5 ? (int)(amount + 0.5f) : (int)(amount * 255.f + 0.5f);")
     p("    if (a < 0) a = 0;")
     p("    if (a > 255) a = 255;")

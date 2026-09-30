@@ -1718,6 +1718,13 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
         if at_suffix and re.search(r"(?<![\w])[A-Za-z_]\w*%s\s*$"
                                    % re.escape(at_suffix), body[:max(j, 0)]):
             continue
+        # a component of a Vector2 value -- a Vector2 helper's result, or a
+        # parenthesized vector expression: C, the struct's member
+        if re.match(r"\)\s*\.\s*[xy]\b(?!\s*\()", body[cm.start():]) and (
+                re.search(r"(?:(?<![\w])Vector2_\w+|GodotVec_\w+|"
+                          r"GodotInput_Vector)\s*$", body[:max(j, 0)])
+                or not re.search(r"[\w\]]\s*$", body[:max(j, 0)])):
+            continue
         seen.append(raw[cm.start():cm.end()])
         return found("Member of a call's result (`f(..).member`) nothing "
                      "lowered.")

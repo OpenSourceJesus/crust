@@ -50,6 +50,7 @@ from tools.unity_pack_anim import *  # noqa: E402,F401,F403
 from tools.unity_pack_audio import *  # noqa: E402,F401,F403
 from tools.unity_pack_build import *  # noqa: E402,F401,F403
 import tools.godot_pack as _godot  # noqa: E402
+import tools.unity_pack_vectors as _vec  # noqa: E402
 
 # C# helpers that moved to cs2cpp; the old names stay for callers and tests.
 _c_string = cs2cpp.c_string
@@ -16088,7 +16089,7 @@ def emit_engine(plan, analyses, used_apis):
     p("   the names are all listed here as comments so data.c and any")
     p("   group can find them. */")
     if _plan_needs_vector2(plan, used_apis):
-        _emit_vector2_struct(p)
+        _emit_vector2_struct(p, godot=bool(plan.get("godot")))
     if "Physics2D.query" in used_apis and plan.get("rigidbody2d") is not None:
         plan["physics2d_queries"] = True
         p("/* Physics2D.Raycast / OverlapCircle / OverlapPoint: Box2D-Packed")
@@ -16296,7 +16297,9 @@ def emit_engine(plan, analyses, used_apis):
     import tools.unity_pack_common as _cmx
     if _cmx.GPU_BATCH[0]:
         import tools.unity_pack_gpu2d as _gfx
-        _gfx.emit_effects(p, len(plan.get("go_names") or []) + 256)
+        _fx_cap = len(plan.get("go_names") or []) + 256
+        _gfx.emit_effects(p, _fx_cap, subtree=_godot_free_tree(plan, _fx_cap)
+                          if plan.get("godot") else None)
     elif _cmx.FX_USED[0]:
         p("/* SpriteEffects2D without --gpu-batch: nothing draws effects */")
         p("static void engine_set_sprite_effect(int go, int effect, float amount) {")
@@ -19384,8 +19387,9 @@ def _plan_needs_vector2int(plan, used_apis=None):
     return False
 
 
-def _emit_vector2_struct(p):
-    """UnityEngine.Vector2 — C-compatible value type for locals / ctor calls."""
+def _emit_vector2_struct(p, godot=False):
+    """UnityEngine.Vector2 — C-compatible value type for locals / ctor calls
+    (and, for a Godot pack, Godot's Vector2 methods)."""
     p("/* UnityEngine.Vector2 — packed fields still use _x/_y slots. */")
     p("typedef struct Vector2 {")
     p("    float x;")
@@ -19416,6 +19420,12 @@ def _emit_vector2_struct(p):
     p("    float dx = a.x - b.x, dy = a.y - b.y;")
     p("    return dx * dx + dy * dy < 9.99999944e-11f;")
     p("}")
+    # the operators, component-wise (unity_pack_vectors lowers them)
+    for line in _vec.VECTOR2_HELPERS_C.splitlines():
+        p(line)
+    if godot:
+        for line in _vec.GODOT_VECTOR2_HELPERS_C.splitlines():
+            p(line)
     p("")
 
 
@@ -21963,6 +21973,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = cs2cpp.code_sub(
             r"(?<![\w.])__sprite_fx\s*\(\s*(?:this\s*\.\s*)?gameObject\s*,",
             "__sprite_fx(_engine_go_of_%s(i)," % idn_fx, text)
+        # another object's, through a reference to it (a Godot node's)
+        for recv, other in sorted(_reference_holds(text, cl, plan,
+                                                   site).items()):
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])__sprite_fx\s*\(\s*(?:this\s*\.\s*)?%s\s*,"
+                % re.escape(recv),
+                "__sprite_fx(_engine_go_of_%s(%s)," % (_c_ident(other), recv),
+                text)
         text = cs2cpp.code_sub(r"(?<![\w.])__sprite_fx\s*\(", "engine_set_sprite_effect(",
                                text)
     # (before the null comparisons: `gp == null` is the connected flag)
@@ -22606,7 +22624,22 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _own_string_locals(text, string_idents, int_idents,
                               _string_store_names(plan) | string_arrays | _sl,
                               arrays=string_arrays | _sl)
+    # Vector2 operators (a + b, v * s, -v, v += w, ==) as the engine's
+    # component-wise helpers: C has no operators on the struct.
+    text = _vec.lower_vector2_ops(
+        text, params=(site or {}).get("args") or "",
+        funcs=_vector2_methods(plan), exact=bool(plan.get("godot")))
     return text
+
+
+def _vector2_methods(plan):
+    """The lowered names of the project's methods that return a Vector2."""
+    out = set()
+    for cname, methods in (plan.get("_methods_by") or {}).items():
+        for _c, m in methods:
+            if (m.get("ret") or "").strip().split(".")[-1] == "Vector2":
+                out.add("%s_%s" % (_c_ident(cname), m["name"]))
+    return out
 
 
 def emit_data(plan, used_apis=None):

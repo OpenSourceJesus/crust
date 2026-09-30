@@ -18,7 +18,9 @@ What is covered: Sprite2D rows and their draw list, Camera2D views and
 following (and a y-down frame through gles2_view.c when EGL is there),
 input actions, Timers and the scripts' own signals, node references
 (GetNode, exported node fields, Timer control), collision layers, the
-runtime hierarchy, a freed node's body leaving the world (with a
+runtime hierarchy, Vector2 arithmetic and methods, the 2D GPU path
+(--gpu-batch: the batch shader's frame, the sprite effects), a freed node's
+body leaving the world (with a
 Box2D-Packed checkout: its library is built once a run, about 10 s), and
 the resource reader's inline objects.
 
@@ -1554,6 +1556,315 @@ class TestFreed(unittest.TestCase):
         self.assertGreater(ys[("Ball2", "n=60")], 290.0)
         # freeing the Area2D (a sensor) under Rest does not drop Rest
         self.assertAlmostEqual(ys[("Rest", "n=60")], 180.0, places=1)
+
+
+# ---------------------------------------------------------------------------
+# Vector2 arithmetic and methods
+# ---------------------------------------------------------------------------
+
+VEC_SCRIPT = """using Godot;
+
+public partial class Vec : Node2D
+{
+    private Vector2 _vel = new Vector2(3, 4);
+
+    public override void _Ready()
+    {
+        Vector2 a = new Vector2(1, 2);
+        Vector2 b = a + a;
+        Vector2 c = b * 2f;
+        Vector2 d = -c;
+        Vector2 e = (a - b) / 2f + _vel * 0.5f;
+        Vector2 f = 2f * a * new Vector2(3, -1);
+        GD.Print("ops ", b.X, ",", b.Y, " ", c.X, ",", c.Y, " ", d.X, ",", d.Y, " ", e.X, ",", e.Y, " ", f.X, ",", f.Y);
+        f += a;
+        f -= new Vector2(1, 1);
+        f *= 0.5f;
+        f /= 2f;
+        GD.Print("assign ", f.X, ",", f.Y);
+        Position = Position + _vel * 2f;
+        Position += Vector2.One;
+        GD.Print("pos ", Position.X, ",", Position.Y, " eq=", Position == new Vector2(17, 29), " ne=", Position != a);
+        Vector2 n = new Vector2(3, 4).Normalized();
+        Vector2 tiny = new Vector2(0.000001f, 0).Normalized();
+        GD.Print("norm ", n.X, ",", n.Y, " tiny=", tiny.X, " len=", new Vector2(3, 4).Length(), " lsq=", _vel.LengthSquared());
+        Vector2 x = Vector2.Right;
+        Vector2 y = Vector2.Down;
+        GD.Print("dot ", x.Dot(y), " cross=", x.Cross(y), " dist=", Vector2.Zero.DistanceTo(_vel), " d2=", Vector2.Zero.DistanceSquaredTo(_vel));
+        GD.Print("angle ", y.Angle() > 1.5707f && y.Angle() < 1.5709f, " to=", x.AngleTo(y) > 1.5707f && x.AngleTo(y) < 1.5709f, " up=", Vector2.Up.Y);
+        Vector2 dir = Vector2.Zero.DirectionTo(new Vector2(0, 5));
+        Vector2 l = Vector2.Zero.Lerp(new Vector2(10, 20), 1.5f);
+        Vector2 m1 = Vector2.Zero.MoveToward(new Vector2(10, 0), 3f);
+        Vector2 m2 = Vector2.Zero.MoveToward(new Vector2(1, 0), 3f);
+        GD.Print("dir ", dir.X, ",", dir.Y, " lerp=", l.X, ",", l.Y, " mt=", m1.X, ",", m2.X);
+        Vector2 r = x.Rotated(0.5f);
+        Vector2 lim = new Vector2(6, 8).LimitLength(5f);
+        Vector2 keep = new Vector2(0.3f, 0.4f).LimitLength();
+        Vector2 ab = new Vector2(-1, 2).Abs();
+        GD.Print("rot ", r.X > 0.8775f && r.X < 0.8776f, " lim=", lim.X, ",", lim.Y, " keep=", keep.X, " abs=", ab.X, ",", ab.Y);
+        Vector2 near = new Vector2(1.0000005f, 1);
+        GD.Print("approx ", new Vector2(0.0000001f, 0).IsZeroApprox(), " ", near.IsEqualApprox(Vector2.One), " exact=", near == Vector2.One);
+        GD.Print("chain ", (Vector2.Left * 3f).Normalized().Rotated(0f).X);
+    }
+}
+"""
+
+
+class TestVectors(unittest.TestCase):
+
+    def _project(self, script=VEC_SCRIPT):
+        return project(self, '[node name="Vec" type="Node2D" parent="."]\n'
+                       'position = Vector2(10, 20)\n'
+                       'script = ExtResource("s_Vec")\n',
+                       scripts={"Vec.cs": script})
+
+    @needs_cc
+    def test_arithmetic_and_methods_by_godots_rules(self):
+        out = pack(self, self._project())
+        with _fast() as err:
+            pass
+        self.assertEqual(run_c(self, out, TICKS.replace("f <= 8", "f <= 1")
+                               .replace('printf("-- f%d\\n", f); ', "")), [
+            # a + a, * 2, unary -, (a - b) / 2 + v * 0.5, s * a * b
+            "ops 2,4 4,8 -4,-8 1,1 6,-4",
+            # += a, -= (1,1), *= 0.5, /= 2: ((6,-4)+(1,2)-(1,1))/4
+            "assign 1.5,-0.75",
+            # Position + v * 2, += One: (10,20) + (6,8) + (1,1); == is exact
+            "pos 17,29 eq=True ne=True",
+            # a vector 1e-6 long still normalizes (only zero stays zero)
+            "norm 0.6,0.8 tiny=1 len=5 lsq=25",
+            "dot 0 cross=1 dist=5 d2=25",
+            # Down's angle is pi/2 (y down); Up is (0, -1)
+            "angle True to=True up=-1",
+            # Lerp is not clamped; MoveToward stops at the target
+            "dir 0,1 lerp=15,30 mt=3,1",
+            "rot True lim=3,4 keep=0.3 abs=1,2",
+            # IsEqualApprox's relative 1e-6; == is exact
+            "approx True True exact=False",
+            "chain -1",
+        ])
+
+    def test_method_refusals(self):
+        body = ("using Godot;\npublic partial class Vec : Node2D {\n"
+                "    public override void _Ready() {\n        %s\n    }\n}\n")
+        cases = [
+            ("Vector2 v = Vector2.Inf;",
+             "(4,21): error CS8000: `Vector2.Inf` (Godot API) is not packed "
+             "yet"),
+            ("float d = Vector2.Zero.Dot();",
+             "error CS8000: Vector2.Dot takes 1 argument(s)"),
+        ]
+        for stmt, want in cases:
+            self.assertIn(want, refusal(self, self._project(body % stmt)))
+
+
+# ---------------------------------------------------------------------------
+# The 2D GPU path (--gpu-batch): one atlas, one draw call, the effects
+# ---------------------------------------------------------------------------
+
+GPU_SCENE = """[node name="Rot" type="Sprite2D" parent="."]
+position = Vector2(12, 12)
+rotation = 1.5707964
+scale = Vector2(3, 3)
+texture = ExtResource("1")
+flip_h = true
+
+[node name="VFlip" type="Sprite2D" parent="."]
+position = Vector2(30, 10)
+scale = Vector2(3, 3)
+texture = ExtResource("1")
+flip_v = true
+
+[node name="Frame" type="Sprite2D" parent="."]
+position = Vector2(50, 10)
+scale = Vector2(4, 4)
+texture = ExtResource("2")
+hframes = 4
+vframes = 2
+frame = 6
+
+[node name="Region" type="Sprite2D" parent="."]
+position = Vector2(70, 10)
+scale = Vector2(3, 3)
+texture = ExtResource("2")
+region_enabled = true
+region_rect = Rect2(0, 0, 6, 4)
+
+[node name="Corner" type="Sprite2D" parent="."]
+position = Vector2(4, 30)
+scale = Vector2(3, 3)
+texture = ExtResource("1")
+centered = false
+offset = Vector2(1, 1)
+modulate = Color(1, 1, 1, 0.5)
+
+[node name="Under" type="Sprite2D" parent="."]
+position = Vector2(40, 40)
+scale = Vector2(5, 5)
+texture = ExtResource("2")
+z_index = 2
+
+[node name="Over" type="Sprite2D" parent="."]
+position = Vector2(44, 42)
+scale = Vector2(3, 3)
+texture = ExtResource("1")
+self_modulate = Color(0, 1, 0, 1)
+z_index = 1
+
+[node name="Holder" type="Node2D" parent="."]
+position = Vector2(70, 40)
+rotation = 0.5
+scale = Vector2(2, 2)
+
+[node name="Mover" type="Sprite2D" parent="Holder"]
+texture = ExtResource("1")
+script = ExtResource("s_Mover")
+"""
+
+FX_SCRIPTS = {
+    "Hurt.cs": """using Godot;
+
+public partial class Hurt : Node2D
+{
+    private int _f;
+
+    public override void _Process(double delta)
+    {
+        _f = _f + 1;
+        if (_f == 1) { SpriteEffects2D.Set(this, SpriteEffect2D.Flash, 1f); }
+        if (_f == 1) { SpriteEffects2D.Set(GetNode<Enemy>("../Enemy"), SpriteEffect2D.Grayscale, 0.5f); }
+        if (_f == 2) { SpriteEffects2D.Clear(this); }
+    }
+}
+""",
+    "Enemy.cs": ("using Godot;\npublic partial class Enemy : Sprite2D\n{\n"
+                 "    public int Hp = 3;\n}\n"),
+}
+
+FX_SCENE = """[node name="Body" type="Node2D" parent="."]
+position = Vector2(20, 20)
+script = ExtResource("s_Hurt")
+
+[node name="Look" type="Sprite2D" parent="Body"]
+texture = ExtResource("1")
+
+[node name="Enemy" type="Sprite2D" parent="."]
+position = Vector2(60, 20)
+texture = ExtResource("1")
+script = ExtResource("s_Enemy")
+
+[node name="Plain" type="Sprite2D" parent="."]
+position = Vector2(80, 20)
+texture = ExtResource("1")
+"""
+
+FX_DUMP = r"""
+#include <stdio.h>
+#include "engine_draw.h"
+extern float Time_deltaTime;
+int main(void) {
+    EngineGpuSprite s[16]; int f, n, k;
+    Time_deltaTime = 1.f / 60.f;
+    for (f = 1; f <= 2; f++) {
+        engine_tick();
+        n = engine_collect_gpu_sprites(s, 16);
+        for (k = 0; k < n; k++)
+            printf("f%d x=%g fx=%d arg=%d\n", f, s[k].x, s[k].effect, s[k].arg);
+    }
+    return 0;
+}
+"""
+
+
+def _fx_project(test):
+    scripts = dict(FX_SCRIPTS)
+    with open(os.path.join(ROOT, "examples", "unity_pack",
+                           "SpriteEffects2D.Godot.cs")) as f:
+        scripts["SpriteEffects2D.cs"] = f.read()
+    return project(test, FX_SCENE, scripts=scripts, viewport=VIEW)
+
+
+def pack_gpu(test, project_dir):
+    out = tempfile.mkdtemp(prefix="gpf-")
+    test.addCleanup(shutil.rmtree, out, True)
+    with _fast():
+        unity_pack.pack(project_dir, out, force=True, gpu_batch=True)
+    return out
+
+
+def gles3_frame(test, out, batch, ticks=None):
+    """gles3_view.c's frame of *out* (per sprite, or -DBATCH: the atlas and
+    one draw call), as (w, h, RGB bytes); skips without GLES 3.1."""
+    e = os.path.join(ROOT, "examples", "unity_pack")
+    exe = os.path.join(out, "view_b" if batch else "view_s")
+    cmd = [_CC, "-O0", "-w", "-I", out, "-I", e, "-I",
+           os.path.join(e, "include"), "-o", exe,
+           os.path.join(e, "gles3_view.c"), os.path.join(out, "engine.c"),
+           os.path.join(out, "data.c"), "-lEGL", "-lGLESv2", "-lm"]
+    if batch:
+        cmd.insert(1, "-DBATCH")
+    if ticks is not None:
+        cmd.insert(1, "-DTICKS_BEFORE_DRAW=%d" % ticks)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        test.skipTest("cannot link the GLES3 view: %s" % r.stderr[-300:])
+    ppm = exe + ".ppm"
+    env = dict(os.environ, EGL_PLATFORM="surfaceless",
+               LIBGL_ALWAYS_SOFTWARE="1")
+    run = subprocess.run([exe, ppm], capture_output=True, text=True, env=env)
+    if run.returncode != 0 or not os.path.isfile(ppm):
+        test.skipTest("no GLES 3.1 rasteriser: %s"
+                      % (run.stderr or run.stdout)[-300:])
+    with open(ppm, "rb") as f:
+        _magic, dims, _maxv, px = f.read().split(b"\n", 3)
+    w, h = map(int, dims.split())
+    return w, h, px
+
+
+def _at(frame, x, y):
+    w, _h, px = frame
+    i = (y * w + x) * 3
+    return tuple(px[i:i + 3])
+
+
+class TestGpuBatch(unittest.TestCase):
+
+    @needs_cc
+    def test_effects_on_a_node_and_its_children(self):
+        out = pack_gpu(self, _fx_project(self))
+        # Set(this): Body's child sprite (Look, x 20) flashes, and Clear
+        # clears it; Set(a reference): Enemy (x 60) at 0.5 (128); Plain none
+        self.assertEqual(run_c(self, out, FX_DUMP), [
+            "f1 x=20 fx=1 arg=255", "f1 x=60 fx=2 arg=128",
+            "f1 x=80 fx=0 arg=0",
+            "f2 x=20 fx=0 arg=0", "f2 x=60 fx=2 arg=128",
+            "f2 x=80 fx=0 arg=0"])
+
+    @needs_cc
+    def test_one_draw_call_draws_the_same_frame(self):
+        """The batch shader's frame is the per-sprite renderer's, byte for
+        byte: rotation with flip_h, flip_v, sprite-sheet frames, a region,
+        offset / centered, modulate alpha, z_index over tree order, a
+        sprite under a scaled, turned parent that moves."""
+        out = pack_gpu(self, project(self, GPU_SCENE, viewport=VIEW))
+        self.assertTrue(os.path.isfile(os.path.join(out, "atlas0.png")))
+        per_sprite = gles3_frame(self, out, batch=False)
+        batch = gles3_frame(self, out, batch=True)
+        self.assertEqual(per_sprite[:2], (96, 64))
+        self.assertEqual(batch[2], per_sprite[2])
+        # Rot: turned 90 degrees clockwise, the image's top (red) is to the
+        # right, its bottom (blue) to the left
+        self.assertEqual(_at(batch, 14, 12), (255, 0, 0))
+        self.assertEqual(_at(batch, 10, 12), (0, 0, 255))
+
+    @needs_cc
+    def test_the_shader_draws_the_effects(self):
+        out = pack_gpu(self, _fx_project(self))
+        frame = gles3_frame(self, out, batch=True, ticks=1)
+        self.assertEqual(_at(frame, 19, 19), (255, 255, 255))  # flashed
+        r, g, b = _at(frame, 59, 19)                             # half gray
+        self.assertTrue(r < 255 and g > 0 and g == b, (r, g, b))
+        self.assertEqual(_at(frame, 79, 19), (255, 0, 0))        # untouched
 
 
 if __name__ == "__main__":
