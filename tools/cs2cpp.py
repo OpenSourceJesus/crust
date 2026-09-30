@@ -973,6 +973,9 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
         return text
     helper = model.string_plus
     whole = [c for c in model.string_calls if c.endswith(")")]
+    # a call whose name begins with one of these returns a string too
+    # (`GodotNodeName_Player(i)`): it starts a chain as a whole call does
+    prefixes = tuple(c for c in model.string_calls if not c.endswith(")"))
     names = frozenset(string_idents or ())
     text = _string_led_by_value(text, model, names, int_idents)
     changed = True
@@ -1010,6 +1013,26 @@ def lower_string_concat(text, model, string_idents=None, int_idents=None):
             elif m_call:
                 left = m_call
                 left_end = i + len(left)
+            elif prefixes and text.startswith(prefixes, i) and (
+                    i == 0 or not (text[i - 1].isalnum()
+                                   or text[i - 1] in "_.>")) and \
+                    re.match(r"[\w.]+\s*\(", text[i:]):
+                k = i + re.match(r"[\w.]+\s*\(", text[i:]).end() - 1
+                depth = 0
+                while k < len(text):
+                    if text[k] == '"':
+                        k = skip_string_literal(text, k)
+                        continue
+                    if text[k] == "(":
+                        depth += 1
+                    elif text[k] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    k += 1
+                if k < len(text):
+                    left = text[i:k + 1]
+                    left_end = k + 1
             elif text[i] == '"':
                 j = skip_string_literal(text, i)
                 left = text[i:j]
@@ -4617,6 +4640,9 @@ def _skip_literal(text, i):
     if j >= len(text) or text[j] not in "\"'" or (j > i and text[j] != '"'):
         return i
     quote = text[j]
+    if "$" in text[i:j] and quote == '"':
+        # interpolated: a quote in a hole (`{Label("bob")}`) is code
+        return cpprust._interpolated_end(text, j, verbatim)[0]
     j += 1
     while j < len(text):
         c = text[j]

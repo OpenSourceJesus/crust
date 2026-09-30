@@ -1160,11 +1160,64 @@ def _match_brace(text, open_idx):
 _QUOTE = re.compile(r"[\"']")
 
 
+def _interpolated_end(text, i, verbatim):
+    """(end, [(start, end) of each hole]) of the C# interpolated string
+    whose opening quote is at *i*: a quote ends it only outside a hole; in
+    a hole, nested literals and brackets are code (C# lets a hole hold
+    `Label("bob", 7)`); `{{` / `}}` are braces."""
+    n = len(text)
+    holes = []
+    j = i + 1
+    while j < n:
+        ch = text[j]
+        if ch == "\\" and not verbatim:
+            j += 2
+            continue
+        if ch == '"':
+            if verbatim and text[j + 1:j + 2] == '"':
+                j += 2
+                continue
+            return j + 1, holes
+        if ch in "{}" and text[j + 1:j + 2] == ch:
+            j += 2
+            continue
+        if ch == "{":
+            k, depth = j + 1, 0
+            while k < n:
+                d = text[k]
+                if d == '"' or d == "'":
+                    pre = k
+                    while pre > 0 and text[pre - 1] in "$@":
+                        pre -= 1
+                    if text[pre:k].count("$"):
+                        k, _h = _interpolated_end(text, k, "@" in text[pre:k])
+                    else:
+                        q = k + 1
+                        while q < n and text[q] != d:
+                            q += 2 if text[q] == "\\" else 1
+                        k = q + 1
+                    continue
+                if d in "([{":
+                    depth += 1
+                elif d in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                k += 1
+            holes.append((j + 1, k))
+            j = k + 1
+            continue
+        j += 1
+    return n, holes
+
+
 def _blank_strings(text):
     """Blank string and char literal bodies, preserving length and newlines.
 
     Only the literals are looked at; the code between them is copied in
-    whole slices rather than a character at a time.
+    whole slices rather than a character at a time. A C# interpolated
+    string is blanked whole, holes too, as any literal -- found to its real
+    end: a quote inside a hole (`{Label("bob")}`) does not end it.
     """
     n = len(text)
     out, last, pos = [], 0, 0
@@ -1174,6 +1227,18 @@ def _blank_strings(text):
             break
         i = m.start()
         c = text[i]
+        pre = i
+        while pre > 0 and text[pre - 1] in "$@":
+            pre -= 1
+        if c == '"' and "$" in text[pre:i]:
+            end, _holes = _interpolated_end(text, i, "@" in text[pre:i])
+            closed = end <= n and end > i + 1 and text[end - 1] == '"'
+            out.append(text[last:i + 1])
+            out.append(_NOT_NEWLINE.sub(" ", text[i + 1:end - 1 if closed
+                                                   else end]))
+            out.append('"' if closed else "")
+            last = pos = end
+            continue
         j = i + 1
         while j < n and text[j] != c:
             j += 2 if text[j] == "\\" else 1

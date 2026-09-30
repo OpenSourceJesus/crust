@@ -19,8 +19,8 @@ following (and a y-down frame through gles2_view.c when EGL is there),
 input actions, Timers and the scripts' own signals, node references
 (GetNode, exported node fields, Timer control), collision layers, the
 runtime hierarchy, Vector2 arithmetic and methods, the 2D GPU path
-(--gpu-batch: the batch shader's frame, the sprite effects), a freed node's
-body leaving the world (with a
+(--gpu-batch: the batch shader's frame, the sprite effects), strings (coost
+fastrings, with a coost checkout), a freed node's body leaving the world (with a
 Box2D-Packed checkout: its library is built once a run, about 10 s), and
 the resource reader's inline objects.
 
@@ -62,7 +62,15 @@ def _fast():
     (the emitted C is then written as emitted), and quiet: the packer's
     progress and warnings are captured, returned as the context's value."""
     saved = unity_pack.validate_emitted_c
-    unity_pack.validate_emitted_c = lambda *a, **k: None
+
+    def validate(text, *a, **k):
+        # A C# string is a coost fastring: C++ that only cpprust's lowering
+        # makes the engine's C, so a pack that has one is lowered for real
+        # (about 2 s); the rest skip it.
+        if "fastring" in text:
+            return saved(text, *a, **k)
+        return None
+    unity_pack.validate_emitted_c = validate
     err = io.StringIO()
     try:
         with contextlib.redirect_stderr(err):
@@ -871,9 +879,9 @@ class TestSignals(unittest.TestCase):
     def test_refusals(self):
         cases = [
             ([("Player.cs", "ScoredEventHandler()",
-               "ScoredEventHandler(string who)")],
-             "signal Scored's parameter `string who`: int, float and bool "
-             "parameters are packed"),
+               "ScoredEventHandler(Node2D who)")],
+             "signal Scored's parameter `Node2D who`: int, float, bool and "
+             "string parameters are packed"),
             ([("Player.cs", 'EmitSignal("Scored")', 'EmitSignal("Missed")')],
              "res://Player.cs(20,28): error CS8000: the script declares no "
              "[Signal] Missed"),
@@ -1865,6 +1873,155 @@ class TestGpuBatch(unittest.TestCase):
         r, g, b = _at(frame, 59, 19)                             # half gray
         self.assertTrue(r < 255 and g > 0 and g == b, (r, g, b))
         self.assertEqual(_at(frame, 79, 19), (255, 0, 0))        # untouched
+
+
+# ---------------------------------------------------------------------------
+# Strings: coost fastrings, as a Unity pack's
+# ---------------------------------------------------------------------------
+
+from tools.unity_pack_common import find_coost_root as _find_coost  # noqa: E402
+
+needs_coost = unittest.skipUnless(
+    _CC is not None and _find_coost() is not None,
+    "a C# string is a coost fastring: clone https://github.com/crustos/coost "
+    "beside this repository")
+
+STR_SCRIPTS = {
+    "Talker.cs": """using Godot;
+
+public partial class Talker : Node2D
+{
+    [Export] public string Greeting = "hi";
+    private string _log = "";
+    private int _n;
+
+    private string Label(string who, int hp)
+    {
+        return who + ":" + hp;
+    }
+
+    public override void _Ready()
+    {
+        string a = "hello";
+        string b = a + " world";
+        _log = _log + b;
+        GD.Print(Greeting, " ", b, " len=", b.Length, " up=", b.ToUpper());
+        GD.Print($"n={_n} label={Label("bob", 7)}");
+        string[] parts = "a,b,c".Split(',');
+        GD.Print(parts.Length, " ", parts[1], " ", string.Join("-", parts));
+        GD.Print(Name + "!", " ", _log.Contains("world"), " ", _log.Replace("o", "0"));
+    }
+}
+""",
+    "Speaker.cs": """using Godot;
+
+public partial class Speaker : Node2D
+{
+    [Signal] public delegate void SaidEventHandler(string line, int n);
+
+    private StringName _mood = "calm";
+
+    public override void _Ready()
+    {
+        GD.PrintS("a", 1, 2.5f, true);
+        GD.PrintT("x", "y");
+        GD.PrintRaw("no newline; ");
+        GD.Print(GD.Str("str", 3), " mood=", _mood);
+        string who = Name;
+        if (who == "Speaker") { GD.Print("named ", who); }
+        if (who != "Nobody" && Name == "Speaker") { GD.Print("Name == works"); }
+        EmitSignal(SignalName.Said, "hello " + who, 2);
+        GD.PrintErr("to stderr ", 7);
+    }
+}
+""",
+    "Ear.cs": """using Godot;
+
+public partial class Ear : Node
+{
+    private string _last = "";
+
+    private void OnSaid(string line, int n)
+    {
+        _last = line;
+        GD.Print("heard '", line, "' x", n, " len=", _last.Length);
+    }
+}
+""",
+}
+
+STR_SCENE = """[node name="Talker" type="Node2D" parent="."]
+script = ExtResource("s_Talker")
+Greeting = "hey"
+
+[node name="Speaker" type="Node2D" parent="."]
+script = ExtResource("s_Speaker")
+
+[node name="Ear" type="Node" parent="."]
+script = ExtResource("s_Ear")
+
+[connection signal="Said" from="Speaker" to="Ear" method="OnSaid"]
+"""
+
+ONE_TICK = TICKS.replace("f <= 8", "f <= 1").replace(
+    'printf("-- f%d\\n", f); ', "")
+
+
+class TestStrings(unittest.TestCase):
+
+    @needs_coost
+    def test_strings_as_godot_prints_them(self):
+        out = pack(self, project(self, STR_SCENE, scripts=STR_SCRIPTS))
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("fastring", engine)          # owned strings: coost's
+        self.assertIn("_cs_str_Equals(", engine)   # == compares the text
+        lines = run_c(self, out, ONE_TICK)
+        # (the classes' _Ready run in class name order: Speaker, Talker)
+        self.assertEqual(lines, [
+            # PrintS / PrintT / PrintRaw (no newline) / GD.Str / StringName
+            "a 1 2.5 True",
+            "x\ty",
+            "no newline; str3 mood=calm",
+            # a string local from Name, compared by its text
+            "named Speaker",
+            "Name == works",
+            # a signal's string argument, kept by the handler
+            "heard 'hello Speaker' x2 len=13",
+            # the export from the scene; owned locals and fields; members
+            "hey hello world len=11 up=HELLO WORLD",
+            # $"..": a hole holding a call with a string literal
+            "n=0 label=bob:7",
+            "3 b a-b-c",
+            "Talker! True hell0 w0rld",
+        ])
+
+    @needs_coost
+    def test_print_err_is_stderr(self):
+        out = pack(self, project(self, STR_SCENE, scripts=STR_SCRIPTS))
+        src = os.path.join(out, "harness.c")
+        with open(src, "w") as f:
+            f.write(ONE_TICK)
+        exe = os.path.join(out, "harness")
+        subprocess.run([_CC, "-O0", "-w", "-I", out, "-o", exe, src,
+                        os.path.join(out, "engine.c"),
+                        os.path.join(out, "data.c"), "-lm"], check=True,
+                       capture_output=True)
+        run = subprocess.run([exe], capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.stderr, "to stderr 7\n")
+        self.assertNotIn("to stderr", run.stdout)
+
+    def test_string_refusals(self):
+        body = ("using Godot;\npublic partial class Speaker : Node2D {\n"
+                "    [Signal] public delegate void SaidEventHandler(%s);\n"
+                "    public override void _Ready() { }\n}\n")
+        d = project(self, '[node name="Speaker" type="Node2D" parent="."]\n'
+                    'script = ExtResource("s_Speaker")\n',
+                    scripts={"Speaker.cs": body % "Node2D who"})
+        self.assertIn("signal Said's parameter `Node2D who`: int, float, "
+                      "bool and string parameters are packed",
+                      refusal(self, d))
 
 
 if __name__ == "__main__":

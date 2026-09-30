@@ -16011,7 +16011,8 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
-            or want_app_open_url or plan.get("player_prefs")):
+            or want_app_open_url or plan.get("player_prefs")
+            or "GodotPrint" in used_apis):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -17125,6 +17126,16 @@ def emit_engine(plan, analyses, used_apis):
             p("static float _godot_gy(int c, unsigned i);")
             p("static void _godot_set_global(int c, unsigned i, float wx,"
               " float wy);")
+        if "GodotPrint" in used_apis:
+            # GD.PrintRaw (stdout, no newline) and GD.PrintErr (stderr)
+            p("static void GodotPrint_Raw(const char *s) {")
+            p("    fputs(s ? s : \"\", stdout);")
+            p("}")
+            p("static void GodotPrint_Err(const char *s) {")
+            p("    fflush(stdout);")
+            p("    fputs(s ? s : \"\", stderr);")
+            p("    fputc('\\n', stderr);")
+            p("}")
         # A node's Name: its node's, fixed (godot_pack's OwnName / GodotName).
         for cname, gcl in sorted(plan["classes"].items()):
             names = [o.get("name") or "" for o in gcl.get("instances") or []]
@@ -22628,7 +22639,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # component-wise helpers: C has no operators on the struct.
     text = _vec.lower_vector2_ops(
         text, params=(site or {}).get("args") or "",
-        funcs=_vector2_methods(plan), exact=bool(plan.get("godot")))
+        funcs=_vector2_methods(plan), exact=bool(plan.get("godot")),
+        string_names=string_idents,
+        string_calls=_PACKED_STRINGS.string_calls + tuple(
+            k for k, v in (plan.get("_method_ret_kinds_local") or {}).items()
+            if v == "s"))
+    if "_cs_str_Equals(" in text:
+        plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
     return text
 
 

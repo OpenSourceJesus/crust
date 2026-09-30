@@ -2240,7 +2240,8 @@ def _script_method_params(script, method):
 
 
 #: A signal's parameter types, as a handler's C parameters are lowered.
-_SIGNAL_PARAM_TYPES = {"int": "int", "float": "float", "bool": "int"}
+_SIGNAL_PARAM_TYPES = {"int": "int", "float": "float", "bool": "int",
+                       "string": "const char *"}
 
 
 def script_signals(text):
@@ -2281,8 +2282,8 @@ def _custom_signal(src, sig, at):
             for ty, name in sigs[sig]:
                 if ty not in _SIGNAL_PARAM_TYPES:
                     raise PackError(
-                        "%s: error: signal %s's parameter `%s %s`: int, float "
-                        "and bool parameters are packed" % (at, sig, ty, name))
+                        "%s: error: signal %s's parameter `%s %s`: int, float, "
+                        "bool and string parameters are packed" % (at, sig, ty, name))
             return sigs[sig]
     return None
 
@@ -2441,7 +2442,9 @@ BINDINGS = [
     cs2cpp.Binding("GodotSignals.IsA", "GodotSignals_IsA"),
     cs2cpp.Binding("GodotSignals.InGroup", "GodotSignals_InGroup"),
     cs2cpp.Binding("GodotSignals.NameOf", "GodotSignals_NameOf"),
-] + [cs2cpp.Binding("GodotInput." + n, "GodotInput_" + n) for n in (
+] + [cs2cpp.Binding("GodotPrint.Raw", "GodotPrint_Raw"),
+      cs2cpp.Binding("GodotPrint.Err", "GodotPrint_Err")] + [
+    cs2cpp.Binding("GodotInput." + n, "GodotInput_" + n) for n in (
     "Pressed", "JustPressed", "JustReleased", "Strength", "RawStrength",
     "Axis", "Vector", "JoyAxis")] + [
     cs2cpp.Binding("GodotVec." + n, "GodotVec_" + n) for n in (
@@ -2465,7 +2468,7 @@ BOOL_CALLS = frozenset((
 #: Calls that return a string, for string concatenation (which may run
 #: before or after the bindings, so both spellings).
 STRING_CALLS = ("GodotSignals_NameOf(", "GodotSignals.NameOf(",
-                "GodotNodeName_")
+                "GodotSignals.OwnName(", "GodotNodeName_")
 
 
 def emit_signal_decls(p):
@@ -2648,7 +2651,8 @@ _REFUSED = [
      "CharacterBody2D"),
     (r"(?<![.\w])(?:this\s*\.\s*)?(?:Visible|Modulate|ZIndex|Show|Hide)\b",
      "CanvasItem"),
-    (r"\bGD\s*\.\s*(?!Print\b)\w+", "GD"),
+    (r"\bGD\s*\.\s*(?!(?:Print|PrintS|PrintT|PrintRaw|PrintErr|Str)\b)\w+",
+     "GD"),
     (r"\bPackedScene\b|\bResourceLoader\b|\bInstantiate\s*[<(]", "PackedScene"),
     (r"\bGodot\s*\.\s*Collections\b", "Godot.Collections"),
 ]
@@ -2805,19 +2809,52 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
             new += " float %s = (float)%s;" % (pm.group(1), delta)
         edits.append((m.start(), m.end(), new))
 
-    # GD.Print(a, b) -> Console.WriteLine("" + a + b): Godot concatenates.
-    for m in re.finditer(r"\bGD\s*\.\s*Print\s*\(", scan):
-        close = _close_paren(scan, m.end() - 1)
-        if close is None:
-            continue
-        args = cs2cpp.split_call_args(text[m.end():close])
-        # Parentheses only where an argument needs them: a literal inside
-        # them, "(frame ", would be typed by counting its parentheses.
-        joined = " + ".join(['""'] + [
-            a.strip() if _SIMPLE_ARG.match(a.strip()) else "(%s)" % a.strip()
-            for a in args if a.strip()])
-        edits.append((m.start(), close + 1,
-                      "System.Console.WriteLine(%s)" % joined))
+    # GD.Print(a, b) -> Console.WriteLine("" + a + b): Godot concatenates;
+    # PrintS / PrintT put a space / a tab between; PrintRaw adds no newline;
+    # PrintErr prints to stderr; GD.Str(a, b) is the concatenation itself.
+    seps = {"Print": None, "PrintRaw": None, "PrintErr": None, "Str": None,
+            "PrintS": '" "', "PrintT": '"\\t"'}
+    calls = {"Print": "System.Console.WriteLine(%s)",
+             "PrintS": "System.Console.WriteLine(%s)",
+             "PrintT": "System.Console.WriteLine(%s)",
+             "PrintRaw": "GodotPrint.Raw(%s)",
+             "PrintErr": "GodotPrint.Err(%s)",
+             "Str": "(%s)"}
+    gd_re = re.compile(r"\bGD\s*\.\s*(Print|PrintS|PrintT|PrintRaw|PrintErr|"
+                       r"Str)\s*\(")
+    # innermost first -- GD.Print(GD.Str(..)) -- a pass at a time, as the
+    # other edits of this pass must not overlap them
+    text = _apply(text, edits)
+    edits = []
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        gd_edits = []
+        for m in gd_re.finditer(scan):
+            close = _close_paren(scan, m.end() - 1)
+            if close is None or gd_re.search(scan, m.end(), close):
+                continue
+            args = [a.strip() for a in cs2cpp.split_call_args(
+                text[m.end():close]) if a.strip()]
+            # Parentheses only where an argument needs them: a literal
+            # inside them, "(frame ", would be typed by counting its
+            # parentheses.
+            parts = [a if _SIMPLE_ARG.match(a) else "(%s)" % a for a in args]
+            sep = seps[m.group(1)]
+            if sep and parts:
+                parts = [x for k, a in enumerate(parts)
+                         for x in ((sep, a) if k else (a,))]
+            gd_edits.append((m.start(), close + 1,
+                             calls[m.group(1)] % " + ".join(['""'] + parts)))
+        if not gd_edits:
+            break
+        text = _apply(text, gd_edits)
+    scan = cs2cpp._blank(text)
+
+    # StringName is a string here (the C# code converts between them)
+    for m in re.finditer(r"(?<![\w.])(?:Godot\s*\.\s*)?StringName\b(?!\s*\.)",
+                         scan):
+        edits.append((m.start(), m.end(), _pad("string", m.end() - m.start())
+                      if m.end() - m.start() >= 6 else "string"))
 
     # QueueFree() on this node -> Destroy(gameObject)
     for m in re.finditer(r"(?<![.\w])(?:this\s*\.\s*)?QueueFree\s*\(\s*\)",
@@ -3318,8 +3355,8 @@ def _lower_custom_signals(path, text, scan, edits, custom_handlers):
         for ty, name in sigs.get(m.group(1), ()):
             if ty not in _SIGNAL_PARAM_TYPES:
                 _refuse(path, text, m.start(2), None,
-                        "signal %s's parameter `%s %s`: int, float and bool "
-                        "parameters are packed" % (m.group(1), ty, name))
+                        "signal %s's parameter `%s %s`: int, float, bool and "
+                        "string parameters are packed" % (m.group(1), ty, name))
         edits.append((m.start(), m.end(), " " * (m.end() - m.start())))
     for m in re.finditer(r"(?<![.\w])(?:this\s*\.\s*)?EmitSignal(\w*)\s*\(",
                          scan):
@@ -3658,10 +3695,16 @@ def analyze_scripts(root, objects, analyze_script):
         if o.get("script"):
             custom.setdefault(o["script"], set()).update(
                 o.get("godot_custom_handlers") or ())
-    analyses = [analyze_script(p, text=adapt_csharp(
-        p, _read(p), project_types, sorted(handlers.get(p, ())),
-        sorted(custom.get(p, ()))))
-        for p in scripts]
+    analyses = []
+    for p in scripts:
+        adapted = adapt_csharp(p, _read(p), project_types,
+                               sorted(handlers.get(p, ())),
+                               sorted(custom.get(p, ())))
+        a = analyze_script(p, text=adapted)
+        if "GodotPrint." in adapted:
+            # GD.PrintRaw / PrintErr: the engine's GodotPrint_* (stdio)
+            a["apis"] = set(a["apis"]) | {"GodotPrint"}
+        analyses.append(a)
     moved = _REFS[0]["pos_written"]
     for a in analyses:
         if any(c["name"] in moved for c in a.get("classes") or ()):

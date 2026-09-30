@@ -174,6 +174,9 @@ class _Fail(Exception):
     pass
 
 
+_NUMBER = re.compile(r"^\s*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[fFuUlL]*\s*$")
+
+
 class _Node(object):
     """An expression: its span in the text, its type ('v' a Vector2, 's'
     anything else), and -- when it had to change -- its new text."""
@@ -196,9 +199,13 @@ class _Parser(object):
     `[i]`, `(args)`, `++` `--`), unary, binary by precedence, `?:`, and
     assignment."""
 
-    def __init__(self, text, toks, env, funcs, exact):
+    def __init__(self, text, toks, env, funcs, exact, strs=(), str_funcs=(),
+                 str_prefixes=()):
         self.text, self.toks, self.env, self.funcs = text, toks, env, funcs
         self.exact = exact
+        self.strs = strs
+        self.str_funcs = str_funcs
+        self.str_prefixes = str_prefixes
         self.k = 0
         self.changed = False
 
@@ -276,6 +283,11 @@ class _Parser(object):
             call = "%s(%s, %s)" % (
                 "Vector2_eq_exact" if self.exact else "Vector2_eq", sa, sb)
             return call if op == "==" else "!" + call
+        if op in ("==", "!=") and "z" in (a.ty, b.ty) and not (
+                _NUMBER.match(sa) or _NUMBER.match(sb)):
+            # C#'s string == compares the text, not the pointer
+            call = "_cs_str_Equals(%s, %s)" % (sa, sb)
+            return call if op == "==" else "!" + call
         return None
 
     def binary(self, min_prec, stop):
@@ -289,6 +301,13 @@ class _Parser(object):
                 return left
             self.k += 1
             right = self.binary(prec + 1, stop)
+            if tok in ("==", "!=") and "z" in (left.ty, right.ty) \
+                    and "v" not in (left.ty, right.ty):
+                call = self._binop(tok, left, right)
+                if call is not None:
+                    self.changed = True
+                    left = _Node(left.start, right.end, "s", call)
+                    continue
             if "v" in (left.ty, right.ty):
                 call = self._binop(tok, left, right)
                 if call is None:
@@ -363,6 +382,10 @@ class _Parser(object):
                 name = self.text[node.start:node.end]
                 args, end = self.call_args()
                 ty = "v" if name in self.funcs else "s"
+                if (name in self.str_funcs or re.search(r"\.\s*c_str$", name)
+                        or (self.str_prefixes
+                            and name.startswith(self.str_prefixes))):
+                    ty = "z"
                 new = None
                 if node.new is not None or any(a.new is not None
                                                for a in args):
@@ -398,12 +421,16 @@ class _Parser(object):
 
     def primary(self, stop):
         kind, tok, s, e = self.peek()
-        if kind in ("num", "str"):
+        if kind == "str":
+            self.k += 1
+            return _Node(s, e, "z" if tok.startswith('"') else "s")
+        if kind == "num":
             self.k += 1
             return _Node(s, e, "s")
         if kind == "id":
             self.k += 1
-            return _Node(s, e, "v" if tok in self.env else "s")
+            return _Node(s, e, "v" if tok in self.env else
+                         "z" if tok in self.strs else "s")
         if kind == "op" and tok == "(":
             self.k += 1
             inner = self.expr((")",))
@@ -422,13 +449,23 @@ def _has_vector_operand(toks, env, funcs):
     return bool(names & (env | funcs))
 
 
-def _rewrite_segment(text, env, funcs, exact):
-    """One expression segment, rewritten if it has Vector2 operators; else
-    the same text."""
+def _has_string_compare(toks):
+    """Whether a string may be compared here (`==` / `!=` beside a string
+    literal, `.c_str()`, a string call or name)."""
+    return any(t[0] == "op" and t[1] in ("==", "!=") for t in toks)
+
+
+def _rewrite_segment(text, env, funcs, exact, strs=frozenset(),
+                     str_funcs=frozenset(), str_prefixes=()):
+    """One expression segment, rewritten if it has Vector2 operators or a
+    string comparison; else the same text."""
     toks = _tokens(text)
-    if not toks or not _has_vector_operand(toks, env, funcs):
+    if not toks or not (_has_vector_operand(toks, env, funcs)
+                        or (_has_string_compare(toks)
+                            and (strs or str_funcs or str_prefixes
+                                 or any(t[0] == "str" for t in toks)))):
         return text
-    p = _Parser(text, toks, env, funcs, exact)
+    p = _Parser(text, toks, env, funcs, exact, strs, str_funcs, str_prefixes)
     try:
         node = p.expr()
         if p.k != len(toks):
@@ -547,18 +584,30 @@ def _emit_statement(stmt, out):
     out.append((True, stmt))
 
 
-def lower_vector2_ops(text, params="", funcs=(), exact=False):
+def lower_vector2_ops(text, params="", funcs=(), exact=False,
+                      string_names=(), string_calls=()):
     """*text*, a lowered method body, with its Vector2 operators as the
-    engine's helpers. *params*: the method's C parameter list (a Vector2
-    parameter is typed); *funcs*: more functions that return a Vector2 (the
-    project's methods); *exact*: Godot's exact `==`, else Unity's
-    approximate one."""
+    engine's helpers, and `==` / `!=` on strings as `_cs_str_Equals`.
+    *params*: the method's C parameter list (a Vector2 parameter is typed);
+    *funcs*: more functions that return a Vector2 (the project's methods);
+    *exact*: Godot's exact `==`, else Unity's approximate one;
+    *string_names*: the names that hold a string; *string_calls*: calls
+    that return one -- whole (`f(`, `f()`) or a name prefix (`f_`)."""
     env = set(_DECL_RE.findall(text)) | set(_DECL_RE.findall(params or ""))
     fns = set(_VEC_FUNCS) | set(funcs)
-    if not env and not (set(re.findall(r"\b\w+\b", text)) & fns):
+    strs = frozenset(string_names)
+    str_funcs = frozenset(c.rstrip("()") for c in string_calls
+                          if c.endswith("(") or c.endswith(")"))
+    str_prefixes = tuple(c for c in string_calls
+                         if not (c.endswith("(") or c.endswith(")")))
+    str_prefixes += ("_str_plus_",)
+    has_cmp = "==" in text or "!=" in text
+    if not env and not (set(re.findall(r"\b\w+\b", text)) & fns) \
+            and not has_cmp:
         return text
     # a `for (a; b; c)` head: its pieces are split by the statement splitter
     # at the `;`s -- rejoin nothing, each is an expression or a declaration
     pieces = _segments(text)
-    return "".join(_rewrite_segment(s, env, fns, exact) if is_expr else s
+    return "".join(_rewrite_segment(s, env, fns, exact, strs, str_funcs,
+                                    str_prefixes) if is_expr else s
                    for is_expr, s in pieces)
