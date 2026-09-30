@@ -127,6 +127,13 @@ original's private state, a counter or a flag, so it carried on as if it
 had already run. `TestSpawnLifecycle` and the fast check's `life` and
 `list_cap` cases run both.
 
+**A clone of a sprite is drawn.** The draw list followed the authored
+objects -- a table of the instances with a SpriteRenderer, fixed when the
+project is packed -- so a clone was never drawn. A class that can have
+clones now draws every live instance through its own draw row
+(`_Cls_spr_row`, -1 for none), which a clone takes from its source; a
+destroyed one is skipped (`TestUnityEngineGaps`).
+
 `TestMaxInstances` runs a bullet that clones itself every frame (held at
 N) and one that fires and is destroyed (firing for all 60 frames). A
 script's component is the class named after its file, as in Unity — the
@@ -598,14 +605,31 @@ local's text is not freed under the caller. Calls are typed where they are
 used: `"x" + Score()` formats an integer, `"ok " + Alive()` a bool. Static
 methods are forward-declared like instance ones.
 
-A field of a packed object reached through a local or parameter of its
-class (`Badge b = ..; b.n = 9;`) reads and writes its slot
-(`Badge_AT(b).n`), as a handle field's does. `go.AddComponent<T>()` on a
+A field of a packed object reached through a local, a parameter or a
+handle field of its class (`Badge b = ..; b.n = 9;`, `hero.speed`) reads and
+writes it through its class's accessors (`Badge_get_n(b)`,
+`Badge_set_n(b, 9)`), which decode it as it is packed -- a half float, a
+bitfield, a null handle. It read the raw slot (`Badge_AT(b).n`): a
+half-float `speed` of 3.5 read as 17152. A method called through one
+(`hero.Boost(2)`) is its class's (`Player_Boost(hero, 2)`). Every class's
+methods and accessors are declared before any class's code, as the
+classes are emitted in name order and a call may come first: a `Coin`
+calling `Player`'s did not compile. `go.AddComponent<T>()` on a
 `GameObject` variable adds to that GameObject (it added to this one).
 `gameObject.activeSelf` / `activeInHierarchy` -- this object's or a
 variable's -- read the engine's active tables. A comparison or logical
 expression in a concatenation prints as a bool (`"ok " + (n >= 0)` is `ok
 True`), and `s[k]` on a string is a `char`.
+
+**`transform.position` under a parent.** A child's position is stored local
+to its parent (`m_Father`), and `transform.position` read that local one:
+under a parent at (1, 2), a child at local (0, 0) read (0, 0), and setting
+it to (10, 10) set the local one, drawing it at (11, 12). It is now the
+world position -- composed through the parents when read, and when set,
+the local position that puts it there (`_engine_gx` / `_engine_set_world`)
+-- on a script's own transform and through a reference;
+`transform.localPosition` is the local one. The composition is the parents'
+positions (their rotation and scale are not applied).
 
 ## Collections: Stack, Queue, HashSet, List members, `T[,]`
 
