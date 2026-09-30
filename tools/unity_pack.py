@@ -12258,6 +12258,10 @@ def _emit_engine_instantiate(
                 p("    ex = _%s_inst_count;" % idn)
                 p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
             p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
+            if _spawnable(plan, cname) and _class_has_position(cl) \
+                    and _godot_sprite_rows(cl):
+                p("    _%s_spr_row[ex] = _%s_spr_row[src]; /* drawn as it is */"
+                  % (idn, idn))
 
             if _has_side_tables(cl):
                 p("    _%s_clone_side((unsigned)ex, (unsigned)src);" % idn)
@@ -13277,16 +13281,17 @@ def _emit_godot_global_helpers(class_ids, p, plan):
     pos = [(cid, _c_ident(cname)) for cname, cid in sorted(
         class_ids.items(), key=lambda kv: kv[1])
         if _class_has_position(plan["classes"][cname])]
-    for ax in "xy":
-        p("static float _godot_g%s(int c, unsigned i) {" % ax)
+    for ax in "xyz":
+        p("static float _engine_g%s(int c, unsigned i) {" % ax)
         p("    float x, y, z;")
         p("    _engine_world_pos(c, i, &x, &y, &z, 0);")
         p("    return %s;" % ax)
         p("}")
-    p("static void _godot_set_global(int c, unsigned i, float wx, float wy) {")
+    p("static void _engine_set_world(int c, unsigned i, float wx, float wy,"
+      " float wz) {")
     p("    int pc = -1;")
     p("    unsigned pi = 0u;")
-    p("    float lx = wx, ly = wy;")
+    p("    float lx = wx, ly = wy, lz = wz;")
     if bases:
         p("    const float *b = 0;")
     p("    switch (c) {")
@@ -13306,6 +13311,7 @@ def _emit_godot_global_helpers(class_ids, p, plan):
     p("        dy = wy - py;")
     p("        lx = dx;")
     p("        ly = dy;")
+    p("        lz = wz - pz;")
     if bases:
         p("        if (b) {")
         p("            float det = b[0] * b[3] - b[1] * b[2];")
@@ -13317,12 +13323,37 @@ def _emit_godot_global_helpers(class_ids, p, plan):
     p("    }")
     p("    switch (c) {")
     for cid, idn in pos:
-        p("    case %d: %s_set_pos_x(i, lx); %s_set_pos_y(i, ly); break;"
-          % (cid, idn, idn))
+        cname = sorted(plan["classes"])[cid]
+        dims = (plan["classes"][cname].get("soa_dims")
+                or (2 if plan["classes"][cname].get("two_d") else 3))
+        p("    case %d: %s_set_pos_x(i, lx); %s_set_pos_y(i, ly);%s break;"
+          % (cid, idn, idn, (" %s_set_pos_z(i, lz);" % idn) if dims == 3
+             else ""))
     p("    default: break;")
     p("    }")
+    p("    (void)lz;")
     p("}")
     p("")
+
+
+#: Where the accessors' prototypes go, filled by _fill_accessor_prototypes.
+_ACCESSOR_PROTOTYPES = "/* @accessor prototypes@ */"
+
+
+def _fill_accessor_prototypes(text):
+    """The prototypes of every one-line `static T Cls_get_f(unsigned i)` /
+    `Cls_set_f(unsigned i, T v)` accessor, at the marker before the class
+    groups: another class's may be called before its own group."""
+    if _ACCESSOR_PROTOTYPES not in text:
+        return text
+    protos = []
+    for m in re.finditer(
+            r"(?m)^static ((?:const )?[\w ]+?\s*\**) *(\w+_(?:get|set)_\w+)"
+            r"\((unsigned i(?:, [^)]*)?)\) \{", text):
+        protos.append("static %s %s(%s);" % (m.group(1).strip(), m.group(2),
+                                             m.group(3)))
+    return text.replace(_ACCESSOR_PROTOTYPES, "\n".join(
+        dict.fromkeys(protos)) or "", 1)
 
 
 def _method_prototypes(cl, cname, methods_by, plan, emit_names, overloaded,
@@ -13365,6 +13396,33 @@ def _godot_local_basis(o):
     sx, sy = (o.get("local_scale") or (1.0, 1.0, 1.0))[:2]
     c, s_ = math.cos(ang), math.sin(ang)
     return (c * sx, -s_ * sy, s_ * sx, c * sy)
+
+
+def _spawnable(plan, cname):
+    """Whether a class's instances can be clones -- Unity's Instantiate
+    (spare rows), a Godot scene's spawn -- so its tables that follow the
+    authored instances (a sprite's draw row) are per instance."""
+    return (cname in (plan.get("godot_spawn") or {})
+            or _mb_pool_extra(plan, cname) > 0)
+
+
+def _emit_spawn_sprite_rows(p, plan):
+    """Before the clone code: each clonable class's draw row per instance
+    (-1 none). A clone takes its source's (Object_Instantiate), so a clone
+    of a sprite is drawn; the draw loop walks the live instances."""
+    for cname in sorted(plan["classes"]):
+        cl = plan["classes"][cname]
+        if not _spawnable(plan, cname) or not _class_has_position(cl):
+            continue
+        rows = {i: k for k, (i, _sp) in enumerate(_godot_sprite_rows(cl))}
+        if not rows:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"] + _mb_pool_extra(plan, cname))
+        p("/* %s's draw row per instance (-1: none); a clone's is its "
+          "source's */" % cname)
+        p("static int _%s_spr_row[%d] = { %s };" % (idn, n, ", ".join(
+            str(rows.get(i, -1)) for i in range(n))))
 
 
 def _godot_sprite_rows(cl):
@@ -13415,17 +13473,6 @@ def _emit_godot_spawn(class_ids, p, plan):
         class_ids.items(), key=lambda kv: kv[1])
         if _class_has_position(plan["classes"][cname])]
     spawn = plan["godot_spawn"]
-    for cname in sorted(spawn):
-        cl = plan["classes"].get(cname)
-        if not cl or not _class_has_position(cl):
-            continue
-        idn = _c_ident(cname)
-        n = max(1, cl["n"] + _mb_pool_extra(plan, cname))
-        rows = {i: k for k, (i, _sp) in enumerate(_godot_sprite_rows(cl))}
-        p("/* %s's draw row per instance (-1: none); a clone's is its "
-          "template's */" % cname)
-        p("static int _%s_spr_row[%d] = { %s };" % (idn, n, ", ".join(
-            str(rows.get(i, -1)) for i in range(n))))
     # rows by class: a frame's row, a GameObject
     for kind in ("gbasis", "xf_basis", "lbasis"):
         p("static float *_godot_%s(int c, unsigned i) {" % kind)
@@ -13538,8 +13585,6 @@ def _emit_godot_spawn(class_ids, p, plan):
         p("            _%s_xf_basis[ex][a] = a == 0 || a == 3 ? 1.f : 0.f;"
           % idn)
         p("        }")
-        if _godot_sprite_rows(plan["classes"][cname]):
-            p("        _%s_spr_row[ex] = _%s_spr_row[src];" % (idn, idn))
         for k, c in enumerate(plan.get("godot_conns") or []):
             if c["from_class"] == cname:
                 p("        if (ex < %du) _godot_conn_%d[ex] = -1;"
@@ -13747,7 +13792,8 @@ def _godot_new_vector_assign(text, target, lower):
         if len(args) < 2 or not sm:
             continue
         out.append(text[last:m.start()])
-        out.append(lower(m, args[0].strip(), args[1].strip()))
+        out.append(lower(m, args[0].strip(), args[1].strip(),
+                         *([args[2].strip()] if len(args) > 2 else [])))
         last = close + 1 + sm.end()
     out.append(text[last:])
     return "".join(out)
@@ -13905,10 +13951,11 @@ def _emit_engine_world_positions(
         p("    }")
         p("}")
         p("")
-        if plan.get("godot"):
-            _emit_godot_global_helpers(class_ids, p, plan)
-            if plan.get("godot_spawn"):
-                _emit_godot_spawn(class_ids, p, plan)
+        # a child's world position, read and written (transform.position
+        # under a parent; Godot's GlobalPosition)
+        _emit_godot_global_helpers(class_ids, p, plan)
+        if plan.get("godot_spawn"):
+            _emit_godot_spawn(class_ids, p, plan)
 
         if want_set_parent and want_go_tables:
             go_n = max(1, len(plan.get("go_names") or []))
@@ -16081,9 +16128,9 @@ def _emit_engine_class_draws(
             if ui_buttons:
                 p("        static const int _spr_btn[] = { %s };" % ", ".join(
                     btn_vals))
-        if cname in (plan.get("godot_spawn") or {}):
-            # a spawned class: every live instance, its draw row its own
-            # (a clone's is its template's; -1 none)
+        if _spawnable(plan, cname):
+            # a clonable class: every live instance, its draw row its own
+            # (a clone's is its source's; -1 none)
             p("        unsigned i;")
             p("        for (i = 0; i < (unsigned)_%s_inst_count && n < max;"
               " i = i + 1) {" % idn)
@@ -17300,6 +17347,7 @@ def emit_engine(plan, analyses, used_apis):
         for _root in sorted({t["nodes"][0]["class"]
                              for t in plan.get("godot_templates") or []}):
             p("static int _godot_spawn_%s(int src);" % _c_ident(_root))
+    _emit_spawn_sprite_rows(p, plan)
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
     _emit_engine_instantiate(
             add_budget, go_spawn_budget, inst_budget, p, plan, want_destroy,
@@ -17613,12 +17661,7 @@ def emit_engine(plan, analyses, used_apis):
                     _c_ident(cname), ax))
                 p("static void %s_set_pos_%s(unsigned i, float v);" % (
                     _c_ident(cname), ax))
-        if plan.get("has_transform_parents"):
-            # a node's global position through its parents (world helpers)
-            p("static float _godot_gx(int c, unsigned i);")
-            p("static float _godot_gy(int c, unsigned i);")
-            p("static void _godot_set_global(int c, unsigned i, float wx,"
-              " float wy);")
+
         if "GodotPrint" in used_apis:
             # GD.PrintRaw (stdout, no newline) and GD.PrintErr (stderr)
             p("static void GodotPrint_Raw(const char *s) {")
@@ -17642,9 +17685,21 @@ def emit_engine(plan, analyses, used_apis):
             p("    return i < %du ? n[i] : %s;" % (
                 len(names), _c_string(clone_name)))
             p("}")
-    if plan.get("godot"):
-        # a script calls another class's method through a node reference:
-        # every class's prototypes, before any class's bodies
+    # every class's accessors' prototypes (filled in once they are all
+    # emitted: a script reads another class's field through its accessor)
+    p(_ACCESSOR_PROTOTYPES)
+    if plan.get("has_transform_parents"):
+        # a child's world position (the world helpers, defined later)
+        p("static float _engine_gx(int c, unsigned i);")
+        p("static float _engine_gy(int c, unsigned i);")
+        p("static float _engine_gz(int c, unsigned i);")
+        p("static void _engine_set_world(int c, unsigned i, float wx,"
+          " float wy, float wz);")
+    if True:
+        # a script calls another class's method through a reference (a
+        # field set in the scene, a Godot node's): every class's
+        # prototypes, before any class's bodies -- the classes are emitted
+        # in name order, and a call may come before its callee's class
         for cname, pcl in sorted(plan["classes"].items()):
             names = _reachable_emit_methods(
                 [m for _c, m in methods_by.get(cname, [])],
@@ -18027,7 +18082,7 @@ def emit_engine(plan, analyses, used_apis):
     p("")
     if _multi_scene(plan):
         _emit_engine_scene_apply(lines, plan, class_ids)
-    return "\n".join(lines) + "\n"
+    return _fill_accessor_prototypes("\n".join(lines) + "\n")
 
 
 def emit_engine_draw_h():
@@ -21462,6 +21517,46 @@ def _lower_godot_tree(text, cl, plan, site):
     return "".join(out)
 
 
+def _handle_field_access(text, plan, holds):
+    """`other.hp` read or written through a reference to another packed
+    object -- a field, local or parameter of its class -- is that class's
+    accessors, `Other_get_hp(other)` / `Other_set_hp(other, v)`, which
+    decode what the field is packed as (a half float, a bitfield, a null
+    handle). It was `Other_AT(other).hp`, the raw storage. `other` is left
+    for the field / local lowering after."""
+    classes = plan.get("classes") or {}
+    for recv, other in sorted(holds.items()):
+        ocl = classes.get(other)
+        if not ocl:
+            continue
+        names = [m[0] for m in ocl.get("members") or ()]
+        if not names:
+            continue
+        o = _c_ident(other)
+        alt = "|".join(re.escape(n) for n in sorted(names, key=len,
+                                                     reverse=True))
+        head = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*(%s)\b" % (
+            re.escape(recv), alt)
+        # writes: `other.f = v;`, `other.f op= v;`, `other.f++;`
+        text = cs2cpp.code_sub(
+            head + r"\s*([-+*/%&|^]?)=(?!=)\s*([^;]*);",
+            lambda m, r=recv: (
+                "%s_set_%s(%s, %s);" % (o, m.group(1), r, m.group(3))
+                if not m.group(2) else
+                "%s_set_%s(%s, %s_get_%s(%s) %s (%s));" % (
+                    o, m.group(1), r, o, m.group(1), r, m.group(2),
+                    m.group(3))), text)
+        text = cs2cpp.code_sub(
+            head + r"\s*(\+\+|--)",
+            lambda m, r=recv: "%s_set_%s(%s, %s_get_%s(%s) %s 1)" % (
+                o, m.group(1), r, o, m.group(1), r, m.group(2)[0]), text)
+        # reads (not a call: a method's is _handle_method_calls')
+        text = cs2cpp.code_sub(
+            head + r"(?!\s*\()(?!\s*\.)",
+            lambda m, r=recv: "%s_get_%s(%s)" % (o, m.group(1), r), text)
+    return text
+
+
 def _handle_positions(text, plan, holds):
     """`other.transform.position.x` (or `localPosition`) read through a
     reference to another packed object -- a field, local or parameter of
@@ -21478,7 +21573,7 @@ def _handle_positions(text, plan, holds):
             if m.group(1) == "z" and flat:
                 return "0.f"
             return "%s_get_pos_%s(%s)" % (o, m.group(1), r)
-        world = bool(plan.get("godot") and plan.get("has_transform_parents"))
+        world = bool(plan.get("has_transform_parents"))
         ocid = sorted(classes).index(other)
         # `ref.transform.<member> = new Vector2(A, B);`: its setters, or
         # for the global position under parents, the inverse
@@ -21486,8 +21581,9 @@ def _handle_positions(text, plan, holds):
         text = _godot_new_vector_assign(
             text, r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
             r"(?:position|localPosition)" % rq,
-            lambda m, a, b, o=_c_ident(other), r=recv, w=world, c=ocid: (
-                "_godot_set_global(%d, %s, %s, %s);" % (c, r, a, b)
+            lambda m, a, b, z="0.f", o=_c_ident(other), r=recv, w=world,
+            c=ocid: (
+                "_engine_set_world(%d, %s, %s, %s, %s);" % (c, r, a, b, z)
                 if w and re.search(r"\bposition$", m.group(1))
                 else "%s_set_pos_x(%s, %s); %s_set_pos_y(%s, %s);" % (
                     o, r, a, o, r, b)))
@@ -21495,7 +21591,7 @@ def _handle_positions(text, plan, holds):
             text = cs2cpp.code_sub(
                 r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
                 r"position\s*\.\s*([xy])\b(?!\s*[-+*/]?=(?!=))" % rq,
-                lambda m, r=recv, c=ocid: "_godot_g%s(%d, %s)" % (
+                lambda m, r=recv, c=ocid: "_engine_g%s(%d, %s)" % (
                     m.group(1), c, r), text)
         text = cs2cpp.code_sub(
             r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
@@ -21535,6 +21631,7 @@ def _local_handle_fields(text, cl, plan, site):
         if m.group(1) in classes:
             holds[m.group(2)] = m.group(1)
     text = _handle_method_calls(text, plan, holds)
+    text = _handle_field_access(text, plan, holds)
     text = _handle_positions(text, plan, holds)
     for recv, other in sorted(holds.items()):
         members = [mm[0] for mm in classes[other].get("members") or ()
@@ -22912,17 +23009,20 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
     text = cs2cpp.lower_bindings(text, _UNITY_API_RECT)
     text = _rewrite_rect_members(text)
-    if plan.get("godot") and plan.get("has_transform_parents") \
-            and _class_has_position(cl):
-        # Godot's GlobalPosition under a parent: composed / inverted
+    if plan.get("has_transform_parents") and _class_has_position(cl):
+        # transform.position (Godot's GlobalPosition) under a parent: the
+        # world position, composed through the parents when read, and the
+        # local one that puts it there when written
         cid = sorted(plan["classes"]).index(cl["name"])
+        three = (cl.get("soa_dims") or (2 if cl.get("two_d") else 3)) == 3
         text = _godot_new_vector_assign(
             text, r"(?<![\w.])transform\s*\.\s*position",
-            lambda m, a, b: "_godot_set_global(%d, i, %s, %s);" % (cid, a, b))
+            lambda m, a, b, c=None: "_engine_set_world(%d, i, %s, %s, %s);"
+            % (cid, a, b, c if c is not None else "0.f"))
         text = cs2cpp.code_sub(
-            r"(?<![\w.])transform\s*\.\s*position\s*\.\s*([xy])\b"
-            r"(?!\s*[-+*/]?=(?!=))",
-            lambda m: "_godot_g%s(%d, i)" % (m.group(1), cid), text)
+            r"(?<![\w.])transform\s*\.\s*position\s*\.\s*([xy%s])\b"
+            r"(?!\s*[-+*/]?=(?!=))" % ("z" if three else ""),
+            lambda m: "_engine_g%s(%d, i)" % (m.group(1), cid), text)
     text = cs2cpp.code_sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = cs2cpp.code_sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
     text = cs2cpp.code_sub(r"transform\.position\.z",
@@ -23125,6 +23225,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         and _c_ident(kind.split(":", 1)[1]) in handle_fields.values()
         and n in handle_fields}
     text = _handle_method_calls(text, plan, field_holds)
+    text = _handle_field_access(text, plan, field_holds)
     text = _handle_positions(text, plan, field_holds)
     text = cs2cpp.lower_packed_fields(
         text, idn, members, class_const_names, handle_fields,
