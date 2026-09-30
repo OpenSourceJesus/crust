@@ -162,7 +162,13 @@ compiles there and does nothing; the packer rewrites the calls to
 texels gone), 5 Outline (its width, 1..8 texels, in the tint, inside the
 sprite's bounds -- a sprite needs a transparent margin; never sampling a
 neighbour in the atlas). `EngineDraw` carries its GameObject (`go`) for the
-table (`test_batch_sprite_effect_flashes_the_coins`).
+table (`test_batch_sprite_effect_flashes_the_coins`). A Godot pack takes the
+same path (`godot_pack.py --gpu-batch`; see GODOT_PACK.md): its scripts call
+`SpriteEffects2D.Set(this | a node reference, ..)`
+(`examples/unity_pack/SpriteEffects2D.Godot.cs`), and the effect covers the
+node's subtree -- `engine_set_sprite_effect` walks a static child table
+(`_engine_fx_child` / `_engine_fx_sib`), a Godot node's sprite being most
+often its child.
 
 **Freeform, Parametric and Sprite lights** (GLES3 path). A Freeform light's
 `m_ShapePath` (and an older Parametric light's regular polygon:

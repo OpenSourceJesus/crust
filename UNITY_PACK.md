@@ -715,6 +715,19 @@ is decided, `x is T` for an `x` declared a `T` is `x != null`, and
 `nameof(x)` is `"x"`. A type used any other way -- reflection, a `Type`
 kept in a variable -- is left as written, and the method is reported.
 
+## Vector2 arithmetic
+
+`Vector2` locals, parameters and results are the engine's C struct, and C
+has no operators on structs. `tools/unity_pack_vectors.py` types each
+expression of a lowered method -- a `Vector2` local or parameter,
+`Vector2_make(..)` (a packed Vector2 field, a `new Vector2`), a helper or a
+project method that returns one -- and lowers every operator with a
+`Vector2` operand to the engine's component-wise helpers: `+` `-` (vectors),
+`*` `/` by a number or component-wise, unary `-`, `+=` `-=` `*=` `/=`, and
+`==` / `!=` as Unity's (`Vector2_eq`, within kEpsilon). Code without a
+`Vector2` operand is left as it was, character for character. They came out
+as C that does not compile.
+
 ## Box2D-Packed: triggers and the Rigidbody2D API
 
 `Destroy(gameObject)` takes the object's Rigidbody2D and Collider2D out of

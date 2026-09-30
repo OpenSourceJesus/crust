@@ -44,6 +44,26 @@ and typed values across lines — `Vector2(..)`, `ExtResource("..")`,
   is owned storage the script can assign, and C# string members work on
   it (see *Strings* in [UNITY_PACK.md](UNITY_PACK.md)).
 
+### Vector2
+
+`Vector2` is the engine's C struct, and its arithmetic is Godot's:
+`a + b`, `a - b`, `v * s`, `s * v`, `a * b` (component-wise), `v / s`,
+`a / b`, `-v`, `==` / `!=` (exact, as GodotSharp's `Equals`), and `+=` `-=`
+`*=` `/=` -- typed and rewritten into the engine's component-wise helpers
+(`tools/unity_pack_vectors.py`), whatever the operands: locals, fields,
+`Position`, a method's result, `(a - b)`. A node's own `Position` /
+`GlobalPosition` is a vector too: read whole, and assigned any vector
+expression.
+
+Its methods are GodotSharp's (`Core/Vector2.cs`): `Length`,
+`LengthSquared`, `Normalized` (only a zero vector stays zero), `Dot`,
+`Cross`, `DistanceTo`, `DistanceSquaredTo`, `Angle`, `AngleTo`,
+`DirectionTo`, `Lerp` (not clamped), `MoveToward`, `Rotated`,
+`LimitLength` (1 by default), `Abs`, `IsZeroApprox`, `IsEqualApprox`
+(Mathf's 1e-6); the constants `Vector2.Zero`, `One`, `Up` (0, -1), `Down`,
+`Left`, `Right`. Any other `Vector2.X` is refused where it is written, and
+so is a method given the wrong number of arguments.
+
 ### The runtime hierarchy
 
 The parent chain is live. A 2D node under a 2D node object is that node's
@@ -96,6 +116,41 @@ AtlasTexture `margin`, a CanvasItem `material`, `show_behind_parent`,
 `AnimatedSprite2D`, `Polygon2D`, `Line2D`, `TileMap` / `TileMapLayer`,
 particles, `MeshInstance2D`, `TextureRect`, `NinePatchRect` -- when they
 have something to draw.
+
+## The 2D GPU path (`--gpu-batch`)
+
+```sh
+python3 tools/godot_pack.py <project> -o out --gpu-batch
+cc -DBATCH -I out -I examples/unity_pack -I examples/unity_pack/include \
+   -o out/view examples/unity_pack/gles3_view.c out/engine.c out/data.c \
+   -lEGL -lGLESv2 -lm
+```
+
+A Godot pack takes unity_pack's GPU path as a Unity one does
+(`tools/unity_pack_gpu2d.py`, `examples/unity_pack/gles3_batch.h`): every
+Sprite2D's texture -- a sprite-sheet frame, a region, an AtlasTexture, each
+cropped at import -- is a rectangle of one atlas, and the frame is one
+instanced draw call. Its sprites are the draw list's, in Godot's order
+(z_index, then tree order), with Godot's flips, rotation, scale, modulate
+and a parent's transform; its camera is the Camera2D's, y down
+(`gles3_render.h`). The batch shader's frame is the per-sprite renderer's,
+byte for byte.
+
+A script sets a 2D effect -- Flash, Grayscale, HueShift, Dissolve,
+Outline -- with the Godot flavour of `SpriteEffects2D`
+(`examples/unity_pack/SpriteEffects2D.Godot.cs`, to put in the project so
+the editor compiles it):
+
+```csharp
+SpriteEffects2D.Set(this, SpriteEffect2D.Flash, 0.8f);
+SpriteEffects2D.Set(GetNode<Enemy>("../Enemy"), SpriteEffect2D.Grayscale, 1f);
+SpriteEffects2D.Clear(this);
+```
+
+The node is `this` or a node reference, and the effect is drawn on its
+sprites and its children's -- a Godot node's sprite is most often its child
+(a body and its Sprite2D), as its modulate is theirs. Without
+`--gpu-batch`, nothing draws the effects.
 
 ## Camera2D
 
@@ -352,7 +407,7 @@ before each step, so a probe there reads one step behind.
 
 ## Tests
 
-`tools/godot_pack_test_fast.py` (`make test_godot_fast`, about a second)
+`tools/godot_pack_test_fast.py` (`make test_godot_fast`)
 covers the newer front end: Sprite2D rows, refusals and a packed draw list;
 Camera2D views, limits and following, and a y-down frame through
 `gles2_view.c` when EGL is there; input actions against Godot's rules; the
