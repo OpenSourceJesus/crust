@@ -717,6 +717,12 @@ kept in a variable -- is left as written, and the method is reported.
 
 ## Box2D-Packed: triggers and the Rigidbody2D API
 
+`Destroy(gameObject)` takes the object's Rigidbody2D and Collider2D out of
+the simulation: the glue's live gate (`physics2d_live`, as for an unloaded
+scene) disables their bodies from the next step, and its touching pairs end.
+They stayed, and other bodies still hit them. A destroyed object's sprite is
+no longer drawn either.
+
 2D physics is Box2D-Packed (`box2d_unity.py` in its checkout generates
 `physics_box2d.c`, which steps a Box2D world over the packed tables).
 

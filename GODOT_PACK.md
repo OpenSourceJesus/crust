@@ -44,8 +44,121 @@ and typed values across lines — `Vector2(..)`, `ExtResource("..")`,
   is owned storage the script can assign, and C# string members work on
   it (see *Strings* in [UNITY_PACK.md](UNITY_PACK.md)).
 
-Global positions are baked at import; the parent chain is not yet a runtime
-hierarchy, so a script moving a parent does not move its children.
+### The runtime hierarchy
+
+The parent chain is live. A 2D node under a 2D node object is that node's
+child at runtime (unity_pack's transform parents: `xf_id` / `father_id`):
+its position is local, its node's `position`, and its world position is
+composed each frame from its parent's, through the parent's global rotation
+and scale -- `global = parent_global * local`, as Godot's. So a sprite under
+a moving node moves with it, scaled and turned as its parent is. Scripts do
+not rotate or scale nodes, so each child's parent basis is a constant.
+
+* `Position` is the local position; `GlobalPosition` is composed through
+  the parents when read, and assigning it sets the local position that puts
+  the node there (the parents' world taken away, the parent's rotation and
+  scale inverted) -- on a script's own node and through a reference.
+* A `RigidBody2D`, `CharacterBody2D`, `StaticBody2D`, `AnimatableBody2D` or
+  `Area2D` has no parent at runtime: it is simulated in the world, as in
+  Godot, where a body does not move with its parent. Its children follow it.
+* A `top_level` node, and a node under a non-2D `Node`, have none either.
+
+Scripts' `_Process` runs class by class (unity_pack's order), not in tree
+order; a parent's move this frame is seen by a child that reads its
+`GlobalPosition` after it.
+
+## Sprite2D
+
+A `Sprite2D` is its object's row in the draw list, as a Unity
+SpriteRenderer is (`engine_collect_draws`), in Godot's pixels:
+
+| Godot | packed |
+|-------|--------|
+| `texture`: a PNG `Texture2D`, or an `AtlasTexture` region of one | the texture table, cropped at import |
+| `region_enabled` / `region_rect`, `hframes` / `vframes` with `frame` or `frame_coords` | cropped as `Sprite2D::_get_rects` does: the region, then the frame |
+| `offset`, `centered` | the draw's centre, a constant offset from the node |
+| `flip_h`, `flip_v` | mirrored in place, as Godot's negative rect size is |
+| global rotation and scale | the draw's basis and half extents |
+| `modulate` of the node and its CanvasItem parents, times its `self_modulate` | the draw's colour |
+| `visible` false on it or a parent | not drawn |
+| `z_index` (with `z_as_relative`), then tree order | painter's order: a z's rank among those used is the sorting layer, tree order the sorting order |
+
+A script moving the node (`Position`) moves its draw, and a node freed with
+`QueueFree()` is no longer drawn. Texture row 0 is the image's bottom in the
+packed tables, as for Unity, and the draw's local y is mirrored so the image's
+top is up in Godot's y-down pixels.
+
+Refused at the scene line: a texture that is not a PNG (`.svg`, a
+`GradientTexture2D` ...), a PNG the packer cannot decode (8-bit RGB / RGBA
+are packed), a frame outside its texture or not whole pixels, an
+AtlasTexture `margin`, a CanvasItem `material`, `show_behind_parent`,
+`y_sort_enabled`, `clip_children`; and drawing nodes not packed yet --
+`AnimatedSprite2D`, `Polygon2D`, `Line2D`, `TileMap` / `TileMapLayer`,
+particles, `MeshInstance2D`, `TextureRect`, `NinePatchRect` -- when they
+have something to draw.
+
+## Camera2D
+
+The view the draw list is seen through is Godot's: world y points down the
+screen (`int Camera_main_y_down = 1` in `data.c`; the example renderers,
+`gles2_view.c` / `gles2_window.c` / `gles3_view.c` / `gles3_window.c`, flip
+their view for it, and read 0 -- Unity's y up -- from a Unity pack).
+
+* Without a Camera2D, the view is the viewport's rect from the origin,
+  `display/window/size/viewport_width` x `_height` (1152 x 648 by default).
+* The current Camera2D is the first enabled one in the tree, as Godot makes
+  current. Its view is the viewport's size over `zoom`, anchored at the node
+  (`anchor_mode` drag centre, or fixed top-left), clamped to the `limit_*`s
+  (left, then right; top, then bottom -- `limit_enabled`), then moved by
+  `offset`: `Camera2D::get_camera_transform`'s order.
+* A camera with a script follows its own node; one without follows its
+  parent -- whose world position the runtime hierarchy composes through all
+  its ancestors, so it follows whichever of them moves -- keeping its offset
+  from it; the limits and offset are applied each frame.
+* The clear colour is `rendering/environment/defaults/default_clear_color`;
+  the window is `window_width_override` / `_height_override` when set, and
+  the view is letterboxed into it, as stretch aspect `keep` does.
+
+Refused at the scene line: position or rotation smoothing, drag margins,
+`custom_viewport`, a rotated camera with `ignore_rotation = false`, a zoom
+that is not positive. A script cannot yet read or move the camera (`GetNode`
+is refused), nor switch cameras.
+
+## Input actions
+
+`Input` reads the InputMap: Godot 4.4's built-in `ui_*` actions (with the
+toggle deadzone, 0.5), then `project.godot`'s `[input]` (0.2 when an action
+gives none), which overrides them. Each action a script names is a slot of
+the engine's tables, evaluated once a tick over the keys and first joypad
+the host reports (`engine_keyboard_<key>`, `engine_gamepad_button[]` /
+`_axis[]`, as a Unity pack's `Keyboard.current` / `Gamepad.current`):
+
+| Godot | packed |
+|-------|--------|
+| `IsActionPressed`, `IsActionJustPressed`, `IsActionJustReleased` | the action's state, and its edges since the last tick |
+| `GetActionStrength`, `GetActionRawStrength` | the strongest event, as Input's action cache |
+| `GetAxis(neg, pos)` | strength(pos) - strength(neg) |
+| `GetVector(nx, px, ny, py[, deadzone])` | raw strengths, the four deadzones' mean unless given, a circular deadzone, length at most 1 |
+| `IsKeyPressed` / `IsPhysicalKeyPressed` / `IsKeyLabelPressed(Key.X)` | the key |
+| `IsJoyButtonPressed(0, JoyButton.X)`, `GetJoyAxis(0, JoyAxis.X)` | the first joypad, y down |
+
+An event is Godot's: a key (its keycode, physical keycode or label; a Shift /
+Ctrl / Alt without a location is either side; the modifiers it asks for must
+be held, others may be), a joypad button, or a joypad axis
+(`InputEventJoypadMotion::action_match`: pressed past the deadzone in its
+direction, strength `inverse_lerp(deadzone, 1, |v|)`, raw strength `|v|`).
+Keys a host reports: letters, digits, Space, Enter, Escape, Tab, Backspace,
+the arrows, Shift, Ctrl, Alt. A built-in's events a host cannot report (KP
+Enter, Page Up / Down, Home, End) are not in it.
+
+Refused where written: an action the InputMap does not have, an action name
+that is not a string literal, `exact_match`, a key a host does not report,
+Meta / Command modifiers, a joypad device other than the first, mouse and
+other events, `Input` members not above, and `_Input` / `_UnhandledInput` /
+`_UnhandledKeyInput` / `_ShortcutInput` overrides.
+
+Edges are per tick: a press between two ticks is one `IsActionJustPressed`,
+and a tick that runs two physics steps shows it to both.
 
 ## Scripts: Godot C#, read as the subset
 
@@ -58,7 +171,7 @@ Unity-shaped C# it already lowers:
 | `_Ready` / `_EnterTree` / `_ExitTree` | `Start` / `Awake` / `OnDestroy` |
 | `_Process(double delta)` / `_PhysicsProcess(..)` | `Update()` / `FixedUpdate()` with `float delta` from `Time.deltaTime` / `Time.fixedDeltaTime` |
 | `[Export]` field or `{ get; set; }` auto-property | a field |
-| `Position` / `GlobalPosition`, `.X` `.Y` `.Z` | `transform.localPosition` / `transform.position`, `.x` `.y` `.z` |
+| `Position` / `GlobalPosition`, `.X` `.Y` `.Z` | `transform.localPosition` / `transform.position` (local / composed through the parents; see *The runtime hierarchy*), `.x` `.y` `.z` |
 | `Vector2.Up` / `Down` / `Left` / `Right` / `Zero` / `One` | Godot's values: `Up` is `(0, -1)` |
 | `GD.Print(a, b)` | `Console.WriteLine("" + a + b)`: Godot concatenates |
 | `QueueFree()` | `Destroy(gameObject)` |
@@ -71,8 +184,8 @@ res://scripts/Player.cs(17,38): error CS8000: `GetNode` (Godot API) is not packe
 res://coin.tscn:6: error: GDScript is not packed yet (res://scripts/coin.gd); unity_pack reads Godot C# scripts
 ```
 
-Refused where used: `GetNode` / `GetParent` / `GetTree` / `AddChild`,
-signals (`[Signal]`, `EmitSignal`, `Connect`), `Input` and `_Input`,
+Refused where used: `GetTree` / `GetChild` / `AddChild`,
+`Connect`, `Input` beyond the actions above, `_Input`,
 `Rotation` / `Scale` / `Transform`, `Velocity` / `MoveAndSlide`, `Visible` /
 `Modulate`, `PackedScene`, `Godot.Collections`, and `GD` members other than
 `Print`. A member the script declares itself (a field named `Scale`) is its
@@ -108,9 +221,19 @@ bounce counted negative (Godot's `godot_body_pair_2d.cpp`); and damping is
 Godot's `v *= 1 - dt * d` a step, not Box2D's per-substep form. An older
 Box2D-Packed checkout without the mode is an error naming the checkout.
 
+`collision_layer` and `collision_mask` are Godot's, 32 bits
+(`godot_body_pair_2d.cpp`, `Area2D::collides_with`): a dynamic body is pushed
+by what its mask has the layer of, and an Area2D reports what its mask has
+the layer of (between two areas, each by its own mask). Box2D-Packed's Godot
+mode filters the body pairs (`_with_godot_layers`: a pair collides when a
+dynamic side's mask has the other's layer), and godot_pack's signal
+dispatch the areas'. A Box2D contact pushes both of its bodies, so two
+dynamic bodies that Godot pushes one way only -- one's mask has the other's
+layer, not the reverse -- are pushed both ways: a warning at the scene line.
+
 Refused at the scene line: other shapes (capsule, segment, polygon,
 `CollisionPolygon2D`), a second enabled shape on one body, one-way
-collision, `collision_layer` / `collision_mask` other than 1, Area2D gravity
+collision, Area2D gravity
 and damping overrides, `constant_linear_velocity`, and 3D bodies. A
 `RigidBody2D` that may rotate is a warning: Box2D-Packed locks body rotation,
 as for Unity, and `lock_rotation = true` says so.
@@ -144,8 +267,77 @@ collider's index, and three things are packed on it:
 | `body.Name` in a `GD.Print` or a string | the node's name |
 
 Any other use of it is refused at its line. A node freed with `QueueFree()`
-sends and receives no more signals; its Box2D body stays in the world, so it
-still collides until the glue can remove shapes (not yet).
+sends and receives no more signals, and its body leaves the world: Box2D-Packed's
+live gate disables the bodies of a freed node (`engine_rb2d_live` /
+`engine_col2d_live`), and drops their touching pairs, from the next step --
+what rested on it falls. `QueueFree()` frees the node's subtree, as
+Godot's: its children first, in reverse order (their `_ExitTree` before
+its), and their bodies leave the world with it.
+
+## Timers and a script's own signals
+
+Besides the physics signals, a `Timer`'s `timeout` and a script's own
+`[Signal]`s are packed, wired either way the physics ones are (a scene
+`[connection]`, or `X += Handler;` in `_Ready` / `_EnterTree` on the
+script's own signal, or a Timer script's `Timeout`):
+
+```csharp
+[Signal] public delegate void HitEventHandler(int damage, float at, bool crit);
+...
+EmitSignal(SignalName.Hit, 3, 1.5f, true);   // or EmitSignal("Hit", ..)
+EmitSignalHit(7, 2.5f, false);               // the generated form
+```
+
+Each emission calls its connections at once, in connection order, with its
+arguments; a freed sender or receiver is skipped. A signal's parameters are
+`int`, `float` or `bool`, and a handler takes the signal's types. A
+`Timer` (a node, or one a script derives from) is Godot's: `wait_time`,
+`one_shot`, `autostart`; each frame `time_left -= delta`, and below 0 it
+sends `timeout` and starts over from what is left (`+= wait_time`), or stops
+when one-shot. Timers tick after the scripts' `_Process` in a frame -- Godot
+ticks one in tree order with the `_process` calls, and it is most often a
+child or later sibling of the script it serves.
+
+Refused where written: another parameter type, `EmitSignal` of a signal the
+script does not declare or with the wrong number of arguments, a signal
+name that is not `SignalName.X` or a literal, a handler whose parameters are
+not the signal's, a deferred connection, a physics-process Timer,
+`ignore_time_scale`, a Timer script's own `Start` / `Stop` / `WaitTime` /
+`OneShot` / `TimeLeft` / `Paused` / `IsStopped`, and other signals (Button
+`pressed`, `tree_exited` ...).
+
+## Node references
+
+`GetNode<T>("path")`, `GetNodeOrNull<T>(..)` and `GetParent<T>()` are
+resolved when the project is packed, for each node that runs the script --
+two instances of `enemy.tscn` each reach their own `Cooldown` -- as
+Node::get_node resolves them: relative (`Child/Grand`, `..`), absolute
+(`/root/Main/Player`), or a scene unique name (`%Boss`). Each call is a
+field of the script's class that the scene seeds, so the usual caching
+(`_player = GetNode<Player>("../Player");` in `_Ready`) copies it, and a use
+anywhere reads it. An `[Export]` node field the scene sets
+(`Target = NodePath("../Player")`) is resolved the same way. The path is a
+string literal; a `GetNodeOrNull` that finds nothing is null.
+
+What the reference is follows T:
+
+| T | the reference | through it |
+|---|---|---|
+| the target's script class (`Player`) | that node's object | its methods and fields; `Position` / `GlobalPosition` (a vector or `.X` / `.Y`), read and assigned (`=`, `+=`, `-=`, `*=` / `/=` by a number); `Name` |
+| a Godot type the target is (`Node2D`, `Sprite2D`, `RigidBody2D` ...) | the node's packed class: its script's, or without one the node's own | the same; a variable given it takes that class |
+| `Timer` | its timer | `Start()` / `Start(t)`, `Stop()`, `IsStopped()`, `TimeLeft`, `WaitTime` / `OneShot` / `Paused` (read and set) -- Godot's Timer: start sets `time_left = wait_time`, stop `-1` |
+
+A Timer script has the Timer members on itself too, and a script's own
+`Name` is its node's (renaming is not packed).
+
+Refused where written: `GetNode` without a type, a path that is not a
+literal, a path that finds no node (the message names the node the path is
+from), a target that is not T, a Godot-typed reference that reaches nodes of
+different classes from the nodes running the script, another member
+through a reference (`_p.Rotation`), a component of another node's position
+assigned (`_p.Position.X = 3`, C#'s CS1612), a Timer's `Timeout +=` on a
+reference (connect it in the scene), `WaitTime +=`. A reference to a node
+that is freed still names it.
 
 ## Checked against real Godot
 
@@ -160,7 +352,13 @@ before each step, so a probe there reads one step behind.
 
 ## Tests
 
-`TestGodot` in `tests/test_unity_pack.py` packs `tests/fixtures/GodotMini`
+`tools/godot_pack_test_fast.py` (`make test_godot_fast`, about a second)
+covers the newer front end: Sprite2D rows, refusals and a packed draw list;
+Camera2D views, limits and following, and a y-down frame through
+`gles2_view.c` when EGL is there; input actions against Godot's rules; the
+reader's inline objects. It skips what is not about Godot -- the emitted C is
+not re-validated through cpprust + crust, and is compiled at -O0 -- so new
+Godot tests belong there. `TestGodot` in `tests/test_unity_pack.py` packs `tests/fixtures/GodotMini`
 and projects it writes itself: the resource reader, transforms and
 instancing, the script adapter and its refusals, bodies and shapes, the
 physics refusals, signal wiring and handler lowering and their refusals,
@@ -173,6 +371,6 @@ the injected build against the standard one.
 
 ## Not yet
 
-Sprite2D and textures, Camera2D, input actions, signals other than the
-physics ones above, node references, collision layers, a runtime hierarchy,
-removing a freed node's body from Box2D, GDScript.
+Camera2D smoothing and drag margins, mouse input, signals other than
+the physics ones, timeouts and the scripts' own, process order by tree,
+GDScript.
