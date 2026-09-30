@@ -2505,7 +2505,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 g = spr.group(2).lower() if spr.group(2) else None
                 # Must resolve to a project asset — no invent / dangling guid.
                 has_sprite = bool(g and g in asset_guids)
+            mat = re.search(r"(?m)^  m_Materials:\s*\n\s+- \{fileID:\s*-?\d+,\s*guid:\s*"
+                            r"([0-9a-fA-F]+)", block)
             rec["sprite"] = {
+                # URP's Sprite-Lit-Default: lit by the 2D lights
+                "lit": int(bool(mat) and mat.group(1).lower()
+                           == "a97c105638bdf8b4a8650670310a4cd3"),
                 "r": float(col.group(1)) if col else 1.0,
                 "g": float(col.group(2)) if col else 1.0,
                 "b": float(col.group(3)) if col else 1.0,
@@ -2655,6 +2660,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             }
         if kind in _JOINT2D_KINDS:
             rec["joint2d"] = _parse_joint2d(kind, block)
+        if kind == "MonoBehaviour" and "m_LightType:" in block:
+            import tools.unity_pack_gpu2d as _gpu
+            _l2d = _gpu.parse_light2d(block)
+            if _l2d:
+                rec["light2d"] = _l2d
         if kind == "ParticleSystem":
             rec["particle_system"] = _parts.parse_particle_system(block)
         if kind == "Rigidbody2D":
@@ -2916,6 +2926,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         rb2d = None
         joints2d = []
         psys = None
+        lights2d = []
         rb3d = None
         col2d = None
         col3d = None
@@ -2992,6 +3003,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 joints2d.append(dict(k["joint2d"], file_id=k.get("file_id")))
             if k.get("particle_system"):
                 psys = dict(k["particle_system"], file_id=k.get("file_id"))
+            if k.get("light2d"):
+                lights2d.append(dict(k["light2d"]))
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
@@ -3356,6 +3369,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "auto_added": True},
             "joints2d": joints2d,
             "particle_system": psys,
+            "lights2d": lights2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
             "collider3d": col3d,
@@ -9138,6 +9152,7 @@ def _emit_engine_gameobject_tables(
         else:
             p("static const int _engine_%s_go_of[%d] = { %s };" % (
                 idn, len(rev), ", ".join(rev)))
+        plan["_go_of_fn"] = True
         p("static int _engine_go_of_%s(unsigned i) {" % idn)
         p("    if (i >= %du) return -1;" % len(rev))
         p("    return _engine_%s_go_of[i];" % idn)
@@ -15384,6 +15399,8 @@ def _emit_engine_class_draws(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_order[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
+        p("        static const int _spr_lit[] = { %s };" % ", ".join(
+            str(int(sp.get("lit") or 0)) for _i, sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
             str(i) for i, _sp in spr_idx))
         any_ui = any(sp.get("source") in ("ui", "ui_tmp")
@@ -15621,6 +15638,9 @@ def _emit_engine_class_draws(
             p("            }")
         p("            out[n].sorting_layer = _spr_layer[k];")
         p("            out[n].sorting_order = _spr_order[k];")
+        p("            out[n].flags = _spr_lit[k];")
+        p("            out[n].go = %s;" % (("_engine_go_of_%s(i)" % idn)
+                                         if plan.get("_go_of_fn") else "-1"))
         p("            n = n + 1;")
         p("        }")
         p("    }")
@@ -15784,7 +15804,9 @@ def emit_engine(plan, analyses, used_apis):
         or want_transform_go or want_set_parent or want_get_sibling
         or want_getcomponent or want_findobject
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy
-        or want_instantiate or want_gcic or want_live_rt)
+        or want_instantiate or want_gcic or want_live_rt
+        # SpriteEffects2D: effects are per GameObject
+        or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0]))
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
     if want_inst_parent or want_gcic:
         want_set_parent = True
@@ -16093,6 +16115,15 @@ def emit_engine(plan, analyses, used_apis):
     if plan.get("_ia_code"):
         p(plan["_ia_code"])
     _parts.emit_api(p, plan)
+    import tools.unity_pack_common as _cmx
+    if _cmx.GPU_BATCH[0]:
+        import tools.unity_pack_gpu2d as _gfx
+        _gfx.emit_effects(p, len(plan.get("go_names") or []) + 256)
+    elif _cmx.FX_USED[0]:
+        p("/* SpriteEffects2D without --gpu-batch: nothing draws effects */")
+        p("static void engine_set_sprite_effect(int go, int effect, float amount) {")
+        p("    (void)go; (void)effect; (void)amount;")
+        p("}")
     if "InputManager.Using" in used_apis:
         p("extern int engine_input_using_keyboard;")
         p("extern int engine_input_using_mouse;")
@@ -17078,6 +17109,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    int tex; /* index into engine_texture_*; -1 = none */")
     p("    int sorting_layer; /* TagManager m_SortingLayers index */")
     p("    int sorting_order; /* SpriteRenderer.m_SortingOrder */")
+    p("    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */")
+    p("    int go; /* its GameObject (-1: unknown): the 2D effects' table */")
     p("} EngineDraw;")
     p("")
     if want_draw_sort:
@@ -17127,6 +17160,7 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
     _parts.emit_collect(p, plan)
+    p("int _engine_draw_nosort = 0; /* the GPU sorts (gles3_batch.h GPU_SORT) */")
     p("int engine_collect_draws(EngineDraw *out, int max) {")
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
@@ -17141,14 +17175,21 @@ def emit_engine(plan, analyses, used_apis):
             want_live_rt, want_ui)
     if plan.get("particles"):
         p("    _ps_collect(out, &n, max);")
+    _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
     elif want_draw_sort:
-        p("    if (n > 1)")
+        p("    if (n > 1 && !_engine_draw_nosort)")
         p("        qsort(out, (size_t)n, sizeof(EngineDraw), _engine_draw_cmp);")
     p("    return n;")
     p("}")
     p("")
+    if _want_gpu_sprites:
+        import tools.unity_pack_gpu2d as _gpu
+        p(_gpu.HEADER.split("int engine_atlas_side")[0])   # the typedef
+        _gpu.emit_engine(p, plan)
+        p(_gpu.LIGHT_HEADER.split("int engine_collect_lights2d")[0])
+        _gpu.emit_engine_lights(p, plan, class_ids, _c_ident, _class_has_position)
 
     # Contiguous position upload buffer — SoA is memcpy-friendly; AoS gathers.
     total_floats = 0
@@ -17203,6 +17244,16 @@ def emit_engine(plan, analyses, used_apis):
 
 def emit_engine_draw_h():
     """Public draw-list API written next to engine.c so hosts stay in sync."""
+    import tools.unity_pack_common as _cmn
+    text = _emit_engine_draw_h_base()
+    if _cmn.GPU_BATCH[0]:
+        import tools.unity_pack_gpu2d as _gpu
+        k = text.rfind("#endif")
+        text = text[:k] + _gpu.HEADER + "\n" + text[k:]
+    return text
+
+
+def _emit_engine_draw_h_base():
     return (
         "/* generated by tools/unity_pack.py — do not edit */\n"
         "#ifndef UNITY_PACK_ENGINE_DRAW_H\n"
@@ -17216,6 +17267,8 @@ def emit_engine_draw_h():
         "    int tex; /* engine_texture_* index; -1 if none */\n"
         "    int sorting_layer; /* TagManager m_SortingLayers index */\n"
         "    int sorting_order; /* SpriteRenderer.m_SortingOrder */\n"
+        "    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */\n"
+        "    int go; /* its GameObject (-1: unknown): the 2D effects' table */\n"
         "} EngineDraw;\n"
         "\n"
         "void engine_tick(void);\n"
@@ -21534,6 +21587,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
     text = _lower_mouse_scroll(text)
+    if "__sprite_fx(" in text:
+        idn_fx = _c_ident(cl["name"])
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])__sprite_fx\s*\(\s*(?:this\s*\.\s*)?gameObject\s*,",
+            "__sprite_fx(_engine_go_of_%s(i)," % idn_fx, text)
+        text = cs2cpp.code_sub(r"(?<![\w.])__sprite_fx\s*\(", "engine_set_sprite_effect(",
+                               text)
     # (before the null comparisons: `gp == null` is the connected flag)
     text = _lower_gamepad(text)
     if collision2d_param:
@@ -22762,6 +22822,9 @@ def emit_data(plan, used_apis=None):
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
+        if plan.get("gpu_atlas"):
+            import tools.unity_pack_gpu2d as _gpu
+            _gpu.emit_data(p, plan)
         p("const int _engine_tex_w[%d] = { %s };" % (
             len(textures),
             ", ".join(str(int(t["w"])) for t in textures)))
@@ -24270,7 +24333,9 @@ def pack(root, outdir, *args, **kwargs):
     """
     import tools.unity_pack_common as _common
     import tools.unity_pack_extensions as _ext
+    _common.GPU_BATCH[0] = bool(kwargs.pop("gpu_batch", False))
     files = {}
+    import tools.unity_pack_gpu2d as _gpu2d
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in (
             "Library", "Temp", "Logs", "obj", "Packages", ".godot", ".git")]
@@ -24282,6 +24347,15 @@ def pack(root, outdir, *args, **kwargs):
                         files[fp] = f.read()
                 except (OSError, UnicodeDecodeError):
                     pass
+    # SpriteEffects2D.Set / Clear (the 2D path's effect byte): rewritten
+    # before the static helpers are copied into their callers
+    _fx_changed = []
+    for fp in list(files):
+        t2 = _gpu2d.desugar_effects(files[fp])
+        if t2 != files[fp]:
+            files[fp] = t2
+            _fx_changed.append(fp)
+    _common.FX_USED[0] = bool(_fx_changed)
     overlay = _ext.desugar_project(files) if files else {}
     # Stack / Queue / HashSet, as the List the packer lowers
     # (tools/unity_pack_collections.py).
@@ -24308,7 +24382,7 @@ def pack(root, outdir, *args, **kwargs):
         # Coroutines, as state machines (tools/unity_pack_coroutines.py).
         import tools.unity_pack_coroutines as _co
         t = _co.desugar_coroutines(t)
-        if t != files[fp]:
+        if t != files[fp] or fp in _fx_changed:
             overlay[fp] = t
     # An API a copied or inlined static helper uses is its caller's too:
     # the per-script scan does not see it there.
@@ -24499,9 +24573,21 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["camera"] = main_cam
     plan["cameras"] = list(cameras)
     plan["textures"] = _collect_textures(objects)
+    import tools.unity_pack_common as _cmn
+    if _cmn.GPU_BATCH[0]:
+        # the 2D GPU path's atlas (tools/unity_pack_gpu2d.py) -- built once
+        # every texture is in the table (see below)
+        plan["_gpu_batch"] = True
     _ensure_texture_guids(
         plan["textures"], _anim_sprite_guids(objects),
         asset_guids)
+    if plan.get("_gpu_batch"):
+        # Sprite lights' cookies, in the texture table (so the atlas)
+        _cookies = [L.get("cookie_guid") for o in objects
+                    for L in (o.get("lights2d") or []) if L.get("cookie_guid")]
+        if _cookies:
+            plan["_cookie_tex"] = _ensure_texture_guids(
+                plan["textures"], _cookies, asset_guids)
     kb_keys = set()
     for a in analyses:
         kb_keys |= set(a.get("keyboard_keys") or [])
@@ -24614,6 +24700,11 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     plan["strict"] = bool(strict)
     import tools.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
+    if plan.get("_gpu_batch"):
+        import tools.unity_pack_gpu2d as _gpu
+        os.makedirs(outdir, exist_ok=True)
+        plan["gpu_atlas"] = _gpu.build_atlas(plan.get("textures") or [], outdir, root)
+        _gpu.build_lights(plan, _load_sorting_layers(root))
     engine = emit_engine(plan, analyses, used_apis)
     _used_helpers = plan.pop("_cs_str_used", None) or set()
     helpers_c = _string_helpers_c(_used_helpers)
@@ -24787,6 +24878,10 @@ def main():
     if "--gpu-handles" in args:
         gpu_handles = True
         args.remove("--gpu-handles")
+    gpu_batch = False
+    if "--gpu-batch" in args:
+        gpu_batch = True
+        args.remove("--gpu-batch")
     if "--soa" in args:
         sys.stderr.write(
             "unity_pack: --soa is gone; SoA positions are the default. "
@@ -24851,7 +24946,7 @@ def main():
         outdir = default_pack_dir(args[0])
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
-                    strict=strict, gpu_handles=gpu_handles,
+                    strict=strict, gpu_handles=gpu_handles, gpu_batch=gpu_batch,
                     physics_inject=physics_inject, box2d_root=box2d_root,
                     coost_root=coost_root)
         exe = build_player_executable(

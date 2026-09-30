@@ -226,6 +226,11 @@ SOURCE_LAYER_NAMES = {}
 #: The code-defined InputActions pack() found (tools/unity_pack_input.py).
 SOURCE_INPUT_ACTIONS = []
 
+#: pack(.., gpu_batch=True): the 2D GPU path (tools/unity_pack_gpu2d.py).
+GPU_BATCH = [False]
+#: a script calls SpriteEffects2D (the effect byte's setter)
+FX_USED = [False]
+
 
 def _read(path):
     if path in SOURCE_OVERLAY:
