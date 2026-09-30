@@ -162,11 +162,11 @@ class TestGodot(unittest.TestCase):
         root = self._copy()
         self._edit(os.path.join(root, "scripts", "Player.cs"),
                    "_ticks = _ticks + 1;",
-                   "_ticks = _ticks + 1; var m = GetNode<Node2D>(\"Muzzle\");")
+                   "_ticks = _ticks + 1; var m = GetTree();")
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.load_project(root)
         self.assertIn("res://scripts/Player.cs(17,38): error CS8000: "
-                      "`GetNode` (Godot API) is not packed yet",
+                      "`GetTree` (Godot API) is not packed yet",
                       str(cm.exception))
 
     def test_a_member_the_script_declares_is_not_refused(self):
@@ -316,8 +316,10 @@ class TestGodot(unittest.TestCase):
         cases = [
             (dict(shapes=two), "main.tscn:32: error: `Ball` has a second "
              "CollisionShape2D"),
-            (dict(body_extra="collision_mask = 3\n"),
-             "main.tscn:28: error: collision_mask is not packed yet"),
+            (dict(shapes='[node name="S" type="CollisionShape2D" '
+                  'parent="Ball"]\nshape = SubResource("box")\n'
+                  'one_way_collision = true\n'),
+             "main.tscn:31: error: one-way collision is not packed yet"),
             (dict(shapes='[node name="S" type="CollisionShape2D" '
                   'parent="Ball"]\nshape = SubResource("mat")\n'),
              "main.tscn:30: error: `S` is a PhysicsMaterial; "
@@ -588,6 +590,109 @@ class TestGodot(unittest.TestCase):
         # Hp and Speed come from the scene; 60 frames at 120 px/s.
         self.assertEqual(run.stdout.splitlines()[:2],
                          ["ready hp=5", "x=220"])
+
+
+    def test_input_actions_pass_the_pipeline(self):
+        """The emitted input evaluator stays in the crust subset: packed
+        through cpprust + crust, as tools/godot_pack_test_fast.py does not.
+        (Its behaviour is tested there.)"""
+        import tools.godot_pack_test_fast as fast
+        d = fast.project(
+            self, '[node name="Player" type="Node2D" parent="."]\n'
+            'script = ExtResource("s_Player")\n',
+            settings=fast.INPUT_MAP, scripts={"Player.cs": fast.PLAYER})
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True)
+        self.assertEqual([a[0] for a in plan["godot_input"]["actions"]], [
+            "move_left", "move_right", "ui_up", "ui_down", "jump", "dash",
+            "<key 4194305>"])
+        with open(os.path.join(out, "engine.c")) as f:
+            self.assertIn("static void _godot_input_latch(void)", f.read())
+
+
+    def test_signals_and_timers_pass_the_pipeline(self):
+        """Timers and the scripts' own signals stay in the crust subset:
+        packed through cpprust + crust. (Their behaviour is tested in
+        tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        d = fast.project(self, fast.SIG_SCENE, scripts=fast.SIG_SCRIPTS)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True)
+        gc = plan["godot_custom"]
+        self.assertEqual(sorted(gc["decls"]), [
+            ("Beat", "timeout"), ("Idle", "timeout"), ("Once", "timeout"),
+            ("Player", "Hit"), ("Player", "Scored"),
+            ("SpawnTimer", "timeout")])
+        self.assertEqual(len(gc["timers"]), 4)
+
+
+    def test_node_references_pass_the_pipeline(self):
+        """GetNode, exported node fields, Timer control, calls and
+        positions through references, and names stay in the crust subset:
+        packed through cpprust + crust. (Their behaviour is tested in
+        tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        t = fast.TestNodeRefs("test_refusals")
+        d = t._project()
+        self.addCleanup(t.doCleanups)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True)
+        spawner = plan["classes"]["Spawner"]["instances"][0]
+        self.assertEqual(spawner["object_refs"]["__gn1"], "godot:0:Player")
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("Player_TakeDamage(Spawner_get__player(i), 2)", engine)
+        self.assertIn("GodotTimer_Start(Spawner_get__timer(i), 0.045f)",
+                      engine)
+
+
+    @needs_box2d
+    def test_hierarchy_and_layers_pass_the_pipeline(self):
+        """The runtime hierarchy (world positions through a scaled parent,
+        GlobalPosition read and assigned through a reference) and Godot's
+        collision layers stay in the crust subset: packed through cpprust +
+        crust. (Their behaviour is tested in tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        d = fast.project(self, fast.HIER_SCENE.replace(
+            'gravity_scale = 0.0\n', 'gravity_scale = 0.0\n'
+            'collision_layer = 2\ncollision_mask = 3\n'),
+            scripts=fast.HIER_SCRIPTS,
+            subs='[sub_resource type="CircleShape2D" id="c"]\n'
+                 'radius = 4.0\n\n')
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertTrue(plan["has_transform_parents"])
+        self.assertTrue(plan["physics2d_layers"])
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("static void _godot_set_global(int c, unsigned i,",
+                      engine)
+        self.assertIn("*x = px + b[0] * lx + b[1] * ly;", engine)
+        with open(os.path.join(out, "physics_box2d.c")) as f:
+            self.assertIn("b2g_layer_filter", f.read())
+
+
+    @needs_box2d
+    def test_freed_bodies_pass_the_pipeline(self):
+        """A freed node's bodies leave the world through Box2D-Packed's live
+        gate, and the gate stays in the crust subset (cpprust + crust).
+        (Its behaviour is tested in tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        d = fast.project(self, fast.FREE_SCENE, scripts=fast.FREE_SCRIPTS,
+                         subs=fast.LAYER_SUBS)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(d, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertTrue(plan["physics2d_live"])
+        with open(os.path.join(out, "engine.c")) as f:
+            self.assertIn("return go < 0 || (!_engine_go_destroyed[go]);",
+                          f.read())
+        with open(os.path.join(out, "physics_box2d.c")) as f:
+            self.assertIn("b2Body_Disable", f.read())
 
 
 class TestBuildSettingsAndActive(unittest.TestCase):
