@@ -163,6 +163,12 @@ test_gles2:
 test_gles2_wasm:
 	python3 tools/gles2_wasm_test.py
 
+# Godot front end, fast: no cpprust + crust re-validation, gcc -O0 (about
+# a second); tests.test_unity_pack.TestGodot packs through the whole pipeline.
+#     make test_godot_fast
+test_godot_fast:
+	python3 tools/godot_pack_test_fast.py
+
 # Packed Unity MiniScene → GLES2 view (native surfaceless).
 #     make test_unity_gles2
 test_unity_gles2:
@@ -1260,7 +1266,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: check-memory mem-safe default test test_macos test_windows test_freebsd testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: check-memory mem-safe default test test_godot_fast test_macos test_windows test_freebsd testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
