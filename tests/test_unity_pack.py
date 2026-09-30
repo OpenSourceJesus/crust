@@ -156,7 +156,7 @@ class TestGodot(unittest.TestCase):
                "    Position = Position + Vector2.Up + Vector2.Zero;\n  }\n}\n")
         out = self.godot.adapt_csharp("M.cs", src, {"M"})
         self.assertIn("new Vector2(0, -1)", out)   # Godot's Up: y is down
-        self.assertIn("Vector2.zero", out)
+        self.assertIn("new Vector2(0, 0)", out)
 
     def test_unpacked_api_is_refused_at_its_line(self):
         root = self._copy()
@@ -693,6 +693,42 @@ class TestGodot(unittest.TestCase):
                           f.read())
         with open(os.path.join(out, "physics_box2d.c")) as f:
             self.assertIn("b2Body_Disable", f.read())
+
+
+    def test_vectors_pass_the_pipeline(self):
+        """Vector2 operators and Godot's Vector2 methods stay in the crust
+        subset: packed through cpprust + crust. (Their values are tested in
+        tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        d = fast.TestVectors("test_method_refusals")._project()
+        self.addCleanup(shutil.rmtree, d, True)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(d, out, force=True)
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("Vector2_add(", engine)
+        self.assertIn("GodotVec_MoveToward(", engine)
+        self.assertIn("Vector2_eq_exact(", engine)
+
+
+    def test_gpu_batch_passes_the_pipeline(self):
+        """A Godot pack made with --gpu-batch -- its atlas, its GPU sprite
+        list, the sprite effects set from a Godot script on a node and its
+        children -- stays in the crust subset: cpprust + crust. (Its frames
+        and effects are tested in tools/godot_pack_test_fast.py.)"""
+        import tools.godot_pack_test_fast as fast
+        d = fast._fx_project(self)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(d, out, force=True, gpu_batch=True)
+        self.assertTrue(os.path.isfile(os.path.join(out, "atlas0.png")))
+        with open(os.path.join(out, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("int engine_collect_gpu_sprites(", engine)
+        self.assertIn("_engine_fx_child[", engine)
+        self.assertIn("engine_set_sprite_effect(_engine_go_of_Hurt(i), 1,",
+                      engine)
 
 
 class TestBuildSettingsAndActive(unittest.TestCase):
