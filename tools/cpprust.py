@@ -4290,6 +4290,24 @@ def _sub_code(pat, repl, text):
     return "".join(out)
 
 
+def _sub_code_and_macros(pat, repl, text):
+    """`_sub_code`, except that `#define` bodies are matched too.
+
+    For the few rewrites that must reach a macro body: C has no global
+    scope operator, so a `::free(p)` in a `#define` has to lose its `::`
+    as surely as one in a function. Literals and comments are still blind to
+    the pattern -- `"::1"` is an IPv6 address, not a qualified name.
+    """
+    look = _blank_strings(_strip_comments(text))
+    out, pos = [], 0
+    for m in re.finditer(pat, look):
+        out.append(text[pos:m.start()])
+        out.append(repl(m))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _split_array_dim(decl):
     """`("T d", "[R * C]")` -- the declarator, and its array suffix.
 
@@ -5502,6 +5520,30 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         info["paths"][f.name] = f.name
         if b in known and not is_ptr and not f.dim:
             value_members.append((f.name, b))
+        elif b in known and not is_ptr and f.dim:
+            bi = known[b]
+            if bi["ctor"] or bi["dtor"] or bi["copy"] or bi["assign"] \
+                    or bi["moveassign"]:
+                # Each element would need its constructor in every
+                # constructor, its destructor in reverse, and an element-wise
+                # copy and assignment. None of that is written, and leaving
+                # the member as plain C made the elements stack garbage that
+                # was never destroyed, so it is refused rather than lowered
+                # half-way. The supplied `std::array` is this exact shape and
+                # has its own, more useful, advice.
+                if prelude and cls.name == "array" and targs:
+                    raise CppError(
+                        "`array<%s>` holds its elements in a plain array "
+                        "member, which this subset does not construct or "
+                        "destroy, and %s has a constructor or destructor. Use "
+                        "`vector<%s>`, which constructs and destroys what it "
+                        "holds." % (", ".join(targs), b, b))
+                raise CppError(
+                    "class %s: member `%s` is an array of %s, whose elements "
+                    "have to be constructed, destroyed and copied one by one. "
+                    "Array members of such a class are not in the C++ subset "
+                    "yet; hold a `%s *` or a container instead."
+                    % (cname, f.name, b, b))
     # A *named* member of an anonymous type is a field like any other, and a
     # body writing `u.a` means `this->u.a`. Its own type has no name to
     # record, which is fine: what is behind the dot is plain C from here.
@@ -6685,7 +6727,8 @@ class _TextMatch(object):
 
 
 class _Frame(object):
-    __slots__ = ("live", "kind", "ret", "vals", "ptrs", "ptrvals", "ret_mark")
+    __slots__ = ("live", "kind", "ret", "vals", "ptrs", "ptrvals", "ret_mark",
+                 "arrs")
 
     def __init__(self, kind, ret):
         self.live = []        # (ctype, vname), in declaration order
@@ -6706,6 +6749,11 @@ class _Frame(object):
         # supplied containers' own `T *nd = realloc(..)` look like a
         # class assignment and broke them.
         self.ptrvals = {}
+        # Arrays of a class declared in this frame: vname -> class. Kept
+        # apart from `vals` because the name is not an object -- only
+        # `name[i]` is -- so every handler reading `vals` would be wrong
+        # about it.
+        self.arrs = {}
 
 
 def _conv_for(name, scopes, type_info):
@@ -7204,6 +7252,63 @@ def _copy_call(ctype, vname, src, info, where):
 
 
 
+def _drop_stmt(type_info, ctype, vname):
+    """The statement that destroys a live local. An array is registered as
+    `name[]` and destroyed element by element, last first -- the reverse of
+    construction, which is C++'s rule for arrays as for members."""
+    fn = _dropfn(type_info.get(ctype), ctype)
+    if vname.endswith("[]"):
+        a = vname[:-2]
+        return ("for (unsigned long __cpp_ai = sizeof(%s) / sizeof(%s[0]); "
+                "__cpp_ai-- > 0; ) %s(&%s[__cpp_ai]); " % (a, a, fn, a))
+    return "%s(&%s); " % (fn, vname)
+
+
+def _elem_assign(elem, rhs, ctype, info, scopes, type_info, mvn):
+    """`a[i] = rhs;` where `a` is an array of `ctype`: the rules of a scalar
+    assignment, applied to an element. The element is named once through a
+    pointer, so an index with a side effect is evaluated once."""
+    trivial = not info["dtor"] and not info["assign"] and \
+        not info["moveassign"] and not info["copy"]
+    if trivial:
+        return "%s = %s;" % (elem, rhs)          # plain data: a struct copy
+    if "=" in _blank_strings(rhs).replace("==", ""):
+        raise CppError(
+            "`%s = %s`: a chained assignment is not in the C++ subset -- "
+            "`operator=` is lowered to a `void` call, so there is no result "
+            "to assign onward." % (elem, rhs))
+    el = "__cpp_el%d" % mvn[0]
+    tmp = "__cpp_et%d" % mvn[0]
+    mvn[0] += 1
+    head = "{ %s *%s = &%s; " % (ctype, el, elem)
+    moved = _move_operand(rhs)
+    if moved is not None and (info["moveassign"] or info["assign"]):
+        src = _copy_source(moved, ctype, scopes, type_info)
+        if src is None:
+            raise CppError(
+                "`%s = std::move(%s)`: the operand of `std::move` has to be "
+                "an object of type %s that this pass can name. Assign it to "
+                "a typed local first." % (elem, moved, ctype))
+        fn = "%s__moveassign" % ctype if info["moveassign"] \
+            else "%s__assign" % ctype
+        return head + "%s(%s, &%s); }" % (fn, el, src)
+    src = _copy_source(rhs, ctype, scopes, type_info)
+    if src is not None and info["assign"]:
+        return head + "%s__assign(%s, &%s); }" % (ctype, el, src)
+    if src is None and (info["assign"] or info["moveassign"]) and \
+            (_is_call_result(rhs) or _is_binop_result(rhs, scopes, type_info, ctype)):
+        # a by-value result is moved in: evaluate, destroy the old value,
+        # then take the representation -- the order the scalar form uses
+        drop = ("%s(%s); " % (_dropfn(info, ctype), el)) if info["dtor"] else ""
+        return "{ %s %s = %s; %s *%s = &%s; %s*%s = %s; }" % (
+            ctype, tmp, rhs, ctype, el, elem, drop, el, tmp)
+    raise CppError(
+        "`%s = %s`: %s owns a resource, so assigning to an element needs "
+        "`operator=` and a right-hand side this pass can name as a %s "
+        "(a local, a member chain, or a call returning one). Assign it to a "
+        "typed local first." % (elem, rhs, ctype, ctype))
+
+
 def _rewrite_scopes(text, type_info, path="<cpp>"):
     """`_rewrite_scopes_inner`, with a line number on whatever it reports.
 
@@ -7260,6 +7365,18 @@ def _rewrite_scopes_inner(text, type_info, _pos):
     # is what keeps that honest.
     decl_re = re.compile(
         r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;{}]*)\))?\s*;" % type_alt)
+    # `T a[N];` -- an array of a class in a block. Each element is an object:
+    # C++ default-constructs them in order and destroys them in reverse at
+    # scope exit. Before this the declaration passed through as plain C, so
+    # the elements were stack garbage that was never destroyed -- and a
+    # method that begins by releasing what it holds (`close()` on an fd)
+    # released whatever the garbage named.
+    arr_decl_scope_re = re.compile(r"(?<![\w.])(%s)\s+(\w+)\s*\[" % type_alt)
+    # `a[i] = rhs;` on such an array. The generic assignment pattern never
+    # matches an indexed left side, so this was a struct copy: two objects
+    # owning one resource, and a double free when both were destroyed.
+    elem_assign_re = re.compile(r"(?<![\w.>\]])(\w+)\s*\[")
+    elem_eq_re = re.compile(r"\s*=(?!=)")
 
     # `T *p = ..;` -- a pointer local of class type. Recorded so the name
     # walker can reach through it, exactly as it already does for a pointer
@@ -7347,8 +7464,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             for ctype, vname in reversed(fr.live):
                 if moved is not None and vname == moved:
                     continue
-                pieces.append("%s(&%s); "
-                              % (_dropfn(type_info.get(ctype), ctype), vname))
+                pieces.append(_drop_stmt(type_info, ctype, vname))
         return "".join(pieces)
 
     def frame_index(kinds):
@@ -7463,8 +7579,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             dead = fr.ret_mark >= 0 and \
                 not "".join(out[fr.ret_mark:]).strip()
             for ctype, vname in ([] if dead else reversed(fr.live)):
-                out.append("%s(&%s); "
-                           % (_dropfn(type_info.get(ctype), ctype), vname))
+                out.append(_drop_stmt(type_info, ctype, vname))
             if not scopes:
                 scopes = [_Frame("file", None)]
             out.append(text[i])
@@ -7684,6 +7799,53 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             i = m.end()
             continue
 
+        m = arr_decl_scope_re.match(look, i)
+        if m and not aggs and len(scopes) > 1 and \
+                _prev_word(look, i) not in ("struct", "typedef", "union"):
+            ctype, vname = m.group(1), m.group(2)
+            info = type_info[ctype]
+            close = _match_bracket(look, m.end() - 1)
+            if close is not None and (info["ctor"] or info["dtor"]):
+                j = close + 1
+                while j < len(look) and look[j] in " \t\n":
+                    j += 1
+                nxt = look[j] if j < len(look) else ""
+                if nxt in ("[", "=", ","):
+                    shape = {"[": "a multi-dimensional array",
+                             "=": "an array with an initializer",
+                             ",": "an array declared beside other names"}[nxt]
+                    raise CppError(
+                        "`%s %s[..]`: %s of %s is not in the C++ subset: each "
+                        "element has to be constructed and destroyed, and "
+                        "this form would need that done element by element "
+                        "through something other than the default "
+                        "constructor. Declare `%s %s[N];` on its own and "
+                        "assign the elements."
+                        % (ctype, vname, shape, ctype, ctype, vname))
+                if nxt == ";":
+                    if info.get("abstract"):
+                        raise CppError(
+                            "`%s %s[..]`: %s has a pure virtual method and "
+                            "cannot be instantiated. Declare `%s *` elements "
+                            "instead." % (ctype, vname, ctype, ctype))
+                    if info["ctor"] and 0 not in info["ctors"]:
+                        raise CppError(
+                            "`%s %s[..]`: the elements of an array are "
+                            "default-constructed, and %s has no constructor "
+                            "taking no arguments." % (ctype, vname, ctype))
+                    out.append(text[i:j + 1])
+                    if info["ctor"]:
+                        out.append(
+                            " for (unsigned long __cpp_ai = 0; __cpp_ai < "
+                            "sizeof(%s) / sizeof(%s[0]); ++__cpp_ai) "
+                            "%s(&%s[__cpp_ai]);"
+                            % (vname, vname, info["ctors"][0]["fn"], vname))
+                    if info["dtor"]:
+                        scopes[-1].live.append((ctype, vname + "[]"))
+                    scopes[-1].arrs[vname] = ctype
+                    i = j + 1
+                    continue
+
         m = _TextMatch.of(init_re.match(look_lit, i), text)
         if m and not aggs and \
                 _prev_word(look, i) not in ("struct", "typedef", "union"):
@@ -7886,6 +8048,36 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                         "typed local first." % (lhs, op, rhs, otype))
                 out.append("%s(&%s, &%s);" % (ent["fn"], lhs, src))
                 i = m.end()
+                continue
+
+        m = None
+        if not aggs:
+            m = elem_assign_re.match(look, i)
+        actype = None
+        if m is not None:
+            for fr in reversed(scopes):
+                if m.group(1) in fr.arrs:
+                    actype = fr.arrs[m.group(1)]
+                    break
+                if m.group(1) in fr.vals or m.group(1) in fr.ptrvals:
+                    break                    # shadowed by a non-array
+        if actype is not None:
+            close = _match_bracket(look, m.end() - 1)
+            # Statements, not a conditional expression: a match and `None`
+            # are different C types once py2c lowers this file.
+            am = None
+            end = None
+            if close is not None:
+                am = elem_eq_re.match(look, close + 1)
+            if am is not None:
+                end = _stmt_end(look, am.end())
+            if am is not None and end is not None and look[end] == ";":
+                info_a = type_info[actype]
+                elem = text[i:close + 1]
+                rhs = text[am.end():end].strip()
+                out.append(_elem_assign(elem, rhs, actype, info_a, scopes,
+                                        type_info, mvn))
+                i = end + 1
                 continue
 
         m = _TextMatch.of(assign_re.match(look_lit, i), text)
@@ -9304,7 +9496,13 @@ def _materialise_ctor_returns(text, scan):
         tmp = "__cpp_ret%d" % n
         n += 1
         out.append(text[last:m.start()])
-        out.append("%s %s = %s(%s); return %s;"
+        # A block, not two statements: after `if (c)`, `else`, or a loop
+        # head the statement is the whole of the branch, and unbraced the
+        # declaration alone became the branch -- the `return` ran
+        # unconditionally, a following `else` lost its `if`, and the
+        # temporary was registered in the enclosing scope, so every later
+        # exit destroyed a temporary another branch had never constructed.
+        out.append("{ %s %s = %s(%s); return %s; }"
                    % (name, tmp, name, args, tmp))
         last = semi + 1
     if not out:
@@ -12868,14 +13066,19 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # with `::free(p)` from a class that has its own `free`, and namespace
     # flattening turned that into `::this->co_free(p)`: invalid C, and the
     # wrong function. The lookbehind keeps `a::b` intact.
-    text = re.sub(r"(?<![\w:])::(?=\w)", "__gsq__", text)
+    # Code and macro bodies only: a `re.sub` over the raw text also
+    # rewrote string literals, so `"::1"` became `"1"` and a server told to
+    # listen on `"::"` silently listened on IPv4 instead.
+    text = _sub_code_and_macros(r"(?<![\w:])::(?=\w)",
+                                lambda _m: "__gsq__", text)
     # `constexpr` asks for compile-time evaluation; C has no such keyword
     # and the lowering emits an ordinary definition either way. Dropped at
     # file scope as well as on members -- coost's `mem.h` writes
     # `constexpr size_t co_cache_line_size = ..` outside any class, which
     # the member-level strip never saw and which reached the C front end
     # verbatim.
-    text = re.sub(r"(?<![\w])constexpr(?![\w])\s*", "", text)
+    text = _sub_code_and_macros(r"(?<![\w])constexpr(?![\w])\s*",
+                                lambda _m: "", text)
     # `std::move` is read here, before `std::` is stripped, because after
     # that it is indistinguishable from a method or function the project
     # named `move` -- and a layout engine moving a box is not a rarity.
