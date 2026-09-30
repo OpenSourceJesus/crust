@@ -669,7 +669,7 @@ class TestGodot(unittest.TestCase):
         self.assertTrue(plan["physics2d_layers"])
         with open(os.path.join(out, "engine.c")) as f:
             engine = f.read()
-        self.assertIn("static void _godot_set_global(int c, unsigned i,",
+        self.assertIn("static void _engine_set_world(int c, unsigned i,",
                       engine)
         self.assertIn("*x = px + b[0] * lx + b[1] * ly;", engine)
         with open(os.path.join(out, "physics_box2d.c")) as f:
@@ -821,6 +821,171 @@ class TestGodot(unittest.TestCase):
             engine = f.read()
         self.assertIn("static int _godot_conn_0[", engine)
         self.assertIn("_godot_timer_fresh[", engine)
+
+
+
+class TestUnityEngineGaps(unittest.TestCase):
+    """Engine-level gaps found while packing Godot scenes, fixed for Unity
+    packs too: a clone of a sprite is drawn; a call to another class's
+    method, or a read of its packed field, through a reference; and
+    transform.position under a parent is the world position."""
+
+    def _mini(self, scripts, scene_edit=None):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        root = os.path.join(d, "MiniScene")
+        shutil.copytree(os.path.join(ROOT, "tests", "fixtures", "MiniScene"),
+                        root)
+        for name, text in scripts.items():
+            with open(os.path.join(root, "Assets", "Scripts", name),
+                      "w") as f:
+                f.write(text)
+        if scene_edit:
+            scene = os.path.join(root, "Assets", "Scenes", "Board.unity")
+            with open(scene) as f:
+                text = f.read()
+            with open(scene, "w") as f:
+                f.write(scene_edit(text))
+        return root
+
+    def _run(self, root, frames=3, log=False):
+        """Pack (cpprust + crust), build with a harness printing each
+        frame's draws -- or the Debug.Log lines -- and return its lines."""
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(root, out, force=True)
+        src = os.path.join(out, "harness.c")
+        with open(src, "w") as f:
+            f.write('#include <stdio.h>\n#include "engine_draw.h"\n'
+                    "extern float Time_deltaTime;\n"
+                    "int main(int argc, char **argv) {\n"
+                    "    EngineDraw b[16]; int f, n, k;\n"
+                    "    engine_apply_argv(argc, argv);\n"
+                    "    Time_deltaTime = 1.f / 60.f;\n"
+                    "    for (f = 1; f <= %d; f++) {\n"
+                    "        engine_tick();\n"
+                    "        n = engine_collect_draws(b, 16);\n"
+                    "        if (%d) continue;\n"
+                    "        printf(\"f%%d:\", f);\n"
+                    "        for (k = 0; k < n; k++)\n"
+                    "            printf(\" (%%g,%%g)\", b[k].x, b[k].y);\n"
+                    "        printf(\"\\n\");\n"
+                    "    }\n    return 0;\n}\n" % (frames, 1 if log else 0))
+        exe = os.path.join(out, "harness")
+        r = subprocess.run([_CC, "-O0", "-w", "-I", out, "-o", exe, src,
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe] + (["-logFile", "-"] if log else []),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.splitlines()
+
+    @needs_cc
+    def test_a_clone_of_a_sprite_is_drawn(self):
+        root = self._mini({"Coin.cs": """using UnityEngine;
+
+[Shared]
+public class Coin : MonoBehaviour {
+    public int hp;
+    public int value;
+    private int _f;
+
+    public void Update() {
+        _f = _f + 1;
+        if (value == 1) {
+            transform.position = new Vector2(5f, 5f);
+        } else if (_f == 1 && transform.position.x > 0f) {
+            Coin c = Instantiate(this);
+            c.value = 1;
+        }
+    }
+}
+"""})
+        lines = self._run(root)
+        # CoinA (1, 2) clones itself: the clone is drawn where it was made,
+        # then where its own Update puts it; it was not drawn at all
+        self.assertEqual(lines[0], "f1: (1,2) (-1,0) (1,2) (0.025,0)")
+        self.assertEqual(lines[1], "f2: (1,2) (-1,0) (5,5) (0.05,0)")
+
+    @needs_cc
+    def test_another_class_through_a_reference(self):
+        def hero_on_coin_a(text):
+            i = text.index("--- !u!114 &1003")
+            j = text.index("--- !u!", i + 5)
+            return text[:i] + text[i:j].rstrip("\n") + (
+                "\n  hero: {fileID: 3003}\n") + text[j:]
+        root = self._mini({"Coin.cs": """using UnityEngine;
+
+[Shared]
+public class Coin : MonoBehaviour {
+    public int hp;
+    public int value;
+    public Player hero;
+
+    public void Update() {
+        if (hero != null) {
+            hero.Boost(2);
+            hero.hp += 1;
+            Debug.Log("coin boosted hero to " + hero.speed + " hp " + hero.hp);
+        }
+    }
+}
+""", "Player.cs": """using UnityEngine;
+
+[Shared]
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+
+    public void Boost(int by) {
+        speed = speed + by;
+    }
+}
+"""}, hero_on_coin_a)
+        # Coin is emitted before Player: its call and its reads compiled
+        # (every class's prototypes come first) and a half float read
+        # through the reference is its value, not its bits (17152)
+        self.assertEqual(self._run(root, log=True), [
+            "coin boosted hero to 3.5 hp 8",       # (Hero's hp: 7)
+            "coin boosted hero to 5.5 hp 9",
+            "coin boosted hero to 7.5 hp 10"])
+
+    @needs_cc
+    def test_position_under_a_parent_is_the_world_position(self):
+        def hero_under_coin_a(text):
+            t = "--- !u!4 &3002\nTransform:\n  m_GameObject: {fileID: 3001}\n"
+            text = text.replace(t, t + "  m_Father: {fileID: 1002}\n")
+            t = "--- !u!4 &1002\nTransform:\n  m_GameObject: {fileID: 1001}\n"
+            return text.replace(t, t + "  m_Children:\n  - {fileID: 3002}\n")
+        root = self._mini({"Player.cs": """using UnityEngine;
+
+[Shared]
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private int _f;
+
+    public void Update() {
+        _f = _f + 1;
+        if (_f == 1) {
+            Debug.Log("world " + transform.position.x + "," + transform.position.y
+                      + " local " + transform.localPosition.x + "," + transform.localPosition.y);
+            transform.position = new Vector2(10f, 10f);
+            Debug.Log("after world " + transform.position.x + "," + transform.position.y
+                      + " local " + transform.localPosition.x + "," + transform.localPosition.y);
+        }
+    }
+}
+"""}, hero_under_coin_a)
+        # Hero under CoinA (1, 2): its world position is its parent's plus
+        # its local one, and setting it sets the local one that puts it
+        # there; both read the local one before
+        self.assertEqual(self._run(root, log=True), [
+            "world 1,2 local 0,0", "after world 10,10 local 9,8"])
+        self.assertEqual(self._run(root, frames=1)[0],
+                         "f1: (1,2) (-1,0) (10,10)")
 
 
 class TestBuildSettingsAndActive(unittest.TestCase):
@@ -2948,7 +3113,9 @@ class TestPackedFields(unittest.TestCase):
         self.assertEqual(plan.get("stubs", []), [], err.getvalue())
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("Enemy_AT(Coin_get_target(i)).hp", eng)
+        # through the other class's accessor, which decodes the field as it
+        # is packed (a bitfield here; a half float, a null handle ..)
+        self.assertIn("Enemy_get_hp(Coin_get_target(i))", eng)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
         run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
