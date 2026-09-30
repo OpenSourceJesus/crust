@@ -28,6 +28,7 @@ extern float Camera_main_rect_x;
 extern float Camera_main_rect_y;
 extern float Camera_main_rect_w;
 extern float Camera_main_rect_h;
+extern int Camera_main_y_down; /* 1: world y points down (Godot) */
 extern float Camera_main_background_r;
 extern float Camera_main_background_g;
 extern float Camera_main_background_b;
@@ -104,6 +105,10 @@ static void g3_refresh_camera_bounds(float aspect)
     g3_right = Camera_main_pos_x + half_w;
     g3_bottom = Camera_main_pos_y - half_h;
     g3_top = Camera_main_pos_y + half_h;
+    if (Camera_main_y_down) { /* Godot: y down the screen */
+        g3_bottom = Camera_main_pos_y + half_h;
+        g3_top = Camera_main_pos_y - half_h;
+    }
 }
 
 /* CameraScript.HandleViewSize: letterbox Camera.rect so authored

@@ -40,6 +40,8 @@ float Camera_main_rect_x __attribute__((weak)) = 0.f;
 float Camera_main_rect_y __attribute__((weak)) = 0.f;
 float Camera_main_rect_w __attribute__((weak)) = 1.f;
 float Camera_main_rect_h __attribute__((weak)) = 1.f;
+/* 1: world y points down the screen (Godot's pixels) */
+int Camera_main_y_down __attribute__((weak)) = 0;
 
 #define WIDTH  96
 #define HEIGHT 64
