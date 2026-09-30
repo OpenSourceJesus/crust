@@ -514,3 +514,293 @@ int main(void) { Holder h; *h.b.p = 4; Holder k(h); k = h;
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestArrayOfObjects(Base):
+    """`T a[N];` in a block passed through as plain C: no element was
+    constructed or destroyed. coost's `tcp::Conn many[50];` then ran
+    `connect()`, which closes the fd it holds first -- a garbage value, so
+    it closed the test's own live sockets. `new T[n]` is refused for this
+    very reason; the stack form slipped past."""
+
+    ORDER = """
+#include <string.h>
+static char g_log[64];
+static int g_n = 0;
+static int g_id = 0;
+class A {
+public:
+    int id;
+    A() { id = g_id++; g_log[g_n++] = 'c'; }
+    ~A() { g_log[g_n++] = (char)('0' + id); }
+};
+"""
+
+    def test_constructed_in_order_destroyed_in_reverse(self):
+        self.assertRuns(self.ORDER + """
+static void f(void) { A a[3]; a[1].id = 1; }
+int main(void) { f(); return strcmp(g_log, "ccc210") == 0 ? 0 : 1; }
+""")
+
+    def test_every_exit_path_destroys(self):
+        self.assertRuns(self.ORDER + """
+static int f(int k) {
+    A a[2];
+    for (int i = 0; i < 3; ++i) {
+        A b[1];
+        if (i == 0) continue;
+        if (i == 1) break;
+    }
+    if (k) return 7;
+    return 0;
+}
+int main(void) {
+    // the array outside the loop, then the inner array made twice
+    if (f(1) != 7) return 1;
+    return strcmp(g_log, "ccc2c310") == 0 ? 0 : 2;
+}
+""")
+
+    def test_array_beside_a_scalar(self):
+        self.assertRuns(self.ORDER + """
+static void f(void) { A x; A a[2]; }
+int main(void) { f(); return strcmp(g_log, "ccc210") == 0 ? 0 : 1; }
+""")
+
+    def test_namespaced_class_with_a_resource(self):
+        # the coost shape: close() on a garbage fd
+        self.assertRuns("""
+#include <stdlib.h>
+static int g_live = 0;
+namespace tcp {
+class Conn {
+public:
+    int *p;
+    Conn() { p = 0; }
+    ~Conn() { this->close(); }
+    void open() { this->close(); p = (int *)malloc(4); g_live++; }
+    void close() { if (p) { free(p); p = 0; g_live--; } }
+};
+}
+static int f(void) {
+    tcp::Conn c[50];
+    for (int i = 0; i < 50; ++i) c[i].open();
+    return g_live;
+}
+int main(void) { return (f() == 50 && g_live == 0) ? 0 : 1; }
+""")
+
+    def test_plain_data_is_left_alone(self):
+        out, _ = self.assertRuns("""
+class P { public: int x; int y; };
+int main(void) { P p[4]; p[0].x = 1; return p[0].x == 1 ? 0 : 1; }
+""")
+        self.assertNotIn("__cpp_ai", out)
+
+    def test_file_scope_is_left_alone(self):
+        # as for a scalar: no automatic construction or drop at file scope
+        out = self.lower("""
+class A { public: int v; A() { v = 1; } };
+A g[2];
+int main(void) { return 0; }
+""")
+        self.assertNotIn("__cpp_ai", out)
+
+    def test_initializer_is_refused(self):
+        self.assertRefused("""
+class A { public: int v; A() { v = 1; } };
+void f(void) { A a[2] = {}; }
+""", "an array with an initializer")
+
+    def test_multi_dimensional_is_refused(self):
+        self.assertRefused("""
+class A { public: int v; A() { v = 1; } };
+void f(void) { A a[2][3]; }
+""", "a multi-dimensional array")
+
+    def test_several_declarators_are_refused(self):
+        self.assertRefused("""
+class A { public: int v; A() { v = 1; } };
+void f(void) { A a[2], b[3]; }
+""", "an array declared beside other names")
+
+    def test_no_default_constructor_is_refused(self):
+        self.assertRefused("""
+class A { public: int v; A(int x) { v = x; } };
+void f(void) { A a[2]; }
+""", "has no constructor taking no arguments")
+
+
+class TestArrayElementAssignment(Base):
+    """`a[i] = x;` on an array of an owning class was a struct copy: two
+    objects holding one buffer, freed twice at scope exit."""
+
+    S = """
+#include <stdlib.h>
+#include <string.h>
+static int g_live = 0;
+class S {
+public:
+    char *p;
+    S() { p = (char *)malloc(8); strcpy(p, "d"); g_live++; }
+    S(const S &o) { p = (char *)malloc(8); strcpy(p, o.p); g_live++; }
+    void operator=(const S &o) { strcpy(p, o.p); }
+    ~S() { free(p); g_live--; }
+};
+"""
+
+    def test_copy_assignment_calls_operator_eq(self):
+        self.assertRuns(self.S + """
+static int f(void) {
+    S a[2]; S x; strcpy(x.p, "x");
+    a[1] = x;
+    return strcmp(a[1].p, "x") == 0 && a[1].p != x.p && g_live == 3;
+}
+int main(void) { return (f() && g_live == 0) ? 0 : 1; }
+""")
+
+    def test_index_is_evaluated_once(self):
+        self.assertRuns(self.S + """
+static int f(void) {
+    S a[3]; S x; strcpy(x.p, "x"); int i = 0;
+    a[i++] = x;
+    return i == 1 && strcmp(a[0].p, "x") == 0 && strcmp(a[1].p, "d") == 0;
+}
+int main(void) { return (f() && g_live == 0) ? 0 : 1; }
+""")
+
+    def test_a_call_result_is_moved_in(self):
+        self.assertRuns(self.S + """
+static S make(void) { S r; strcpy(r.p, "m"); return r; }
+static int f(void) {
+    S a[2];
+    a[0] = make();
+    return strcmp(a[0].p, "m") == 0 && g_live == 2;
+}
+int main(void) { return (f() && g_live == 0) ? 0 : 1; }
+""")
+
+    def test_plain_data_stays_a_struct_copy(self):
+        out, _ = self.assertRuns("""
+class P { public: int x; int y; };
+int main(void) { P a[2]; P q; q.x = 3; q.y = 4; a[1] = q;
+                 return (a[1].x == 3 && a[1].y == 4) ? 0 : 1; }
+""")
+        self.assertNotIn("__cpp_el", out)
+
+    def test_owning_class_without_operator_eq_is_refused(self):
+        self.assertRefused("""
+#include <stdlib.h>
+class R { public: int *p; R() { p = (int *)malloc(4); } ~R() { free(p); } };
+void f(void) { R a[2]; R x; a[0] = x; }
+""", "owns a resource, so assigning to an element")
+
+
+class TestArrayMembers(Base):
+    """An array *member* of a class with a constructor or destructor was
+    left as plain C: never constructed, never destroyed, never copied. Only
+    `std::array` was refused (with advice to use `vector`); the general
+    shape is now refused too, rather than lowered half-way."""
+
+    def test_owning_element_is_refused(self):
+        self.assertRefused("""
+class S { public: int v; S() { v = 1; } ~S() { v = 0; } };
+class H { public: S m[2]; };
+int main(void) { H h; return 0; }
+""", "member `m` is an array of S")
+
+    def test_plain_data_member_array_is_fine(self):
+        self.assertRuns("""
+class P { public: int x; };
+class H { public: P m[2]; int k; H() { k = 1; m[1].x = 5; } };
+int main(void) { H h; return (h.k == 1 && h.m[1].x == 5) ? 0 : 1; }
+""")
+
+
+class TestGlobalScopeInLiterals(Base):
+    """The global-scope `::` was stripped with a `re.sub` over the raw text,
+    so literals lost it too: `"::1"` lowered to `"1"`, and coost's
+    `srv.start("::", 80)` would have listened on IPv4 without a word. The
+    `constexpr` strip beside it had the same flaw."""
+
+    def test_literals_keep_their_colons(self):
+        self.assertRuns("""
+#include <string.h>
+int main(void) {
+    const char *a = "::1";
+    const char *b = "[::1]:81";
+    const char *k = "constexpr";
+    char c = ':';
+    return (strcmp(a, "::1") == 0 && strcmp(b, "[::1]:81") == 0
+            && strcmp(k, "constexpr") == 0 && c == ':') ? 0 : 1;
+}
+""")
+
+    def test_code_and_macro_bodies_are_still_rewritten(self):
+        # the case the rewrite exists for: a class with its own `free`
+        # reaching the C library's, in a body and in a macro
+        self.assertRuns("""
+#include <stdlib.h>
+#define RELEASE(p) ::free(p)
+static int g = 0;
+class M { public: void free(void *p) { ::free(p); g++; } };
+constexpr int K = 2;
+int main(void) {
+    M m; m.free(malloc(4));
+    void *q = malloc(4); RELEASE(q);
+    return (g == 1 && K == 2) ? 0 : 1;
+}
+""")
+
+
+class TestConstructorReturnInABranch(Base):
+    """`if (c) return T(..);` without braces. The return was rewritten into
+    two statements, so the `if` guarded only the declaration: the `return`
+    ran unconditionally, a following `else` lost its `if`, and the
+    temporary joined the enclosing scope -- every later exit destroyed a
+    temporary another branch had never constructed. coost's `http.h` had to
+    brace these by hand."""
+
+    F = """
+#include <stdlib.h>
+#include <string.h>
+static int g_live = 0;
+class F {
+public:
+    char *p;
+    F() { p = 0; g_live++; }
+    F(const char *s) { p = strdup(s); g_live++; }
+    F(const F &o) { p = o.p ? strdup(o.p) : 0; g_live++; }
+    ~F() { free(p); g_live--; }
+};
+"""
+
+    def test_if_else_and_loop_bodies(self):
+        out, _ = self.assertRuns(self.F + """
+static F pick(int k) {
+    if (k == 0) return F();
+    else if (k == 1) return F("one");
+    for (;;) return F("loop");
+}
+int main(void) {
+    int ok = 1;
+    { F a = pick(0); ok &= a.p == 0; }
+    { F b = pick(1); ok &= b.p && strcmp(b.p, "one") == 0; }
+    { F c = pick(2); ok &= c.p && strcmp(c.p, "loop") == 0; }
+    return (ok && g_live == 0) ? 0 : 1;
+}
+""")
+        # no branch destroys another branch's temporary
+        self.assertNotIn("F_drop(&__cpp_ret0); return _cpp_ret1", out)
+
+    def test_plain_data_class_in_a_method(self):
+        # the coost shape: a method returning a class by value from a guard
+        self.assertRuns("""
+class P { public: int v; P() { v = 0; } P(int x) { v = x; } };
+class Q {
+public:
+    int k;
+    P get(int d) const { if (d == 0) return P(); return P(d + k); }
+};
+int main(void) { Q q; q.k = 1; return (q.get(0).v == 0 && q.get(2).v == 3) ? 0 : 1; }
+""")
