@@ -17147,3 +17147,126 @@ class TestAnimationCurves(unittest.TestCase):
             unity_pack.pack(self._project({1: self.CURVES[1]}, weighted=3),
                             tempfile.mkdtemp(prefix="upack-curve-out-"), force=True)
         self.assertIn("weighted", cm.exception.message)
+
+
+
+class TestLineRenderer(unittest.TestCase):
+    """A LineRenderer: read from the scene, scripted, and drawn as one quad
+    a segment. It was not read at all: the scene reader's kind whitelist
+    did not name it, so the component vanished."""
+
+    SCRIPT = """using UnityEngine;
+public class Drawer : MonoBehaviour {
+    public LineRenderer lr;
+    void Start() {
+        lr.positionCount = 4;
+        lr.SetPosition(3, new Vector3(0f, 2f, 0f));
+        lr.loop = true;
+        lr.startColor = Color.blue;
+        Debug.Log("n=" + lr.positionCount + " y3=" + lr.GetPosition(3).y + " w0=" + lr.startWidth);
+    }
+}
+"""
+
+    @staticmethod
+    def _key(t, v, i, o):
+        return ("      - serializedVersion: 3\n        time: %s\n        value: %s\n"
+                "        inSlope: %s\n        outSlope: %s\n        tangentMode: 0\n"
+                "        weightedMode: 0\n        inWeight: 0.33333334\n"
+                "        outWeight: 0.33333334\n" % (t, v, i, o))
+
+    def _project(self, script, world=1, rot_z=0.0):
+        lr = ("--- !u!120 &5\nLineRenderer:\n  m_GameObject: {fileID: 1}\n  m_Enabled: 1\n"
+              "  m_SortingOrder: 3\n  m_Positions:\n  - {x: 0, y: 0, z: 0}\n"
+              "  - {x: 2, y: 0, z: 0}\n  - {x: 2, y: 2, z: 0}\n  m_Parameters:\n"
+              "    serializedVersion: 3\n    widthMultiplier: 0.5\n    widthCurve:\n"
+              "      serializedVersion: 2\n      m_Curve:\n"
+              + self._key(0, 1, 0, -0.5) + self._key(1, 0.5, -0.5, 0) +
+              "      m_PreInfinity: 2\n      m_PostInfinity: 2\n      m_RotationOrder: 4\n"
+              "    colorGradient:\n      serializedVersion: 2\n"
+              "      key0: {r: 1, g: 1, b: 1, a: 1}\n      key1: {r: 1, g: 0, b: 0, a: 1}\n"
+              "      ctime0: 0\n      ctime1: 65535\n      atime0: 0\n      atime1: 65535\n"
+              "      m_Mode: 0\n      m_NumColorKeys: 2\n      m_NumAlphaKeys: 2\n"
+              "  m_UseWorldSpace: %d\n  m_Loop: 0\n" % world)
+        scene = ("%%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Drawer\n  m_Component:\n"
+                 "  - component: {fileID: 2}\n  - component: {fileID: 3}\n"
+                 "  - component: {fileID: 5}\n--- !u!4 &2\nTransform:\n"
+                 "  m_GameObject: {fileID: 1}\n  m_LocalRotation: {x: 0, y: 0, z: %s, w: %s}\n"
+                 "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                 "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                 "  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+                 "  lr: {fileID: 5}\n" % (rot_z, (1 - rot_z * rot_z) ** 0.5)) + lr
+        root = tempfile.mkdtemp(prefix="upack-lr-")
+        self.addCleanup(shutil.rmtree, root, True)
+        d = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(d)
+        with open(os.path.join(d, "Drawer.cs"), "w") as f:
+            f.write(script)
+        with open(os.path.join(d, "Drawer.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(scene)
+        return root
+
+    @needs_cc
+    def test_scripted_line_draws_as_unity_evaluates_it(self):
+        import math
+        import tools.unity_pack_curves as uc
+        import tools.unity_pack_lines as ul
+        out = tempfile.mkdtemp(prefix="upack-lr-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(self._project(self.SCRIPT), out, force=True, strict=True)
+        src = os.path.join(out, "h.c")
+        with open(src, "w") as f:
+            f.write('#include <stdio.h>\n#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { EngineDraw b[32]; int n, k;\n"
+                    "  engine_apply_argv(c, v); Time_deltaTime = 1.f / 60.f;\n"
+                    "  engine_tick(); n = engine_collect_draws(b, 32);\n"
+                    "  for (k = 0; k < n; k++) if (b[k].tex == -2)\n"
+                    "    printf(\"Q %g %g %g %g %g %g %g %g %g %d\\n\", b[k].x, b[k].y,\n"
+                    "           b[k].half_w, b[k].half_h, b[k].m00, b[k].m10,\n"
+                    "           b[k].r, b[k].g, b[k].b, b[k].sorting_order);\n"
+                    "  return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O2", "-w", "-I", out, "-o", exe, src,
+                            os.path.join(out, "engine.c"), os.path.join(out, "data.c"),
+                            "-lm"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        lines = run.stdout.splitlines()
+        self.assertIn("n=4 y3=2 w0=0.5", lines)
+        quads = [list(map(float, l.split()[1:])) for l in lines if l.startswith("Q ")]
+        # the reference: Unity's rules, independently of the engine
+        pts = [(0, 0), (2, 0), (2, 2), (0, 2)]          # 4th set by the script
+        width = {"keys": [(0, 1, 0, -0.5), (1, 0.5, -0.5, 0)], "pre": 2, "post": 2}
+        grad = {"mode": 0, "colors": [(0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 0.0, 0.0)],
+                "alphas": [(0.0, 1.0), (1.0, 1.0)]}     # startColor = blue
+        segs = [(pts[k], pts[(k + 1) % 4]) for k in range(4)]   # loop = true
+        lens = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in segs]
+        self.assertEqual(len(quads), 4)
+        run_ = 0.0
+        for (a, b), L, q in zip(segs, lens, quads):
+            u = (run_ + L / 2) / sum(lens)
+            run_ += L
+            col = ul.gradient_eval(grad, u)
+            want = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, L / 2,
+                    0.5 * uc.evaluate(width, u) / 2, (b[0] - a[0]) / L,
+                    (b[1] - a[1]) / L, col[0], col[1], col[2], 3]
+            for got, exp in zip(q, want):
+                self.assertAlmostEqual(got, exp, places=4)
+
+    def test_gradient_reference(self):
+        import tools.unity_pack_lines as ul
+        g = {"mode": 0, "colors": [(0.0, 1.0, 1.0, 1.0), (1.0, 1.0, 0.0, 0.0)],
+             "alphas": [(0.0, 1.0), (1.0, 0.0)]}
+        self.assertEqual(ul.gradient_eval(g, 0.25), (1.0, 0.75, 0.75, 0.75))
+        fixed = dict(g, mode=1)                # the first key at or after t
+        self.assertEqual(ul.gradient_eval(fixed, 0.25), (1.0, 0.0, 0.0, 0.0))
+
+    def test_local_space_on_a_rotated_object_is_refused(self):
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(self._project(self.SCRIPT, world=0, rot_z=0.3),
+                            tempfile.mkdtemp(prefix="upack-lr-out-"), force=True)
+        self.assertIn("local space", cm.exception.message)
