@@ -295,7 +295,9 @@ def _want_rb2d_tables(plan, used_apis=None, getcomponent_types=None):
         or "Rigidbody2D" in gct
         or "Rigidbody2D" in used_apis
         or "Rigidbody2D" in add_types
-        or bool(plan.get("collider2d")))
+        or bool(plan.get("collider2d"))
+        # Physics2D queries are the Box2D-Packed glue's, built with these
+        or "Physics2D.query" in used_apis)
 
 
 def _want_rb3d_tables(plan, used_apis=None, getcomponent_types=None):

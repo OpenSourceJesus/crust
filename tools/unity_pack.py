@@ -17034,8 +17034,7 @@ def emit_engine(plan, analyses, used_apis):
     p("   group can find them. */")
     if _plan_needs_vector2(plan, used_apis):
         _emit_vector2_struct(p, godot=bool(plan.get("godot")))
-    if "Physics2D.query" in used_apis and plan.get("rigidbody2d") is not None:
-        plan["physics2d_queries"] = True
+    if "Physics2D.query" in used_apis:
         p("/* Physics2D.Raycast / OverlapCircle / OverlapPoint: Box2D-Packed")
         p("   queries (physics_box2d.c); a collider index, -1 for none. */")
         p("int engine_box2d_raycast(float ox, float oy, float dx, float dy,")
