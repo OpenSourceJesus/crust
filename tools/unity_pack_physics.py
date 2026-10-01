@@ -31,6 +31,7 @@ __all__ = [
     '_PHYSICS_COMPONENTS',
     '_COLLIDER2D_TYPES',
     '_build_collider2d_tables',
+    '_triangulate_paths',
     '_build_collider3d_tables',
     '_build_rigidbody_tables',
     '_collision2d_arg_name',
@@ -374,6 +375,48 @@ def _build_rigidbody_tables(plan):
     return (rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_file_id, rb3d_by_file_id)
 
 
+def _triangulate_paths(paths):
+    """PolygonCollider2D paths → triangles [((x,y),(x,y),(x,y)), ...] by ear clipping.
+
+    ponytail: every path is solid (a path inside another is not cut out as a hole)
+    and triangles stay triangles (not merged into convex polygons of up to 8, which
+    would mean fewer Box2D shapes); O(n³) worst case, fine for authored outlines.
+    """
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    tris = []
+    for path in paths:
+        pts = []
+        for q in path:
+            if not pts or q != pts[-1]:
+                pts.append(q)
+        if len(pts) > 1 and pts[0] == pts[-1]:
+            pts.pop()
+        area = sum(pts[i - 1][0] * q[1] - q[0] * pts[i - 1][1]
+                   for i, q in enumerate(pts))
+        if area < 0:
+            pts.reverse()
+        while len(pts) > 3:
+            n = len(pts)
+            for i in range(n):
+                a, b, c = pts[i - 1], pts[i], pts[(i + 1) % n]
+                if cross(a, b, c) <= 0:
+                    continue  # reflex or straight corner
+                if any(cross(a, b, p) >= 0 and cross(b, c, p) >= 0
+                       and cross(c, a, p) >= 0
+                       for p in pts if p not in (a, b, c)):
+                    continue  # another corner inside the ear
+                tris.append((a, b, c))
+                del pts[i]
+                break
+            else:
+                break  # self-intersecting: keep what was cut
+        if len(pts) == 3 and cross(*pts) > 0:
+            tris.append(tuple(pts))
+    return tris
+
+
 def _build_collider2d_tables(plan):
     """Authored Box / Circle / CapsuleCollider2D → packed contact table."""
     cols = []
@@ -392,9 +435,12 @@ def _build_collider2d_tables(plan):
             body = 2  # static (no RB)
             if rb_i is not None:
                 body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
-            kind = {"box": 0, "capsule_v": 2, "capsule_h": 3}.get(
-                c.get("kind"), 1)
+            kind = {"box": 0, "capsule_v": 2, "capsule_h": 3,
+                    "polygon": 4}.get(c.get("kind"), 1)
+            if kind == 4:
+                plan["physics2d_polygons"] = True
             cols.append({
+                "tris": c.get("tris") or [],
                 "name": o.get("name") or "obj",
                 "owner_class": cname,
                 "owner_class_id": cid,

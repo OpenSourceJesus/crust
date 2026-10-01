@@ -847,6 +847,33 @@ class TestUnityEngineGaps(unittest.TestCase):
                 "DestroyImmediate(go, true); Object.DestroyImmediate(f(a, b));"),
             "Destroy(go); Destroy(f(a, b));")
 
+    def test_polygon_collider_triangles(self):
+        # a clockwise L of area 3, closed by repeating its first corner
+        ell = [(0, 0), (0, 2), (1, 2), (1, 1), (2, 1), (2, 0), (0, 0)]
+        tris = unity_pack._triangulate_paths([ell])
+        self.assertEqual(len(tris), 4)
+        area = sum((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+                   for a, b, c in tris) / 2
+        self.assertAlmostEqual(area, 3.0)  # all counter-clockwise, none overlap
+        # two paths, offset then mirrored by the scale, about their bounds' center
+        objs = unity_pack.parse_unity_yaml(
+            "--- !u!1 &1\nGameObject:\n  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n  m_Name: G\n  m_IsActive: 1\n"
+            "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalScale: {x: -2, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+            "--- !u!60 &3\nPolygonCollider2D:\n  m_GameObject: {fileID: 1}\n"
+            "  m_Offset: {x: 1, y: 0}\n  m_Points:\n    m_Paths:\n"
+            "    - - {x: 0, y: 0}\n      - {x: 1, y: 0}\n      - {x: 0, y: 1}\n"
+            "    - - {x: 5, y: 5}\n      - {x: 6, y: 5}\n      - {x: 5, y: 6}\n"
+            "  m_UseDelaunayMesh: 0\n")[0]
+        col = objs[0]["collider2d"]
+        self.assertEqual((col["ox"], col["oy"], col["hw"], col["hh"]),
+                         (-8.0, 3.0, 6.0, 3.0))
+        self.assertEqual(col["tris"][0], (6.0, -2.0, 4.0, -3.0, 6.0, -3.0))
+        self.assertEqual(len(col["tris"]), 2)
+
     def _mini(self, scripts, scene_edit=None):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)

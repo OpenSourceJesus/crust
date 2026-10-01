@@ -508,6 +508,7 @@ _ADDABLE_BUILTINS = frozenset((
     "Rigidbody",
     "BoxCollider2D",
     "CircleCollider2D",
+    "PolygonCollider2D",
     "BoxCollider",
     "SphereCollider",
     "Animation",
@@ -2263,7 +2264,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|CapsuleCollider2D|"
-            r"BoxCollider|"
+            r"PolygonCollider2D|BoxCollider|"
             r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
             r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
             r"SliderJoint2D|WheelJoint2D|FrictionJoint2D|RelativeJoint2D|"
@@ -2291,6 +2292,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "CircleCollider2D"
         elif type_id == "70":
             kind = "CapsuleCollider2D"
+        elif type_id == "60":
+            kind = "PolygonCollider2D"
         elif type_id == "65":
             kind = "BoxCollider"
         elif type_id == "135":
@@ -2747,6 +2750,29 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "size_y": float(sz.group(2)) if sz else 1.0,
                 "material_guid": _parse_material_guid(block),
             }
+        if kind == "PolygonCollider2D":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
+            off = re.search(
+                r"m_Offset:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            paths = []
+            pm = re.search(r"(?m)^[ \t]+m_Paths:\n((?:[ \t]+-.*\n)*)", block)
+            for line in (pm.group(1) if pm else "").splitlines():
+                pt = re.search(r"\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", line)
+                if not pt:
+                    continue
+                if re.match(r"\s*-\s+-", line) or not paths:
+                    paths.append([])
+                paths[-1].append((float(pt.group(1)), float(pt.group(2))))
+            rec["collider2d"] = {
+                "kind": "polygon",
+                "enabled": int(en.group(1)) if en else 1,
+                "is_trigger": int(trig.group(1)) if trig else 0,
+                "offset_x": float(off.group(1)) if off else 0.0,
+                "offset_y": float(off.group(2)) if off else 0.0,
+                "paths": paths,
+                "material_guid": _parse_material_guid(block),
+            }
         if kind == "CircleCollider2D":
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
@@ -3010,7 +3036,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
             if k.get("kind") in ("BoxCollider2D", "CircleCollider2D",
-                                 "CapsuleCollider2D") and k.get(
+                                 "CapsuleCollider2D",
+                                 "PolygonCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
@@ -3082,7 +3109,22 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             col2d["oy"] = float(col2d.get("offset_y", 0.0)) * sy
             col2d["cos_z"] = math.cos(rz)
             col2d["sin_z"] = math.sin(rz)
-            if col2d.get("kind") != "circle":
+            if col2d.get("kind") == "polygon":
+                ssx, ssy = float(scale[0]), float(scale[1])
+                offx = float(col2d.get("offset_x", 0.0))
+                offy = float(col2d.get("offset_y", 0.0))
+                paths = [[((x + offx) * ssx, (y + offy) * ssy) for x, y in pth]
+                         for pth in col2d.get("paths") or []]
+                pts = [q for pth in paths for q in pth] or [(0.0, 0.0)]
+                x0, x1 = min(q[0] for q in pts), max(q[0] for q in pts)
+                y0, y1 = min(q[1] for q in pts), max(q[1] for q in pts)
+                cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+                col2d["ox"], col2d["oy"] = cx, cy
+                col2d["hw"], col2d["hh"] = (x1 - x0) * 0.5, (y1 - y0) * 0.5
+                col2d["tris"] = [
+                    tuple(v for (x, y) in tri for v in (x - cx, y - cy))
+                    for tri in _triangulate_paths(paths)]
+            elif col2d.get("kind") != "circle":
                 col2d["hw"] = abs(float(col2d.get("size_x", 1.0))) * sx * 0.5
                 col2d["hh"] = abs(float(col2d.get("size_y", 1.0))) * sy * 0.5
             else:
@@ -9504,6 +9546,7 @@ def _emit_engine_gameobject_tables(
     for col_ty, unity_ty in (
             ("BoxCollider2D", "UnityEngine.BoxCollider2D"),
             ("CircleCollider2D", "UnityEngine.CircleCollider2D"),
+            ("PolygonCollider2D", "UnityEngine.PolygonCollider2D"),
             ("BoxCollider", "UnityEngine.BoxCollider"),
             ("SphereCollider", "UnityEngine.SphereCollider")):
         if col_ty in add_types:
@@ -16453,7 +16496,7 @@ def emit_engine(plan, analyses, used_apis):
     want_rb2d = _want_rb2d_tables(plan, used_apis, getcomponent_types)
     want_rb3d = _want_rb3d_tables(plan, used_apis, getcomponent_types)
     want_col2d = bool(col2d_list) or bool(
-        add_types & {"BoxCollider2D", "CircleCollider2D"})
+        add_types & {"BoxCollider2D", "CircleCollider2D", "PolygonCollider2D"})
     want_col3d = bool(col3d_list) or bool(
         add_types & {"BoxCollider", "SphereCollider"})
     want_anim = bool(anim_players)
@@ -16929,7 +16972,12 @@ def emit_engine(plan, analyses, used_apis):
     if want_col2d:
         nc = max(1, len(col2d_list))
         p("extern const int _Collider2D_count;")
-        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h */" % nc)
+        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h 4 polygon */" % nc)
+        if plan.get("physics2d_polygons"):
+            p("extern const int _Collider2D_tri_start[%d];" % nc)
+            p("extern const int _Collider2D_tri_count[%d];" % nc)
+            p("extern const float _Collider2D_tri_xy[%d];" % (
+                6 * max(1, sum(len(c.get("tris") or []) for c in col2d_list))))
         p("extern const int _Collider2D_is_trigger[%d];" % nc)
         if plan.get("physics2d_layers"):
             p("extern const unsigned _Collider2D_layer_bits[%d];" % nc)
@@ -23776,6 +23824,18 @@ def emit_data(plan, used_apis=None):
         p("const int _Collider2D_count = %d;" % n)
         p("const int _Collider2D_kind[%d] = { %s };" % (
             n, ", ".join(str(int(c["kind"])) for c in col2d_list)))
+        if plan.get("physics2d_polygons"):
+            starts, tris = [], []
+            for c in col2d_list:
+                starts.append(len(tris))
+                tris.extend(c.get("tris") or [])
+            p("const int _Collider2D_tri_start[%d] = { %s };" % (
+                n, ", ".join(map(str, starts))))
+            p("const int _Collider2D_tri_count[%d] = { %s };" % (
+                n, ", ".join(str(len(c.get("tris") or [])) for c in col2d_list)))
+            p("const float _Collider2D_tri_xy[%d] = { %s };" % (
+                6 * max(1, len(tris)), ", ".join(
+                    "%sf" % repr(float(v)) for t in tris for v in t) or "0.0f"))
         p("const int _Collider2D_layer[%d] = { %s };" % (
             max(1, len(col2d_list)), ", ".join(
                 str(v) for v in _collider2d_layers(plan, col2d_list)) or "0"))
