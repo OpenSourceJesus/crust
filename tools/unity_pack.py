@@ -24877,6 +24877,14 @@ def validate_emitted_c(text, path="engine.c", analyses=None):
                   % (path, len(text)))
         return text
     import tools.cpprust as cpprust
+    # Texture bytes are numbers in a brace list: the subset question is the
+    # declaration, not 10^6 literals (most of a pack's validate time).
+    blobs = {}
+
+    def _elide(m):
+        blobs[m.group(2)] = m.group(4)
+        return "%s%s%s{ 0 }" % (m.group(1), m.group(2), m.group(3))
+    text = _BYTE_BLOB_RE.sub(_elide, text)
     try:
         scan = cpprust._blank_directives(cpprust._strip_comments(text))
         cpprust._check_unsupported(scan, path)
@@ -24888,7 +24896,18 @@ def validate_emitted_c(text, path="engine.c", analyses=None):
             analyses=analyses,
             source_text=text))
     _crust_compile_c(translated, path, analyses=analyses, source_text=translated)
+    for name, body in blobs.items():
+        translated, n = re.subn(
+            r"(unsigned char %s\[\d+\]\s*=\s*)\{ 0 \}" % re.escape(name),
+            lambda m, body=body: m.group(1) + body, translated, count=1)
+        if n != 1:
+            raise PackError("%s: byte array %s lost in translation" % (path, name))
     return translated
+
+
+#: `const unsigned char name[N] = { ... };` with a large literal body.
+_BYTE_BLOB_RE = re.compile(
+    r"(\bconst unsigned char )(\w+)(\[\d+\]\s*=\s*)(\{[\d\s,xXa-fA-F]{4096,}\})")
 
 
 def _strip_ansi(s):
