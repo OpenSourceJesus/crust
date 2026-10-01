@@ -367,12 +367,16 @@ def _desugar_callbacks(text, names, slots):
             "_ia_subscribe" if sign == "+" else "_ia_unsubscribe",
             slots[name], _PHASES[phase], h)
         text = text[:m.start()] + call + text[end:]
-    # method-group handlers: the context parameter goes, its uses are the
-    # engine's
-    for cname, method in HANDLERS:
+    # A method taking a context -- a method-group handler, or one the
+    # Inspector's UnityEvents call -- loses the parameter; its uses are the
+    # engine's. ponytail: a call that passes a context on is not rewritten
+    ctx_re = (r"(\bvoid\s+(\w+)\s*\()\s*(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?"
+              r"InputAction\s*\.\s*CallbackContext\s+(\w+)\s*"
+              r"(?:=\s*default\s*(?:\([^()]*\))?\s*)?(\))")
+    methods = [m.group(2) for m in re.finditer(ctx_re, cs2cpp._blank(text))]
+    for method in methods:
         text = re.sub(
-            r"(\bvoid\s+%s\s*\()\s*(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?"
-            r"InputAction\s*\.\s*CallbackContext\s+(\w+)\s*(\))" % re.escape(method),
+            ctx_re.replace(r"(\w+)", re.escape(method), 1),
             lambda m: m.group(1) + m.group(3) + "/*ctx:%s*/" % m.group(2), text)
         cm = re.search(r"\bvoid\s+%s\s*\(\s*\)/\*ctx:(\w+)\*/" % re.escape(method), text)
         if cm:

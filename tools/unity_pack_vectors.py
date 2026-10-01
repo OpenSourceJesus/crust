@@ -54,6 +54,36 @@ static Vector2 Vector2_neg(Vector2 v) {
 /* Godot ==: exact, component by component. */
 static int Vector2_eq_exact(Vector2 a, Vector2 b) {
     return a.x == b.x && a.y == b.y;
+}
+static float Vector2_sqrMagnitude(Vector2 v) {
+    return v.x * v.x + v.y * v.y;
+}
+static float Vector2_magnitude(Vector2 v) {
+    return sqrtf(v.x * v.x + v.y * v.y);
+}
+static float Vector2_Dot(Vector2 a, Vector2 b) {
+    return a.x * b.x + a.y * b.y;
+}
+static Vector2 Vector2_ClampMagnitude(Vector2 v, float max) {
+    float sq = v.x * v.x + v.y * v.y;
+    float m;
+    if (sq <= max * max) return v;
+    m = sqrtf(sq);
+    return Vector2_make(v.x / m * max, v.y / m * max);
+}
+/* Unity: unsigned degrees, 0 when either vector is (near) zero */
+static float Vector2_Angle(Vector2 a, Vector2 b) {
+    float den = sqrtf((a.x * a.x + a.y * a.y) * (b.x * b.x + b.y * b.y));
+    float d;
+    if (den < 1e-15f) return 0.f;
+    d = (a.x * b.x + a.y * b.y) / den;
+    if (d < -1.f) d = -1.f;
+    if (d > 1.f) d = 1.f;
+    return acosf(d) * 57.29578f;
+}
+static float Vector2_SignedAngle(Vector2 a, Vector2 b) {
+    float ang = Vector2_Angle(a, b);
+    return a.x * b.y - a.y * b.x < 0.f ? 0.f - ang : ang;
 }"""
 
 #: Godot's Vector2 methods (GodotSharp's Core/Vector2.cs and Mathf.cs),
@@ -145,7 +175,16 @@ _VEC_FUNCS = frozenset((
     "GodotVec_Normalized", "GodotVec_DirectionTo", "GodotVec_Lerp",
     "GodotVec_MoveToward", "GodotVec_Rotated", "GodotVec_LimitLength",
     "GodotVec_Abs",
-    "RectTransform_get_anchoredPosition"))
+    "RectTransform_get_anchoredPosition", "RectTransform_get_localPosition",
+    "RectTransform_get_sizeDelta", "Transform_get_position2",
+    "Camera_main_ScreenToWorldPoint", "Mouse_current_position",
+    "Rect_center", "Rect_max", "Rect_min", "Rect_size",
+    "Vector2_ClampMagnitude", "Random_insideUnitCircle"))
+
+#: A Vector2's members that are helpers: name -> (helper, returns a Vector2).
+_VEC_MEMBERS = {"magnitude": ("Vector2_magnitude", False),
+                "sqrMagnitude": ("Vector2_sqrMagnitude", False),
+                "normalized": ("Vector2_normalized", True)}
 
 _TOKEN_RE = re.compile(r"""
     (?P<ws>\s+)
@@ -363,6 +402,12 @@ class _Parser(object):
                 if k2 != "id":
                     raise _Fail()
                 self.k += 2
+                if node.ty == "v" and tok == "." and t2 in _VEC_MEMBERS:
+                    fn, vec = _VEC_MEMBERS[t2]
+                    self.changed = True
+                    node = _Node(node.start, e2, "v" if vec else "s",
+                                 "%s(%s)" % (fn, self.src(node)))
+                    continue
                 # a Vector2's member is a float
                 new = None if node.new is None else "%s%s%s" % (
                     self.src(node), tok, t2)
@@ -479,7 +524,7 @@ def _rewrite_segment(text, env, funcs, exact, strs=frozenset(),
     return text[:lead] + node.new + text[len(text) - trail:]
 
 
-_DECL_RE = re.compile(r"(?<![\w.])Vector2\s+(\w+)\s*(?=[=;,)])")
+_DECL_RE = re.compile(r"(?<![\w.])Vector2\s+(\w+)\s*(?=[=;,)]|$)")
 
 
 def _segments(text):

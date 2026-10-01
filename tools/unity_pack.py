@@ -508,6 +508,7 @@ _ADDABLE_BUILTINS = frozenset((
     "Rigidbody",
     "BoxCollider2D",
     "CircleCollider2D",
+    "PolygonCollider2D",
     "BoxCollider",
     "SphereCollider",
     "Animation",
@@ -2263,7 +2264,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|CapsuleCollider2D|"
-            r"BoxCollider|"
+            r"PolygonCollider2D|BoxCollider|"
             r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
             r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
             r"SliderJoint2D|WheelJoint2D|FrictionJoint2D|RelativeJoint2D|"
@@ -2291,6 +2292,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "CircleCollider2D"
         elif type_id == "70":
             kind = "CapsuleCollider2D"
+        elif type_id == "60":
+            kind = "PolygonCollider2D"
         elif type_id == "65":
             kind = "BoxCollider"
         elif type_id == "135":
@@ -2747,6 +2750,29 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "size_y": float(sz.group(2)) if sz else 1.0,
                 "material_guid": _parse_material_guid(block),
             }
+        if kind == "PolygonCollider2D":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
+            off = re.search(
+                r"m_Offset:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            paths = []
+            pm = re.search(r"(?m)^[ \t]+m_Paths:\n((?:[ \t]+-.*\n)*)", block)
+            for line in (pm.group(1) if pm else "").splitlines():
+                pt = re.search(r"\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", line)
+                if not pt:
+                    continue
+                if re.match(r"\s*-\s+-", line) or not paths:
+                    paths.append([])
+                paths[-1].append((float(pt.group(1)), float(pt.group(2))))
+            rec["collider2d"] = {
+                "kind": "polygon",
+                "enabled": int(en.group(1)) if en else 1,
+                "is_trigger": int(trig.group(1)) if trig else 0,
+                "offset_x": float(off.group(1)) if off else 0.0,
+                "offset_y": float(off.group(2)) if off else 0.0,
+                "paths": paths,
+                "material_guid": _parse_material_guid(block),
+            }
         if kind == "CircleCollider2D":
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
@@ -3010,7 +3036,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rb3d = dict(k["rigidbody"])
                 rb3d["file_id"] = k.get("file_id")
             if k.get("kind") in ("BoxCollider2D", "CircleCollider2D",
-                                 "CapsuleCollider2D") and k.get(
+                                 "CapsuleCollider2D",
+                                 "PolygonCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
@@ -3082,7 +3109,22 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             col2d["oy"] = float(col2d.get("offset_y", 0.0)) * sy
             col2d["cos_z"] = math.cos(rz)
             col2d["sin_z"] = math.sin(rz)
-            if col2d.get("kind") != "circle":
+            if col2d.get("kind") == "polygon":
+                ssx, ssy = float(scale[0]), float(scale[1])
+                offx = float(col2d.get("offset_x", 0.0))
+                offy = float(col2d.get("offset_y", 0.0))
+                paths = [[((x + offx) * ssx, (y + offy) * ssy) for x, y in pth]
+                         for pth in col2d.get("paths") or []]
+                pts = [q for pth in paths for q in pth] or [(0.0, 0.0)]
+                x0, x1 = min(q[0] for q in pts), max(q[0] for q in pts)
+                y0, y1 = min(q[1] for q in pts), max(q[1] for q in pts)
+                cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+                col2d["ox"], col2d["oy"] = cx, cy
+                col2d["hw"], col2d["hh"] = (x1 - x0) * 0.5, (y1 - y0) * 0.5
+                col2d["tris"] = [
+                    tuple(v for (x, y) in tri for v in (x - cx, y - cy))
+                    for tri in _triangulate_paths(paths)]
+            elif col2d.get("kind") != "circle":
                 col2d["hw"] = abs(float(col2d.get("size_x", 1.0))) * sx * 0.5
                 col2d["hh"] = abs(float(col2d.get("size_y", 1.0))) * sy * 0.5
             else:
@@ -4078,7 +4120,8 @@ def _ast_find_getcomponent_chains(text):
         })
     # Standalone this.GetComponent<T>() / GetComponent<T>() — not recv.GetComponent.
     for m in re.finditer(
-            r"(?:(?<![\w.])this\s*\.\s*)?(?<![\w.])GetComponent\s*<", scan):
+            r"(?:(?<![\w.])this\s*\.\s*)?(?<![\w.])GetComponent(InParent)?\s*<",
+            scan):
         # Skip if already covered as part of a Find chain.
         if any(c["start"] <= m.start() < c["end"] for c in out):
             continue
@@ -4113,9 +4156,11 @@ def _ast_find_getcomponent_chains(text):
             "field": field,
             "axis": axis,
             "on_this": True,
+            "in_parent": bool(m.group(1)),
         })
     # recv.GetComponent<T>() — GO / component handle is already an index.
-    for m in re.finditer(r"(?<![\w.])(\w+)\s*\.\s*GetComponent\s*<", scan):
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\.\s*GetComponent(InParent)?\s*<",
+                         scan):
         recv = m.group(1)
         if recv == "this":
             continue
@@ -4153,6 +4198,7 @@ def _ast_find_getcomponent_chains(text):
             "axis": axis,
             "recv": recv,
             "on_this": False,
+            "in_parent": bool(m.group(2)),
         })
     out.sort(key=lambda c: c["start"], reverse=True)
     return out
@@ -4503,7 +4549,7 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     bases_map = plan.get("mb_bases") or _collect_mb_bases(analyses)
     known = (set(plan.get("classes") or {})
              | _ADDABLE_BUILTINS
-             | _PHYSICS_COMPONENTS
+             | _PHYSICS_COMPONENTS | _COLLIDER2D_TYPES
              | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
              | _UI_GETCOMPONENT_TYPES
              | _TRANSFORM_GETCOMPONENT_TYPES
@@ -4655,7 +4701,8 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
     ``Renderer`` resolves to ``SpriteRenderer``. ``.Length`` → ``.size()``.
     """
     gcic = set(plan.get("getcomponentsinchildren_types") or [])
-    if not re.search(r"GetComponentsInChildren\s*<", text):
+    if not re.search(r"GetComponentsInChildren\s*<|Object_FindObjectsOfType_",
+                     text):
         return text
     classes = plan.get("classes") or {}
     cl = classes.get(this_class) or {
@@ -4756,6 +4803,10 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
             out.append(call)
         i = after
     text = "".join(out)
+    # T[] name = FindObjectsOfType<T>() (lowered already): the same vector
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\.)?\w+\s*\[\s*\]\s+(\w+)"
+        r"(\s*=\s*Object_FindObjectsOfType_)", r"std::vector<int> \1\2", text)
     # Also catch ref-array fields assigned earlier as Class_field names.
     for f in cl.get("ref_array_fields") or []:
         vector_names.add(f["name"])
@@ -5593,7 +5644,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
     def _known_component(comp):
         return (comp in (plan.get("classes") or {})
-                or comp in _PHYSICS_COMPONENTS
+                or comp in _PHYSICS_COMPONENTS or comp in _COLLIDER2D_TYPES
                 or comp in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or comp in _ADDABLE_BUILTINS
                 or comp in _UI_GETCOMPONENT_TYPES
@@ -5605,6 +5656,12 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
         if idx is None:
             idx = ch.get("start") or 0
         _raise_cs_at_site(site, idx, "CS0246", _CS0246 % comp)
+
+    def _in_parent(ch, repl):
+        if not ch.get("in_parent"):
+            return repl
+        return repl.replace("GameObject_GetComponent_",
+                            "GameObject_GetComponentInParent_")
 
     for ch in chains:
         comp = ch.get("component")
@@ -5631,7 +5688,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
             else:
                 repl = "GameObject_GetComponent_%s(%s)" % (
                     _c_ident(comp), go_expr)
-            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            text = text[:ch["start"]] + _in_parent(ch, repl) + text[ch["end"]:]
             continue
 
         find_args = ch.get("find_args") or ""
@@ -5654,7 +5711,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                 else:
                     repl = "GameObject_GetComponent_%s(%s)" % (
                         _c_ident(comp), go_expr)
-            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            text = text[:ch["start"]] + _in_parent(ch, repl) + text[ch["end"]:]
             continue
         if not comp:
             repl = go_expr
@@ -5672,7 +5729,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                     "_up_go < 0 ? (%s, -1) "
                     ": GameObject_GetComponent_%s(_up_go); })"
                     % (go_expr, nre, _c_ident(comp)))
-        text = text[:ch["start"]] + repl + text[ch["end"]:]
+        text = text[:ch["start"]] + _in_parent(ch, repl) + text[ch["end"]:]
     return text
 
 
@@ -5724,6 +5781,9 @@ def analyze_script(path, text=None, shallow=False):
             getcomponent_types.add(ch["component"])
             if ch["component"] in _PHYSICS_COMPONENTS:
                 apis.add(ch["component"])
+            if ch.get("in_parent"):
+                apis.add("GetComponentInParent<%s>" % ch["component"])
+                apis.add("transform.parent")
         elif ch.get("on_this"):
             apis.add("GetComponent")
     for m in re.finditer(
@@ -5825,13 +5885,15 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Vector2")
     # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
     # read for its GameObject.
-    if re.search(r"\bPhysics2D\s*\.\s*(?:Raycast|OverlapCircle|OverlapPoint)(?:All)?"
-                 r"\s*\(", scan):
+    if re.search(r"\bPhysics2D\s*\.\s*(?:(?:Raycast|OverlapCircle|OverlapPoint)"
+                 r"(?:All)?|Linecast)\s*\(", scan):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
+    if re.search(r"\bVector2Int\b", scan):
+        apis.add("Vector2Int")
     # The Input System's Gamepad.current: the host's gamepad.
-    if re.search(r"(?<![\w.])Gamepad\s*\.\s*current\b", text):
+    if re.search(r"(?<![\w.])Gamepad\s*\.\s*(?:current|all)\b", text):
         apis.add("Gamepad.current")
         apis.add("Vector2")
     # The mouse wheel: the host's scroll, per frame.
@@ -5929,6 +5991,12 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("FindObjectOfType")
         findobject_types.add(m.group(1))
     for m in re.finditer(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectsOfType\s*<\s*(\w+)\s*>",
+            scan):
+        apis.add("FindObjectOfType")
+        apis.add("FindObjectsOfType<%s>" % m.group(1))
+        findobject_types.add(m.group(1))
+    for m in re.finditer(
             r"(?<![\w.])(\w+)\s*\.\s*(?:Instance|instance)\b", scan):
         # CosmeticsMenu.Instance — not foo.instance unless type-like name.
         tname = m.group(1)
@@ -5953,8 +6021,10 @@ def analyze_script(path, text=None, shallow=False):
     elif (re.search(r"(?<![\w.])Keyboard\.current\b", scan)
           or _KEYBOARD_KEY.search(scan)):
         apis.add("Keyboard")
-    if re.search(r"(?:UnityEngine\.)?Debug\.Log\s*\(", scan):
+    if re.search(r"(?:UnityEngine\.)?Debug\.Log(?:Warning|Error)?\s*\(", scan):
         apis.add("Debug.Log")
+    if re.search(r"(?<![\w.])Cursor\s*\.\s*visible\b", scan):
+        apis.add("Cursor.visible")
     if re.search(r"(?<![\w.])print\s*\(", scan):
         apis.add("print")
     if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b", scan):
@@ -6029,9 +6099,11 @@ def analyze_script(path, text=None, shallow=False):
     # The runtime table's APIs are helpers emitted with the string ones.
     if runtime.API_RE.search(scan):
         apis.add("string.+")
-        if re.search(r"\bTime\s*\.\s*(?:realtimeSinceStartup|unscaledTime)",
-                     scan):
+        if re.search(r"\bTime\s*\.\s*(?:realtimeSinceStartup|unscaledTime\b|"
+                     r"timeSinceLevelLoad)", scan):
             apis.add("Time.time")
+        if re.search(r"\bRandom\s*\.\s*insideUnitCircle\b", scan):
+            apis.add("Vector2")
     # A string compared with null is lowered to a string helper, which
     # lives with the scratch slots.
     if re.search(r"(?<![\w.])string\b", scan) and re.search(
@@ -6473,6 +6545,15 @@ def _csharp_type_decl_kind(name):
     return next(iter(found)) if len(found) == 1 else None
 
 
+#: UnityEngine enums: an integer in the packed engine, `default(T)` is 0.
+_UNITY_ENUM_TYPES = frozenset((
+    "KeyCode", "ForceMode2D", "RigidbodyType2D", "Space", "TouchPhase",
+    "RigidbodyInterpolation2D", "CollisionDetectionMode2D", "SendMessageOptions",
+    "PrimitiveType", "FilterMode", "WrapMode", "HideFlags", "LogType",
+    "RuntimePlatform", "FullScreenMode", "CursorLockMode", "LoadSceneMode",
+))
+
+
 def _default_arg_c(expr, ty=None):
     """C for a C# default parameter value, or None when it needs type-aware
     lowering this does not do (enum members, constants, expressions).
@@ -6502,8 +6583,10 @@ def _default_arg_c(expr, ty=None):
         if e == "null" and base not in _PRIMITIVE_PARAM_TYPES:
             return "-1"
         if e == "default":
-            if base in _PRIMITIVE_PARAM_TYPES:
+            if base in _PRIMITIVE_PARAM_TYPES or base in _UNITY_ENUM_TYPES:
                 return "0"
+            if base == "Vector2":
+                return "Vector2_make(0.f, 0.f)"
             kind = _csharp_type_decl_kind(base)
             if kind == "enum":
                 return "0"
@@ -7335,6 +7418,11 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
             r"\s*\(\s*false\s*\)" % re.escape(tname),
             "Object_FindObjectOfType_%s(0)" % oidn, text)
+        text = cs2cpp.code_sub(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectsOfType\s*<\s*%s\s*>"
+            r"\s*\(\s*(true|false|1|0)?\s*\)" % re.escape(tname),
+            lambda m, o=oidn: "Object_FindObjectsOfType_%s(%d)" % (
+                o, m.group(1) in ("true", "1")), text)
     for ocname, pairs in methods_by.items():
         oidn = _c_ident(ocname)
         overloaded = _overload_method_names([m for _c, m in pairs])
@@ -9204,6 +9292,23 @@ def _emit_engine_gameobject_tables(
         p("    return go;")
         p("}")
         p("")
+    if (getcomponent_types & _COLLIDER2D_TYPES) and want_go_tables:
+        # ponytail: first collider on the GO, a linear scan of the table
+        p("/* GetComponent<Collider2D> — the GO's first collider index */")
+        if plan.get("collider2d"):
+            p("static int _col2d_go(int ci);")
+            p("static int GameObject_GetComponent_Collider2D(int go) {")
+            p("    int ci;")
+            p("    for (ci = 0; ci < _Collider2D_count; ci = ci + 1)")
+            p("        if (_col2d_go(ci) == go) return ci;")
+            p("    return -1;")
+            p("}")
+        else:
+            p("static int GameObject_GetComponent_Collider2D(int go) {")
+            p("    (void)go;")
+            p("    return -1;")
+            p("}")
+        p("")
     # Live uGUI GetComponent maps (mutable; seeded from authored presence).
     ui_gc = sorted(
         (getcomponent_types & _UI_GETCOMPONENT_TYPES)
@@ -9441,6 +9546,7 @@ def _emit_engine_gameobject_tables(
     for col_ty, unity_ty in (
             ("BoxCollider2D", "UnityEngine.BoxCollider2D"),
             ("CircleCollider2D", "UnityEngine.CircleCollider2D"),
+            ("PolygonCollider2D", "UnityEngine.PolygonCollider2D"),
             ("BoxCollider", "UnityEngine.BoxCollider"),
             ("SphereCollider", "UnityEngine.SphereCollider")):
         if col_ty in add_types:
@@ -12349,7 +12455,7 @@ def _emit_engine_get_components_in_children(
             # Need a GetComponent map / packed class / subclass / Transform.
             has_map = (
                 bool(collectors)
-                or tname in _PHYSICS_COMPONENTS
+                or tname in _PHYSICS_COMPONENTS or tname in _COLLIDER2D_TYPES
                 or tname in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or tname in _ADDABLE_BUILTINS
                 or tname in _UI_GETCOMPONENT_TYPES
@@ -12393,14 +12499,22 @@ def _emit_engine_get_components_in_children(
 
 def _emit_engine_find_object_of_type(
         findobject_packed, p, plan, singleton_instance_types, want_destroy,
-        want_findobject, want_ui):
-    """emit_engine: Object.FindObjectOfType<T> and Type.Instance."""
+        want_findobject, want_ui, many_types=()):
+    """emit_engine: Object.FindObjectOfType<T> and Type.Instance, and
+    FindObjectsOfType<T> (every live one, as a vector) for `many_types`."""
     if want_findobject and findobject_packed:
         p("/* Object.FindObjectOfType<T> — first live component index */")
-        for cname in findobject_packed:
+        for cname, many in [(c, m) for c in findobject_packed
+                            for m in ((False, True) if c in many_types
+                                      else (False,))]:
             idn = _c_ident(cname)
-            p("static int Object_FindObjectOfType_%s(int includeInactive) {"
-              % idn)
+            if many:
+                p("static std::vector<int> Object_FindObjectsOfType_%s("
+                  "int includeInactive) {" % idn)
+                p("    std::vector<int> out;")
+            else:
+                p("static int Object_FindObjectOfType_%s(int includeInactive) {"
+                  % idn)
             p("    int go, ci;")
             if not want_ui:
                 p("    (void)includeInactive;")
@@ -12415,9 +12529,9 @@ def _emit_engine_find_object_of_type(
                 p("        if (!includeInactive")
                 p("            && !_engine_go_active_in_hierarchy(go))")
                 p("            continue;")
-            p("        return ci;")
+            p("        %s;" % ("out.push_back(ci)" if many else "return ci"))
             p("    }")
-            p("    return -1;")
+            p("    return %s;" % ("out" if many else "-1"))
             p("}")
             p("")
         for cname in sorted(singleton_instance_types):
@@ -16382,7 +16496,7 @@ def emit_engine(plan, analyses, used_apis):
     want_rb2d = _want_rb2d_tables(plan, used_apis, getcomponent_types)
     want_rb3d = _want_rb3d_tables(plan, used_apis, getcomponent_types)
     want_col2d = bool(col2d_list) or bool(
-        add_types & {"BoxCollider2D", "CircleCollider2D"})
+        add_types & {"BoxCollider2D", "CircleCollider2D", "PolygonCollider2D"})
     want_col3d = bool(col3d_list) or bool(
         add_types & {"BoxCollider", "SphereCollider"})
     want_anim = bool(anim_players)
@@ -16623,6 +16737,11 @@ def emit_engine(plan, analyses, used_apis):
         p("    h.distance = out[5];")
         p("    return h;")
         p("}")
+        p("static int RaycastHit2D_collider(RaycastHit2D h) { return h.collider; }")
+        p("static RaycastHit2D Physics2D_Linecast(Vector2 a, Vector2 b, int mask) {")
+        p("    Vector2 d = Vector2_make(b.x - a.x, b.y - a.y);")
+        p("    return Physics2D_Raycast(a, d, sqrtf(d.x * d.x + d.y * d.y), mask);")
+        p("}")
         p("static int Physics2D_OverlapCircle(Vector2 c, float r, int mask) {")
         p("    return engine_box2d_overlap_circle(c.x, c.y, r, (unsigned int)mask);")
         p("}")
@@ -16704,6 +16823,8 @@ def emit_engine(plan, analyses, used_apis):
     p("extern float Time_deltaTime;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
+    if "Cursor.visible" in used_apis:
+        p("extern int Cursor_visible;")
     p("extern float Time_fixedDeltaTime;")
     p("extern int Screen_width;")
     p("extern int Screen_height;")
@@ -16851,7 +16972,12 @@ def emit_engine(plan, analyses, used_apis):
     if want_col2d:
         nc = max(1, len(col2d_list))
         p("extern const int _Collider2D_count;")
-        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h */" % nc)
+        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle 2|3 capsule v|h 4 polygon */" % nc)
+        if plan.get("physics2d_polygons"):
+            p("extern const int _Collider2D_tri_start[%d];" % nc)
+            p("extern const int _Collider2D_tri_count[%d];" % nc)
+            p("extern const float _Collider2D_tri_xy[%d];" % (
+                6 * max(1, sum(len(c.get("tris") or []) for c in col2d_list))))
         p("extern const int _Collider2D_is_trigger[%d];" % nc)
         if plan.get("physics2d_layers"):
             p("extern const unsigned _Collider2D_layer_bits[%d];" % nc)
@@ -17359,11 +17485,29 @@ def emit_engine(plan, analyses, used_apis):
             add_types, getcomponentsinchildren_types, p, plan, want_destroy, want_gcic,
             want_go_tables, want_ui)
 
+    # GetComponentInParent<T>: the GO itself, then each ancestor.
+    for tname in sorted(a.split("<", 1)[1][:-1] for a in used_apis
+                        if a.startswith("GetComponentInParent<")):
+        idn = _c_ident(tname)
+        p("static int GameObject_GetComponentInParent_%s(int go) {" % idn)
+        p("    int ci, guard;")
+        p("    for (guard = 0; go >= 0 && guard < _engine_go_count + 2;"
+          " guard = guard + 1) {")
+        p("        ci = GameObject_GetComponent_%s(go);" % idn)
+        p("        if (ci >= 0) return ci;")
+        p("        go = Transform_get_parent(go);")
+        p("    }")
+        p("    return -1;")
+        p("}")
+        p("")
+
     # Object.FindObjectOfType / Type.Instance — after GO maps (and optional
     # active-hierarchy helpers when want_ui).
     _emit_engine_find_object_of_type(
             findobject_packed, p, plan, singleton_instance_types, want_destroy,
-            want_findobject, want_ui)
+            want_findobject, want_ui,
+            {a.split("<", 1)[1][:-1] for a in used_apis
+             if a.startswith("FindObjectsOfType<")})
 
     p("static float f16_to_f32(uint16_t h) {")
     p("    unsigned s = (h >> 15) & 1u;")
@@ -18514,7 +18658,8 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
     text = sub(r"\(\s*Vector2\s*\)\s*(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
                lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
     # Implicit Vector3 → Vector2 inside calls whose result is a Vector2.
-    text = sub(r"(?<![\w.])Vector2\s*\.\s*Distance\s*\(", "Vector2_Distance(",
+    # ponytail: Vector3.Distance as the 2D distance; a packed position's z is 0
+    text = sub(r"(?<![\w.])Vector[23]\s*\.\s*Distance\s*\(", "Vector2_Distance(",
                text)
     text = sub(r"(?<![\w.])(Vector2\s+\w+\s*=\s*)Vector3\s*\.\s*Lerp\s*\(",
                r"\1Vector2_Lerp(", text)
@@ -18601,6 +18746,9 @@ def _rewrite_vector2_eq(text, fns):
         m2 = re.compile(call).match(text, got[1] + op.end())
         got2 = m2 and _match_call_args(text, m2.end() - 1)
         if not got2:
+            continue
+        # `a == b - c`: the right operand is all of `b - c` (lower_vector2_ops)
+        if re.match(r"\s*[-+*/%](?![=])", text[got2[1]:]):
             continue
         text = "%s%sVector2_eq(%s, %s)%s" % (
             text[:m.start()], "!" if op.group(1) == "!=" else "",
@@ -19947,8 +20095,8 @@ def _plan_needs_vector2(plan, used_apis=None):
 
 
 def _plan_needs_vector2int(plan, used_apis=None):
-    if used_apis and "Dictionary" in used_apis:
-        pass  # may still need scan of tys
+    if used_apis and "Vector2Int" in used_apis:
+        return True
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2int_fields"):
             return True
@@ -20355,6 +20503,7 @@ _UNITY_API_CORE = [
     _B("Time.deltaTime", "Time_deltaTime", "value"),
     _B("Time.fixedDeltaTime", "Time_fixedDeltaTime", "value"),
     _B("Time.time", "Time_time", "value"),
+    _B("Cursor.visible", "Cursor_visible", "value", _UE),
     _B("Screen.width", "Screen_width", "value"),
     _B("Screen.height", "Screen_height", "value"),
     _B("Application.dataPath", "Application_dataPath", "getter", _UE),
@@ -20389,6 +20538,9 @@ _UNITY_API_SCENE = [
 ] + [_B("Input." + m, "Input_" + m) for m in ("GetAxis", "GetButton", "GetKey")]
 
 _UNITY_API_LOG = [
+    _B("Debug.LogWarning", "Debug_Log", "value", _UE),
+    _B("Debug.LogError", "Debug_Log", "value", _UE),
+    _B("Debug.isDebugBuild", "false", "value", _UE),
     _B("Debug.Log", "Debug_Log", "value", _UE),
     _B("print", "Debug_Log", "callee"),
 ]
@@ -21727,7 +21879,7 @@ def _lower_physics2d_queries(text):
         scan = cs2cpp._blank(text)
         m = re.search(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
                       r"(RaycastAll|Raycast|OverlapCircleAll|OverlapCircle|"
-                      r"OverlapPointAll|OverlapPoint)\s*\(", scan)
+                      r"OverlapPointAll|OverlapPoint|Linecast)\s*\(", scan)
         if not m:
             break
         op = m.end() - 1
@@ -21745,6 +21897,9 @@ def _lower_physics2d_queries(text):
             rep = "Physics2D_%s(%s, %s, %s, %s)" % (
                 which, _query_vec2(args[0]), _query_vec2(args[1]),
                 args[2] if len(args) > 2 else "1e30f", mask_at(3))
+        elif which == "Linecast" and len(args) >= 2:
+            rep = "Physics2D_Linecast(%s, %s, %s)" % (
+                _query_vec2(args[0]), _query_vec2(args[1]), mask_at(2))
         elif which in ("OverlapCircle", "OverlapCircleAll") and len(args) >= 2:
             rep = "Physics2D_%s(%s, %s, %s)" % (which, _query_vec2(args[0]),
                                                 args[1], mask_at(2))
@@ -21756,7 +21911,20 @@ def _lower_physics2d_queries(text):
                 _query_vec2(args[0]), mask_at(1))
         else:
             break
+        null = re.match(r"\s*\.\s*collider\s*(==|!=)\s*null\b", scan[cp + 1:])
+        if null and which in ("Raycast", "Linecast"):
+            rep = "(RaycastHit2D_collider(%s) %s)" % (
+                rep, "< 0" if null.group(1) == "==" else ">= 0")
+            cp += null.end()
         text = text[:m.start()] + rep + text[cp + 1:]
+    # Transforms are read live, so there is nothing to sync.
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*SyncTransforms"
+        r"\s*\(\s*\)", "(void)0", text)
+    # ponytail: Unity's default, not the project's Physics2DSettings value
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
+        r"defaultContactOffset\b", "0.01f", text)
     scan = cs2cpp._blank(text)
     # the *All results' lists (tools/unity_pack_physics.desugar_layers)
     for n in set(re.findall(r"(?<![\w.])List\s*<\s*(?:RaycastHit2D|Collider2D)\s*>"
@@ -21870,6 +22038,11 @@ def _lower_gamepad(text):
     if "Gamepad" not in text:
         return text
     tail = r"(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?Gamepad\s*\.\s*current"
+    # ponytail: the host has one gamepad, so Gamepad.all is it or nothing
+    all_ = r"(?<![\w.])(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?Gamepad\s*\.\s*all"
+    text = cs2cpp.code_sub(all_ + r"\s*\.\s*Count\b", "engine_gamepad_connected",
+                           text)
+    text = cs2cpp.code_sub(all_ + r"\s*\[[^\[\]]*\]", "Gamepad.current", text)
     gp = r"(?<![\w.])" + tail
     decl = r"(?<![\w.])(?:var|Gamepad)\s+(\w+)\s*=\s*" + tail + r"\s*;"
     locals_ = re.findall(decl, cs2cpp._blank(text))
@@ -21880,6 +22053,8 @@ def _lower_gamepad(text):
         text = cs2cpp.code_sub(r + r"\s*(==|!=)\s*null\b",
                                lambda m: "(%sengine_gamepad_connected)" % (
                                    "!" if m.group(1) == "==" else ""), text)
+        text = cs2cpp.code_sub(r + r"\s*\.\s*enabled\b",
+                               "engine_gamepad_connected", text)
         names = sorted(set(_GAMEPAD_BUTTONS) | set(_GAMEPAD_VALUES), key=len,
                        reverse=True)
         alt = "|".join(re.escape(n).replace(r"\.", r"\s*\.\s*") for n in names)
@@ -22396,6 +22571,26 @@ def _lower_string_members(text, string_idents, plan):
             break
         if not changed:
             break
+    return text
+
+
+def _desugar_destroy_immediate(text):
+    """`DestroyImmediate(obj[, allowDestroyingAssets])` -> `Destroy(obj)`: a
+    player has no assets to destroy, and Destroy's second argument is a
+    delay, so the flag goes."""
+    pat = re.compile(r"(?<![\w.])(?:(?:UnityEngine\s*\.\s*)?Object\s*\.\s*)?"
+                     r"DestroyImmediate\s*\(")
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        m = pat.search(scan)
+        if not m:
+            break
+        cp = _match_close(scan, m.end() - 1, "(", ")")
+        if cp is None:
+            break
+        args = cs2cpp.split_call_args(text[m.end():cp])
+        text = "%sDestroy(%s)%s" % (text[:m.start()], args[0].strip() if args
+                                    else "", text[cp + 1:])
     return text
 
 
@@ -22982,7 +23177,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _mark_string_chars(text, string_idents, string_arrays
                               | _string_store_names(plan)
                               | plan.get("_string_lists_local", set()))
-    text = _format_bools(text, _bool_names(cl, body, site),
+    text = _format_bools(text, _bool_names(cl, body, site)
+                         | {"Cursor_visible", "true", "false"},
                          _string_helper_names("bool") | {
                              "_engine_go_active_in_hierarchy",
                              "GameObject_activeSelf",
@@ -23128,6 +23324,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Vector2\s*\.\s*(Angle|SignedAngle|ClampMagnitude|Dot|"
+        r"Distance)\s*\(", r"Vector2_\1(", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Vector2\s*\.\s*Scale\s*\(", "Vector2_mulv(", text)
     text = _rewrite_vector2_ctor_normalized(text)
     # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
     def _fold_v2_axis_ctors(src, axis_fn, axis):
@@ -23193,6 +23394,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Vector2Int\s*\(",
         "Vector2Int(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])Vector2Int\s*\.\s*one\b",
+                           "Vector2Int(1, 1)", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])Vector2Int\s*\.\s*zero\b",
+                           "Vector2Int(0, 0)", text)
     for vf in cl.get("vec3_fields") or []:
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
@@ -23393,6 +23598,9 @@ def emit_data(plan, used_apis=None):
     p("float Time_deltaTime = 0.0166667f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
+    if "Cursor.visible" in used_apis:
+        # ponytail: remembered only; the host window's cursor is not hidden
+        p("int Cursor_visible = 1;")
     godot = plan.get("godot")
     if godot:
         # Godot's physics ticks and gravity: pixels / s^2, y down.
@@ -23616,6 +23824,18 @@ def emit_data(plan, used_apis=None):
         p("const int _Collider2D_count = %d;" % n)
         p("const int _Collider2D_kind[%d] = { %s };" % (
             n, ", ".join(str(int(c["kind"])) for c in col2d_list)))
+        if plan.get("physics2d_polygons"):
+            starts, tris = [], []
+            for c in col2d_list:
+                starts.append(len(tris))
+                tris.extend(c.get("tris") or [])
+            p("const int _Collider2D_tri_start[%d] = { %s };" % (
+                n, ", ".join(map(str, starts))))
+            p("const int _Collider2D_tri_count[%d] = { %s };" % (
+                n, ", ".join(str(len(c.get("tris") or [])) for c in col2d_list)))
+            p("const float _Collider2D_tri_xy[%d] = { %s };" % (
+                6 * max(1, len(tris)), ", ".join(
+                    "%sf" % repr(float(v)) for t in tris for v in t) or "0.0f"))
         p("const int _Collider2D_layer[%d] = { %s };" % (
             max(1, len(col2d_list)), ", ".join(
                 str(v) for v in _collider2d_layers(plan, col2d_list)) or "0"))
@@ -24877,6 +25097,14 @@ def validate_emitted_c(text, path="engine.c", analyses=None):
                   % (path, len(text)))
         return text
     import tools.cpprust as cpprust
+    # Texture bytes are numbers in a brace list: the subset question is the
+    # declaration, not 10^6 literals (most of a pack's validate time).
+    blobs = {}
+
+    def _elide(m):
+        blobs[m.group(2)] = m.group(4)
+        return "%s%s%s{ 0 }" % (m.group(1), m.group(2), m.group(3))
+    text = _BYTE_BLOB_RE.sub(_elide, text)
     try:
         scan = cpprust._blank_directives(cpprust._strip_comments(text))
         cpprust._check_unsupported(scan, path)
@@ -24888,7 +25116,18 @@ def validate_emitted_c(text, path="engine.c", analyses=None):
             analyses=analyses,
             source_text=text))
     _crust_compile_c(translated, path, analyses=analyses, source_text=translated)
+    for name, body in blobs.items():
+        translated, n = re.subn(
+            r"(unsigned char %s\[\d+\]\s*=\s*)\{ 0 \}" % re.escape(name),
+            lambda m, body=body: m.group(1) + body, translated, count=1)
+        if n != 1:
+            raise PackError("%s: byte array %s lost in translation" % (path, name))
     return translated
+
+
+#: `const unsigned char name[N] = { ... };` with a large literal body.
+_BYTE_BLOB_RE = re.compile(
+    r"(\bconst unsigned char )(\w+)(\[\d+\]\s*=\s*)(\{[\d\s,xXa-fA-F]{4096,}\})")
 
 
 def _strip_ansi(s):
@@ -25498,6 +25737,7 @@ def pack(root, outdir, *args, **kwargs):
         t = _inp.desugar_input_actions(t, _common.SOURCE_INPUT_ACTIONS,
                                        os.path.relpath(fp, root),
                                        _ia_serialized.get(os.path.abspath(fp)))
+        t = _desugar_destroy_immediate(t)
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)

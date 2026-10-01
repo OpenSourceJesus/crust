@@ -138,6 +138,14 @@ _h("Random_value", "float",
    "static float Random_value(void) {\n"
    "    return (float)(_engine_rng_next() >> 8) / 16777215.f;\n}",
    deps=("_engine_rng",))
+_h("Random_insideUnitCircle", "Vector2",
+   "static Vector2 Random_insideUnitCircle(void) {\n"
+   "    float x, y;\n"
+   "    while (1) {\n"
+   "        x = 2.f * Random_value() - 1.f;\n"
+   "        y = 2.f * Random_value() - 1.f;\n"
+   "        if (x * x + y * y <= 1.f) return Vector2_make(x, y);\n"
+   "    }\n}", deps=("Random_value",))
 _h("Random_Range_f", "float",
    "static float Random_Range_f(float a, float b) {\n"
    "    return a + (b - a) * Random_value();\n}", deps=("Random_value",))
@@ -971,6 +979,7 @@ _CALLS = {
     ("Mathf", "Approximately", 2): "Mathf_Approximately",
     ("Random", "InitState", 1): "Random_InitState",
     ("Random", "value", None): "Random_value",
+    ("Random", "insideUnitCircle", None): "Random_insideUnitCircle",
     ("int", "Parse", 1): "_cs_int_Parse", ("Int32", "Parse", 1): "_cs_int_Parse",
     ("float", "Parse", 1): "_cs_float_Parse",
     ("Single", "Parse", 1): "_cs_float_Parse",
@@ -999,7 +1008,9 @@ API_RE = re.compile(
         "|".join(sorted({re.escape(k[1]) for k in _CALLS}
                         | set(MATHF_CONSTANTS) | {"Range", "TryParse",
                                                   "realtimeSinceStartup",
-                                                  "unscaledTime"}))))
+                                                  "unscaledTime",
+                                                  "timeSinceLevelLoad",
+                                                  "unscaledDeltaTime"}))))
 
 
 def lower_runtime_apis(text, used, blank, split_args, operand_kind,
@@ -1022,9 +1033,12 @@ def lower_runtime_apis(text, used, blank, split_args, operand_kind,
         Time.realtimeSinceStartup ->  Time.time
     """
     # Time: the packed engine has no time scale and reads no wall clock.
+    # ponytail: timeSinceLevelLoad is not reset by a scene load
     text = _sub(text, blank, r"(?<![\w.])" + _QUAL +
-                r"Time\s*\.\s*(?:realtimeSinceStartup|unscaledTime)"
-                r"(?:AsDouble)?\b", lambda m: "Time.time")
+                r"Time\s*\.\s*(?:realtimeSinceStartup|unscaledTime|"
+                r"timeSinceLevelLoad)(?:AsDouble)?\b", lambda m: "Time.time")
+    text = _sub(text, blank, r"(?<![\w.])" + _QUAL +
+                r"Time\s*\.\s*unscaledDeltaTime\b", lambda m: "Time.deltaTime")
     # Mathf constants
     for name, val in MATHF_CONSTANTS.items():
         def rep(m, v=val):
