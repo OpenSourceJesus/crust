@@ -4136,7 +4136,10 @@ def _iter_template_uses(text, tnames):
         inner = text[open_idx + 1:close]
         if "<" in inner:
             continue                      # an outer use; its turn comes later
-        args = [a.strip() for a in _split_targs(inner)]
+        # `Node*` and `Node *` are one argument: compared as written, the
+        # two spellings (cs2cpp's and this lowering's own) were two
+        # instantiations, one of them "not discovered"
+        args = [re.sub(r"\s*\*", " *", a.strip()) for a in _split_targs(inner)]
         if not args or not all(args):
             continue
         out.append((m.start(), close + 1, m.group(1), tuple(args)))
@@ -4532,7 +4535,11 @@ def _auto_contracts(text):
 
 
 def _mangle(name):
-    return re.sub(r"\W+", "_", name).strip("_")
+    # `*` as `P`: `vector<Node *>` is vector_Node_P. Dropped as any other
+    # non-word character, it mangled to vector_Node -- the instantiation
+    # for `vector<Node>`, a different type. (Not `ptr`: vector<Node>'s
+    # `ptr` method is the C function vector_Node_ptr.)
+    return re.sub(r"\W+", "_", name.replace("*", " P ")).strip("_")
 
 
 #: Scalar spellings that may also be taken by reference. A reference is a
@@ -4554,7 +4561,9 @@ _SCALAR_TYPES = frozenset((
 #: an unknown type, so no `byte[]` parameter or `push_back` compiled. A
 #: class name is still one word, so nothing that matched before matches
 #: differently now.
-_CPP_REF_TYPE = r"[\w:]+(?:\s+[\w:]+)*"
+#: A pointer, `Node *`, too: passed by value like a scalar -- `vector<Node *>`
+#: left `__cpp_ref(Node *)` unexpanded.
+_CPP_REF_TYPE = r"[\w:]+(?:\s+[\w:]+)*(?:\s*\*)*"
 
 
 def _expand_cpp_rref(params, names):
@@ -6352,6 +6361,26 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # leave an unused static function in every translation unit.
     #
     # `delete` needs no helper: it is a statement, so it lowers in place.
+    # An arena class (C#'s `[MaxInstances(N)]`, given as `__max_instances`):
+    # `new` takes the next of N static slots, zeroed, and nothing is freed
+    # one at a time -- `T__arena_reset()` destroys every live one and
+    # empties the arena. More than N at once aborts: C# would grow, and a
+    # silent overwrite is the one thing this must not do.
+    arena_n = None
+    for _am in cls.members:
+        if _am.kind == "sconst" and _am.name == "__max_instances" \
+                and not getattr(_am, "mutable", False):
+            try:
+                arena_n = int(str(_am.definit).strip())
+            except ValueError:
+                arena_n = None
+    if arena_n is not None and not abstract:
+        out.append("static %s %s__arena[%d]; static int %s__arena_n;"
+                   % (cname, cname, arena_n, cname))
+        drop = info.get("dtor") and "%s_drop(&%s__arena[k]); " % (cname, cname) or ""
+        out.append("%s void %s__arena_reset(void) { int k; for (k = 0; k < %s__arena_n; "
+                   "k = k + 1) { %s} %s__arena_n = 0; }"
+                   % (stor, cname, cname, drop, cname))
     if wants_new and not abstract:
         wants_new = set(wants_new)
         # One allocator per constructor, so `new T(a, b)` reaches the same
@@ -6362,7 +6391,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             fwd = [n for n in (_param_name(x)
                                for x in _split_top(cparams)) if n]
             alloc = ent["alloc"] if ent else "%s__alloc" % cname
-            body = ["%s *p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
+            if arena_n is not None:
+                body = ["%s *p;" % cname,
+                        "if (%s__arena_n >= %d) { abort(); }" % (cname, arena_n),
+                        "p = &%s__arena[%s__arena_n]; %s__arena_n = %s__arena_n + 1;"
+                        % (cname, cname, cname, cname),
+                        "memset(p, 0, sizeof(%s));" % cname]
+            else:
+                body = ["%s *p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
             if ent:
                 # A failed allocation must not be constructed through. C++
                 # would throw here; the subset has no exceptions, so `new`
@@ -10312,6 +10348,32 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                     cls, is_ptr = _ret_class(ient["ret"], cinfo)
                     addressable = True
                     pos = cb + 1
+                    continue
+            # `a.get()->next.get()`: a field of a class type, followed by
+            # a call or a subscript, continues the chain from the field's
+            # own type. It stopped at the field, and the next call reached
+            # C unlowered (`shared_ptr_Node` has no member `get`). A field
+            # that ends the expression is left to the passes that read
+            # and assign plain fields.
+            fm = re.match(r"\s*(\.|->)\s*(\w+)\b(?!\s*\()", look[pos:])
+            if fm is not None and cls is not None and cls in cinfo:
+                fent = cinfo[cls]["fields"].get(fm.group(2))
+                after = pos + fm.end()
+                # through a pointer, `.f` is `->f` -- the C# spelling of
+                # an arena reference's member, on a subscript or a call's
+                # result (a named pointer is auto-dereferenced already)
+                if fent is not None and is_ptr and fm.group(1) == "." and not (
+                        fent[0] in cinfo and re.match(
+                            r"\s*(?:(?:\.|->)\s*\w+\s*\(|\[|\.)", look[after:])):
+                    return "%s->%s" % (expr, fm.group(2)), after
+                if fent and fent[0] in cinfo and re.match(
+                        r"\s*(?:(?:\.|->)\s*\w+\s*\(|\[)", look[after:]) or (
+                        fent and fent[0] in cinfo and is_ptr
+                        and re.match(r"\s*\.", look[after:])):
+                    expr = "%s%s%s" % (expr, "->" if is_ptr else ".", fm.group(2))
+                    cls, is_ptr = fent[0], bool(fent[1])
+                    addressable = True
+                    pos = after
                     continue
             nm = cont_re.match(look, pos)
             if nm is None:

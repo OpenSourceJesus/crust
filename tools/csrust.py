@@ -44,6 +44,8 @@ def translate(text, path="<cs>", owning=None, basedir=None, incdirs=(),
         defines=defines, clang=False if clang is None else clang,
         rtti=rtti, decls=decls, decls_out=decls_out,
         contracts=contracts, mem_safe=mem_safe, any_order=True)
+    # C# `null` is lowered to NULL, which C defines only in <stddef.h>
+    c = cpprust._sub_code(r"(?<![\w])NULL(?![\w])", lambda m: "((void *)0)", c)
     return _with_wrapv(c)
 
 

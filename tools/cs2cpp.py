@@ -100,8 +100,6 @@ _REFUSED = [
     ("checked", "`checked` and `unchecked` switch overflow behaviour for a "
                 "region. This subset has one behaviour, C's. Test the "
                 "operands."),
-    ("unchecked", "`unchecked` switches overflow behaviour for a region; "
-                  "this subset has one behaviour, C's."),
     ("lock", "`lock` takes a monitor on an object header, which means every "
              "object carries one. Crust's threading model declares threads "
              "to the compiler instead -- see BAREMETAL_THREADS.md. Use the "
@@ -121,6 +119,10 @@ _REFUSED = [
 #: does lower -- but the C# spelling puts the keyword at the *call site*
 #: too, and nothing reads it yet. Separated from the table above because
 #: the reason is "not yet" rather than "not ever".
+#: Checked after _lower_ref_out: a `ref` / `out` left is an argument to a
+#: method the program does not declare with one (so nothing lowers it);
+#: `in` is a read-only reference, refused until it is told apart from a
+#: by-value parameter.
 _REFUSED_PARAM_MODS = ("ref", "out", "in")
 
 
@@ -1973,6 +1975,8 @@ def _lower_new(text, shared_names):
     def expr(m):
         typ, args = m.group(1), m.group(2).strip()
         base = typ.split("<")[0]
+        if base in _ARENA:
+            return m.group(0)                # the arena's T__alloc
         if base in shared_names:
             return "std::make_shared<%s>(%s)" % (typ, args)
         if args:
@@ -2043,13 +2047,19 @@ def _check_unsupported_forms(text, table, path):
     if m:
         fail(m.start(1), "named arguments (`%s:`) are not in the C# subset. "
              "Pass the arguments in order." % m.group(1))
-    # a generic *method*: `T Name<T>(..)` with a body
-    m = re.search(r"(?<![\w.])[A-Za-z_][\w<>\[\],]*\s+([A-Za-z_]\w*)\s*<[^<>;(){}]*>\s*\([^;{}]*\)\s*\{",
-                  scan)
+    # a generic *method*: `T Name<T>(..)` with a body -- not `new List<T>()
+    # { a, b }`, a collection initializer, whose "type" is the keyword `new`
+    m = None
+    for gm in re.finditer(r"(?<![\w.])([A-Za-z_][\w<>\[\],]*)\s+([A-Za-z_]\w*)\s*"
+                          r"<[^<>;(){}]*>\s*\([^;{}]*\)\s*\{", scan):
+        if gm.group(1) not in ("new", "return", "else", "throw", "await", "yield",
+                               "in", "is", "as", "case"):
+            m = gm
+            break
     if m:
-        fail(m.start(1), "generic method `%s<..>` is not in the C# subset "
+        fail(m.start(2), "generic method `%s<..>` is not in the C# subset "
              "yet; only generic classes are. Make the type a class parameter."
-             % m.group(1))
+             % m.group(2))
     # `Base b = new Derived(..)`: an owned value of the base type cannot hold
     # a derived object -- it would be sliced to the base's fields.
     classes = dict((n, i) for n, i in table.items() if i["kind"] == "class")
@@ -2243,6 +2253,115 @@ def _check_strings(text, path):
             % _at(path, text, m.start()))
 
 
+_CCTOR = "__cctor"
+_LITERAL_INIT = re.compile(r"^\s*(?:-?\s*[\d.]+[fFdDmMlLuU]*|true|false|'[^']*'|null)\s*$")
+
+
+def _lower_static_init(text, table):
+    """Static field initializers and static constructors, run before first
+    use.
+
+    C# runs a class's static initializers -- and then `static C() { .. }`
+    -- before the class is first used. C has no code at startup, so each
+    such class gets `C.__cctor()`: guarded, it runs the initializers in
+    textual order, then the static constructor's body. It is called first
+    thing in every method, constructor and accessor of the class, and of
+    every method that names the class (`C.x`). That is "before first use",
+    which C# allows a class without a static constructor (beforefieldinit);
+    one with a static constructor runs it at its first access exactly in C#,
+    and here possibly sooner. A literal initializer (`static int n = 3;`)
+    stays a C initializer.
+    """
+    import tools.cpprust as cpprust
+    scan = _blank(text)
+    edits = []
+    cctors = {}                         # class -> (brace, close) of its body
+    for kind, name, start, brace, close in _find_types(text):
+        if kind not in ("class", "struct"):
+            continue
+        inits, body_parts = [], []
+        i, seg = brace + 1, brace + 1
+        while i < close:
+            c = scan[i]
+            if c == "{":
+                j = cpprust._match_brace(scan, i)
+                if j is None:
+                    break
+                head = scan[seg:i]
+                sm = re.search(r"(?<![\w.])static\s+%s\s*\(\s*\)\s*$" % re.escape(name), head)
+                if sm:                  # `static C() { body }`: its body
+                    body_parts.append(text[i + 1:j])
+                    edits.append((seg + sm.start(), j + 1,
+                                  "\n" * text[seg + sm.start():j + 1].count("\n")))
+                i = j + 1
+                seg = i
+                continue
+            if c == ";":
+                piece = scan[seg:i]
+                fm = re.match(r"^(\s*(?:\[[^\]]*\]\s*)*(?:(?:public|private|protected|internal|"
+                              r"readonly|new|volatile)\s+)*static\s+(?:readonly\s+)?"
+                              r"[A-Za-z_][\w.<>,\[\]* ]*?\s+([A-Za-z_]\w*)\s*)=(?!=)(.*)$",
+                              piece, re.S)
+                if fm and "const" not in piece.split() and \
+                        not _LITERAL_INIT.match(fm.group(3)):
+                    eq = seg + len(fm.group(1))
+                    inits.append("%s = %s;" % (fm.group(2), text[eq + 1:i].strip()))
+                    edits.append((eq, i, "\n" * text[eq:i].count("\n")))
+                seg = i + 1
+            i += 1
+        if inits or body_parts:
+            cctors[name] = (brace, close)
+            body = " ".join(inits) + " " + " ".join(b.replace("\n", " ") for b in body_parts)
+            edits.append((close, close,
+                          " private static bool __cctor_done; public static void %s() "
+                          "{ if (__cctor_done) return; __cctor_done = true; %s } "
+                          % (_CCTOR, body.strip())))
+    if not cctors:
+        return text
+    # every method / constructor / accessor body: its own class's
+    # initializer, and any class it names
+    alt = "|".join(re.escape(n) for n in sorted(cctors, key=len, reverse=True))
+    for kind, name, start, brace, close in _find_types(text):
+        if kind not in ("class", "struct"):
+            continue
+        i = brace + 1
+        seg = i
+        while i < close:
+            c = scan[i]
+            if c == "{":
+                j = cpprust._match_brace(scan, i)
+                if j is None:
+                    break
+                head = scan[seg:i]
+                is_body = re.search(r"\)\s*(?::\s*(?:base|this)\s*\([^{}]*\))?\s*$", head) \
+                    or re.search(r"(?<![\w.])(?:get|set)\s*$", head)
+                is_cctor = re.search(r"static\s+%s\s*\(\s*\)\s*$" % re.escape(name), head)
+                if is_body and not is_cctor:
+                    calls = []
+                    if name in cctors:
+                        calls.append(name)
+                    for n in sorted(set(re.findall(r"(?<![\w.])(%s)\s*\." % alt,
+                                                   scan[i:j]))):
+                        if n not in calls:
+                            calls.append(n)
+                    if calls:
+                        edits.append((i + 1, i + 1, " " + " ".join(
+                            "%s.%s();" % (n, _CCTOR) for n in calls) + " "))
+                elif not is_body and re.search(r"\{\s*(?:get|set)\b", scan[i:j + 1]):
+                    # a property: descend into its accessors
+                    i += 1
+                    continue
+                i = j + 1
+                seg = i
+                continue
+            if c == ";":
+                seg = i + 1
+            i += 1
+    for a, b, rep in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        text = text[:a] + rep + text[b:]
+    return text
+
+
 def _check_static_fields(text, table, path):
     """Refuse a static field that would need code to run at startup.
 
@@ -2280,13 +2399,10 @@ def _check_static_fields(text, table, path):
             where = _at(path, text, brace + 1 + m.start())
             scalar = typ in _PRIM_UNMANAGED or \
                 (table.get(typ) or {}).get("kind") == "enum"
-            if not scalar and typ != "bool":
-                raise CsError(
-                    "%sstatic field `%s.%s` of type `%s` is not in the C# "
-                    "subset: it has to be constructed before first use, which "
-                    "needs a static constructor, and C has no code that runs "
-                    "at startup. Keep it in an instance, or make it a scalar."
-                    % (where, name, fname, typ))
+            # A non-scalar static is constructed by its class's __cctor
+            # when it has an initializer (_lower_static_init); without one
+            # it starts empty -- where C# would have null.
+            del scalar
             if init is not None and re.search(r"\(|\bnew\b", init):
                 raise CsError(
                     "%sstatic field `%s.%s` is initialised by `%s`, which runs "
@@ -2692,6 +2808,9 @@ def _type_start(look, end):
     i = end
     while i > 0 and look[i - 1] in " \t":
         i -= 1
+    # `Node*[]`: an array of arena references -- the `*` is the element's
+    while i > 0 and look[i - 1] in "* \t":
+        i -= 1
     if i > 0 and look[i - 1] == ">":
         depth, i = 0, i
         while i > 0:
@@ -3080,6 +3199,12 @@ def _type_table(text):
             info["fields"], info["ctors"], info["props"] = _instance_fields(
                 scan[brace + 1:close], name)
             info["inits"] = _has_field_initializer(scan[brace + 1:close])
+            info["statics"] = dict(
+                (m.group(2), re.sub(r"\s+", "", m.group(1)))
+                for m in re.finditer(
+                    r"(?<![\w.])static\s+(?:readonly\s+)?([A-Za-z_][\w.]*"
+                    r"(?:\s*<[^;=(){}]*>)?(?:\s*\[\s*\])*)\s+([A-Za-z_]\w*)\s*[;=]",
+                    scan[brace + 1:close]))
         table[name] = info
     return table
 
@@ -3499,6 +3624,13 @@ def _lower_new_arrays(text, table, path, need):
                        % (base, text[m.start(2):m.end(2)]))
             pos = m.end()
             continue
+        if elem.rstrip("*").strip() in _ARENA:
+            # references to an arena class: n nulls, as in C#
+            out.append(text[pos:m.start()])
+            out.append("%s::__new_array(%s)" % (elem.rstrip("*").strip(),
+                                                 text[m.start(2):m.end(2)]))
+            pos = m.end()
+            continue
         if elem not in _PRIM_UNMANAGED:
             raise CsError(
                 "%s`new %s[n]` is only in the subset for a primitive or enum "
@@ -3711,16 +3843,17 @@ def _helper_text(kind, typ):
         return ("static std::vector<%s> _cs_new_array_%s(int n) { "
                 "std::vector<%s> v(n); int i = 0; if (n < 0) { abort(); } "
                 "while (i < n) { v.push_back(0); i = i + 1; } return v; } "
-                % (ctype, typ, ctype))
+                % (ctype, typ.replace("*", "_ptr"), ctype))
     if kind == "listidx":
         ctype = dict(_TYPES).get(typ, typ)
+        nm = typ.replace("*", "P")      # an arena reference: Node* -> NodeP
         return ("static int _cs_list_index_%s(std::vector<%s> &v, %s x) { "
                 "int i = 0; while (i < v.size()) { if (v[i] == x) { "
                 "return i; } i = i + 1; } return -1; } "
                 "static bool _cs_list_remove_%s(std::vector<%s> &v, %s x) { "
                 "int i = _cs_list_index_%s(v, x); if (i < 0) { return false; } "
                 "v.erase(v.ptr(i)); return true; } "
-                % (typ, ctype, ctype, typ, ctype, ctype, typ))
+                % (nm, ctype, ctype, nm, ctype, ctype, nm))
     if kind == "bytes":
         return ("static std::vector<unsigned char> _cs_blit_bytes_%s(%s *p) { "
                 "std::vector<unsigned char> out(%s); unsigned char *s = (unsigned char *)p; int i = 0; "
@@ -4235,6 +4368,18 @@ def _field_type(table, cls, name):
     return None
 
 
+def _static_field_type(table, cls, name):
+    """C# type of `cls`'s static field `name` (or of a base's), or None."""
+    seen = set()
+    while cls and cls in table and cls not in seen:
+        seen.add(cls)
+        t = (table[cls].get("statics") or {}).get(name)
+        if t:
+            return t
+        cls = (table[cls].get("base") or "").split(",")[0].strip()
+    return None
+
+
 def _expr_type(chain, pos, scan, table, types, depth=0):
     """C# type of the receiver `chain` written at `pos`, or None."""
     if depth > 4:
@@ -4259,6 +4404,13 @@ def _expr_type(chain, pos, scan, table, types, depth=0):
                     typ = _element_type(src)
             if typ is None:
                 typ = _field_type(table, here[0], head)
+            if typ is None:
+                typ = _static_field_type(table, here[0], head)
+        if typ is None and head in table and len(parts) > 1 \
+                and not parts[1].startswith("["):
+            # `Counter.log`: a static field through its type
+            typ = _static_field_type(table, head, parts[1])
+            parts = parts[1:]
     for part in parts[1:]:
         if typ is None:
             return None
@@ -4622,6 +4774,9 @@ def _lower_list_members(text, table, path, need):
                 e = info["base"].strip() or "int"
             elif elem in _PRIM_UNMANAGED:
                 e = elem
+            elif elem.endswith("*") and elem.rstrip("*").strip() in _ARENA:
+                # an arena reference: Equals is reference equality, `==`
+                e = elem
             else:
                 raise CsError(
                     "%s`List<%s>.%s` compares elements with `Equals`. For a "
@@ -4650,7 +4805,7 @@ def _lower_list_members(text, table, path, need):
                               % (elem, tmp, argv[0], recv, tmp)))
                 continue
         edits.append((rstart, close + 1,
-                      form.replace("{r}", recv).replace("{e}", e)
+                      form.replace("{r}", recv).replace("{e}", e.replace("*", "P"))
                       .format(*argv)))
     # `foreach (var x in b.items)`: the C++ half deduces a loop variable from
     # a local's declared type, not through a member chain, so the element
@@ -4813,10 +4968,152 @@ def _strip_attributes(text):
         out.append(" " * (m.end() - m.start()))
         pos = m.end()
     out.append(text[pos:])
+    text = "".join(out)
+    # The same-line form, `[Shared] public class Node`, `[SerializeField]
+    # private int x;`: an attribute directly before a declaration keyword,
+    # where `[` cannot be an index or an array declarator. Only the
+    # whole-line form was dropped, and the same-line `[Shared]` -- which the
+    # shared-name scan does accept -- reached the C.
+    scan = _blank(text)
+    out, pos = [], 0
+    for m in _ATTRIBUTE_INLINE.finditer(scan):
+        found.append(m.group(1))
+        out.append(text[pos:m.start()])
+        out.append(" " * (m.end() - m.start()))
+        pos = m.end()
+    out.append(text[pos:])
     return "".join(out), found
 
 
+_ATTRIBUTE_INLINE = re.compile(
+    r"(?<![\w\]\)])\[\s*([A-Za-z_][\w.]*)\s*(?:\([^()\[\]]*\))?\s*\]"
+    r"(?=[ \t]*(?:public|private|protected|internal|static|readonly|const|"
+    r"virtual|override|abstract|sealed|partial|class|struct|interface|enum|"
+    r"void|new|extern|unsafe)\b)")
+
+
 # ---------------------------------------------------------------------------
+
+#: Arena classes of the translation underway: name -> MaxInstances.
+_ARENA = {}
+
+
+def _lower_arena_classes(text):
+    """`[MaxInstances(N)] class T`: reference semantics from an arena.
+
+    A reference to `T` is a plain `T*`: assignment copies it, `null` is 0,
+    `==` compares references -- C#'s semantics for a class, which the
+    default single-owner `class` does not have. `new T(..)` takes the next
+    of N statically allocated slots (cpprust's `T__alloc`, given the
+    capacity as `__max_instances`), and nothing is freed one at a time:
+    `T__arena_reset()` releases them all. More than N live at once aborts.
+
+    The attribute's own class (`class MaxInstancesAttribute :
+    System.Attribute`, which Unity needs to compile the source) is a marker
+    and is dropped, as is any class deriving from `Attribute`.
+    """
+    import tools.cpprust as cpprust
+    _ARENA.clear()
+    scan = _blank(text)
+    edits = []
+    types = _find_types(text)
+    for kind, name, start, brace, close in types:
+        head = scan[start:brace]
+        if kind == "class" and re.search(r":\s*(?:System\s*\.\s*)?Attribute\b", head):
+            a = start
+            # its own attribute lines above it go too ([AttributeUsage(..)])
+            while True:
+                prev = scan.rfind("\n", 0, a - 1)
+                line = scan[prev + 1:a].strip()
+                if line.startswith("[") and line.endswith("]"):
+                    a = prev + 1
+                else:
+                    break
+            edits.append((a, close + 1, "\n" * text[a:close + 1].count("\n")))
+    for m in re.finditer(r"\[\s*MaxInstances\s*\(\s*(\d+)\s*\)\s*\]", scan):
+        cm = re.compile(r"\bclass\s+([A-Za-z_]\w*)").search(scan, m.end())
+        if cm is None or "{" in scan[m.end():cm.start()]:
+            continue
+        name, n = cm.group(1), int(m.group(1))
+        _ARENA[name] = n
+        edits.append((m.start(), m.end(), " " * (m.end() - m.start())))
+        for kind, tname, start, brace, close in types:
+            if tname == name and kind == "class":
+                # `new T[n]`: n null references -- with the class, so its
+                # body follows the vector's instantiation (a file-top helper
+                # came before it, an incomplete type)
+                edits.append((brace + 1, brace + 1,
+                              " public const int __max_instances = %d; "
+                              "public static List<%s> __new_array(int __n) { "
+                              "List<%s> __arr = new List<%s>(); int __i = 0; "
+                              "while (__i < __n) { __arr.Add(null); __i = __i + 1; } "
+                              "return __arr; } "
+                              % (n, name, name, name)))
+    for a, b, r in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        text = text[:a] + r + text[b:]
+    if not _ARENA:
+        return text
+    alt = "|".join(re.escape(n) for n in sorted(_ARENA, key=len, reverse=True))
+    # a type use: `T x`, `T[] x`, `T F(`, a generic argument, a cast
+    text = cpprust._sub_code(
+        r"(?<![\w.])(%s)(?=(?:\s*\[\s*\])*\s+[A-Za-z_]\w*\s*[;=,)(\[{])" % alt,
+        lambda m: m.group(1) + "*", text)
+    text = cpprust._sub_code(
+        r"(?<=[<,])(\s*)(%s)(?=(?:\s*\[\s*\])*\s*[,>])" % alt,
+        lambda m: m.group(1) + m.group(2) + "*", text)
+    text = cpprust._sub_code(r"\(\s*(%s)\s*\)(?=\s*[\w(])" % alt,
+                             lambda m: "(%s*)" % m.group(1), text)
+    return text
+
+
+def _lower_ref_out(text):
+    """`ref` / `out` parameters: the callee writes the caller's variable.
+
+    A parameter `ref T x` / `out T x` becomes the C++ reference `T &x`,
+    which the C++ half passes as a pointer. At a call to a method the
+    program declares with such a parameter, `ref a` / `out a` is `a`, the
+    variable itself -- C# requires a variable there (a local, a field, an
+    array element), which is what a reference binds to. Every other `ref`
+    is left as written: `MemoryMarshal.CreateSpan(ref x, 1)` is read by its
+    own pass, and an argument to a method nothing declares is refused after
+    this (_REFUSED_PARAM_MODS).
+    """
+    scan = _blank(text)
+    param = re.compile(r"(?<=[(,])(\s*)(?:ref|out)\s+([A-Za-z_][\w.]*(?:\s*<[^()<>]*>)?"
+                       r"(?:\s*\[\s*\])*)\s+([A-Za-z_]\w*)(?=\s*[,)=])")
+    declared = set()
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s*\(([^()]*)\)\s*(?:\{|=>|;)", scan):
+        if param.search("(" + m.group(2) + ")"):
+            declared.add(m.group(1))
+    if not declared:
+        return text
+    text = cpprust._sub_code(param.pattern, lambda m: "%s%s &%s" % (
+        m.group(1), m.group(2), m.group(3)), text)
+    scan = _blank(text)
+    edits = []
+    alt = "|".join(re.escape(n) for n in sorted(declared, key=len, reverse=True))
+    for m in re.finditer(r"(?<![\w])(?:%s)\s*\(" % alt, scan):
+        close = cpprust._match_paren(scan, m.end() - 1)
+        if close is None:
+            continue
+        for a in re.finditer(r"(?<=[(,])(\s*)(?:ref|out)\s+(?=[A-Za-z_(])",
+                             scan[m.end() - 1:close + 1]):
+            k = m.end() - 1 + a.start()
+            edits.append((k, m.end() - 1 + a.end(), a.group(1)))
+    for a, b, rep in sorted(set(edits), reverse=True):
+        text = text[:a] + rep + text[b:]
+    return text
+
+
+def _lower_unchecked(text):
+    """`unchecked { .. }` -> `{ .. }`, `unchecked(e)` -> `(e)`.
+
+    Wrapping is this subset's arithmetic (WRAPV_PRAGMA, and shift counts
+    masked): `unchecked` asks for what the C does anyway, so it is a no-op
+    -- Clipper wraps its 128-bit product halves in it. `checked` still is
+    refused: trapping on overflow would need a test per operation."""
+    return cpprust._sub_code(r"(?<![\w.])unchecked\s*(?=[({])", lambda m: "", text)
+
 
 #: Prefixed to the C csrust emits. C# integer arithmetic wraps; in C
 #: signed overflow is undefined, and an optimiser exploits that -- a loop
@@ -4831,12 +5128,17 @@ WRAPV_PRAGMA = '_Pragma("GCC optimize(\\"wrapv\\")") '
 
 def translate(text, path="<cs>"):
     """Rewrite a C# subset source into the C++ subset. Raises CsError."""
+    text = _lower_arena_classes(text)
+    text = _lower_unchecked(text)
+    text = _lower_ref_out(text)
     # Before a single character is rewritten, so every message names a C#
     # construct at a C# line.
     _check_refusals(text, path)
 
     shared = _find_shared_names(text)
     # Read from the source as written, before any pass renames a type.
+    table = _type_table(text)
+    text = _lower_static_init(text, table)
     table = _type_table(text)
     _check_static_fields(text, table, path)
     text = _lower_ctor_initializers(text, table, path)
