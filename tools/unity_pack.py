@@ -5953,8 +5953,10 @@ def analyze_script(path, text=None, shallow=False):
     elif (re.search(r"(?<![\w.])Keyboard\.current\b", scan)
           or _KEYBOARD_KEY.search(scan)):
         apis.add("Keyboard")
-    if re.search(r"(?:UnityEngine\.)?Debug\.Log\s*\(", scan):
+    if re.search(r"(?:UnityEngine\.)?Debug\.Log(?:Warning|Error)?\s*\(", scan):
         apis.add("Debug.Log")
+    if re.search(r"(?<![\w.])Cursor\s*\.\s*visible\b", scan):
+        apis.add("Cursor.visible")
     if re.search(r"(?<![\w.])print\s*\(", scan):
         apis.add("print")
     if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b", scan):
@@ -6029,9 +6031,11 @@ def analyze_script(path, text=None, shallow=False):
     # The runtime table's APIs are helpers emitted with the string ones.
     if runtime.API_RE.search(scan):
         apis.add("string.+")
-        if re.search(r"\bTime\s*\.\s*(?:realtimeSinceStartup|unscaledTime)",
-                     scan):
+        if re.search(r"\bTime\s*\.\s*(?:realtimeSinceStartup|unscaledTime\b|"
+                     r"timeSinceLevelLoad)", scan):
             apis.add("Time.time")
+        if re.search(r"\bRandom\s*\.\s*insideUnitCircle\b", scan):
+            apis.add("Vector2")
     # A string compared with null is lowered to a string helper, which
     # lives with the scratch slots.
     if re.search(r"(?<![\w.])string\b", scan) and re.search(
@@ -16704,6 +16708,8 @@ def emit_engine(plan, analyses, used_apis):
     p("extern float Time_deltaTime;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
+    if "Cursor.visible" in used_apis:
+        p("extern int Cursor_visible;")
     p("extern float Time_fixedDeltaTime;")
     p("extern int Screen_width;")
     p("extern int Screen_height;")
@@ -20355,6 +20361,7 @@ _UNITY_API_CORE = [
     _B("Time.deltaTime", "Time_deltaTime", "value"),
     _B("Time.fixedDeltaTime", "Time_fixedDeltaTime", "value"),
     _B("Time.time", "Time_time", "value"),
+    _B("Cursor.visible", "Cursor_visible", "value", _UE),
     _B("Screen.width", "Screen_width", "value"),
     _B("Screen.height", "Screen_height", "value"),
     _B("Application.dataPath", "Application_dataPath", "getter", _UE),
@@ -20389,6 +20396,9 @@ _UNITY_API_SCENE = [
 ] + [_B("Input." + m, "Input_" + m) for m in ("GetAxis", "GetButton", "GetKey")]
 
 _UNITY_API_LOG = [
+    _B("Debug.LogWarning", "Debug_Log", "value", _UE),
+    _B("Debug.LogError", "Debug_Log", "value", _UE),
+    _B("Debug.isDebugBuild", "false", "value", _UE),
     _B("Debug.Log", "Debug_Log", "value", _UE),
     _B("print", "Debug_Log", "callee"),
 ]
@@ -22982,7 +22992,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _mark_string_chars(text, string_idents, string_arrays
                               | _string_store_names(plan)
                               | plan.get("_string_lists_local", set()))
-    text = _format_bools(text, _bool_names(cl, body, site),
+    text = _format_bools(text, _bool_names(cl, body, site)
+                         | {"Cursor_visible", "true", "false"},
                          _string_helper_names("bool") | {
                              "_engine_go_active_in_hierarchy",
                              "GameObject_activeSelf",
@@ -23393,6 +23404,9 @@ def emit_data(plan, used_apis=None):
     p("float Time_deltaTime = 0.0166667f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
+    if "Cursor.visible" in used_apis:
+        # ponytail: remembered only; the host window's cursor is not hidden
+        p("int Cursor_visible = 1;")
     godot = plan.get("godot")
     if godot:
         # Godot's physics ticks and gravity: pixels / s^2, y down.
