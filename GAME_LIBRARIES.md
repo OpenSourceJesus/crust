@@ -136,6 +136,41 @@ computed at runtime, a reference crust cannot trace -- keeps the object on the
 CPU. The fallback is always the ordinary, correct path; the optimisation only
 removes work crust can prove is unobserved.
 
+### Marking a tree for the GPU, and the cave benchmark
+
+Proving every condition above automatically is the end goal; to start, the
+user marks a tree: **`GpuHierarchy`**, an empty MonoBehaviour on a root, says
+"the animation and transforms under here may be computed on the GPU -- no
+script reads them". It is an ordinary component, so the project still opens in
+Unity, and crust can still check the simple cases (a marked tree that a script
+*does* read is refused, with the line that reads it). **planned**
+
+`tools/gen_cave_scene.py` generates the benchmark: a Unity project in
+`/tmp/cave` -- worms made of chains of spheres (each segment the child of the
+one before, depth 40 by default), animated by legacy clips whose euler curves
+address every segment by its child path; bats with flapping wings; water
+falling from holes into a pool under blue Light2Ds; red and yellow Light2Ds
+at a big hole top left; every worm and bat root marked `GpuHierarchy`. Sizes
+are flags (`--worms`, `--segments`, `--bats`, `--holes`). **exists**
+
+It packs (1,111 objects, depth 41, 595 draws a frame), and its first result is
+a gap on the CPU side: the worms' curves are not played. Curve paths resolve
+through packed objects only, and a segment that has nothing but a Transform
+(its sphere is a child, so segment scales do not compound down the chain) is
+not packed -- the path stops at `S1`. That was silent; unity_pack now warns,
+naming the curve. So the order is:
+
+1. **The CPU baseline**: transform-only objects that an animation curve's path
+   passes through are packed, so the curves play; measure the per-frame cost
+   of evaluating them and composing depth-40 chains.
+2. **The GPU path** for marked trees: the tree flattened in parent-before-child
+   order (parent index, local position / rotation / scale, curve key ranges),
+   uploaded once; each frame a compute shader evaluates the curves at the
+   frame's time and composes world transforms level by level, and the sprites
+   draw from them. The CPU does nothing for the tree.
+3. **Compare**: the same scene with the mark honoured and ignored, the same
+   transforms (to a tolerance), and the time each takes.
+
 ### More of the same kind
 
 The same view gives other optimisations, each guarded the same way:
