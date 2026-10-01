@@ -205,15 +205,18 @@ def lower_api(text, cl, plan, c_ident):
     """`curve.Evaluate(t)` / `curve.length` on an AnimationCurve field."""
     idn = c_ident(cl["name"])
     for f in cl.get("fields") or []:
-        if f.get("ty") != "AnimationCurve":
+        if f.get("ty") not in ("AnimationCurve", "Curve"):
             continue
+        # Unity's Evaluate, Godot's Sample: the same evaluation (a Godot
+        # Curve is read into the table in godot_pack._godot_curve).
+        meth = "Evaluate" if f["ty"] == "AnimationCurve" else "Sample"
         recv = r"(?<![\w.])(?:this\s*\.\s*)?%s" % re.escape(f["name"])
         handle = "(int)%s_get_%s(i)" % (idn, f["name"])
         text = cs2cpp.code_sub(
-            recv + r"\s*\.\s*Evaluate\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)",
+            recv + r"\s*\.\s*%s\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)" % meth,
             lambda m, h=handle: "AnimationCurve_Evaluate(%s, (float)(%s))"
             % (h, m.group(1).strip()), text)
-        text = cs2cpp.code_sub(recv + r"\s*\.\s*length\b",
+        text = cs2cpp.code_sub(recv + r"\s*\.\s*(?:length|PointCount)\b",
                                lambda m, h=handle: "AnimationCurve_get_length(%s)" % h,
                                text)
     return text

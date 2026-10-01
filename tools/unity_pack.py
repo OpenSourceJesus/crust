@@ -584,6 +584,7 @@ _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
 _PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
 import tools.unity_pack_particles as _parts
 import tools.unity_pack_curves as _curves
+import tools.unity_pack_lines as _lines
 
 
 
@@ -2310,7 +2311,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
             r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
             r"SliderJoint2D|WheelJoint2D|FrictionJoint2D|RelativeJoint2D|"
-            r"TargetJoint2D|ParticleSystem):",
+            r"TargetJoint2D|ParticleSystem|LineRenderer):",
             block)
         if km:
             kind = km.group(1)
@@ -2713,6 +2714,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["light2d"] = _l2d
         if kind == "ParticleSystem":
             rec["particle_system"] = _parts.parse_particle_system(block)
+        if kind == "LineRenderer":
+            try:
+                rec["line_renderer"] = _lines.parse_line_renderer(block)
+            except (_lines.LineError, _curves.CurveError) as e:
+                raise PackError("LineRenderer &%s: %s" % (file_id, e))
         if kind == "Rigidbody2D":
             bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
             mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
@@ -2996,6 +3002,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         rb2d = None
         joints2d = []
         psys = None
+        line_r = None
         lights2d = []
         rb3d = None
         col2d = None
@@ -3082,6 +3089,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 joints2d.append(dict(k["joint2d"], file_id=k.get("file_id")))
             if k.get("particle_system"):
                 psys = dict(k["particle_system"], file_id=k.get("file_id"))
+            if k.get("line_renderer"):
+                line_r = dict(k["line_renderer"], file_id=k.get("file_id"))
             if k.get("light2d"):
                 lights2d.append(dict(k["light2d"]))
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
@@ -3465,6 +3474,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "auto_added": True},
             "joints2d": joints2d,
             "particle_system": psys,
+            "line_renderer": line_r,
             "lights2d": lights2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -5699,6 +5709,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
         return (comp in (plan.get("classes") or {})
                 or comp in _PHYSICS_COMPONENTS or comp in _COLLIDER2D_TYPES
                 or comp in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
+                or comp == "LineRenderer"
                 or comp in _ADDABLE_BUILTINS
                 or comp in _UI_GETCOMPONENT_TYPES
                 or comp in _TRANSFORM_GETCOMPONENT_TYPES
@@ -8085,7 +8096,9 @@ def plan_layouts(objects, analyses, two_d=None):
                     members.append((fname, "uint16_t", 16, "f16"))
                 else:
                     members.append((fname, "float", 32, "f32"))
-            elif ty == "AnimationCurve":
+            elif ty == "LineRenderer":
+                members.append((fname, "int", 32, "idx:LineRenderer"))
+            elif ty in ("AnimationCurve", "Curve"):     # Godot's Curve too
                 # A row of the scene's curve table (unity_pack_curves.py),
                 # full width: it indexes every curve, not this class's.
                 members.append((fname, "int", 32, "idx:AnimationCurve"))
@@ -16970,6 +16983,7 @@ def emit_engine(plan, analyses, used_apis):
         p(plan["_ia_code"])
     _parts.emit_api(p, plan)
     _curves.emit_c(p, plan)
+    _lines.emit_api(p, plan)
     import tools.unity_pack_common as _cmx
     if _cmx.GPU_BATCH[0]:
         import tools.unity_pack_gpu2d as _gfx
@@ -17921,6 +17935,7 @@ def emit_engine(plan, analyses, used_apis):
     if plan.get("godot_custom"):
         _godot.emit_custom_dispatch(p, plan, _c_ident, want_go_tables)
     _parts.emit_sim(p, plan, class_ids, _c_ident, _class_has_position)
+    _lines.emit_owner_pos(p, plan, _c_ident, _class_has_position)
 
     # Live Transform hierarchy (m_Father): world = parent_world + local.
     # SetParent also needs these tables (mutable) even with no authored parents.
@@ -18205,6 +18220,7 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
     _parts.emit_collect(p, plan)
+    _lines.emit_collect(p, plan)
     p("int _engine_draw_nosort = 0; /* the GPU sorts (gles3_batch.h GPU_SORT) */")
     p("int engine_collect_draws(EngineDraw *out, int max) {")
     p("    int n = 0;")
@@ -18220,6 +18236,8 @@ def emit_engine(plan, analyses, used_apis):
             want_live_rt, want_ui, want_destroy)
     if plan.get("particles"):
         p("    _ps_collect(out, &n, max);")
+    if plan.get("lines"):
+        p("    _lr_collect(out, &n, max);")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
@@ -23081,6 +23099,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             lambda m: "_%s_scale_%s[i]" % (_sidn, m.group(1)), text)
     text = _parts.lower_api(text, cl, plan, _c_ident)
     text = _curves.lower_api(text, cl, plan, _c_ident)
+    text = _lines.lower_api(text, cl, plan, _c_ident)
     text = _lower_joint2d_api(text, cl, plan, site)
     text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
@@ -24298,6 +24317,10 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:Rigidbody":
                     parts.append(str(_rb_field_init_index(
                         plan, o, name, "3d")))
+                elif kind == "idx:LineRenderer":
+                    fid = (o.get("object_refs") or {}).get(name)
+                    parts.append(str(int((plan.get("lr_by_file_id") or {})
+                                         .get(str(fid), -1))))
                 elif kind == "idx:AnimationCurve":
                     parts.append(str(int((plan.get("anim_curve_index") or {})
                                          .get((cname, inst_i, name), -1))))
@@ -25296,6 +25319,31 @@ def _csharp_type_site(analyses, tname):
     return None
 
 
+_CS_KEYWORD_TYPES = frozenset((
+    "string", "int", "uint", "long", "ulong", "short", "ushort", "byte",
+    "sbyte", "float", "double", "decimal", "bool", "char", "object"))
+
+
+def _csharp_new_array_site(analyses, tname):
+    """(path, text, idx) of the first `new T[` in the scripts, or None."""
+    pat = re.compile(r"(?<![\w.])new\s+(%s)\s*\[" % re.escape(tname))
+    for a in analyses or []:
+        path = a.get("path") or ""
+        text = None
+        for c in a.get("classes") or []:
+            if c.get("file_text") is not None:
+                text = c["file_text"]
+                break
+        if text is None and path and os.path.isfile(path):
+            text = _read(path)
+        if not text:
+            continue
+        m = pat.search(cs2cpp._blank(text))
+        if m:
+            return path, text, m.start()
+    return None
+
+
 def _emitted_subset_error_to_unity(err, emitted_path="engine.cpp",
                                    analyses=None, source_text=None):
     """Map cpprust subset failures to Unity ``Assets/…(line,col): error …``."""
@@ -25303,6 +25351,17 @@ def _emitted_subset_error_to_unity(err, emitted_path="engine.cpp",
     # engine.cpp: `new List` is not in the C++ subset …
     m = re.search(
         r"`new\s+(\w+)` is not in the C\+\+ subset", err)
+    if m and m.group(1) in _CS_KEYWORD_TYPES:
+        # `new int` refused by the subset is an *array creation* nothing
+        # lowered (`new int[] { 1, 2 }`), not an unknown type: CS0246 here
+        # said `int` could not be found, at the first `int` in any script.
+        site = _csharp_new_array_site(analyses, m.group(1))
+        msg = ("`new %s[..]` is not lowered yet: an array created in an "
+               "expression" % m.group(1))
+        if site:
+            path, text, idx = site
+            return _cs_diag(path, text, idx, "CS8000", msg)
+        return "<cs>(1,1): error CS8000: %s" % msg
     if m:
         tname = m.group(1)
         site = _csharp_type_site(analyses, tname)
@@ -26118,6 +26177,10 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     _build_joint2d_table(plan)
     _parts.build_particle_table(plan)
     _curves.build_table(plan)
+    try:
+        _lines.build_table(plan)
+    except _lines.LineError as e:
+        raise PackError(str(e))
     # Rigidbody2D rotation: a body Box2D-Packed may turn -- not static, not
     # FreezeRotation -- turns its owner's Transform, which then keeps a live
     # rotation (drawn rotated). Unity mode; the glue locked it before.

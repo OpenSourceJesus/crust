@@ -1785,6 +1785,18 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
         return found("C# method call nothing lowered.")
     if rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[A-Z][a-zA-Z0-9]*\s*\("):
         return found("Static method call (`Type.Method(`) nothing lowered.")
+    # The rule above wants a capitalised type, so a static call on C#'s
+    # keyword aliases -- `string.Join(..)`, `int.Parse(..)` -- went through
+    # unflagged, and so did an inline array creation, `new int[] { 1, 2 }`:
+    # both reached the emitted C++, where the subset check failed with an
+    # error mapped to the first `int` in any script.
+    if rec(r"(?<![\w.])(?:string|int|uint|long|ulong|short|ushort|byte|sbyte"
+           r"|float|double|decimal|bool|char|object)\s*\.\s*[A-Z]\w*\s*\("):
+        return found("Static method on a C# keyword type (`string.Join(`) "
+                     "nothing lowered.")
+    if rec(r"(?<![\w.])new\s+[A-Za-z_][\w.]*(?:\s*<[^;{}()]*>)?\s*\["):
+        return found("Array creation (`new T[..]`) in an expression nothing "
+                     "lowered.")
     if rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b"):
         return found("Static field or property (`Type.member`) nothing "
                      "lowered.")

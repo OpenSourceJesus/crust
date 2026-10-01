@@ -2645,5 +2645,122 @@ class TestNothingDropped(unittest.TestCase):
         self.assertIn("emitted as an empty method", err.getvalue())
 
 
+class TestLinesAndCurves(unittest.TestCase):
+    """Line2D, drawn through unity_pack_lines (one quad a segment), and a
+    script's exported Curve, sampled through the AnimationCurve table. A
+    Line2D used to be refused ("not packed yet"); a Curve export, a
+    resource, was too."""
+
+    CURVE = ('[sub_resource type="Curve" id="Curve_w"]\n'
+             '_data = [Vector2(0, 1), 0.0, -0.5, 0, 0, Vector2(1, 0.5), -0.5, 0.0, 0, 0]\n'
+             'point_count = 2\n\n')
+    GRAD = ('[sub_resource type="Gradient" id="Grad_c"]\n'
+            'offsets = PackedFloat32Array(0, 0.5, 1)\n'
+            'colors = PackedColorArray(1, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0.5)\n'
+            'interpolation_mode = %d\n\n')
+
+    def _mini(self, scene_edit, script_edit=None):
+        d = tempfile.mkdtemp(prefix="gpf-lines-")
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.rmtree(d)
+        shutil.copytree(os.path.join(ROOT, "tests", "fixtures", "GodotMini"), d)
+        p = os.path.join(d, "main.tscn")
+        with open(p) as f:
+            text = f.read()
+        with open(p, "w") as f:
+            f.write(scene_edit(text))
+        if script_edit:
+            sp = os.path.join(d, "scripts", "Player.cs")
+            with open(sp) as f:
+                src = f.read()
+            with open(sp, "w") as f:
+                f.write(script_edit(src))
+        return d
+
+    def _draws(self, out):
+        return [list(map(float, l.split()[1:])) for l in run_c(self, out,
+                '#include <stdio.h>\n#include "engine_draw.h"\n'
+                "extern float Time_deltaTime;\n"
+                "int main(int c, char **v) { EngineDraw b[64]; int n, k;\n"
+                "  engine_apply_argv(c, v); Time_deltaTime = 1.f / 60.f;\n"
+                "  engine_tick(); n = engine_collect_draws(b, 64);\n"
+                "  for (k = 0; k < n; k++) if (b[k].tex == -2)\n"
+                '    printf("Q %g %g %g %g %g %g %g %g %g %g %d\\n", b[k].x, b[k].y,\n'
+                "           b[k].half_w, b[k].half_h, b[k].m00, b[k].m10, b[k].r,\n"
+                "           b[k].g, b[k].b, b[k].a, b[k].sorting_order);\n"
+                "  return 0; }\n") if l.startswith("Q ")]
+
+    @needs_cc
+    def test_line2d_draws_as_godot_samples_it(self):
+        import math
+        import tools.unity_pack_curves as uc
+        import tools.unity_pack_lines as ul
+        for mode, rot in ((0, 0.0), (1, 0.0), (0, 0.6)):
+            def edit(text, mode=mode, rot=rot):
+                k = text.index("[node ")
+                return (text[:k] + self.CURVE + self.GRAD % mode + text[k:] +
+                        '\n[node name="Trail" type="Line2D" parent="."]\n'
+                        'position = Vector2(10, 20)\nrotation = %s\n'
+                        'points = PackedVector2Array(0, 0, 100, 0, 100, 50)\n'
+                        'width = 8.0\nwidth_curve = SubResource("Curve_w")\n'
+                        'gradient = SubResource("Grad_c")\nclosed = true\n'
+                        'z_index = 2\n' % rot)
+            quads = self._draws(pack(self, self._mini(edit)))
+            c, sn = math.cos(rot), math.sin(rot)
+            pts = [(10 + c * x - sn * y, 20 + sn * x + c * y)
+                   for x, y in ((0, 0), (100, 0), (100, 50))]
+            width = {"keys": [(0.0, 1.0, 0.0, -0.5), (1.0, 0.5, -0.5, 0.0)],
+                     "pre": 8, "post": 8}
+            # Godot's Constant: the last key at or before the offset
+            g = {"mode": 2 if mode == 1 else 0,
+                 "colors": [(0, 1, 1, 1), (0.5, 0, 1, 0), (1, 1, 0, 0)],
+                 "alphas": [(0, 1), (0.5, 1), (1, 0.5)]}
+            segs = [(pts[i], pts[(i + 1) % 3]) for i in range(3)]
+            lens = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in segs]
+            self.assertEqual(len(quads), 3, (mode, rot))
+            run_ = 0.0
+            for (a, b), L, q in zip(segs, lens, quads):
+                u = (run_ + L / 2) / sum(lens)
+                run_ += L
+                want = ([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, L / 2,
+                         8 * uc.evaluate(width, u) / 2, (b[0] - a[0]) / L,
+                         (b[1] - a[1]) / L] + list(ul.gradient_eval(g, u)) + [2])
+                for got, exp in zip(q, want):
+                    self.assertAlmostEqual(got, exp, places=3, msg=(mode, rot))
+
+    @needs_cc
+    def test_exported_curve_samples(self):
+        import tools.unity_pack_curves as uc
+        ts = [-0.5, 0.0, 0.25, 0.5, 0.8, 1.0, 1.4]
+
+        def scene(text):
+            k = text.index("[node ")
+            text = (text[:k] + '[sub_resource type="Curve" id="Curve_s"]\n'
+                    '_data = [Vector2(0, 0), 0.0, 3.0, 0, 0, Vector2(0.5, 1), '
+                    '1.0, -2.0, 0, 0, Vector2(1, 0.2), 0.0, 0.0, 0, 0]\n'
+                    'point_count = 3\n\n' + text[k:])
+            return text.replace('script = ExtResource("',
+                                'Ramp = SubResource("Curve_s")\nscript = ExtResource("', 1)
+
+        def script(src):
+            src = src.replace("    private int _ticks;",
+                              "    private int _ticks;\n    [Export] public Curve Ramp;")
+            return src.replace(
+                'GD.Print("ready hp=", Hp);',
+                'GD.Print("ready hp=", Hp); GD.Print("n=", Ramp.PointCount);'
+                + "".join(' GD.Print("s=", Ramp.Sample(%rf));' % t for t in ts))
+        out = pack(self, self._mini(scene, script))
+        lines = run_c(self, out, '#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                      "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                      "  Time_deltaTime = 1.f / 60.f; engine_tick(); return 0; }\n")
+        self.assertIn("n=3", lines)
+        ref = {"keys": [(0.0, 0.0, 0.0, 3.0), (0.5, 1.0, 1.0, -2.0), (1.0, 0.2, 0.0, 0.0)],
+               "pre": 8, "post": 8}
+        got = [float(l.split("=", 1)[1]) for l in lines if l.startswith("s=")]
+        self.assertEqual(len(got), len(ts))
+        for t, g in zip(ts, got):
+            self.assertAlmostEqual(g, uc.evaluate(ref, t), places=4, msg=t)
+
+
 if __name__ == "__main__":
     unittest.main()

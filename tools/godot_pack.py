@@ -1132,6 +1132,7 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
             local_scale = (ls[0], ls[1], 1.0)
         fields = {}
         spawn_refs = {}
+        gd_curves = {}
         if node.script:
             cls = _script_class(node.script)
             if node.script not in exports:
@@ -1141,6 +1142,14 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
                     if isinstance(props[k], GdCall) \
                             and props[k].name == "NodePath":
                         continue      # a node reference (_node_refs)
+                    if isinstance(props[k], dict) \
+                            and props[k].get("_type") == "Curve":
+                        # sampled through the curve table (unity_pack_curves)
+                        gd_curves[k] = _godot_curve(
+                            props[k], "%s:%d: error: `%s.%s`" % (
+                                godot_display_path(node.scene), node.line,
+                                node.name, k))
+                        continue
                     if isinstance(props[k], dict) \
                             and props[k].get("_type") == "PackedScene":
                         # a scene to spawn: a template's index, once the
@@ -1174,6 +1183,13 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
                                     xf2[node][1][0], xf2[node][1][1])
                                    if node in xf2 else (1.0, 0.0, 0.0, 1.0)),
         })
+        if gd_curves:
+            objects[-1]["anim_curves"] = gd_curves
+        if node.type == "Line2D":
+            # drawn as the scene's lines are (tools/unity_pack_lines.py)
+            objects[-1]["line_renderer"] = _line2d(
+                node, props, glob, "%s:%d" % (godot_display_path(node.scene),
+                                             node.line))
     drop = _fold_physics(proj, root, objects, obj_of, xf2)
     _link_hierarchy(root, objects, obj_of, xf2, scene_index, drop)
     _fold_sprites(root, objects, obj_of, xf2)
@@ -1354,7 +1370,6 @@ _DRAWING_REFUSED = {
     "AnimatedSprite2D": "AnimatedSprite2D is not packed yet; a Sprite2D "
                         "with hframes / vframes and frame is",
     "Polygon2D": "Polygon2D is not packed yet",
-    "Line2D": "Line2D is not packed yet",
     "MeshInstance2D": "MeshInstance2D is not packed yet",
     "MultiMeshInstance2D": "MultiMeshInstance2D is not packed yet",
     "TileMap": "TileMap is not packed yet",
@@ -1367,6 +1382,83 @@ _DRAWING_REFUSED = {
 
 #: Godot's z_index range (RenderingServer::CANVAS_ITEM_Z_MIN / _MAX).
 _Z_MIN, _Z_MAX = -4096, 4096
+
+
+def _godot_curve(res, where):
+    """A Curve resource -> the AnimationCurve table's record. Each point is
+    `Vector2(x, y), left_tangent, right_tangent, left_mode, right_mode`;
+    sampling is the cubic Bezier with control points a third of the way
+    along at those tangents (Curve::sample), which is Unity's Hermite with
+    in = left, out = right -- and it clamps outside the points."""
+    data = res.get("_data") or []
+    keys = []
+    for i in range(0, len(data) - 4, 5):
+        v = data[i]
+        if not (isinstance(v, GdCall) and v.name == "Vector2"):
+            raise PackError("%s: a Curve this pack cannot read" % where)
+        keys.append((float(v.args[0]), float(v.args[1]),
+                     float(data[i + 1]), float(data[i + 2])))
+    return {"keys": sorted(keys), "pre": 8, "post": 8}
+
+
+def _line2d(node, props, glob, where):
+    """A Line2D node -> the line record unity_pack_lines draws.
+
+    Its points are local to the node: the node's rotation and scale are
+    baked into them here, and its position is followed as it moves. Width is
+    `width` times `width_curve`, color is `gradient` (or `default_color`),
+    both sampled at a point's fraction of the line's length, as Godot's
+    LineBuilder does. A Godot Curve's sample is the cubic Bezier through its
+    points with control points a third of the way along, at the stored
+    tangents -- the same cubic as Unity's Hermite with in / out slopes, so
+    it goes into the AnimationCurve table as is; it clamps outside its
+    points.
+    """
+    import tools.unity_pack_lines as _lines
+    pts = []
+    pv = props.get("points")
+    if isinstance(pv, GdCall) and pv.name == "PackedVector2Array":
+        a = [float(x) for x in pv.args]
+        pts = list(zip(a[0::2], a[1::2]))
+    (m00, m01, _tx), (m10, m11, _ty) = glob[0], glob[1]
+    sx, sy = math.hypot(m00, m10), math.hypot(m01, m11)
+    if abs(sx - sy) > 1e-6:
+        raise PackError("%s: error: `%s`: a Line2D under a non-uniform scale "
+                        "is not packed yet (its width would stretch)"
+                        % (where, node.name))
+    pts = [(m00 * x + m01 * y, m10 * x + m11 * y) for x, y in pts]
+    if len(pts) > _lines.PER_LINE_CAP:
+        raise PackError("%s: error: `%s`: %d points (a line holds %d)"
+                        % (where, node.name, len(pts), _lines.PER_LINE_CAP))
+    width = {"keys": [(0.0, 1.0, 0.0, 0.0)], "pre": 8, "post": 8}
+    wc = props.get("width_curve")
+    if isinstance(wc, dict) and wc.get("_type") == "Curve":
+        width = _godot_curve(wc, "%s: error: `%s`: width_curve" % (where, node.name))
+    col = _color(props.get("default_color"), (0.4, 0.5, 1.0, 1.0))
+    grad = {"mode": 0, "colors": [(0.0,) + col[:3], (1.0,) + col[:3]],
+            "alphas": [(0.0, col[3]), (1.0, col[3])]}
+    g = props.get("gradient")
+    if isinstance(g, dict) and g.get("_type") == "Gradient":
+        mode = int(g.get("interpolation_mode", 0))
+        if mode not in (0, 1) or int(g.get("interpolation_color_space", 0)) != 0:
+            raise PackError("%s: error: `%s`: a gradient interpolated other "
+                            "than linearly or constantly in sRGB is not packed "
+                            "yet" % (where, node.name))
+        offs = g.get("offsets")
+        cols = g.get("colors")
+        offs = [float(x) for x in offs.args] if isinstance(offs, GdCall) else [0.0, 1.0]
+        cs = [float(x) for x in cols.args] if isinstance(cols, GdCall) \
+            else [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        keys = sorted((offs[i],) + tuple(cs[4 * i:4 * i + 4]) for i in range(len(offs)))
+        grad = {"mode": 2 if mode == 1 else 0,
+                "colors": [(k[0], k[1], k[2], k[3]) for k in keys][:8],
+                "alphas": [(k[0], k[4]) for k in keys][:8]}
+    return {"enabled": 1 if props.get("visible", True) else 0,
+            "positions": pts, "world": 0, "baked_xform": True,
+            "loop": 1 if props.get("closed", False) else 0,
+            "mult": float(props.get("width", 10.0)) * sx,
+            "width": width, "gradient": grad,
+            "sorting_order": int(props.get("z_index", 0))}
 
 
 def _color(v, default=(1.0, 1.0, 1.0, 1.0)):
