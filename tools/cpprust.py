@@ -7209,17 +7209,48 @@ def _move_method_receiver(text, at, scopes, type_info):
     else:
         return None
     rend = j + 1
-    while j >= 0 and (text[j].isalnum() or text[j] in "_." or
-                      (text[j] == ">" and j >= 1 and text[j - 1] == "-") or
-                      (text[j] == "-" and text[j + 1:j + 2] == ">")):
-        j -= 1
+    while j >= 0:
+        if text[j].isalnum() or text[j] in "_." or \
+                (text[j] == ">" and j >= 1 and text[j - 1] == "-") or \
+                (text[j] == "-" and text[j + 1:j + 2] == ">"):
+            j -= 1
+        elif text[j] == "]":
+            # `v[i].push_back(std::move(x))`: step back over a subscript
+            depth = 0
+            while j >= 0:
+                if text[j] == "]":
+                    depth += 1
+                elif text[j] == "[":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j -= 1
+            j -= 1
+        else:
+            break
     recv = text[j + 1:rend].strip()
     if not recv:
+        return None
+    # A name followed only by subscripts: resolve the name, then take each
+    # `operator[]`'s element type. Anything else answers as before.
+    subs = 0
+    sm = re.match(r"^([^\[]+)((?:\s*\[[^\[\]]*\])+)$", recv)
+    if sm is not None:
+        recv = sm.group(1).strip()
+        subs = sm.group(2).count("[")
+    elif "[" in recv:
         return None
     found = _named_object(recv.replace("->", "."), scopes, type_info)
     if found is None:
         return None
     cls = found[1]
+    for _k in range(subs):
+        ix = (type_info.get(cls) or {}).get("index")
+        if ix is None:
+            return None
+        cls = _ret_class(ix["ret"], type_info)[0]
+        if cls is None:
+            return None
     info = type_info.get(cls)
     if info is None or meth not in info.get("move_methods", {}):
         return None
@@ -8151,6 +8182,19 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                     break
                 if m.group(1) in fr.vals or m.group(1) in fr.ptrvals:
                     break                    # shadowed by a non-array
+        if m is not None and actype is None:
+            # `v[i] = x` through a class's `operator[]` -- a container whose
+            # element is itself a class: `map<int, vector<int>>`, a vector
+            # of vectors. The element is an object, so the same rules apply
+            # as to an array's. A struct copy here left the container's
+            # element and `x` owning one buffer, freed twice.
+            found = _named_object(m.group(1), scopes, type_info)
+            if found is not None:
+                ix = (type_info.get(found[1]) or {}).get("index")
+                if ix is not None:
+                    ec = _ret_class(ix["ret"], type_info)[0]
+                    if ec is not None and ec in type_info:
+                        actype = ec
         if actype is not None:
             close = _match_bracket(look, m.end() - 1)
             # Statements, not a conditional expression: a match and `None`
@@ -9470,10 +9514,15 @@ def _materialise_ctor_temporaries(text, scan, path):
     if not cls_names:
         return text
     edits, n = [], 0
-    for m in re.finditer(r"(?<![\w.>])(\w+)\s*\(", scan):
-        name = m.group(1)
-        if name not in cls_names:
+    # `Cls(..)` or `Tmpl<args>(..)`. A template's arguments sit between the
+    # name and the parenthesis, so `h.c = Cell<int>();` used not to match,
+    # and reached C as a call to `Cell_int()`, which is a type.
+    for m in re.finditer(r"(?<![\w.>])(\w+)(\s*<(?:[^<>;(){}]|<[^<>;(){}]*>)*>)?"
+                         r"\s*\(", scan):
+        if m.group(1) not in cls_names:
             continue
+        name = m.group(1) + (re.sub(r"\s+", " ", m.group(2).strip())
+                             if m.group(2) else "")
         op = m.end() - 1
         close = _match_paren(scan, op)
         if close is None:
@@ -10241,6 +10290,29 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
         for exactly the same reason `o.node()->name()` does.
         """
         while True:
+            # `v[i][j]`: a subscript chained onto an element that is itself
+            # a class with `operator[]` -- a vector of vectors. Wrapped the
+            # way the first subscript was, and the chain goes on from the
+            # element's type. It used to stop here, leaving a C subscript
+            # on a struct. Only on an addressable expression: the operator
+            # takes its receiver's address.
+            sm = re.match(r"\s*\[", look[pos:])
+            if sm is not None and cls is not None and cls in cinfo \
+                    and cinfo[cls]["index"] is not None \
+                    and (is_ptr or addressable):
+                ob = pos + sm.end() - 1
+                cb = _match_bracket(look, ob)
+                if cb is not None:
+                    ient = cinfo[cls]["index"]
+                    recv = expr if is_ptr else "&%s" % expr
+                    expr = "(*%s(%s, %s))" % (
+                        ient["fn"], recv,
+                        fix_args(text[ob + 1:cb], ient.get("refs") or set(),
+                                 scopes).strip())
+                    cls, is_ptr = _ret_class(ient["ret"], cinfo)
+                    addressable = True
+                    pos = cb + 1
+                    continue
             nm = cont_re.match(look, pos)
             if nm is None:
                 return expr, pos
@@ -10250,9 +10322,19 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             nxt = _match_paren(look, nm.end() - 1)
             if nxt is None:
                 return expr, pos
-            ent = _pick(cinfo[cls]["methods"][meth], text[nm.end():nxt],
-                        cls, meth)
-            args = fix_args(text[nm.end():nxt], ent["refs"], scopes)
+            # `v[i].push_back(std::move(x))`: the move overload, with the
+            # operand passed by reference -- as the receiver-call branch
+            # does. Through the copy overload it became `&({ .. })`, the
+            # address of a statement expression, which C rejects.
+            mvarg = _move_operand(text[nm.end():nxt].strip())
+            if mvarg is not None and \
+                    meth in cinfo[cls].get("move_methods", {}):
+                ent = _pick(cinfo[cls]["move_methods"][meth], mvarg, cls, meth)
+                args = fix_args(mvarg, ent["refs"], scopes)
+            else:
+                ent = _pick(cinfo[cls]["methods"][meth], text[nm.end():nxt],
+                            cls, meth)
+                args = fix_args(text[nm.end():nxt], ent["refs"], scopes)
             if not is_ptr and not addressable:
                 # C cannot take the address of a function *result*, and a
                 # method needs an addressable receiver. A dereference is a
@@ -10516,6 +10598,22 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                     expr = _emit_method_call(expr, cls, is_ptr, meth, args,
                                              ent, cinfo, rconst)
                     rcls, rptr = _ret_class(ent["ret"], cinfo)
+                    # `(*p.get(k))[i]` / `(*p.get(k)).m()`: a call returning
+                    # a pointer to a class, dereferenced in place and used
+                    # as a receiver or subscripted. Nothing chained through
+                    # the closing parenthesis, so the subscript reached C
+                    # applied to a struct. The `(*` already emitted is taken
+                    # back and the chain continues from the object.
+                    if rptr and rcls is not None and len(out) >= 2 \
+                            and out[-2:] == ["(", "*"] \
+                            and look[close + 1:close + 2] == ")" \
+                            and re.match(r"\s*(?:\[|\.)", look[close + 2:]):
+                        del out[-2:]
+                        expr, end = follow("(*%s)" % expr, rcls, False,
+                                           close + 2, meth, addressable=True)
+                        out.append(expr)
+                        i = end
+                        continue
                     expr, end = follow(expr, rcls, rptr, close + 1, meth)
                     out.append(expr)
                     i = end
@@ -10796,7 +10894,18 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                         "`__cpp_copy(%s, ..)`: %s has no copy constructor, "
                         "so an element copy would duplicate whatever it "
                         "owns. Add `%s(const %s &o)`." % (ty, ty, ty, ty))
-                out.append("%s_copy(&%s, %s)" % (ty, parts[1], parts[2]))
+                # A source written `__cpp_addr(T, x)` -- the vector's copy
+                # constructor and assignment -- is `&(x)` for a class, and is
+                # spelled so here. Left as a call for a later pass, it reached
+                # the argument check as an unaddressable call result, and a
+                # vector of an owning class (`vector<vector<int>>`) could not
+                # be copied.
+                src = parts[2].strip()
+                am = re.match(r"^__cpp_addr\s*\(\s*([\w:]+)\s*,(.*)\)$",
+                              src, re.S)
+                if am is not None and am.group(1) == ty:
+                    src = "&(%s)" % am.group(2).strip()
+                out.append("%s_copy(&%s, %s)" % (ty, parts[1], src))
             i = close + 1
             continue
 
@@ -11111,6 +11220,7 @@ void *memcpy(void *, const void *, unsigned long);
 void *memmove(void *, const void *, unsigned long);
 void *memset(void *, int, unsigned long);
 int memcmp(const void *, const void *, unsigned long);
+void abort(void);
 """
 
 _STD_STRING = """
@@ -11339,7 +11449,13 @@ public:
     }
     vector<T> &operator=(const vector<T> &o) {
         if (vd != o.vd) {
-            vn = 0;
+            /* The old elements are destroyed, not just forgotten: `vn = 0`
+               alone leaked each one that owned something -- the inner
+               vectors of a `vector<vector<int>>` assigned over. */
+            while (vn > 0) {
+                vn = vn - 1;
+                __cpp_drop(T, vd[vn]);
+            }
             reserve(o.vn);
             int i = 0;
             while (i < o.vn) {
@@ -11706,7 +11822,9 @@ public:
         pn = pn + 1;
         return pd[i].second;
     }
-    void erase(__cpp_ref(K) k) {
+    /* The number of entries removed, 0 or 1 -- what `std::map::erase(key)`
+       returns, and what C#'s `Dictionary.Remove` reports as a bool. */
+    int erase(__cpp_ref(K) k) {
         pair<K,V> *f;
         int i;
         f = find(k);
@@ -11719,7 +11837,20 @@ public:
                         (unsigned long)((pn - i - 1) * (int)sizeof(pair<K,V>)));
             }
             pn = pn - 1;
+            return 1;
         }
+        return 0;
+    }
+    /* `std::map::at`, without exceptions: the value for `k`, which must be
+       present -- a missing key aborts, where `operator[]` would insert a
+       default and carry on. A pointer, since this subset lowers references
+       to pointers anyway. C#'s `Dictionary` reads through it: its indexer
+       throws on a missing key. */
+    V *at_ptr(__cpp_ref(K) k) {
+        pair<K,V> *f;
+        f = find(k);
+        if (f == pd + pn) { abort(); }
+        return &f->second;
     }
 };
 """
@@ -12545,15 +12676,31 @@ def _std_prelude(text):
         parts.append(_STD_SHARED)
     if "enable_shared_from_this" in wanted:
         parts.append(_STD_ENABLE_SHARED)
-    if "pair" in wanted or "map" in wanted:
+    # `pair` holds both halves by value, so a container used as a `map`
+    # value or a `pair` half has to be complete before the `pair` around it
+    # -- and instantiations are emitted in their templates' order. A
+    # `vector` holds its elements behind a pointer and needs the opposite
+    # only for its methods: `vector<pair<..>>` wants `pair` first. Both
+    # are ordinary, so the order follows the program. `map<int,
+    # vector<int>>` (C#'s `Dictionary<int, List<int>>`) was refused with
+    # `pair` always first; a program that needs both orders at once still
+    # is, by the ordering check.
+    nested = re.search(r"\b(?:map|pair)\s*<[^;{}()]*\b(?:vector|ownvector|set|map)\s*<",
+                       text) is not None
+    if ("pair" in wanted or "map" in wanted) and not nested:
         parts.append(_STD_PAIR)
     if "vector" in wanted:
         parts.append(_STD_VECTOR)
     if "ownvector" in wanted:
         parts.append(_STD_OWNVECTOR)
+    if nested:
+        if "set" in wanted:
+            parts.append(_STD_SET)
+        if "pair" in wanted or "map" in wanted:
+            parts.append(_STD_PAIR)
     if "map" in wanted:
         parts.append(_STD_MAP)
-    if "set" in wanted:
+    if "set" in wanted and not nested:
         parts.append(_STD_SET)
     if "priority_queue" in wanted:
         parts.append(_STD_PRIORITY_QUEUE)

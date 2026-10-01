@@ -414,6 +414,7 @@ def _lower_foreach(text):
     `foreach` is seven characters against `for` plus four spaces, and ` in `
     is four against ` : ` plus one.
     """
+    text = _brace_foreach_bodies(text)
     scan = _blank(text)
     out, pos = [], 0
     for m in re.finditer(r"(?<![\w])foreach\s*\(", scan):
@@ -429,21 +430,70 @@ def _lower_foreach(text):
         out.append(text[m.end():m.end() + kw.start()])
         out.append(":  ")
         pos = m.end() + kw.end()
-        # A body that is one statement, unbraced -- the usual C# spelling
-        # of a short loop -- gets braces: the C++ half needs a block for
-        # the loop variable to live in, and refused it in C++ terms.
-        j = close + 1
-        while j < len(scan) and scan[j] in " \t\r\n":
-            j += 1
-        if j < len(scan) and scan[j] != "{" and \
-                not re.match(r"(?:for|foreach|while|if|do|switch|try)\b", scan[j:]):
-            end = cpprust._stmt_end(scan, j) if hasattr(cpprust, "_stmt_end") else None
-            if end is not None and scan[end] == ";":
-                out.append(text[pos:j])
-                out.append("{ " + text[j:end + 1] + " }")
-                pos = end + 1
     out.append(text[pos:])
     return "".join(out)
+
+
+def _stmt_span_end(scan, j):
+    """Index of the last character of the statement starting at @j, or
+    None: a block, a `;`-terminated statement, or a `for` / `foreach` /
+    `while` / `if` (with its `else`) head followed by its own statement."""
+    n = len(scan)
+    while j < n and scan[j] in " \t\r\n":
+        j += 1
+    if j >= n:
+        return None
+    if scan[j] == "{":
+        return cpprust._match_brace(scan, j)
+    hm = re.match(r"(for|foreach|while|if)\s*\(", scan[j:])
+    if hm:
+        pc = cpprust._match_paren(scan, j + hm.end() - 1)
+        if pc is None:
+            return None
+        end = _stmt_span_end(scan, pc + 1)
+        if end is not None and hm.group(1) == "if":
+            em = re.match(r"\s*else\b", scan[end + 1:])
+            if em:
+                end = _stmt_span_end(scan, end + 1 + em.end())
+        return end
+    if re.match(r"(?:do|switch|try)\b", scan[j:]):
+        return None
+    end = cpprust._stmt_end(scan, j)
+    if end is None or scan[end] != ";":
+        return None
+    return end
+
+
+def _brace_foreach_bodies(text):
+    """Braces around every unbraced `foreach` body -- the usual C# spelling
+    of a short loop, `foreach (int v in xs) sum += v;`, and of a nested one,
+    `foreach (var r in g) foreach (int x in r) s += x;`.
+
+    The C++ half's range-`for` needs a block for its loop variable: an
+    unbraced single statement was refused in C++ terms, and a body that was
+    itself an unbraced loop lost that loop's head, so its variable came out
+    undeclared. Outermost first, a statement at a time, until none is left.
+    """
+    while True:
+        scan = _blank(text)
+        done = True
+        for m in re.finditer(r"(?<![\w])foreach\s*\(", scan):
+            close = cpprust._match_paren(scan, m.end() - 1)
+            if close is None:
+                continue
+            j = close + 1
+            while j < len(scan) and scan[j] in " \t\r\n":
+                j += 1
+            if j >= len(scan) or scan[j] == "{":
+                continue
+            end = _stmt_span_end(scan, j)
+            if end is None:
+                continue
+            text = text[:j] + "{ " + text[j:end + 1] + " }" + text[end + 1:]
+            done = False
+            break
+        if done:
+            return text
 
 
 class ObjectModel(object):
@@ -1878,6 +1928,11 @@ def _lower_generic_classes(text):
     return "".join(out)
 
 
+#: A generic argument list, nested up to three deep: `<int>`,
+#: `<Box<int>>`, `<Pair<int, Box<long>>>`.
+_ANGLES = r"<(?:[^;<>]|<(?:[^;<>]|<[^;<>]*>)*>)*>"
+
+
 def _lower_new(text, shared_names):
     """`T x = new T(args);` -> `T x(args);` (no temporary to copy).
 
@@ -1895,10 +1950,12 @@ def _lower_new(text, shared_names):
             return "%s %s(%s);" % (typ, name, args)
         return "%s %s;" % (typ, name)
 
-    # `Box<int>` needs the angle list in the type.
+    # `Box<int>` needs the angle list in the type -- nested to three levels,
+    # `Box<Box<int>>`: a flat `<[^<>]*>` stopped at the inner `<`, and the
+    # nested `new` fell through to a heap allocation of a stack value.
     text = cpprust._sub_code(
-        r"(?<![\w.])([\w:]+(?:\s*<[^;<>]*>)?)\s+(\w+)\s*=\s*"
-        r"new\s+\1\s*\(([^)]*)\)\s*;",
+        r"(?<![\w.])([\w:]+(?:\s*%s)?)\s+(\w+)\s*=\s*"
+        r"new\s+\1\s*\(([^)]*)\)\s*;" % _ANGLES,
         decl, text)
 
     def expr(m):
@@ -1911,7 +1968,7 @@ def _lower_new(text, shared_names):
         return "%s()" % typ
 
     return cpprust._sub_code(
-        r"(?<![\w.])new\s+([\w:]+(?:\s*<[^;<>]*>)?)\s*\(([^)]*)\)",
+        r"(?<![\w.])new\s+([\w:]+(?:\s*%s)?)\s*\(([^)]*)\)" % _ANGLES,
         expr, text)
 
 
@@ -2000,6 +2057,159 @@ def _check_unsupported_forms(text, table, path):
                  "of the object. Declare it as `%s`, or mark `%s` "
                  "`[Shared]`." % (m.group(1), m.group(2), m.group(1),
                                   m.group(1), m.group(2), m.group(1)))
+
+
+def _borrow_interface_params(text, table, path):
+    """`int Total(IShape a)` -> `int Total(IShape &a)`.
+
+    A C# interface is a reference type: passing `q` to an `IShape`
+    parameter lends the object, it neither copies nor moves it. Spelled by
+    value, the parameter was an abstract struct the C compiler could not
+    convert a `Sq` to. A reference says what C# means -- a borrow -- and the
+    C++ half binds a derived object to it and dispatches through the vtable.
+
+    An interface-typed local, field or return is refused: an owned value of
+    an interface type would have to hold an object whose size it does not
+    know.
+    """
+    ifaces = sorted((n for n, i in table.items() if i["kind"] == "interface"),
+                    key=len, reverse=True)
+    if not ifaces:
+        return text
+    alt = "|".join(re.escape(n) for n in ifaces)
+    scan = _blank(text)
+    edits = []
+    # a method head: `Name(params) {` or `Name(params) =>`
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s*\(", scan):
+        close = cpprust._match_paren(scan, m.end() - 1)
+        if close is None or not re.match(r"\s*(\{|=>|;)", scan[close + 1:]):
+            continue
+        prev = scan[:m.start()].rstrip()
+        if not prev or not (prev[-1].isalnum() or prev[-1] in "_>]"):
+            continue                       # a call, not a declaration
+        if re.search(r"(?<![\w.])(?:new|return|else|await)$", prev):
+            continue
+        for p in re.finditer(r"(?:^|,)\s*(%s)(\s+)([A-Za-z_]\w*)\s*(?=,|$)" % alt,
+                             scan[m.end():close]):
+            pos = m.end() + p.end(2)
+            edits.append((pos, pos, "&"))
+    for a, b, rep in sorted(edits, reverse=True):
+        text = text[:a] + rep + text[b:]
+    # storage of an interface type
+    scan = _blank(text)
+    m = re.search(r"(?<![\w.&])(%s)\s+([A-Za-z_]\w*)\s*(=(?!=)|;|\(|\{)" % alt, scan)
+    while m is not None:
+        word = m.group(3)
+        before = scan[:m.start()].rstrip()
+        if before.endswith(("interface", "class", "struct", ":", ",", "new", "typeof", "<")):
+            m = re.search(r"(?<![\w.&])(%s)\s+([A-Za-z_]\w*)\s*(=(?!=)|;|\(|\{)" % alt,
+                          scan, m.end())
+            continue
+        what = "return type" if word in ("(", "{") else "local or field"
+        raise CsError(
+            "%s`%s %s`: an interface-typed %s is not in the C# subset. Owned "
+            "values have one concrete type here, so an `%s` can only be "
+            "borrowed: take it as a parameter, or use the concrete class."
+            % (_at(path, text, m.start()), m.group(1), m.group(2), what,
+               m.group(1)))
+    return text
+
+
+def _lower_ctor_initializers(text, table, path):
+    """Constructor initializer lists, from C#'s two sources of them.
+
+    `: base(args)` names the base class's constructor; C++ spells it with
+    the base's name, `: Base(args)`. It passed through as `: base(args)`,
+    which the C++ half could not read, so it looked for a base constructor
+    taking no arguments.
+
+    A field initialized with arguments, `Inner i = new Inner(3);`, became
+    `Inner i(3);` -- direct-initialization, which C++ does not allow on a
+    member, and which the C++ half refuses for a class-typed one anyway,
+    asking for the initializer list instead. So it goes there: `: i(3)` in
+    every constructor of the class (one is made when there is none), in
+    declaration order -- C#'s order, and C++'s for members. C# runs field
+    initializers before the base constructor; C++ constructs bases first.
+    The difference shows only if an initializer's arguments read the base,
+    which C# forbids (an initializer cannot use `this`).
+
+    `: this(args)` is refused: the C++ half has no delegating constructors.
+    """
+    scan = _blank(text)
+    edits = []
+    for kind, name, _start, brace, close in _find_types(text):
+        if kind not in ("class", "struct"):
+            continue
+        info = table.get(name) or {}
+        bases = [b.strip() for b in (info.get("base") or "").split(",") if b.strip()]
+        base_cls = None
+        for b in bases:
+            bk = (table.get(re.sub(r"<.*", "", b)) or {}).get("kind")
+            if bk in ("class", "struct") or (bk is None and b == bases[0]
+                                             and not re.match(r"I[A-Z]", b)):
+                base_cls = b
+                break
+        # depth-0 pieces of the body
+        inits, ctors = [], []
+        i = brace + 1
+        seg = i
+        while i < close:
+            c = scan[i]
+            if c == "{":
+                j = cpprust._match_brace(scan, i)
+                if j is None:
+                    break
+                head = scan[seg:i]
+                cm = re.search(r"(?<![\w.])%s\s*\(" % re.escape(name), head)
+                if cm is not None and not re.search(r"(?:new|=|\.)\s*$",
+                                                    head[:cm.start()]):
+                    pclose = cpprust._match_paren(scan, seg + cm.end() - 1)
+                    if pclose is not None and pclose < i:
+                        ctors.append((pclose, i))
+                i = j + 1
+                seg = i
+                continue
+            if c == ";":
+                piece = scan[seg:i]
+                fm = re.match(r"^(\s*(?:(?:public|private|protected|internal|readonly)\s+)*)"
+                              r"([A-Za-z_][\w.]*(?:\s*<[^;=(){}]*>)?)\s+([A-Za-z_]\w*)\s*"
+                              r"=\s*new\s+\2\s*\((.*)\)\s*$", piece, re.S)
+                if fm is not None and fm.group(4).strip() and "static" not in piece.split():
+                    tk = (table.get(re.sub(r"<.*", "", fm.group(2).strip())) or {}).get("kind")
+                    if tk in ("class", "struct"):
+                        inits.append((fm.group(3), text[seg + fm.start(4):seg + fm.end(4)]))
+                        eq = seg + piece.index("=", fm.end(3))
+                        edits.append((eq, i, ""))
+                seg = i + 1
+            i += 1
+        for pclose, obrace in ctors:
+            between = scan[pclose + 1:obrace]
+            add = ["%s(%s)" % (f, a) for f, a in inits]
+            tm = re.match(r"\s*:\s*this\s*\(", between)
+            if tm:
+                raise CsError(
+                    "%s`: this(..)` constructor chaining is not in the C# subset "
+                    "yet: the C++ half has no delegating constructors. Move the "
+                    "shared part into a method both constructors call."
+                    % _at(path, text, pclose + 1 + tm.start()))
+            bm = re.match(r"\s*:\s*base\s*\(", between)
+            if bm:
+                if base_cls is None:
+                    raise CsError("%s`: base(..)` in `%s`, which has no base "
+                                  "class." % (_at(path, text, pclose), name))
+                kw = pclose + 1 + between.index("base")
+                edits.append((kw, kw + 4, base_cls))
+                if add:
+                    bclose = cpprust._match_paren(scan, pclose + 1 + bm.end() - 1)
+                    edits.append((bclose + 1, bclose + 1, ", " + ", ".join(add)))
+            elif add:
+                edits.append((pclose + 1, pclose + 1, " : " + ", ".join(add)))
+        if inits and not ctors:
+            edits.append((close, close, " public %s() : %s { } " % (
+                name, ", ".join("%s(%s)" % (f, a) for f, a in inits))))
+    for a, b, rep in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        text = text[:a] + rep + text[b:]
+    return text
 
 
 def _check_strings(text, path):
@@ -4041,7 +4251,11 @@ def _expr_type(chain, pos, scan, table, types, depth=0):
         if typ is None:
             return None
         if part.startswith("["):
-            typ = _element_type(typ)
+            # Indexing a `Dictionary` yields its value -- `d[k].Add(x)` on a
+            # `Dictionary<int, List<int>>`. Not in `_element_type`, which a
+            # `foreach` also asks, and which over a dictionary yields a pair.
+            kv = _dict_types(typ)
+            typ = kv[1] if kv is not None else _element_type(typ)
         else:
             typ = _field_type(table, typ, part)
     return typ
@@ -4142,6 +4356,169 @@ def _list_property_storage(text, table):
     for start, end, repl in sorted(edits, reverse=True):
         text = text[:start] + repl + text[end:]
     return text
+
+
+def _dict_types(t):
+    """(K, V) for a `Dictionary<K, V>` / `SortedList<K, V>` type, in its C#
+    or its lowered `std::map` spelling; None otherwise."""
+    t = _norm_type(t)
+    m = re.match(r"^(?:System\.Collections\.Generic\.|std::)?"
+                 r"(?:Dictionary|SortedList|map)<(.+)>$", t)
+    if m is None:
+        return None
+    args = m.group(1)
+    depth = 0
+    for i, c in enumerate(args):
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+        elif c == "," and depth == 0:
+            return args[:i].strip(), args[i + 1:].strip()
+    return None
+
+
+def _receiver_at(scan, start):
+    """(start, chain) of the receiver ending just before @start (a `.` or a
+    `[`): identifiers and dots, or None."""
+    seg = scan[:start].rstrip()
+    cm = _CHAIN.search(seg)
+    if cm is None:
+        return None
+    rstart = cm.start()
+    if rstart > 0 and scan[rstart - 1] in ".>]":
+        return None                        # part of a longer chain
+    return rstart, cm.group(0)
+
+
+#: `Dictionary` members this lowering has, for the refusal's list.
+_DICT_MEMBERS = ("Count", "ContainsKey", "Remove", "Clear", "Add")
+
+
+def _lower_dict_members(text, table, path):
+    """`Dictionary<K, V>` indexing and members, with C#'s semantics.
+
+    The indexer *reads* through `at_ptr`, which aborts on a missing key --
+    C# throws `KeyNotFoundException`. Through `operator[]`, as before, a
+    read of a missing key inserted a default and returned it: `d[7]` was
+    silently 0, and `d[5] += 3` silently 3. Only a plain assignment,
+    `d[k] = v`, sets (inserting or overwriting) through `operator[]`; a
+    compound one, `d[k] += v`, and `d[k]++` read first, so they go through
+    `at_ptr` too, which is still an lvalue.
+
+    `Count`, `ContainsKey`, `Remove` (which reports whether a key went),
+    `Clear`, and `Add`, which throws in C# when the key is already there and
+    aborts here. Any other member is refused, rather than reaching C as a
+    struct member that does not exist.
+    """
+    types = _find_types(text)
+
+    def dict_of(scan, rstart, chain):
+        # `types` as bound when called: rebound below after the indexer edits
+        typ = _expr_type(chain, rstart, scan, table, types)
+        return _dict_types(typ) if typ else None
+
+    # the indexer first, then the members, each over a fresh scan
+    scan = _blank(text)
+    edits = []
+    for m in re.finditer(r"\[", scan):
+        rc = _receiver_at(scan, m.start())
+        if rc is None:
+            continue
+        rstart, chain = rc
+        if dict_of(scan, rstart, chain) is None:
+            continue
+        close = _match_paren_or_bracket(scan, m.start())
+        if close is None:
+            continue
+        if re.match(r"\s*=(?!=)", scan[close + 1:]):
+            continue                       # `d[k] = v`: a set
+        recv = _storage_chain(text[rstart:m.start()].strip(), rstart, scan,
+                              table, types)
+        key = text[m.start() + 1:close]
+        dot = re.match(r"\s*\.", scan[close + 1:])
+        if dot is not None:
+            # `d[k].Add(x)`: the value is a receiver. `p->m()` rather than
+            # `(*p).m()`, which is the same in C++ and the form the C++ half
+            # chains a call through.
+            edits.append((rstart, close + 1 + dot.end(),
+                          "%s.at_ptr(%s)->" % (recv, key)))
+        else:
+            edits.append((rstart, close + 1, "(*%s.at_ptr(%s))" % (recv, key)))
+    for a, b, rep in sorted(edits, reverse=True):
+        text = text[:a] + rep + text[b:]
+
+    # the edits above moved every later position: find the types again
+    types = _find_types(text)
+    scan = _blank(text)
+    edits = []
+    for m in re.finditer(r"\.\s*([A-Z]\w*)\b", scan):
+        member = m.group(1)
+        rc = _receiver_at(scan, m.start())
+        if rc is None:
+            continue
+        rstart, chain = rc
+        kv = dict_of(scan, rstart, chain)
+        if kv is None:
+            continue
+        recv = _storage_chain(text[rstart:m.start()].strip(), rstart, scan,
+                              table, types)
+        after = scan[m.end():]
+        if member == "Count":
+            edits.append((rstart, m.end(), "%s.size()" % recv))
+            continue
+        call = re.match(r"\s*\(", after)
+        if member not in _DICT_MEMBERS or call is None:
+            raise CsError(
+                "%s`Dictionary.%s` is not in the C# subset yet. The members "
+                "that are: %s, and indexing." % (
+                    _at(path, text, m.start()), member,
+                    ", ".join("`%s`" % x for x in _DICT_MEMBERS)))
+        open_p = m.end() + call.end() - 1
+        close_p = cpprust._match_paren(scan, open_p)
+        if close_p is None:
+            continue
+        args = text[open_p + 1:close_p]
+        if member == "ContainsKey":
+            rep = "(%s.count(%s) != 0)" % (recv, args)
+        elif member == "Remove":
+            rep = "(%s.erase(%s) != 0)" % (recv, args)
+        elif member == "Clear":
+            rep = "%s.clear()" % recv
+        else:  # Add
+            parts = _split_top_commas(args)
+            if len(parts) != 2:
+                continue
+            rep = ("{ %s __dk = %s; if (%s.count(__dk) != 0) { abort(); } "
+                   "%s[__dk] = %s; }" % (kv[0], parts[0].strip(), recv, recv,
+                                         parts[1].strip()))
+            # a statement: swallow its `;`
+            semi = re.match(r"\s*;", scan[close_p + 1:])
+            if semi is None:
+                raise CsError("%s`Dictionary.Add` is a statement; its result "
+                              "is void." % _at(path, text, m.start()))
+            edits.append((rstart, close_p + 1 + semi.end(), rep))
+            continue
+        edits.append((rstart, close_p + 1, rep))
+    for a, b, rep in sorted(edits, reverse=True):
+        text = text[:a] + rep + text[b:]
+    return text
+
+
+def _split_top_commas(s):
+    parts, depth, cur = [], 0, []
+    for c in s:
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    parts.append("".join(cur))
+    return parts
 
 
 def _lower_list_members(text, table, path, need):
@@ -4450,6 +4827,7 @@ def translate(text, path="<cs>"):
     # Read from the source as written, before any pass renames a type.
     table = _type_table(text)
     _check_static_fields(text, table, path)
+    text = _lower_ctor_initializers(text, table, path)
     text = _zero_scalar_fields(text, table)
     text = _mask_shifts(text)
     _check_declaration_order(text, table, shared, path)
@@ -4480,8 +4858,10 @@ def translate(text, path="<cs>"):
     text = _lower_memory_marshal(text, table, path, need)
     _check_strings(text, path)
     _check_unsupported_forms(text, table, path)
+    text = _borrow_interface_params(text, table, path)
     # Before initializers: `xs.Add(new T { .. })` becomes a declaration.
     text = _lower_list_members(text, table, path, need)
+    text = _lower_dict_members(text, table, path)
     text = _list_property_storage(text, table)
     text = _qualify_type_named_fields(text, table)
     text = _lower_static_calls(text, table)
