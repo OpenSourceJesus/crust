@@ -4078,7 +4078,8 @@ def _ast_find_getcomponent_chains(text):
         })
     # Standalone this.GetComponent<T>() / GetComponent<T>() — not recv.GetComponent.
     for m in re.finditer(
-            r"(?:(?<![\w.])this\s*\.\s*)?(?<![\w.])GetComponent\s*<", scan):
+            r"(?:(?<![\w.])this\s*\.\s*)?(?<![\w.])GetComponent(InParent)?\s*<",
+            scan):
         # Skip if already covered as part of a Find chain.
         if any(c["start"] <= m.start() < c["end"] for c in out):
             continue
@@ -4113,9 +4114,11 @@ def _ast_find_getcomponent_chains(text):
             "field": field,
             "axis": axis,
             "on_this": True,
+            "in_parent": bool(m.group(1)),
         })
     # recv.GetComponent<T>() — GO / component handle is already an index.
-    for m in re.finditer(r"(?<![\w.])(\w+)\s*\.\s*GetComponent\s*<", scan):
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\.\s*GetComponent(InParent)?\s*<",
+                         scan):
         recv = m.group(1)
         if recv == "this":
             continue
@@ -4153,6 +4156,7 @@ def _ast_find_getcomponent_chains(text):
             "axis": axis,
             "recv": recv,
             "on_this": False,
+            "in_parent": bool(m.group(2)),
         })
     out.sort(key=lambda c: c["start"], reverse=True)
     return out
@@ -5606,6 +5610,12 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
             idx = ch.get("start") or 0
         _raise_cs_at_site(site, idx, "CS0246", _CS0246 % comp)
 
+    def _in_parent(ch, repl):
+        if not ch.get("in_parent"):
+            return repl
+        return repl.replace("GameObject_GetComponent_",
+                            "GameObject_GetComponentInParent_")
+
     for ch in chains:
         comp = ch.get("component")
         field = ch.get("field")
@@ -5631,7 +5641,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
             else:
                 repl = "GameObject_GetComponent_%s(%s)" % (
                     _c_ident(comp), go_expr)
-            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            text = text[:ch["start"]] + _in_parent(ch, repl) + text[ch["end"]:]
             continue
 
         find_args = ch.get("find_args") or ""
@@ -5654,7 +5664,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                 else:
                     repl = "GameObject_GetComponent_%s(%s)" % (
                         _c_ident(comp), go_expr)
-            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            text = text[:ch["start"]] + _in_parent(ch, repl) + text[ch["end"]:]
             continue
         if not comp:
             repl = go_expr
@@ -5672,7 +5682,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                     "_up_go < 0 ? (%s, -1) "
                     ": GameObject_GetComponent_%s(_up_go); })"
                     % (go_expr, nre, _c_ident(comp)))
-        text = text[:ch["start"]] + repl + text[ch["end"]:]
+        text = text[:ch["start"]] + _in_parent(ch, repl) + text[ch["end"]:]
     return text
 
 
@@ -5724,6 +5734,9 @@ def analyze_script(path, text=None, shallow=False):
             getcomponent_types.add(ch["component"])
             if ch["component"] in _PHYSICS_COMPONENTS:
                 apis.add(ch["component"])
+            if ch.get("in_parent"):
+                apis.add("GetComponentInParent<%s>" % ch["component"])
+                apis.add("transform.parent")
         elif ch.get("on_this"):
             apis.add("GetComponent")
     for m in re.finditer(
@@ -17399,6 +17412,22 @@ def emit_engine(plan, analyses, used_apis):
     _emit_engine_get_components_in_children(
             add_types, getcomponentsinchildren_types, p, plan, want_destroy, want_gcic,
             want_go_tables, want_ui)
+
+    # GetComponentInParent<T>: the GO itself, then each ancestor.
+    for tname in sorted(a.split("<", 1)[1][:-1] for a in used_apis
+                        if a.startswith("GetComponentInParent<")):
+        idn = _c_ident(tname)
+        p("static int GameObject_GetComponentInParent_%s(int go) {" % idn)
+        p("    int ci, guard;")
+        p("    for (guard = 0; go >= 0 && guard < _engine_go_count + 2;"
+          " guard = guard + 1) {")
+        p("        ci = GameObject_GetComponent_%s(go);" % idn)
+        p("        if (ci >= 0) return ci;")
+        p("        go = Transform_get_parent(go);")
+        p("    }")
+        p("    return -1;")
+        p("}")
+        p("")
 
     # Object.FindObjectOfType / Type.Instance — after GO maps (and optional
     # active-hierarchy helpers when want_ui).
