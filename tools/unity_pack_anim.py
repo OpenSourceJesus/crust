@@ -488,6 +488,14 @@ def _build_animation_tables(plan):
             if tr["path"]:
                 hit = _resolve_anim_child_path(owner, tr["path"], plan)
                 if not hit:
+                    # Not silently: a path through an object with nothing
+                    # but a Transform (not packed as an instance) does not
+                    # resolve, and the curve was dropped without a word.
+                    sys.stderr.write(
+                        "unity_pack: warning: animation curve on %r of %r is not "
+                        "played: the path does not reach a packed object (an "
+                        "object with only a Transform on the way is not packed)\n"
+                        % (tr["path"], (owner or {}).get("name")))
                     continue
                 tc, tinst, _to = hit
             else:
