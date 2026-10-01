@@ -6407,6 +6407,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 body.append("if (p) { %s(p%s); }"
                             % (ent["fn"], "".join(", " + f for f in fwd)))
             body.append("return p;")
+            # declared with the methods: one of them may `new` its own
+            # class (a pool's Create), and the definition comes after them --
+            # undeclared, C took it for an `int` function and they conflicted
+            mprotos.append("%s %s *%s(%s);" % (stor, cname, alloc, cparams or "void"))
             out.append("%s %s *%s(%s) { %s }"
                        % (stor, cname, alloc, cparams or "void",
                           " ".join(body)))

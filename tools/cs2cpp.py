@@ -3256,6 +3256,8 @@ def _is_plain_struct(name, table):
     runs, and a class with none has nothing else to run. No base class,
     which would bring a vtable pointer the zeroing must not clear.
     """
+    if name in _ARENA:
+        return False     # a reference to an arena slot, never a value to zero
     info = table.get(name)
     if info is None or info["ctors"] or info.get("inits"):
         return False
@@ -4819,6 +4821,13 @@ def _lower_list_members(text, table, path, need):
                                         types))
         if elem:
             edits.append((m.start(1), m.end(1), elem))
+    # An edit inside another's span -- `xs.Count` in the argument of
+    # `xs.RemoveAt(xs.Count - 1)` -- waits for the next pass (the caller
+    # repeats to a fixed point): applied by position under the outer one,
+    # both corrupted the text (an extra `)`).
+    edits = [e for e in edits if not any(
+        o is not e and o[0] <= e[0] and e[1] <= o[1] and (o[0], o[1]) != (e[0], e[1])
+        for o in edits)]
     for start, end, repl in sorted(edits, reverse=True):
         text = text[:start] + repl + text[end:]
     return text
@@ -5174,7 +5183,14 @@ def translate(text, path="<cs>"):
     _check_unsupported_forms(text, table, path)
     text = _borrow_interface_params(text, table, path)
     # Before initializers: `xs.Add(new T { .. })` becomes a declaration.
-    text = _lower_list_members(text, table, path, need)
+    # To a fixed point: a member inside another's argument -- the
+    # `xs.Count` of `xs.RemoveAt(xs.Count - 1)` -- overlaps the outer call's
+    # edit and waits for the next pass. It reached C as `.Count`.
+    for _ in range(8):
+        lowered = _lower_list_members(text, table, path, need)
+        if lowered == text:
+            break
+        text = lowered
     text = _lower_dict_members(text, table, path)
     text = _list_property_storage(text, table)
     text = _qualify_type_named_fields(text, table)

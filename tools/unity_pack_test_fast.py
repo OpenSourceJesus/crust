@@ -711,5 +711,60 @@ class TestOtherPosition(unittest.TestCase):
         self.assertIn("t 1 0 m 0.25", lines)
 
 
+
+DESTRUCTION = os.environ.get("UNITY_2D_DESTRUCTION") or os.path.join(
+    os.path.dirname(ROOT), "Unity-2D-Destruction")
+needs_destruction = unittest.skipUnless(
+    os.path.isdir(DESTRUCTION),
+    "Unity-2D-Destruction not found: clone https://github.com/crustos/"
+    "Unity-2D-Destruction beside crust (or set UNITY_2D_DESTRUCTION)")
+
+
+@needs_destruction
+class TestUnity2DDestruction(unittest.TestCase):
+    """The crust port of Unity-2D-Destruction (its runtime scripts; the
+    Editor code is not part of it). The files that translate stay
+    translating; every other one is refused with a diagnostic, never a
+    crash of the translator -- so the port's frontier is measured, and
+    moves only forward. See UNITY_PACK.md, "Unity-2D-Destruction"."""
+
+    BASE = "unity2DDestruction/Assets/2D_Destruction"
+    TRANSLATE = (
+        "Scripts/MaxInstancesAttribute.cs",
+        "Unity-delaunay/Delaunay/ICoord.cs",
+        "Unity-delaunay/Delaunay/LR.cs",
+        "Unity-delaunay/geom/LineSegment.cs",
+        "Unity-delaunay/geom/Polygon.cs",
+        "Unity-delaunay/geom/Winding.cs",
+        "Unity-delaunay/utils/IDisposable.cs",
+    )
+
+    def _runtime_files(self):
+        import glob
+        base = os.path.join(DESTRUCTION, self.BASE)
+        return sorted(f for f in glob.glob(os.path.join(base, "**", "*.cs"),
+                                           recursive=True)
+                      if os.sep + "Editor" + os.sep not in f)
+
+    def test_these_translate(self):
+        import tools.csrust as csrust
+        for rel in self.TRANSLATE:
+            path = os.path.join(DESTRUCTION, self.BASE, rel)
+            with open(path, encoding="utf-8-sig") as f:
+                csrust.translate(f.read(), path=os.path.basename(path))
+
+    def test_the_rest_is_refused_not_crashed(self):
+        import tools.csrust as csrust
+        import tools.cs2cpp as cs2cpp
+        import tools.cpprust as cpprust
+        for path in self._runtime_files():
+            with open(path, encoding="utf-8-sig") as f:
+                src = f.read()
+            try:
+                csrust.translate(src, path=os.path.basename(path))
+            except (cs2cpp.CsError, cpprust.CppError):
+                pass                    # a refusal, with a line and a reason
+
+
 if __name__ == "__main__":
     unittest.main()
