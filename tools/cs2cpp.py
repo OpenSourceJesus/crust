@@ -1704,6 +1704,8 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
         return (what, seen[-1] if seen else "")
 
     known_types = set(known_types)
+    if rec(r"[(,]\s*(?:ref|out|in)\s+[A-Za-z_]"):
+        return found("`ref` / `out` / `in` argument (not in the C# subset).")
     if rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+"):
         return found("C# array local or field left after rewrite.")
     if rec(r"\w+\s*<\s*\w+\s*>\s*\("):
