@@ -13937,7 +13937,10 @@ class TestSystems(unittest.TestCase):
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
         msg = cm.exception.message
         self.assertIn("Assets/Scripts/Spark.cs(", msg)
-        self.assertIn("error CS0117", msg)
+        # `Emit` exists -- as an *instance* method. Called through the type,
+        # csc reports CS0120 ("an object reference is required"); CS0117 is
+        # for a member the type does not have (below).
+        self.assertIn("error CS0120", msg)
         self.assertIn("ParticleSystem", msg)
         self.assertIn("Emit", msg)
 
@@ -16935,3 +16938,113 @@ class TestSceneManager(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestParticleSystems(unittest.TestCase):
+    """A scene with a ParticleSystem, and the script forms that reach it.
+
+    Every such project failed to pack -- the simulation calls `cosf` and
+    `sinf`, and `<math.h>` was included by a feature list particles were not
+    on -- and the static-call refusal had been switched off, so an invented
+    `ParticleSystem.X(..)` emptied its method with only a warning."""
+
+    SCENE = (
+        "%%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Spark\n  m_Component:\n"
+        "  - component: {fileID: 2}\n  - component: {fileID: 3}\n"
+        "  - component: {fileID: 4}\n--- !u!4 &2\nTransform:\n"
+        "  m_GameObject: {fileID: 1}\n  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+        "  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+        "%s--- !u!198 &4\nParticleSystem:\n  m_GameObject: {fileID: 1}\n")
+
+    def _project(self, script, field=None):
+        root = tempfile.mkdtemp(prefix="upack-ps-")
+        self.addCleanup(shutil.rmtree, root, True)
+        s = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(s)
+        with open(os.path.join(s, "Spark.cs"), "w") as f:
+            f.write(script)
+        with open(os.path.join(s, "Spark.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        sc = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(sc)
+        with open(os.path.join(sc, "S.unity"), "w") as f:
+            f.write(self.SCENE % (("  %s: {fileID: 4}\n" % field) if field else ""))
+        return root
+
+    def _pack(self, root):
+        out = tempfile.mkdtemp(prefix="upack-ps-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(root, out, force=True, strict=True)  # a stub fails
+        return out
+
+    def _script(self, members):
+        return ("using UnityEngine;\npublic class Spark : MonoBehaviour {\n"
+                + members + "\n}\n")
+
+    def test_instance_forms_lower(self):
+        for members, field in (
+                ("    public ParticleSystem ps;\n"
+                 "    public void Update() { ps.Emit(3); }", "ps"),
+                # "Color Color": the name means the field, not the type
+                ("    public ParticleSystem ParticleSystem;\n"
+                 "    public void Update() { ParticleSystem.Emit(3); }",
+                 "ParticleSystem"),
+                ("    public void Update() { GetComponent<ParticleSystem>().Emit(2); }",
+                 None)):
+            out = self._pack(self._project(self._script(members), field))
+            with open(os.path.join(out, "engine.c")) as f:
+                self.assertIn("ParticleSystem_Emit(", f.read(), members)
+
+    def test_a_unity_stub_is_still_a_warning_by_default(self):
+        # Godot packs strict by default; Unity keeps its documented warning
+        # until the move to cs2cpp is done (UNITY_PACK.md).
+        root = self._project(self._script(
+            "    public void Update() { Foo.Bar(); }"))
+        out = tempfile.mkdtemp(prefix="upack-ps-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            unity_pack.pack(root, out, force=True)
+        self.assertIn("warning CS8000", err.getvalue())
+
+    def test_static_calls_are_refused_as_csc_would(self):
+        for call, code in (("ParticleSystem.Emit(0f, 0f)", "CS0120"),
+                           ("ParticleSystem.Explode()", "CS0117")):
+            root = self._project(self._script(
+                "    public void Update() { %s; }" % call))
+            with self.assertRaises(unity_pack.PackError) as cm:
+                self._pack(root)
+            self.assertIn("error %s" % code, cm.exception.message)
+            self.assertIn("Spark.cs(3,", cm.exception.message)
+
+    @needs_cc
+    def test_emit_stop_play_counts(self):
+        root = self._project(self._script("""
+    public ParticleSystem ps;
+    int f;
+    void Start() { ps.Stop(); ps.Clear(); }
+    void Update() {
+        f++;
+        if (f == 2) ps.Emit(3);
+        if (f == 5) ps.Play();
+        if (f == 1 || f == 4 || f == 65) Debug.Log("n=" + ps.particleCount);
+    }"""), "ps")
+        out = self._pack(root)
+        src = os.path.join(out, "harness.c")
+        with open(src, "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int argc, char **argv) { int f;\n"
+                    "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f;\n"
+                    "  for (f = 1; f <= 66; f++) engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O0", "-w", "-I", out, "-o", exe, src,
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        # stopped and cleared; three emitted while stopped (5 s lifetime);
+        # then one second of the default 10/s after Play
+        self.assertEqual(run.stdout.split(), ["n=0", "n=3", "n=13"])
