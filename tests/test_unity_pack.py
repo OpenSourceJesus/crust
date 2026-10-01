@@ -841,6 +841,12 @@ class TestUnityEngineGaps(unittest.TestCase):
         self.assertEqual(vec.lower_vector2_ops("float a = f.magnitude;"),
                          "float a = f.magnitude;")
 
+    def test_destroy_immediate_is_destroy(self):
+        self.assertEqual(
+            unity_pack._desugar_destroy_immediate(
+                "DestroyImmediate(go, true); Object.DestroyImmediate(f(a, b));"),
+            "Destroy(go); Destroy(f(a, b));")
+
     def _mini(self, scripts, scene_edit=None):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)

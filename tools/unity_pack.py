@@ -22471,6 +22471,26 @@ def _lower_string_members(text, string_idents, plan):
     return text
 
 
+def _desugar_destroy_immediate(text):
+    """`DestroyImmediate(obj[, allowDestroyingAssets])` -> `Destroy(obj)`: a
+    player has no assets to destroy, and Destroy's second argument is a
+    delay, so the flag goes."""
+    pat = re.compile(r"(?<![\w.])(?:(?:UnityEngine\s*\.\s*)?Object\s*\.\s*)?"
+                     r"DestroyImmediate\s*\(")
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        m = pat.search(scan)
+        if not m:
+            break
+        cp = _match_close(scan, m.end() - 1, "(", ")")
+        if cp is None:
+            break
+        args = cs2cpp.split_call_args(text[m.end():cp])
+        text = "%sDestroy(%s)%s" % (text[:m.start()], args[0].strip() if args
+                                    else "", text[cp + 1:])
+    return text
+
+
 def _match_close(scan, k, o, c):
     depth = 0
     while k < len(scan):
@@ -25602,6 +25622,7 @@ def pack(root, outdir, *args, **kwargs):
         t = _inp.desugar_input_actions(t, _common.SOURCE_INPUT_ACTIONS,
                                        os.path.relpath(fp, root),
                                        _ia_serialized.get(os.path.abspath(fp)))
+        t = _desugar_destroy_immediate(t)
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
