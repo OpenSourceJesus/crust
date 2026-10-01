@@ -5825,8 +5825,8 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Vector2")
     # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
     # read for its GameObject.
-    if re.search(r"\bPhysics2D\s*\.\s*(?:Raycast|OverlapCircle|OverlapPoint)(?:All)?"
-                 r"\s*\(", scan):
+    if re.search(r"\bPhysics2D\s*\.\s*(?:(?:Raycast|OverlapCircle|OverlapPoint)"
+                 r"(?:All)?|Linecast)\s*\(", scan):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
@@ -16640,6 +16640,11 @@ def emit_engine(plan, analyses, used_apis):
         p("    h.distance = out[5];")
         p("    return h;")
         p("}")
+        p("static int RaycastHit2D_collider(RaycastHit2D h) { return h.collider; }")
+        p("static RaycastHit2D Physics2D_Linecast(Vector2 a, Vector2 b, int mask) {")
+        p("    Vector2 d = Vector2_make(b.x - a.x, b.y - a.y);")
+        p("    return Physics2D_Raycast(a, d, sqrtf(d.x * d.x + d.y * d.y), mask);")
+        p("}")
         p("static int Physics2D_OverlapCircle(Vector2 c, float r, int mask) {")
         p("    return engine_box2d_overlap_circle(c.x, c.y, r, (unsigned int)mask);")
         p("}")
@@ -21754,7 +21759,7 @@ def _lower_physics2d_queries(text):
         scan = cs2cpp._blank(text)
         m = re.search(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
                       r"(RaycastAll|Raycast|OverlapCircleAll|OverlapCircle|"
-                      r"OverlapPointAll|OverlapPoint)\s*\(", scan)
+                      r"OverlapPointAll|OverlapPoint|Linecast)\s*\(", scan)
         if not m:
             break
         op = m.end() - 1
@@ -21772,6 +21777,9 @@ def _lower_physics2d_queries(text):
             rep = "Physics2D_%s(%s, %s, %s, %s)" % (
                 which, _query_vec2(args[0]), _query_vec2(args[1]),
                 args[2] if len(args) > 2 else "1e30f", mask_at(3))
+        elif which == "Linecast" and len(args) >= 2:
+            rep = "Physics2D_Linecast(%s, %s, %s)" % (
+                _query_vec2(args[0]), _query_vec2(args[1]), mask_at(2))
         elif which in ("OverlapCircle", "OverlapCircleAll") and len(args) >= 2:
             rep = "Physics2D_%s(%s, %s, %s)" % (which, _query_vec2(args[0]),
                                                 args[1], mask_at(2))
@@ -21783,7 +21791,20 @@ def _lower_physics2d_queries(text):
                 _query_vec2(args[0]), mask_at(1))
         else:
             break
+        null = re.match(r"\s*\.\s*collider\s*(==|!=)\s*null\b", scan[cp + 1:])
+        if null and which in ("Raycast", "Linecast"):
+            rep = "(RaycastHit2D_collider(%s) %s)" % (
+                rep, "< 0" if null.group(1) == "==" else ">= 0")
+            cp += null.end()
         text = text[:m.start()] + rep + text[cp + 1:]
+    # Transforms are read live, so there is nothing to sync.
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*SyncTransforms"
+        r"\s*\(\s*\)", "(void)0", text)
+    # ponytail: Unity's default, not the project's Physics2DSettings value
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
+        r"defaultContactOffset\b", "0.01f", text)
     scan = cs2cpp._blank(text)
     # the *All results' lists (tools/unity_pack_physics.desugar_layers)
     for n in set(re.findall(r"(?<![\w.])List\s*<\s*(?:RaycastHit2D|Collider2D)\s*>"
