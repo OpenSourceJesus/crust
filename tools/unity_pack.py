@@ -6479,6 +6479,15 @@ def _csharp_type_decl_kind(name):
     return next(iter(found)) if len(found) == 1 else None
 
 
+#: UnityEngine enums: an integer in the packed engine, `default(T)` is 0.
+_UNITY_ENUM_TYPES = frozenset((
+    "KeyCode", "ForceMode2D", "RigidbodyType2D", "Space", "TouchPhase",
+    "RigidbodyInterpolation2D", "CollisionDetectionMode2D", "SendMessageOptions",
+    "PrimitiveType", "FilterMode", "WrapMode", "HideFlags", "LogType",
+    "RuntimePlatform", "FullScreenMode", "CursorLockMode", "LoadSceneMode",
+))
+
+
 def _default_arg_c(expr, ty=None):
     """C for a C# default parameter value, or None when it needs type-aware
     lowering this does not do (enum members, constants, expressions).
@@ -6508,8 +6517,10 @@ def _default_arg_c(expr, ty=None):
         if e == "null" and base not in _PRIMITIVE_PARAM_TYPES:
             return "-1"
         if e == "default":
-            if base in _PRIMITIVE_PARAM_TYPES:
+            if base in _PRIMITIVE_PARAM_TYPES or base in _UNITY_ENUM_TYPES:
                 return "0"
+            if base == "Vector2":
+                return "Vector2_make(0.f, 0.f)"
             kind = _csharp_type_decl_kind(base)
             if kind == "enum":
                 return "0"
