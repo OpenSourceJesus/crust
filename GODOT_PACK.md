@@ -145,7 +145,7 @@ Refused at the scene line: a texture that is not a PNG (`.svg`, a
 are packed), a frame outside its texture or not whole pixels, an
 AtlasTexture `margin`, a CanvasItem `material`, `show_behind_parent`,
 `y_sort_enabled`, `clip_children`; and drawing nodes not packed yet --
-`AnimatedSprite2D`, `Polygon2D`, `Line2D`, `TileMap` / `TileMapLayer`,
+`AnimatedSprite2D`, `Polygon2D`, `TileMap` / `TileMapLayer`,
 particles, `MeshInstance2D`, `TextureRect`, `NinePatchRect` -- when they
 have something to draw.
 
@@ -536,9 +536,34 @@ Godot's rules end to end: restitution, absorbent materials, damping, a crate
 stack in pixel units, contact and area signals, a freed node's silence, and
 the injected build against the standard one.
 
+## Lines and curves
+
+A **Line2D** is drawn as a Unity LineRenderer is (see *LineRenderer* in
+[UNITY_PACK.md](UNITY_PACK.md)): one quad a segment, as wide as `width`
+times `width_curve` at the segment's midpoint and in `gradient`'s color there
+(or `default_color`), both sampled at the point's fraction of the line's
+length, as Godot's LineBuilder samples them; `closed` adds the closing
+segment, `z_index` sorts it, `visible` hides it. Its points are local to the
+node: the node's rotation and scale are baked in at pack time and its
+position is followed as it moves. Godot's joints, caps, texture and
+antialiasing are not drawn -- a line is a chain of straight bands.
+
+A **Curve** -- a Line2D's `width_curve`, or a script's `[Export] public Curve
+Ramp;` -- goes into the same table as Unity's AnimationCurve. Curve::sample is
+the cubic Bezier through the points with control points a third of the way
+along at the stored tangents, which is exactly Unity's Hermite with
+`in = left_tangent`, `out = right_tangent`; it clamps outside the points.
+Scripts: `Ramp.Sample(x)`, `Ramp.PointCount`.
+
+Refused at the scene line: a Line2D under a non-uniform scale (its width
+would stretch), more than 256 points, and a gradient that interpolates
+cubically or in another color space. A gradient's Constant mode is Godot's --
+the last color at or before the offset, not Unity's Fixed.
+
 ## Not yet
 
-Camera2D smoothing and drag margins, mouse input, signals other than
+Line2D and Curve from a script (`AddPoint`, `SetPointPosition`,
+`SampleBaked`), Camera2D smoothing and drag margins, mouse input, signals other than
 the physics ones, timeouts and the scripts' own, process order by tree,
 a body below a spawned scene's root, a spawned body's physics signals to
 another node, GDScript.

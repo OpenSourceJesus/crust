@@ -991,6 +991,26 @@ built-ins: `EaseInOut(0,0,1,1)` is smoothstep (`Evaluate(0.25)` = 0.15625),
 `Linear` the line. Not yet: editing a curve from a script (`AddKey`, `keys`,
 `MoveKey`), and a curve anywhere but a script field.
 
+**LineRenderer** (tools/unity_pack_lines.py): its points (`m_Positions`,
+in world space, or offset by its GameObject's position in local space), its
+width (`widthMultiplier` times `widthCurve`, through the AnimationCurve table)
+and its color (`colorGradient`: Blend, linear between keys and clamped at the
+ends, or Fixed, the first key at or after the point), evaluated as Unity does
+at a point's fraction of the line's length -- the closing segment counts when
+`m_Loop` is set. It is drawn as everything is, quads in the draw list: one per
+segment, the segment's length, as wide as the line at its midpoint, turned to
+its angle, in the gradient's color there (`tex -2`). So a line is a chain of
+straight bands: Unity's joins (`numCornerVertices`), caps, per-vertex color
+and material are not drawn. Scripts, on a field, a local or
+`GetComponent<LineRenderer>()`: `positionCount` (get / set, up to 256 points),
+`SetPosition(i, new Vector3(..))` / `new Vector2(..)`, `GetPosition(i).x` /
+`.y`, `loop`, `enabled`, `widthMultiplier`, `startColor` / `endColor` (set,
+from `new Color(..)` or a named color: the gradient's first / last key), and
+`startWidth` / `endWidth` (get). Refused: a local-space line on a rotated or
+scaled GameObject, and a PerceptualBlend gradient. The component used to be
+dropped without a word: the scene reader's list of component kinds did not
+name it.
+
 **ParticleSystem** (tools/unity_pack_particles.py): the component's main,
 emission and shape modules are read -- lifetime, speed, size and color (a
 constant, or random between two; a curve's scalar), gravity modifier,
