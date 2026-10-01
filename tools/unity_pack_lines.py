@@ -21,7 +21,8 @@ Scripts, on a LineRenderer field (serialized or GetComponent's), local or
 new Vector3(x, y, z))` / `new Vector2(x, y)`, `GetPosition(i).x` / `.y`,
 `loop`, `enabled`, `widthMultiplier`, `useWorldSpace` (get / set),
 `startColor` / `endColor` (set: the first / last key of the gradient),
-`startWidth` / `endWidth` (get).
+`startWidth` / `endWidth` (get). `gameObject.AddComponent<LineRenderer>()`
+takes a spare row (null when the GameObject already has one).
 """
 import re
 
@@ -177,6 +178,22 @@ def build_table(plan):
             lines.append(dict(lr, owner_class=cname, owner_inst=i,
                               go_index=o.get("go_index"), wcurve=row,
                               pos=(float(pos[0]), float(pos[1]))))
+    # AddComponent<LineRenderer>(): spare rows, Unity's new line (two points
+    # at the origin, width 1, white, world space). ponytail: a removed line's
+    # row is not reused; the budget is one a calling instance.
+    spares = int((plan.get("addcomponent_budget") or {}).get("LineRenderer") or 0)
+    if not spares and "LineRenderer" in (plan.get("addcomponent_types") or ()):
+        spares = 1
+    if spares:
+        plan["lines_first_spare"] = len(lines)
+    for _ in range(spares):
+        curves.append({"keys": [(0.0, 1.0, 0.0, 0.0)], "pre": 2, "post": 2})
+        lines.append({"enabled": 1, "positions": [(0.0, 0.0), (0.0, 0.0)], "world": 1,
+                      "loop": 0, "mult": 1.0, "sorting_order": 0,
+                      "gradient": {"mode": 0, "colors": [(0.0, 1.0, 1.0, 1.0)],
+                                   "alphas": [(0.0, 1.0)]},
+                      "owner_class": None, "go_index": None,
+                      "wcurve": len(curves) - 1, "pos": (0.0, 0.0)})
     plan["lines"] = lines
     plan["lr_by_file_id"] = by_fid
 
@@ -200,7 +217,7 @@ def emit_api(p, plan):
                                                 len(vals), ", ".join(vals)))
     p("/* LineRenderers (tools/unity_pack_lines.py) */")
     arr("int", "go", [str(int(l["go_index"])) if l.get("go_index") is not None else "-1"
-                      for l in lines])
+                      for l in lines], const=False)
     arr("int", "world", [str(int(l["world"])) for l in lines], const=False)
     arr("int", "wcurve", [str(l["wcurve"]) for l in lines])
     arr("int", "order", [str(int(l["sorting_order"])) for l in lines])
@@ -297,9 +314,19 @@ def emit_api(p, plan):
     p("}")
     p("static int GameObject_GetComponent_LineRenderer(int go) {")
     p("    int s;")
+    p("    if (go < 0) return -1;")
     p("    for (s = 0; s < %d; s = s + 1) if (_lr_go[s] == go) return s;" % n)
     p("    return -1;")
     p("}")
+    if plan.get("lines_first_spare") is not None:
+        p("/* a GameObject holds one Renderer: a second add is null, as Unity's */")
+        p("static int GameObject_AddComponent_LineRenderer(int go) {")
+        p("    int s;")
+        p("    if (go < 0 || GameObject_GetComponent_LineRenderer(go) >= 0) return -1;")
+        p("    for (s = %d; s < %d; s = s + 1)" % (plan["lines_first_spare"], n))
+        p("        if (_lr_go[s] < 0) { _lr_go[s] = go; return s; }")
+        p("    return -1;")
+        p("}")
     p("static void _lr_owner_pos(int s, float *x, float *y);")
     p("")
 
@@ -313,7 +340,7 @@ def emit_owner_pos(p, plan, c_ident, class_has_position):
     p("    switch (s) {")
     for k, l in enumerate(lines):
         cl = plan["classes"].get(l["owner_class"]) or {}
-        if class_has_position(cl) and not cl.get("static"):
+        if cl and class_has_position(cl) and not cl.get("static"):
             idn = c_ident(l["owner_class"])
             p("    case %d: *x = %s_get_pos_x(%du); *y = %s_get_pos_y(%du); return;"
               % (k, idn, l["owner_inst"], idn, l["owner_inst"]))

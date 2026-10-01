@@ -584,6 +584,7 @@ _ADDABLE_BUILTINS = frozenset((
     "Animation",
     "Animator",
     "AudioSource",
+    "LineRenderer",     # spare rows (tools/unity_pack_lines.py)
 ))
 
 # Unity marks these with [DisallowMultipleComponent] — a second AddComponent

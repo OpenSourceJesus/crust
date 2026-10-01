@@ -375,7 +375,7 @@ public class Drawer : MonoBehaviour {
                 "        weightedMode: 0\n        inWeight: 0.33333334\n"
                 "        outWeight: 0.33333334\n" % (t, v, i, o))
 
-    def _project(self, script, world=1, rot_z=0.0):
+    def _project(self, script, world=1, rot_z=0.0, with_line=True):
         lr = ("--- !u!120 &5\nLineRenderer:\n  m_GameObject: {fileID: 1}\n  m_Enabled: 1\n"
               "  m_SortingOrder: 3\n  m_Positions:\n  - {x: 0, y: 0, z: 0}\n"
               "  - {x: 2, y: 0, z: 0}\n  - {x: 2, y: 2, z: 0}\n  m_Parameters:\n"
@@ -396,6 +396,9 @@ public class Drawer : MonoBehaviour {
                  "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
                  "  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
                  "  lr: {fileID: 5}\n" % (rot_z, (1 - rot_z * rot_z) ** 0.5)) + lr
+        if not with_line:
+            scene = scene.split("--- !u!120 ")[0].replace(
+                "  - component: {fileID: 5}\n", "").replace("  lr: {fileID: 5}\n", "")
         root = tempfile.mkdtemp(prefix="upack-lr-")
         self.addCleanup(shutil.rmtree, root, True)
         d = os.path.join(root, "Assets", "Scripts")
@@ -409,14 +412,11 @@ public class Drawer : MonoBehaviour {
             f.write(scene)
         return root
 
-    @needs_cc
-    def test_scripted_line_draws_as_unity_evaluates_it(self):
-        import math
-        import tools.unity_pack_curves as uc
-        import tools.unity_pack_lines as ul
+    def _run_lines(self, root):
+        """Pack, tick once; the log and the untextured quads' lines."""
         out = tempfile.mkdtemp(prefix="upack-lr-out-")
         self.addCleanup(shutil.rmtree, out, True)
-        unity_pack.pack(self._project(self.SCRIPT), out, force=True, strict=True)
+        unity_pack.pack(root, out, force=True, strict=True)
         src = os.path.join(out, "h.c")
         with open(src, "w") as f:
             f.write('#include <stdio.h>\n#include "engine_draw.h"\nextern float Time_deltaTime;\n'
@@ -435,7 +435,14 @@ public class Drawer : MonoBehaviour {
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
                              text=True, timeout=60)
-        lines = run.stdout.splitlines()
+        return run.stdout.splitlines()
+
+    @needs_cc
+    def test_scripted_line_draws_as_unity_evaluates_it(self):
+        import math
+        import tools.unity_pack_curves as uc
+        import tools.unity_pack_lines as ul
+        lines = self._run_lines(self._project(self.SCRIPT))
         self.assertIn("n=4 y3=2 w0=0.5", lines)
         quads = [list(map(float, l.split()[1:])) for l in lines if l.startswith("Q ")]
         # the reference: Unity's rules, independently of the engine
@@ -456,6 +463,25 @@ public class Drawer : MonoBehaviour {
                     (b[1] - a[1]) / L, col[0], col[1], col[2], 3]
             for got, exp in zip(q, want):
                 self.assertAlmostEqual(got, exp, places=4)
+
+    @needs_cc
+    def test_added_line_takes_a_spare_row(self):
+        lines = self._run_lines(self._project("""using UnityEngine;
+public class Drawer : MonoBehaviour {
+    void Start() {
+        LineRenderer a = gameObject.AddComponent<LineRenderer>();
+        a.positionCount = 3;
+        a.SetPosition(2, new Vector3(1f, 2f, 0f));
+        a.useWorldSpace = false;
+        Debug.Log("n=" + a.positionCount + " y2=" + a.GetPosition(2).y + " ws=" + a.useWorldSpace
+                  + " again=" + (gameObject.AddComponent<LineRenderer>() == null)
+                  + " same=" + (GetComponent<LineRenderer>() == a));
+    }
+}
+""", with_line=False))
+        self.assertIn("n=3 y2=2 ws=False again=True same=True", lines)
+        # Unity's new line: two points at the origin (no quad), then the one set
+        self.assertEqual(len([l for l in lines if l.startswith("Q ")]), 1)
 
     def test_gradient_reference(self):
         import tools.unity_pack_lines as ul
