@@ -19,7 +19,28 @@ class Node { }              // single owner
 [Shared] class Node { }     // shared_ptr; assignment aliases; cycles may leak
 ```
 
+```csharp
+[MaxInstances(255)] class Node { }  // arena: a reference is a plain Node*
+```
+
 Pinned in `tests/test_csrust.py` (`TestSemantics`).
+
+**Arena classes** are C#'s reference semantics without a GC or a reference
+count: `[MaxInstances(N)]` gives the class N statically allocated slots. A
+reference is a plain `T*` -- assignment copies it, `null` is 0, `==` compares
+references, a reference can be stored in a field, a `List<T>`, a `T[]`
+(`new T[n]` is n nulls) or passed and returned. `new T(..)` takes the next
+slot, zeroed, and runs the constructor; nothing is freed one at a time:
+`T__arena_reset()` destroys every live object and empties the arena, and an
+(N+1)th live object aborts rather than overwrite one. This is what graph code
+needs -- linked lists, `this` stored into a structure, object pools -- and
+what Unity-2D-Destruction's Delaunay and Clipper libraries are written in.
+The attribute's own class (`class MaxInstancesAttribute : System.Attribute`,
+which Unity needs to compile the source) is a marker and is dropped, as is
+any class deriving from `Attribute`. unity_pack reads the same attribute on a
+MonoBehaviour as its pool size. (`TestArenaClasses`, checked against Mono.)
+Attributes on a declaration's own line (`[SerializeField] private int x;`)
+are stripped, not only whole-line ones.
 
 ## Phase 1 surface
 
@@ -59,13 +80,22 @@ Pinned in `tests/test_csrust.py` (`TestSemantics`).
 | `using X = Y;` | kept; `using System;` dropped |
 | `--emit-decls` | same class digest as C++ (CPPRPY.md) |
 
+**Also in** (§9): `ref` / `out` parameters (a C++ reference; at a call to a
+method the program declares with one, the argument is the variable itself --
+any other call-site `ref` is refused, `MemoryMarshal.CreateSpan(ref x, 1)`
+aside); `unchecked { .. }` / `unchecked(e)` (a no-op: wrapping is the
+arithmetic here; `checked` stays refused); static field initializers and
+`static C() { .. }`, run before first use by a guarded `C.__cctor()` called
+at the top of every method, constructor and accessor of `C` and of any method
+that names `C` -- "before first use", which C# allows a class without a static
+constructor; one with a static constructor may run it sooner than C# would. A
+non-scalar static without an initializer starts empty, where C# has null.
+
 **Out** (refused in C# terms before conversion): `Dictionary` members other
 than those above (`Keys`, `Values`, `TryGetValue`, ..), an interface-typed
 local, field or return, `: this(..)` constructor chaining, `string` (§7), `base.M()`,
 `is`, named arguments, generic *methods*, a base-typed local holding a
-derived object (`A a = new B()`, which an owned value would slice), a static
-field that needs code at startup (an array, `List` or class, or one
-initialised by a call or `new`), `async`/`await`, LINQ,
+derived object (`A a = new B()`, which an owned value would slice), a `async`/`await`, LINQ,
 `yield`, `dynamic`, `event`, multidimensional arrays, `ref`/`out`/`in`
 parameters, `$"…"`, file-scoped namespaces, `??` / `?.`, `char`, `lock`,
 `decimal`, `partial`, `goto`, `params`, `stackalloc`, `checked`/`unchecked`,

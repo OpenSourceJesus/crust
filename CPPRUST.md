@@ -2239,3 +2239,18 @@ anything, which translation alone cannot see.
 shared header fails every file that includes it, and grouping is what shows
 which single fix buys the most files. Translations are cached against the
 translator's own sources, so editing `cpprust.py` invalidates everything.
+
+
+## Arena classes and pointer containers (part VI)
+
+A class with a `static const int __max_instances = N` (C#'s `[MaxInstances(N)]`,
+from cs2cpp) is an arena class: `T__alloc` takes the next of N static slots,
+zeroed, instead of `malloc`, an (N+1)th aborts, and `T__arena_reset()` destroys
+every live object and empties the arena. `vector<T *>` now works:
+a pointer argument mangles with `P` (`vector<Node *>` is `vector_Node_P`; it
+was `vector_Node`, the name of `vector<Node>`, and the two collided),
+`__cpp_ref(Node *)` expands (by value), and `Node*` / `Node *` are one
+template argument. A member access through a pointer-valued expression -- a
+subscript or a call's result -- lowers `.f` to `->f`, as it already did for a
+named pointer, and a call after a class-typed field (`a.get()->next.get()`)
+continues the chain from the field's type.

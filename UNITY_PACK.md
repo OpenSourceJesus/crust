@@ -207,6 +207,7 @@ python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
 /tmp/upack/MiniScene
 
 python3 tools/unity_pack.py <project> --strict   # a stub is an error
+python3 tools/unity_pack_test_fast.py            # newer fixes' tests, ~seconds
 python3 tools/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
 python3 tools/unity_pack.py <project> --coost PATH   # coost checkout (string locals)
 ```
@@ -990,6 +991,46 @@ a class named `AnimationCurve` -- always null. The checks are Unity's own
 built-ins: `EaseInOut(0,0,1,1)` is smoothstep (`Evaluate(0.25)` = 0.15625),
 `Linear` the line. Not yet: editing a curve from a script (`AddKey`, `keys`,
 `MoveKey`), and a curve anywhere but a script field.
+
+**Everyday script APIs.** `name` / `gameObject.name` is the GameObject's name
+(a class's own `name` field, or a local, stays itself). `Input.GetButton`,
+`GetButtonDown` and `GetButtonUp` read a button by name -- every name a script
+uses gets a host global `engine_input_button_<Name>`, latched once a frame, so
+Down / Up are pressed / released this frame (only "Jump" existed; any other
+name was silently never pressed). A singleton field, `public static GM
+Instance; .. Instance = this;`, is a static field: null until assigned and
+again once its object is destroyed, with no FindObjectOfType fallback (that is
+for an `Instance` *property*); `Instance = this` had reached C as
+`GM_Instance() = i`. A Transform field's `target.position` is a vector value
+too in a 2D pack. String concatenation with the literal second (`name + " hp"`)
+is detected (its helper was never emitted).
+
+**Position as a vector** (a 2D pack): `transform.position` read as a value
+is the Vector2 of its x / y -- `Vector2 p = transform.position;`,
+`Vector2.MoveTowards(transform.position, ..)` -- and `transform.position =
+<vector>` evaluates it once and keeps z (a camera keeps its -10). Vector2's
+`MoveTowards` (Unity's: the target when within reach, a negative step moves
+away), `Lerp` (t clamped), `LerpUnclamped`, `Min` and `Max` are lowered, and
+in a 2D pack so are Vector3's `Lerp` / `LerpUnclamped` / `MoveTowards`, as
+Vector3.Distance already was. Only `.x`, `+=` and `= new Vector3` were before;
+anything else emptied the method. **Not yet:** a project is 2D only while no
+script names `Vector3` at all -- and a 2D Unity game names it constantly --
+so these Vector3 forms still stub in most projects; and `other.position`
+through a Transform field.
+
+**transform.Translate** moves by a delta -- `(x, y[, z])`, a `new Vector3 /
+Vector2(..)`, or any Vector2 expression, evaluated once -- in the object's
+own axes (`Space.Self`, Unity's default: the delta turned by its z rotation as
+it is now, so an object that turns moves along its new heading) or the
+world's (`Space.World`). A 2D pack: rotation about x / y is not part of it.
+It is rewritten into a position update before lowering, and its class keeps a
+live rotation. A Transform member Unity has but this pack does not lower is
+`error CS8000: 'Transform.right' is not packed yet`; CS1061 ("does not contain
+a definition") is for a member Unity does not have -- every unlowered member
+used to get CS1061, `Translate` included. The runtime helpers a method uses
+(`_cs_euler_z`, ..) are emitted in every engine now: their place was emitted
+only with string concatenation, and an engine without it failed with
+`undeclared identifier`.
 
 **LineRenderer** (tools/unity_pack_lines.py): its points (`m_Positions`,
 in world space, or offset by its GameObject's position in local space), its
