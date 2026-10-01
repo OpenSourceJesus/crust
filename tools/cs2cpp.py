@@ -429,6 +429,19 @@ def _lower_foreach(text):
         out.append(text[m.end():m.end() + kw.start()])
         out.append(":  ")
         pos = m.end() + kw.end()
+        # A body that is one statement, unbraced -- the usual C# spelling
+        # of a short loop -- gets braces: the C++ half needs a block for
+        # the loop variable to live in, and refused it in C++ terms.
+        j = close + 1
+        while j < len(scan) and scan[j] in " \t\r\n":
+            j += 1
+        if j < len(scan) and scan[j] != "{" and \
+                not re.match(r"(?:for|foreach|while|if|do|switch|try)\b", scan[j:]):
+            end = cpprust._stmt_end(scan, j) if hasattr(cpprust, "_stmt_end") else None
+            if end is not None and scan[end] == ";":
+                out.append(text[pos:j])
+                out.append("{ " + text[j:end + 1] + " }")
+                pos = end + 1
     out.append(text[pos:])
     return "".join(out)
 
@@ -1931,6 +1944,336 @@ def _mark_except_functions(text):
         maybe, text)
 
 
+_DECL_NOISE = frozenset(("public", "private", "protected", "internal",
+                         "readonly", "volatile", "new"))
+_NOT_A_FIELD = frozenset(("static", "const", "event", "delegate", "using",
+                          "abstract", "override", "virtual", "class",
+                          "struct", "enum", "interface", "operator"))
+
+
+def _check_unsupported_forms(text, table, path):
+    """Constructs that reached the C compiler as invalid C, refused here in
+    C# terms instead."""
+    scan = _blank(text)
+
+    def fail(pos, msg):
+        raise CsError("%s%s" % (_at(path, text, pos), msg))
+
+    m = re.search(r"(?<![\w.])base\s*\.\s*\w+", scan)
+    if m:
+        fail(m.start(), "`base.%s` is not in the C# subset yet: a call to the "
+             "base class's own implementation is not lowered. Move the shared "
+             "part into a non-virtual method and call that."
+             % m.group(0).split(".")[-1].strip())
+    m = re.search(r"(?<![\w.])is(?![\w])", scan)
+    if m:
+        fail(m.start(), "`is` is not in the C# subset: an owned object has "
+             "one type, so there is nothing to test. Use a virtual method.")
+    # named arguments: `F(a: 1)` / `F(x, b: 2)` -- not `case A:`, not `?:`
+    m = re.search(r"[(,]\s*([A-Za-z_]\w*)\s*:(?!:)", scan)
+    if m:
+        fail(m.start(1), "named arguments (`%s:`) are not in the C# subset. "
+             "Pass the arguments in order." % m.group(1))
+    # a generic *method*: `T Name<T>(..)` with a body
+    m = re.search(r"(?<![\w.])[A-Za-z_][\w<>\[\],]*\s+([A-Za-z_]\w*)\s*<[^<>;(){}]*>\s*\([^;{}]*\)\s*\{",
+                  scan)
+    if m:
+        fail(m.start(1), "generic method `%s<..>` is not in the C# subset "
+             "yet; only generic classes are. Make the type a class parameter."
+             % m.group(1))
+    # `Base b = new Derived(..)`: an owned value of the base type cannot hold
+    # a derived object -- it would be sliced to the base's fields.
+    classes = dict((n, i) for n, i in table.items() if i["kind"] == "class")
+
+    def derives(d, b, seen=()):
+        info = classes.get(d)
+        if info is None or d in seen:
+            return False
+        base = info["base"].split(",")[0].strip()
+        return base == b or derives(base, b, seen + (d,))
+
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s+\w+\s*=\s*new\s+([A-Za-z_]\w*)\s*\(",
+                         scan):
+        if m.group(1) != m.group(2) and derives(m.group(2), m.group(1)):
+            fail(m.start(), "`%s x = new %s(..)`: a `%s` is an owned value "
+                 "here, not a reference, so it would hold only the `%s` part "
+                 "of the object. Declare it as `%s`, or mark `%s` "
+                 "`[Shared]`." % (m.group(1), m.group(2), m.group(1),
+                                  m.group(1), m.group(2), m.group(1)))
+
+
+def _check_strings(text, path):
+    """Refuse `string` as a type.
+
+    Not in the owned object model yet: the C++ half's `string` cannot lower
+    C#'s everyday uses -- `name + "x"` on a member, `s == "lit"`, `"n=" + 5`
+    -- so a `string` went through as an unknown C type, and the C compiler
+    reported `unknown type name 'string'`. String *literals* passed to a call
+    are fine; it is the type that is refused. (unity_pack's packed model has
+    a string type of its own, `_cs_string`; see `lower_local_types`.)
+    """
+    m = re.search(r"(?<![\w.])string(?![\w])", _blank(text))
+    if m is not None:
+        raise CsError(
+            "%s`string` is not in the C# subset yet: concatenation, `==` and "
+            "`.Length` on it do not lower to C here. Keep text out of the "
+            "translated code, or carry it as a `byte[]`."
+            % _at(path, text, m.start()))
+
+
+def _check_static_fields(text, table, path):
+    """Refuse a static field that would need code to run at startup.
+
+    C# runs a static field's initializer, and a static constructor, before
+    the type is first used. C has no such hook: a static is either zero or
+    a compile-time constant. A static of a type that has to be constructed
+    (an array, `string`, a `List`, a class) or initialised by a call or a
+    `new` reached C as `initializer element is not constant`.
+    """
+    scan = _blank(text)
+    for kind, name, start, brace, close in _find_types(text):
+        if kind not in ("class", "struct"):
+            continue
+        body = scan[brace + 1:close]
+        # depth-0 statements of the body only
+        flat, i = [], 0
+        while i < len(body):
+            if body[i] == "{":
+                j = cpprust._match_brace(body, i)
+                if j is None:
+                    break
+                flat.append("@" * (j + 1 - i))
+                i = j + 1
+                continue
+            flat.append(body[i])
+            i += 1
+        flat = "".join(flat)
+        for m in re.finditer(r"(?<![\w])static\s+(?:readonly\s+)?([^;=@()]+?)\s+"
+                             r"([A-Za-z_]\w*)\s*(=\s*([^;@]*))?;", flat):
+            typ, fname, init = m.group(1).strip(), m.group(2), m.group(4)
+            typ = re.sub(r"^(?:(?:public|private|protected|internal|new|volatile)\s+)+",
+                         "", typ)
+            if "const" in typ.split():
+                continue
+            where = _at(path, text, brace + 1 + m.start())
+            scalar = typ in _PRIM_UNMANAGED or \
+                (table.get(typ) or {}).get("kind") == "enum"
+            if not scalar and typ != "bool":
+                raise CsError(
+                    "%sstatic field `%s.%s` of type `%s` is not in the C# "
+                    "subset: it has to be constructed before first use, which "
+                    "needs a static constructor, and C has no code that runs "
+                    "at startup. Keep it in an instance, or make it a scalar."
+                    % (where, name, fname, typ))
+            if init is not None and re.search(r"\(|\bnew\b", init):
+                raise CsError(
+                    "%sstatic field `%s.%s` is initialised by `%s`, which runs "
+                    "code; C initialises a static only with a constant. Assign "
+                    "it at the start of `Main` instead."
+                    % (where, name, fname, init.strip()))
+
+
+def _zero_scalar_fields(text, table):
+    """`public int n;` -> `public int n = 0;` in a class or struct.
+
+    C# zeroes every field of a new object before its field initializers and
+    constructor run. C does not, and the C++ half constructs only the
+    members that are objects -- so a scalar field no initializer and no
+    constructor statement assigned was whatever the stack held: `new P(5)`
+    with a constructor that set one field left the others as garbage, and so
+    did a class with no constructor at all once it held a `List`.
+
+    A default member initializer is what the C++ half already turns into an
+    assignment at the top of every constructor (and a constructor of its
+    own when there is none), so writing one says exactly what C# means, in
+    C#'s order: zero first, then the constructor body. A field that has an
+    initializer keeps it; an auto-property gets `= 0;` after its accessors,
+    which `_lower_auto_properties` reads as a C# 6 property initializer.
+
+    Scalars only -- primitives and enums. A plain struct (see
+    `_is_plain_struct`) is left alone: it is zeroed at its declaration
+    already, and must stay free of constructors to stay plain. Static and
+    const fields live in static storage, which is zero anyway.
+    """
+    scan = _blank(text)
+    edits = []
+
+    def scalar(t):
+        t = t.strip()
+        if t == "char":
+            return False
+        return t in _PRIM_UNMANAGED or \
+            (table.get(t) or {}).get("kind") == "enum"
+
+    def zero_of(t):
+        return "false" if t.strip() == "bool" else "0"
+
+    def head_type(piece):
+        """(type, offset of the declarators) for a scalar declaration."""
+        p2 = re.sub(r"\[[^\]]*\]", lambda m: " " * len(m.group(0)), piece)
+        words = p2.split()
+        if not words or set(words) & _NOT_A_FIELD:
+            return None
+        m = re.match(r"^(\s*(?:(?:%s)\s+)*)([A-Za-z_]\w*)\s+(?=\w)"
+                     % "|".join(sorted(_DECL_NOISE)), p2)
+        if m is None or not scalar(m.group(2)):
+            return None
+        return m.group(2), m.end()
+
+    for kind, name, start, brace, close in _find_types(text):
+        if kind not in ("class", "struct") or _is_plain_struct(name, table):
+            continue
+        i = brace + 1
+        seg = i
+        while i < close:
+            c = scan[i]
+            if c == "{":
+                j = cpprust._match_brace(scan, i)
+                if j is None:
+                    break
+                piece = scan[seg:i]
+                ht = head_type(piece)
+                if ht is not None and _AUTO_PROP_BODY.match(scan[i:j + 1]) \
+                        and re.match(r"^\s*\w+\s*$", piece[ht[1]:]) \
+                        and not re.match(r"\s*=", scan[j + 1:]):
+                    edits.append((j + 1, " = %s;" % zero_of(ht[0])))
+                i = j + 1
+                seg = i
+                continue
+            if c == ";":
+                piece = scan[seg:i]
+                ht = head_type(piece)
+                if ht is not None and "(" not in piece and "=>" not in piece:
+                    off = seg + ht[1]
+                    for part in piece[ht[1]:].split(","):
+                        nm = re.match(r"^\s*(\w+)\s*$", part)
+                        if nm is not None:
+                            edits.append((off + nm.end(1),
+                                          " = %s" % zero_of(ht[0])))
+                        off += len(part) + 1
+                seg = i + 1
+            i += 1
+    for pos, ins in sorted(edits, reverse=True):
+        text = text[:pos] + ins + text[pos:]
+    return text
+
+
+_ACCESSOR_MODS = r"(?:(?:public|private|protected|internal)\s+)*"
+
+
+def _lower_accessor_properties(text, names):
+    """Properties with accessor bodies, rewritten in place to methods.
+
+        int N { get { return _n; } set { _n = value; } }
+        int N { get => _n; set => _n = value; }
+        int Area => w * h;
+
+    become `int get_N() {..}` and `void set_N(int value) {..}`, the same
+    pair an auto-property gets, and `names` gains `N` so every `.N` use goes
+    through them. Unsupported, they reached C as `get { .. }` -- `get`
+    undeclared.
+
+    Rewritten *in place*: the header and closing brace are blanked and each
+    accessor keyword becomes its method's head, so every newline stays
+    where it was and diagnostics keep their line. Accessor modifiers
+    (`private set`) are dropped; the subset has one visibility.
+    """
+    scan = _blank(text)
+    head = re.compile(r"(?<![\w.])((?:[\w.]+(?:\s*<[^;{}()=]*>)?(?:\s*\[\s*\])*))"
+                      r"\s+(\w+)\s*(\{|=>)")
+    edits = []
+    pos = 0
+    while True:
+        m = head.search(scan, pos)
+        if m is None:
+            break
+        typ, name, kind = m.group(1), m.group(2), m.group(3)
+        pos = m.end()
+        if typ in ("return", "new", "else", "class", "struct", "interface",
+                   "enum", "namespace", "operator", "case", "in", "is", "as"):
+            continue
+        if kind == "=>":
+            # `T Name => expr;` -- a get-only property. Not a lambda: a
+            # lambda's parameter is not preceded by a type and a name.
+            end = scan.find(";", m.end())
+            if end < 0 or "{" in scan[m.end():end]:
+                continue
+            prev = scan[:m.start()].rstrip()
+            if prev and prev[-1] not in ";{}]":
+                continue
+            edits.append((m.start(2), m.end(), "get_%s() { return " % name))
+            edits.append((end, end + 1, "; }"))
+            names.append(name)
+            pos = end + 1
+            continue
+        open_b = m.end() - 1
+        close_b = cpprust._match_brace(scan, open_b)
+        if close_b is None:
+            continue
+        body = scan[open_b + 1:close_b]
+        acc = re.compile(r"\s*%s(get|set)\b\s*" % _ACCESSOR_MODS)
+        first = acc.match(body)
+        if first is None:
+            continue
+        # every accessor: its keyword span and its body span
+        parts = []
+        i = 0
+        ok = True
+        while i < len(body):
+            am = acc.match(body, i)
+            if am is None:
+                if body[i:].strip():
+                    ok = False
+                break
+            j = am.end()
+            if j < len(body) and body[j] == "{":
+                k = cpprust._match_brace(body, j)
+                if k is None:
+                    ok = False
+                    break
+                parts.append((am.group(1), open_b + 1 + am.start(1),
+                              open_b + 1 + am.end(1), None))
+                i = k + 1
+            elif body.startswith("=>", j):
+                k = body.find(";", j)
+                if k < 0:
+                    ok = False
+                    break
+                parts.append((am.group(1), open_b + 1 + am.start(1),
+                              open_b + 1 + j + 2, open_b + 1 + k))
+                i = k + 1
+            else:
+                ok = False          # `get;` -- an auto-property, done above
+                break
+        if not ok or not parts:
+            continue
+        # the header `T Name {` goes, keeping the type for each accessor
+        edits.append((m.start(), open_b + 1, ""))
+        for kw, ks, ke, semi in parts:
+            # the modifier before the keyword goes too
+            ms = ks
+            before = scan[open_b + 1:ks]
+            mm = re.search(r"(?:(?:public|private|protected|internal)\s+)+$",
+                           before)
+            if mm:
+                ms = open_b + 1 + mm.start()
+            sig = ("%s get_%s()" % (typ, name) if kw == "get"
+                   else "void set_%s(%s value)" % (name, typ))
+            if semi is None:
+                edits.append((ms, ke, sig + " "))
+            else:
+                ret = "return " if kw == "get" else ""
+                edits.append((ms, ke, sig + " { %s" % ret))
+                edits.append((semi, semi + 1, "; }"))
+        edits.append((close_b, close_b + 1, ""))
+        names.append(name)
+        pos = close_b + 1
+    for a, b, rep in sorted(edits, reverse=True):
+        # keep every newline the replaced span held
+        text = text[:a] + rep + "\n" * text[a:b].count("\n") + text[b:]
+    return text
+
+
 def _lower_auto_properties(text):
     """`int Count { get; set; }` -> field + get_Count / set_Count.
 
@@ -1939,21 +2282,46 @@ def _lower_auto_properties(text):
     """
     prop = re.compile(
         r"(?<![\w.])([\w:<>,\s\*\&]+?)\s+(\w+)\s*\{\s*get\s*;\s*"
-        r"(?:(?:public|private|protected|internal)\s+)?set\s*;\s*\}")
+        r"(?:(?:public|private|protected|internal)\s+)?set\s*;\s*\}"
+        r"(?:\s*=\s*([^;{}]+);)?")
     names = []
 
     def repl(m):
+        # `{ get; set; } = init;` (C# 6) initialises the backing field; the
+        # zeroing pass writes `= 0;` for a scalar one that has none.
         typ, name = m.group(1).strip(), m.group(2)
         names.append(name)
         field = "_" + name
-        return ("%s %s; %s get_%s() { return this->%s; } "
+        init = (" = " + m.group(3).strip()) if m.group(3) else ""
+        return ("%s %s%s; %s get_%s() { return this->%s; } "
                 "void set_%s(%s v) { this->%s = v; }"
-                % (typ, field, typ, name, field, name, typ, field))
+                % (typ, field, init, typ, name, field, name, typ, field))
 
     text = cpprust._sub_code(prop.pattern, repl, text)
+    text = _lower_accessor_properties(text, names)
     for name in sorted(set(names), key=len, reverse=True):
+        # Read-modify-write through the accessors: `c.A += 4`, `c.A++`.
+        # Through the getter alone it was `get_A() += 4`, not an lvalue.
+        # The receiver is a plain name chain, so naming it twice evaluates
+        # nothing twice; any other receiver is left to the passes below.
         text = cpprust._sub_code(
-            r"\." + re.escape(name) + r"\s*=\s*([^;]+);",
+            r"(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\." + re.escape(name)
+            + r"\s*(\+|-|\*|/|%|&|\||\^|<<|>>)=\s*([^;]+);",
+            lambda m, n=name: "%s.set_%s(%s.get_%s() %s (%s));"
+            % (m.group(1), n, m.group(1), n, m.group(2), m.group(3)), text)
+        text = cpprust._sub_code(
+            r"(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\." + re.escape(name)
+            + r"\s*(\+\+|--)\s*;",
+            lambda m, n=name: "%s.set_%s(%s.get_%s() %s 1);"
+            % (m.group(1), n, m.group(1), n, m.group(2)[0]), text)
+        text = cpprust._sub_code(
+            r"(?<![\w.+-])(\+\+|--)\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\."
+            + re.escape(name) + r"\s*;",
+            lambda m, n=name: "%s.set_%s(%s.get_%s() %s 1);"
+            % (m.group(2), n, m.group(2), n, m.group(1)[0]), text)
+        # `=` but not `==`: a comparison is a read.
+        text = cpprust._sub_code(
+            r"\." + re.escape(name) + r"\s*=(?!=)\s*([^;]+);",
             lambda m, n=name: ".set_%s(%s);" % (n, m.group(1)), text)
         text = cpprust._sub_code(
             r"\.(?!get_|set_)" + re.escape(name) + r"\b(?!\s*\()",
@@ -2286,6 +2654,194 @@ def _instance_fields(body, name):
     return fields, ctors, props
 
 
+_SHIFT_STOP = set("=<>!&^|?:,;({[}")
+_SHIFT_KEYWORDS = frozenset(("return", "case", "throw", "else", "in", "is",
+                             "as", "new", "await", "yield"))
+
+
+def _shift_left_start(scan, i):
+    """Start of the left operand of the shift whose operator is at @i:
+    everything that binds tighter (`+ - * / %`, calls, indexing, casts),
+    and an earlier shift too, since shifts associate to the left."""
+    j = i - 1
+    start = i
+    while j >= 0:
+        c = scan[j]
+        if c in " \t\r\n":
+            j -= 1
+            continue
+        if c in ")]":
+            k = _match_back(scan, j)
+            if k is None:
+                break
+            start = j = k
+            j -= 1
+            continue
+        if c in "<>" and j >= 1 and scan[j - 1] == c and \
+                (j < 2 or scan[j - 2] != c):
+            j -= 2                          # an earlier `<<` / `>>`
+            continue
+        if c in _SHIFT_STOP:
+            break
+        if c.isalnum() or c == "_":
+            k = j
+            while k > 0 and (scan[k - 1].isalnum() or scan[k - 1] == "_"):
+                k -= 1
+            if scan[k:j + 1] in _SHIFT_KEYWORDS:
+                break
+            start = k
+            j = k - 1
+            continue
+        if c in ".+-*/%~":
+            start = j
+            j -= 1
+            continue
+        break
+    while start < i and scan[start] in " \t\r\n":
+        start += 1
+    return start
+
+
+def _match_back(scan, j):
+    """Index of the opener matching the `)` or `]` at @j, or None."""
+    close = scan[j]
+    opener = "(" if close == ")" else "["
+    depth = 0
+    for k in range(j, -1, -1):
+        if scan[k] == close:
+            depth += 1
+        elif scan[k] == opener:
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
+
+
+def _shift_right_end(scan, k):
+    """One past the end of the right operand starting at @k."""
+    j = k
+    end = k
+    n = len(scan)
+    while j < n:
+        c = scan[j]
+        if c in " \t\r\n":
+            j += 1
+            continue
+        if c in "([":
+            m = _match_paren_or_bracket(scan, j)
+            if m is None:
+                break
+            end = j = m + 1
+            continue
+        if c in "=<>&^|?:,;)]}{":
+            break
+        if c == "!" and j + 1 < n and scan[j + 1] == "=":
+            break                           # `!=` binds looser than a shift
+        end = j = j + 1
+    return end
+
+
+def _match_paren_or_bracket(scan, j):
+    if scan[j] == "(":
+        return cpprust._match_paren(scan, j)
+    depth = 0
+    for k in range(j, len(scan)):
+        if scan[k] == "[":
+            depth += 1
+        elif scan[k] == "]":
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
+
+
+def _closes_generic(scan, i):
+    """True if the `>>` at @i closes two generic argument lists
+    (`List<List<int>>`) rather than shifting."""
+    j = i - 1
+    while j >= 0 and scan[j] in " \t":
+        j -= 1
+    if j < 0 or not (scan[j].isalnum() or scan[j] in "_>]"):
+        return False
+    stmt = max(scan.rfind(";", 0, i), scan.rfind("{", 0, i),
+               scan.rfind("}", 0, i)) + 1
+    seg = scan[stmt:i]
+    opens = len(re.findall(r"\w\s*<(?!<)", seg))
+    closes = seg.count(">") - 2 * seg.count(">>")
+    return opens - closes >= 2
+
+
+def _mask_shifts(text):
+    """`x << n` -> `x << ((n) & (int)(sizeof((x) + 0) * 8 - 1))`.
+
+    C# defines a shift count as taken modulo the width of the (promoted)
+    left operand: 5 bits for `int`, 6 for `long`. C leaves a count at or
+    beyond the width undefined, and an optimiser folds it: `1 << 33` is 2
+    in C# and came out 0 under gcc -O2. `sizeof((x) + 0)` is the width
+    after C's integer promotion -- the same promotion C# applies, so a
+    `byte` shifts by a count modulo 32 in both -- and `sizeof` does not
+    evaluate `x`. `<<=` and `>>=` are masked the same way.
+    """
+    pos = 0
+    while True:
+        scan = _blank(text)
+        m = re.compile(r"<<=?|>>=?").search(scan, pos)
+        if m is None:
+            return text
+        op = m.group(0)
+        i = m.start()
+        # `<<<`/`>>>` (C# 11 unsigned shift) and lone `<`/`>` are not ours
+        if (i > 0 and scan[i - 1] == op[0]) or \
+                (m.end() < len(scan) and scan[m.end()] == op[0]):
+            pos = m.end()
+            continue
+        if op.startswith(">>") and len(op) == 2 and _closes_generic(scan, i):
+            pos = m.end()
+            continue
+        ls = _shift_left_start(scan, i)
+        re_ = _shift_right_end(scan, m.end())
+        left = text[ls:i].strip()
+        right = text[m.end():re_].strip()
+        if not left or not right:
+            pos = m.end()
+            continue
+        masked = "((%s) & (int)(sizeof((%s) + 0) * 8 - 1))" % (right, left)
+        # keep the operand's own newlines, so no line moves
+        nl = "\n" * text[m.end():re_].count("\n")
+        text = text[:m.end()] + " " + masked + nl + text[re_:]
+        pos = m.end() + 1 + len(masked)
+
+
+def _has_field_initializer(body):
+    """True if an instance field or auto-property in @body has an
+    initializer (`int w = 3;`, `{ get; set; } = 7;`).
+
+    Such a type has code to run when it is created, so it is not plain data
+    even with no constructor: zeroing it in place of construction skipped
+    the initializers, and `new C()` came out with every field 0.
+    """
+    flat, i, n = [], 0, len(body)
+    while i < n:
+        if body[i] == "{":
+            j = cpprust._match_brace(body, i)
+            if j is None:
+                break
+            flat.append(" ; " if _AUTO_PROP_BODY.match(body[i:j + 1]) else " @;")
+            i = j + 1
+            continue
+        flat.append(body[i])
+        i += 1
+    for piece in "".join(flat).split(";"):
+        if "@" in piece or "(" in piece.split("=", 1)[0]:
+            continue
+        words = piece.split()
+        if "static" in words or "const" in words:
+            continue
+        if re.search(r"(?<![=!<>])=(?![=>])", piece):
+            return True
+    return False
+
+
 def _type_table(text):
     """Every declared type by name: kind, base clause, fields, ctors."""
     scan = _blank(text)
@@ -2301,6 +2857,7 @@ def _type_table(text):
         if kind in ("struct", "class"):
             info["fields"], info["ctors"], info["props"] = _instance_fields(
                 scan[brace + 1:close], name)
+            info["inits"] = _has_field_initializer(scan[brace + 1:close])
         table[name] = info
     return table
 
@@ -2353,7 +2910,7 @@ def _is_plain_struct(name, table):
     which would bring a vtable pointer the zeroing must not clear.
     """
     info = table.get(name)
-    if info is None or info["ctors"]:
+    if info is None or info["ctors"] or info.get("inits"):
         return False
     if info["kind"] == "struct":
         return _unmanaged_reason(name, table) is None
@@ -3734,7 +4291,7 @@ def _static_member(scan, types, tname, member):
 
 
 def _lower_static_calls(text, table):
-    """`Type.Method(..)` -> `Type::Method(..)` for a `static` method.
+    """`Type.Member` -> `Type::Member` for a `static` method or field.
 
     C# names a static member through its type with a dot; C++ with `::`,
     which is what the C++ half recognises as a call with no receiver.
@@ -3749,7 +4306,10 @@ def _lower_static_calls(text, table):
     scan = _blank(text)
     types = _find_types(text)
     edits = []
-    pat = r"(?<![\w.])(%s)\s*\.\s*([A-Za-z_]\w*)\s*\(" % "|".join(
+    # A static field or property is named the same way as a static method
+    # (`Counter.Count`, `Config.Max`), and was left as `Counter.Count` --
+    # a type used as a value, which C rejects.
+    pat = r"(?<![\w.])(%s)\s*\.\s*([A-Za-z_]\w*)\b" % "|".join(
         re.escape(n) for n in sorted(tnames, key=len, reverse=True))
     for m in re.finditer(pat, scan):
         if _static_member(scan, types, m.group(1), m.group(2)):
@@ -3869,6 +4429,17 @@ def _strip_attributes(text):
 
 # ---------------------------------------------------------------------------
 
+#: Prefixed to the C csrust emits. C# integer arithmetic wraps; in C
+#: signed overflow is undefined, and an optimiser exploits that -- a loop
+#: whose counter wraps past `int.MaxValue` was compiled by gcc -O2 into an
+#: infinite one. GCC's `optimize` pragma turns `-fwrapv` on from there to the
+#: end of the translation unit; shivyc ignores it and wraps anyway; clang
+#: ignores it, so build with `-fwrapv` there. The operator form, on the first
+#: line of the *C*: the C++ half must not see it, since a declaration that
+#: shares a line with it is misread.
+WRAPV_PRAGMA = '_Pragma("GCC optimize(\\"wrapv\\")") '
+
+
 def translate(text, path="<cs>"):
     """Rewrite a C# subset source into the C++ subset. Raises CsError."""
     # Before a single character is rewritten, so every message names a C#
@@ -3878,6 +4449,9 @@ def translate(text, path="<cs>"):
     shared = _find_shared_names(text)
     # Read from the source as written, before any pass renames a type.
     table = _type_table(text)
+    _check_static_fields(text, table, path)
+    text = _zero_scalar_fields(text, table)
+    text = _mask_shifts(text)
     _check_declaration_order(text, table, shared, path)
     need = set()
     # Before the generic attribute pass, which would drop a whole-line
@@ -3904,6 +4478,8 @@ def translate(text, path="<cs>"):
     # pass, so an initializer's `P = 1` becomes `x.P = 1` in time to be
     # turned into `x.set_P(1)` like any other.
     text = _lower_memory_marshal(text, table, path, need)
+    _check_strings(text, path)
+    _check_unsupported_forms(text, table, path)
     # Before initializers: `xs.Add(new T { .. })` becomes a declaration.
     text = _lower_list_members(text, table, path, need)
     text = _list_property_storage(text, table)
