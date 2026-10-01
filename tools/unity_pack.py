@@ -107,8 +107,11 @@ def _report_stub(plan, site, cl, m, why):
     """
     what, text = why
     text = " ".join(str(text).split())
-    message = ("`%s.%s` is not lowered yet (`%s`: %s); it is emitted as an "
-               "empty method" % (cl["name"], m["name"], text, what.rstrip(".")))
+    message = ("`%s.%s` is not lowered yet (`%s`: %s)"
+               % (cl["name"], m["name"], text, what.rstrip(".")))
+    if not plan.get("strict"):
+        # only a warning says what happens next; an error stops the pack
+        message += "; it is emitted as an empty method"
     path = site.get("path") or "<cs>"
     ft = site.get("file_text") or ""
     at = int(site.get("body_abs") or 0)
@@ -233,6 +236,27 @@ def _analyzed_mb_typenames(analyses):
     return {c["name"] for a in (analyses or [])
             for c in a.get("classes") or [] if c.get("name")}
 
+
+# A call into the C math library anywhere in the emitted engine. The header
+# is included by feature (`want_math`, `want_anim`, ..), and this is the
+# net under that list: it checked three names, so ParticleSystem's
+# simulation -- `cosf` / `sinf` for the emitter's shape -- failed to
+# compile in every project that had one, `undeclared identifier 'cosf'`.
+_LIBM_CALL = re.compile(
+    r"(?<![\w.])(?:sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|sqrt|cbrt"
+    r"|pow|exp|exp2|log|log2|log10|floor|ceil|round|trunc|fmod|fabs|hypot"
+    r"|fmin|fmax|copysign)f?\s*\(")
+
+# UnityEngine.ParticleSystem's instance methods: called through the type
+# they are CS0120, not CS0117 -- the member exists, it needs an object.
+_PARTICLE_SYSTEM_INSTANCE_MEMBERS = frozenset((
+    "Emit", "Play", "Stop", "Pause", "Clear", "Simulate", "IsAlive",
+    "GetParticles", "SetParticles", "TriggerSubEmitter", "GetComponent",
+))
+# `ParticleSystem ParticleSystem` / `ParticleSystem` as a parameter name: the
+# name then means the variable.
+_PS_NAMED_VARIABLE = re.compile(
+    r"(?<![\w.])[A-Za-z_][\w.<>]*\s+ParticleSystem\s*[;=,)]")
 
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({
@@ -430,12 +454,29 @@ def _check_refused_api(path, text, scan):
             r"new\s+(%s)\s*(?:<|\()" % tname, scan)
         if m:
             _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % tname)
-    # Member forms analyze maps to refused keys (Emit / Evaluate / current).
-    m = None and re.search(r"ParticleSystem\.(Emit)\b", scan)
-    if m:
-        _raise_cs(
-            path, text, m.start(1), "CS0117",
-            "'ParticleSystem' does not contain a definition for 'Emit'")
+    # `ParticleSystem.X(..)` through the *type*. Since particle systems are
+    # read and simulated (unity_pack_particles.py) this check had been
+    # switched off (`m = None and ..`), and a static call nothing lowers --
+    # `ParticleSystem.Emit(0f, 0f)` -- was no longer refused: the method
+    # holding it was emptied, with only a CS8000 warning. csc's answer
+    # depends on the member: an instance member called through the type is
+    # CS0120, a member the type does not have is CS0117. A field, local or
+    # parameter *named* `ParticleSystem` makes the name the variable (C#'s
+    # "Color Color" rule), and then it is an ordinary instance call.
+    if not _PS_NAMED_VARIABLE.search(scan):
+        m = re.search(r"(?<![\w.])(?:UnityEngine\.)?ParticleSystem\s*\.\s*"
+                      r"([A-Za-z_]\w*)\s*\(", scan)
+        if m:
+            member = m.group(1)
+            if member in _PARTICLE_SYSTEM_INSTANCE_MEMBERS:
+                _raise_cs(
+                    path, text, m.start(1), "CS0120",
+                    "An object reference is required for the non-static "
+                    "field, method, or property 'ParticleSystem.%s'" % member)
+            _raise_cs(
+                path, text, m.start(1), "CS0117",
+                "'ParticleSystem' does not contain a definition for '%s'"
+                % member)
     m = re.search(r"AnimationCurve\.(Evaluate)\b", scan)
     if m:
         _raise_cs(
@@ -25773,7 +25814,7 @@ def pack(root, outdir, *args, **kwargs):
         _common.SOURCE_OVERLAY.update(saved)
 
 
-def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
+def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
          gpu_handles=False, physics_inject=False, box2d_root=None,
          coost_root=None):
     """Pack the Unity-subset project at *root* into *outdir*.
@@ -26106,6 +26147,15 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     # A method the translator cannot lower is a warning, or with `strict`
     # an error (`_report_stub`).
+    # A stub -- a method emptied because something in it is not lowered yet
+    # -- is an error for a Godot project. GODOT_PACK.md promises that what is
+    # not in the subset "is refused where it is written, never dropped", and
+    # a stub is exactly a drop: a lambda, a tuple or a static call nothing
+    # lowers emptied its method with only a CS8000 warning. A Unity project
+    # keeps warnings by default until the move to cs2cpp is done (see
+    # UNITY_PACK.md); either can be set explicitly.
+    if strict is None:
+        strict = _godot.is_godot_project(root)
     plan["strict"] = bool(strict)
     import tools.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
@@ -26119,7 +26169,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=False
     helpers_c = _string_helpers_c(_used_helpers)
     if (runtime.needs_math(runtime.closure(
             {h for h in _used_helpers if runtime.is_runtime_helper(h)}))
-            or "atan2f(" in engine or "powf(" in engine or "sqrtf(" in engine) \
+            or _LIBM_CALL.search(engine)) \
             and "#include <math.h>" not in engine:
         k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
         engine = engine[:k] + "#include <math.h>\n" + engine[k:]
@@ -26282,7 +26332,7 @@ def main():
     soa = True
     soa_vec4 = False
     force = False
-    strict = False
+    strict = None   # by project: strict for Godot (see _pack_impl)
     if "--force" in args:
         force = True
         args.remove("--force")

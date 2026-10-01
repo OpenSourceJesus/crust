@@ -2592,5 +2592,58 @@ public partial class Turret : Node2D
                 "Gun.cs": GUN_CS.replace(old, new)})))
 
 
+class TestNothingDropped(unittest.TestCase):
+    """GODOT_PACK.md: what is not in the subset "is refused where it is
+    written, never dropped". A method the translator could not lower was
+    emptied with only a CS8000 warning -- a lambda, a tuple, a static call
+    nothing lowers -- so a Godot project packs strict by default: each is an
+    error at its line. `strict=False` still asks for the warning."""
+
+    def _project(self, method, call):
+        d = tempfile.mkdtemp(prefix="gpf-drop-")
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.rmtree(d)
+        shutil.copytree(os.path.join(ROOT, "tests", "fixtures", "GodotMini"), d)
+        p = os.path.join(d, "scripts", "Player.cs")
+        with open(p) as f:
+            src = f.read()
+        src = src.replace('GD.Print("ready hp=", Hp);',
+                          'GD.Print("ready hp=", Hp); %s;' % call)
+        src = src.rstrip()[:-1] + method + "\n}\n"
+        with open(p, "w") as f:
+            f.write(src)
+        return d
+
+    CASES = (
+        ("    int Twice(int x) { System.Func<int, int> f = y => y * 2; return f(x); }",
+         "Twice(1)"),
+        ("    int T() { var t = (1, 2); return t.Item1; }", "T()"),
+        ("    void Q() { Foo.Bar(); }", "Q()"),
+    )
+
+    def test_each_is_an_error_at_its_line(self):
+        for method, call in self.CASES:
+            d = self._project(method, call)
+            out = tempfile.mkdtemp(prefix="gpf-")
+            self.addCleanup(shutil.rmtree, out, True)
+            with self.assertRaises(unity_pack.PackError) as cm:
+                with _fast():
+                    unity_pack.pack(d, out, force=True)
+            msg = str(cm.exception)
+            self.assertIn("error CS8000", msg, method)
+            self.assertIn("scripts/Player.cs(", msg, method)
+            self.assertNotIn("emitted as an empty method", msg)
+
+    def test_strict_false_still_warns(self):
+        method, call = self.CASES[2]
+        d = self._project(method, call)
+        out = tempfile.mkdtemp(prefix="gpf-")
+        self.addCleanup(shutil.rmtree, out, True)
+        with _fast() as err:
+            unity_pack.pack(d, out, force=True, strict=False)
+        self.assertIn("warning CS8000", err.getvalue())
+        self.assertIn("emitted as an empty method", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
