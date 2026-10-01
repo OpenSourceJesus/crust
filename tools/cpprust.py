@@ -1463,7 +1463,7 @@ def _check_unsupported(scan, path, rtti=False):
 class Member(object):
     __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
                  "init", "virt", "pure", "outline", "definit",
-                 "declared_only", "stat", "contracts")
+                 "declared_only", "stat", "contracts", "mutable")
 
     def __init__(self, kind, ret, name, params, body, line, dim="",
                  init=None, virt=False, pure=False):
@@ -1480,6 +1480,7 @@ class Member(object):
         # Declared `static`: a member function with no receiver. It is
         # emitted without a `this` parameter and called as `Cls::name(..)`
         # rather than through an object.
+        self.mutable = False
         self.stat = False
         # Defined out of line, under a qualified name. Its body is emitted
         # where the author wrote it rather than at the class, so a body that
@@ -1866,19 +1867,27 @@ def _split_members(body, cname, line0, path="<cpp>"):
                 # named `Class_name`, with uses inside the class rewritten
                 # to that. coost's vendored `dtoa_milo.h` declares seven.
                 sm = re.match(r"^\s*static\s+(?:constexpr\s+)?"
-                              r"(?:const\s+)?(.+)$", decl)
+                              r"(const\s+)?(.+)$", decl)
                 if sm is not None:
+                    # Without `const` it is a class *variable*: one object
+                    # shared by every instance, and assignable. It used to be
+                    # taken for a constant when it had an initializer (so
+                    # `count++` hit a read-only variable) and for a field
+                    # when it had none (so `static int n;` sat inside the
+                    # struct, which is not C).
+                    mutable = sm.group(1) is None
                     eq0 = _top_level_eq(decl)
+                    cdecl = sm.group(2).strip()
+                    cinit = None
                     if eq0 >= 0:
                         cinit = decl[eq0 + 1:].strip()
-                        cdecl = sm.group(1).strip()
                         cdecl = cdecl[:_top_level_eq(cdecl)].strip() \
                             if _top_level_eq(cdecl) >= 0 else cdecl
-                        cparts = cdecl.replace("*", " * ").split()
-                        if len(cparts) >= 2:
-                            statics.append((" ".join(cparts[:-1]),
-                                            cparts[-1], cinit))
-                            continue
+                    cparts = cdecl.replace("*", " * ").split()
+                    if len(cparts) >= 2 and (eq0 >= 0 or mutable):
+                        statics.append((" ".join(cparts[:-1]),
+                                        cparts[-1], cinit, mutable))
+                        continue
                 definit = None
                 eq = _top_level_eq(decl)
                 if eq >= 0:
@@ -2141,9 +2150,15 @@ def _split_members(body, cname, line0, path="<cpp>"):
         # clauses that preceded its body.
         for _new in members[_before:]:
             _new.contracts = list(contracts)
-    for _sty, _snm, _sini in statics:
-        _sm = Member("sconst", _sty, _snm, None, None, line0)
+    for _sty, _snm, _sini, _smut in statics:
+        # `tbl[4]`: the name is what a use spells, the bound goes with the
+        # declaration.
+        _nm = re.match(r"^(\w+)(.*)$", _snm)
+        _sm = Member("sconst", _sty, _nm.group(1) if _nm else _snm,
+                     None, None, line0)
         _sm.definit = _sini
+        _sm.mutable = _smut
+        _sm.dim = _nm.group(2) if _nm else ""
         members.append(_sm)
     return members
 
@@ -4806,17 +4821,66 @@ def _lower_refs(text, names):
     return text
 
 
-def _implicit_this(body, mnames):
+def _static_var_definitions(text, svars):
+    """`int Cls::n = 5;` at file scope -> `static int Cls::n = 5;`.
+
+    A class variable is emitted with the class as `static T Cls_n;`, a
+    tentative definition. The out-of-line definition C++ requires is the
+    real one, and has to agree on linkage: without `static` it declared the
+    same name with external linkage, which C rejects. The qualified name is
+    renamed by the pass after this one. Only at brace depth zero -- inside a
+    function the same spelling is an expression.
+    """
+    look = _blank_strings(_strip_comments(text))
+    pat = re.compile(r"(?<![\w.>:])(%s)\s*::\s*(\w+)\s*(?:\[[^\]]*\]\s*)?(?==|;)"
+                     % _type_alt(set(c for c, _n in svars)))
+    starts = []
+    for m in pat.finditer(look):
+        if (m.group(1), m.group(2)) not in svars:
+            continue
+        # the start of the declaration: back to the previous `;`, `}` or
+        # `{`, and only at depth zero
+        depth = look.count("{", 0, m.start()) - look.count("}", 0, m.start())
+        if depth != 0:
+            continue
+        j = max(look.rfind(";", 0, m.start()), look.rfind("}", 0, m.start()),
+                look.rfind("{", 0, m.start())) + 1
+        while j < m.start() and look[j] in " \t\r\n":
+            j += 1
+        head = look[j:m.start()].strip()
+        if not head or head.startswith("static") or \
+                re.match(r"^(return|case|goto|throw|delete|else)\b", head):
+            continue
+        starts.append(j)
+    for j in reversed(starts):
+        text = text[:j] + "static " + text[j:]
+    return text
+
+
+def _implicit_this(body, mnames, statics=(), cname=None):
     """`helper(x)` inside a method -> `this->helper(x)`.
 
     Rewriting to an explicit receiver rather than straight to
     `Cname_helper(this, x)` means the ordinary call pass resolves it, so a
     bare call to an inherited method upcasts and a bare call to a virtual
     one dispatches -- both for free, and both correct.
+
+    A `static` method has no receiver, so a bare call to one goes through
+    the class instead, `Cname::helper(x)`, which the call pass lowers to a
+    plain call. Sent through `this` it came out as `this->helper(..)` in a
+    static method, which has no `this`, and as `Cname_helper(this, ..)` in
+    an instance one -- an extra argument. `statics` holds the names whose
+    every overload is static; a name with an instance overload as well is
+    left to the receiver path, which also drops the receiver for a static
+    entry.
     """
-    if not mnames:
+    if statics and cname:
+        body = _sub_code(r"(?<![\w.>:])(%s)\s*\(" % _type_alt(statics),
+                         lambda m: "%s::%s(" % (cname, m.group(1)), body)
+    rest = [n for n in mnames if n not in statics]
+    if not rest:
         return body
-    return _sub_code(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames),
+    return _sub_code(r"(?<![\w.>:])(%s)\s*\(" % _type_alt(rest),
                      lambda m: "this->%s(" % m.group(1), body)
 
 
@@ -5459,8 +5523,21 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             if _o.kind == "sconst":
                 _sinit = re.sub(r"(?<![\w.>])%s(?![\w])" % re.escape(_o.name),
                                 "%s_%s" % (cname, _o.name), _sinit)
-        head.append("static const %s %s_%s = %s;"
-                    % (_sm.ret, cname, _sm.name, _sinit))
+        if getattr(_sm, "mutable", False):
+            # A class variable: file scope, zero unless initialised, which
+            # is what static storage is in C++ and C alike. Without an
+            # initializer it is a *tentative* definition, so an out-of-line
+            # `int Cls::n = 5;` (made `static` below) can still define it.
+            if _sm.definit is None:
+                head.append("static %s %s_%s%s;"
+                            % (_sm.ret, cname, _sm.name, _sm.dim))
+            else:
+                head.append("static %s %s_%s%s = %s;"
+                            % (_sm.ret, cname, _sm.name, _sm.dim, _sinit))
+            continue
+        head.append("static const %s %s_%s%s = %s;"
+                    % (_sm.ret, cname, _sm.name, getattr(_sm, "dim", ""),
+                       _sinit))
     head.append("struct %s { %s };" % (cname, " ".join(parts) or
                                        "char _cpp_empty;"))
     # An abstract class gets its descriptor as an object of its own, since it
@@ -5481,6 +5558,19 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                cname))
 
     mnames = [m.name for m in cls.members if m.kind == "method"]
+    # Names every overload of which is static, own and inherited alike: a
+    # bare call to one has no receiver.
+    _st_names = set(m.name for m in cls.members
+                    if m.kind == "method" and getattr(m, "stat", False))
+    _in_names = set(m.name for m in cls.members
+                    if m.kind == "method" and not getattr(m, "stat", False))
+    if base_info:
+        for _k, _v in base_info["methods"].items():
+            if _v and all(_e.get("static") for _e in _v.values()):
+                _st_names.add(_k)
+            else:
+                _in_names.add(_k)
+    static_calls = sorted(_st_names - _in_names)
     if base_info:
         mnames = sorted(set(mnames) | set(base_info["methods"]))
     info = {"ctor": False, "dtor": False, "ctors": {}, "methods": {},
@@ -5767,7 +5857,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
                 lambda _m: "(*%s)" % rname, inner)
         inner = _addr_of_class_refs(inner, class_refs)
-        inner = _implicit_this(inner, mnames)
+        inner = _implicit_this(inner, mnames, static_calls, cname)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
         # rather than the bare name -- `id` in a derived method is
@@ -9690,6 +9780,11 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo,
             return e
         return "((%s *)%s)" % (want, e)
 
+    if ent.get("static"):
+        # `obj.f()` where `f` is static: legal C++, and the object is only
+        # a way of naming the class. There is no `this` to pass -- passing
+        # one handed the function an extra first argument.
+        return "%s(%s)" % (ent["fn"], args)
     if ent["virtual"]:
         # Dispatch through the table. The vptr lives at offset zero in the
         # root, so the cast is free.
@@ -13744,10 +13839,15 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # emitted; a use from free code or another class's method still has
     # its qualification, which C reads as a syntax error.
     sconst_alt = []
+    svar_alt = []
     for _s, _e, _cls in classes:
         for _mem in _cls.members:
             if _mem.kind == "sconst":
                 sconst_alt.append((_cls.name, _mem.name))
+                if getattr(_mem, "mutable", False):
+                    svar_alt.append((_cls.name, _mem.name))
+    if svar_alt:
+        out = _static_var_definitions(out, svar_alt)
     if sconst_alt:
         out = _sub_code(
             r"(?<![\w.>])(%s)\s*::\s*(\w+)\b" % _type_alt(

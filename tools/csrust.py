@@ -39,11 +39,23 @@ def translate(text, path="<cs>", owning=None, basedir=None, incdirs=(),
     unless a caller insists.
     """
     cpp = cs2cpp.translate(text, path=path)
-    return cpprust.translate(
+    c = cpprust.translate(
         cpp, path=path, owning=owning, basedir=basedir, incdirs=incdirs,
         defines=defines, clang=False if clang is None else clang,
         rtti=rtti, decls=decls, decls_out=decls_out,
         contracts=contracts, mem_safe=mem_safe, any_order=True)
+    return _with_wrapv(c)
+
+
+def _with_wrapv(c):
+    """`cs2cpp.WRAPV_PRAGMA` on the first line that is not a directive, so
+    no line moves and no `#include` is broken."""
+    lines = c.split("\n")
+    for k, line in enumerate(lines):
+        if not line.lstrip().startswith("#"):
+            lines[k] = cs2cpp.WRAPV_PRAGMA + line
+            break
+    return "\n".join(lines)
 
 
 def main():
