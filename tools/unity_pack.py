@@ -5833,7 +5833,7 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"\bVector2Int\b", scan):
         apis.add("Vector2Int")
     # The Input System's Gamepad.current: the host's gamepad.
-    if re.search(r"(?<![\w.])Gamepad\s*\.\s*current\b", text):
+    if re.search(r"(?<![\w.])Gamepad\s*\.\s*(?:current|all)\b", text):
         apis.add("Gamepad.current")
         apis.add("Vector2")
     # The mouse wheel: the host's scroll, per frame.
@@ -21935,6 +21935,11 @@ def _lower_gamepad(text):
     if "Gamepad" not in text:
         return text
     tail = r"(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?Gamepad\s*\.\s*current"
+    # ponytail: the host has one gamepad, so Gamepad.all is it or nothing
+    all_ = r"(?<![\w.])(?:UnityEngine\s*\.\s*InputSystem\s*\.\s*)?Gamepad\s*\.\s*all"
+    text = cs2cpp.code_sub(all_ + r"\s*\.\s*Count\b", "engine_gamepad_connected",
+                           text)
+    text = cs2cpp.code_sub(all_ + r"\s*\[[^\[\]]*\]", "Gamepad.current", text)
     gp = r"(?<![\w.])" + tail
     decl = r"(?<![\w.])(?:var|Gamepad)\s+(\w+)\s*=\s*" + tail + r"\s*;"
     locals_ = re.findall(decl, cs2cpp._blank(text))
@@ -21945,6 +21950,8 @@ def _lower_gamepad(text):
         text = cs2cpp.code_sub(r + r"\s*(==|!=)\s*null\b",
                                lambda m: "(%sengine_gamepad_connected)" % (
                                    "!" if m.group(1) == "==" else ""), text)
+        text = cs2cpp.code_sub(r + r"\s*\.\s*enabled\b",
+                               "engine_gamepad_connected", text)
         names = sorted(set(_GAMEPAD_BUTTONS) | set(_GAMEPAD_VALUES), key=len,
                        reverse=True)
         alt = "|".join(re.escape(n).replace(r"\.", r"\s*\.\s*") for n in names)
