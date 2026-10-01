@@ -17048,3 +17048,102 @@ class TestParticleSystems(unittest.TestCase):
         # stopped and cleared; three emitted while stopped (5 s lifetime);
         # then one second of the default 10/s after Play
         self.assertEqual(run.stdout.split(), ["n=0", "n=3", "n=13"])
+
+
+class TestAnimationCurves(unittest.TestCase):
+    """A script's AnimationCurve field: read from the scene and evaluated
+    as Unity evaluates it. It used to be packed as a reference to a class
+    named `AnimationCurve` -- always null, its keys dropped."""
+
+    TS = [-0.6, 0.0, 0.25, 0.5, 0.9, 1.0, 1.5, 2.25, 3.7]
+    CURVES = {
+        1: ([(0, 0, 0, 0), (1, 1, 0, 0)], 8, 8),                  # EaseInOut, clamp
+        2: ([(0, 0, 0, 3), (1, 2, 1, "Infinity"), (2, 5, -1, 0)], 2, 4),  # Hermite, step; loop / pingpong
+    }
+
+    @staticmethod
+    def _key(t, v, i, o, weighted=0):
+        return ("    - serializedVersion: 3\n      time: %s\n      value: %s\n"
+                "      inSlope: %s\n      outSlope: %s\n      tangentMode: 0\n"
+                "      weightedMode: %d\n      inWeight: 0.33333334\n"
+                "      outWeight: 0.33333334\n" % (t, v, i, o, weighted))
+
+    def _project(self, curves, weighted=0):
+        script = ("using UnityEngine;\npublic class Mover : MonoBehaviour {\n"
+                  "    public AnimationCurve speed;\n    public int tag;\n    int f;\n"
+                  "    void Update() {\n        f++;\n        if (f != 1) return;\n"
+                  "        Debug.Log(\"c\" + tag + \" n=\" + speed.length);\n"
+                  + "".join("        Debug.Log(\"c\" + tag + \" \" + speed.Evaluate(%rf));\n" % t
+                            for t in self.TS)
+                  + "    }\n}\n")
+        scene = "%YAML 1.1\n"
+        for n, (keys, pre, post) in sorted(curves.items()):
+            fid = 10 * n
+            scene += (
+                "--- !u!1 &%d\nGameObject:\n  m_Name: M%d\n  m_Component:\n"
+                "  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+                "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+                "  speed:\n    serializedVersion: 2\n    m_Curve:\n"
+                % (fid, n, fid + 1, fid + 2, fid + 1, fid, fid + 2, fid)
+                + "".join(self._key(*k, weighted=weighted) for k in keys)
+                + "    m_PreInfinity: %d\n    m_PostInfinity: %d\n"
+                  "    m_RotationOrder: 4\n  tag: %d\n" % (pre, post, n))
+        root = tempfile.mkdtemp(prefix="upack-curve-")
+        self.addCleanup(shutil.rmtree, root, True)
+        s = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(s)
+        with open(os.path.join(s, "Mover.cs"), "w") as f:
+            f.write(script)
+        with open(os.path.join(s, "Mover.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(scene)
+        return root
+
+    def test_reference_matches_unity_known_values(self):
+        import tools.unity_pack_curves as uc
+        ease = {"keys": [(0, 0, 0, 0), (1, 1, 0, 0)], "pre": 8, "post": 8}
+        lin = {"keys": [(0, 0, 1, 1), (1, 1, 1, 1)], "pre": 8, "post": 8}
+        # AnimationCurve.EaseInOut is smoothstep; .Linear is the line
+        self.assertAlmostEqual(uc.evaluate(ease, 0.25), 0.15625)
+        self.assertAlmostEqual(uc.evaluate(lin, 0.5), 0.5)
+        self.assertAlmostEqual(uc.evaluate(dict(lin, post=2), 1.25), 0.25)
+        self.assertAlmostEqual(uc.evaluate(dict(lin, post=4), 1.25), 0.75)
+
+    @needs_cc
+    def test_engine_evaluates_as_the_reference(self):
+        import tools.unity_pack_curves as uc
+        out = tempfile.mkdtemp(prefix="upack-curve-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(self._project(self.CURVES), out, force=True, strict=True)
+        src = os.path.join(out, "h.c")
+        with open(src, "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f; engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O2", "-w", "-I", out, "-o", exe, src,
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        lines = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                               text=True, timeout=60).stdout.split("\n")
+        for n, (keys, pre, post) in self.CURVES.items():
+            rows = [l.split(" ", 1)[1] for l in lines if l.startswith("c%d " % n)]
+            self.assertEqual(rows[0], "n=%d" % len(keys))
+            ref = {"keys": [(float(a), float(b), uc._num(str(c)), uc._num(str(d)))
+                            for a, b, c, d in keys], "pre": pre, "post": post}
+            for t, got in zip(self.TS, rows[1:]):
+                self.assertAlmostEqual(float(got), uc.evaluate(ref, t), places=4,
+                                       msg="curve %d at t=%g" % (n, t))
+
+    def test_weighted_tangents_are_refused(self):
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(self._project({1: self.CURVES[1]}, weighted=3),
+                            tempfile.mkdtemp(prefix="upack-curve-out-"), force=True)
+        self.assertIn("weighted", cm.exception.message)
