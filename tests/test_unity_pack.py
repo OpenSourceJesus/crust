@@ -1023,11 +1023,13 @@ public class Player : MonoBehaviour {
     }
 }
 """}, hero_under_coin_a)
-        # Hero under CoinA (1, 2): its world position is its parent's plus
-        # its local one, and setting it sets the local one that puts it
-        # there; both read the local one before
+        # Hero under CoinA (1, 2), scale 0.4: its world position is its
+        # parent's plus its local one turned and scaled by the parent
+        # (Unity's parent * T R S), and setting it sets the local one that
+        # puts it there -- (10 - 1, 10 - 2) / 0.4. It was pinned as the
+        # offset alone, (9, 8), from when the hierarchy was translation-only.
         self.assertEqual(self._run(root, log=True), [
-            "world 1,2 local 0,0", "after world 10,10 local 9,8"])
+            "world 1,2 local 0,0", "after world 10,10 local 22.5,20"])
         self.assertEqual(self._run(root, frames=1)[0],
                          "f1: (1,2) (-1,0) (10,10)")
 
