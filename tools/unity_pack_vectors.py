@@ -170,6 +170,7 @@ GODOT_VECTOR2_FUNCS = frozenset((
 #: Engine helpers that return a Vector2.
 _VEC_FUNCS = frozenset((
     "Vector2_make", "Vector2_normalized", "Vector2_Lerp", "Vector2_add",
+    "Vector2_LerpUnclamped", "Vector2_MoveTowards", "Vector2_Min", "Vector2_Max",
     "Vector2_sub", "Vector2_scale", "Vector2_mulv", "Vector2_div",
     "Vector2_divv", "Vector2_neg", "GodotInput_Vector",
     "GodotVec_Normalized", "GodotVec_DirectionTo", "GodotVec_Lerp",

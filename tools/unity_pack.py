@@ -282,12 +282,37 @@ _QUATERNION_SUPPORTED = frozenset({
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
+    "Translate",
     "localScale", "parent", "gameObject", "SetParent", "GetSiblingIndex",
     "worldToLocalMatrix", "localToWorldMatrix",
     "localPosition", "localRotation",
     "TransformPoint",
     # RectTransform members (UI Transform is a RectTransform).
     "anchoredPosition", "sizeDelta",
+})
+
+
+# Every member UnityEngine.Transform has (and what it inherits from
+# Component / Object). A real one this pack does not lower is "not packed
+# yet"; CS1061 -- "does not contain a definition" -- is for a member Unity
+# does not have. Every unlowered member used to get CS1061, telling the user
+# that `Translate`, `right` or `childCount` do not exist.
+_TRANSFORM_UNITY_MEMBERS = frozenset({
+    "position", "localPosition", "eulerAngles", "localEulerAngles", "right",
+    "up", "forward", "rotation", "localRotation", "localScale", "parent",
+    "worldToLocalMatrix", "localToWorldMatrix", "root", "childCount",
+    "lossyScale", "hasChanged", "hierarchyCapacity", "hierarchyCount",
+    "gameObject", "tag", "name", "transform", "hideFlags",
+    "SetParent", "SetPositionAndRotation", "SetLocalPositionAndRotation",
+    "Translate", "Rotate", "RotateAround", "LookAt", "TransformDirection",
+    "InverseTransformDirection", "TransformVector", "InverseTransformVector",
+    "TransformPoint", "InverseTransformPoint", "DetachChildren",
+    "SetAsFirstSibling", "SetAsLastSibling", "SetSiblingIndex",
+    "GetSiblingIndex", "Find", "IsChildOf", "GetChild", "GetEnumerator",
+    "GetComponent", "GetComponents", "GetComponentInChildren",
+    "GetComponentsInChildren", "GetComponentInParent", "GetComponentsInParent",
+    "TryGetComponent", "CompareTag", "SendMessage", "SendMessageUpwards",
+    "BroadcastMessage", "GetInstanceID", "ToString", "Equals", "GetHashCode",
 })
 
 
@@ -360,6 +385,9 @@ def _check_transform_api(path, text, scan):
         if member in _TRANSFORM_SUPPORTED:
             continue
         member_idx = m.start(1)
+        if member in _TRANSFORM_UNITY_MEMBERS:
+            _raise_cs(path, text, member_idx, "CS8000",
+                      "'Transform.%s' is not packed yet" % member)
         _raise_cs(
             path, text, member_idx, "CS1061",
             "'Transform' does not contain a definition for '%s' and no "
@@ -625,6 +653,8 @@ _API = {
     # are emitted in emit_engine once string.h / externs are in place.
     "Input.GetAxis": True,
     "Input.GetButton": True,
+    "Input.GetButtonDown": True,
+    "Input.GetButtonUp": True,
     "Input.GetKey": True,
     "Keyboard.current": True,
     # Player.log by default (not stdout). -logFile - → stdout.
@@ -716,7 +746,14 @@ _UNITY_API = re.compile(
     r"GameObject\.Find|GetComponent\s*<|"
     r"Vector2|Vector3|Quaternion)\b)"
 )
-_WANT_INPUT = frozenset({"Input.GetAxis", "Input.GetButton", "Input.GetKey"})
+_WANT_INPUT = frozenset({"Input.GetAxis", "Input.GetButton", "Input.GetKey",
+                         "Input.GetButtonDown", "Input.GetButtonUp"})
+_BUTTON_APIS = ("Input.GetButton", "Input.GetButtonDown", "Input.GetButtonUp")
+
+
+def _button_ident(name):
+    """`Fire1` -> `Fire1`, `My Button` -> `My_Button`: the host global's name."""
+    return re.sub(r"\W", "_", name)
 _KEYBOARD_KEY = re.compile(
     r"Keyboard\.current\.(\w+)Key\.(isPressed|wasPressedThisFrame|"
     r"wasReleasedThisFrame)"
@@ -5878,8 +5915,8 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
                  scan):
         apis.add("transform.LookAt")
-    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\b",
-                 scan):
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+                 r"(?:eulerAngles\b|Translate\s*\()", scan):
         apis.add("transform.eulerAngles")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*rotation\b",
                  scan):
@@ -5946,6 +5983,20 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("GameObject.SetActive")
     if re.search(r"\.\s*(?:reactionForce|GetReactionForce|linearOffset|target)\b",
                  scan) and re.search(r"Joint2D\b", scan):
+        apis.add("Vector2")
+    # `name` / `gameObject.name`: the GameObject name table (a local of that
+    # name only costs the table)
+    if re.search(r"(?<![\w.])(?:this\s*\.\s*|gameObject\s*\.\s*)?name\b(?!\s*\()",
+                 scan):
+        apis.add("MonoBehaviour.name")
+    # a position used as a value, or a Vector3 function a 2D pack lowers
+    # through Vector2 (_lower_position_values): Vector2 values appear
+    if re.search(r"(?<![\w.])(?:this\s*\.\s*)?\w+(?:\s*\[[^\[\]]*\])?\s*\.\s*position\b"
+                 r"(?!\s*\.)(?!\s*[-+*/]?=(?!=))", scan) or re.search(
+                     r"(?<![\w.])Vector[23]\s*\.\s*(?:Lerp|LerpUnclamped|"
+                     r"MoveTowards|Min|Max)\s*\(", scan) or re.search(
+                     r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*position\s*"
+                     r"=(?!=)\s*(?!new\b)", scan):
         apis.add("Vector2")
     # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
     # read for its GameObject.
@@ -6068,6 +6119,19 @@ def analyze_script(path, text=None, shallow=False):
             apis.add("Singleton.Instance")
             singleton_instance_types.add(tname)
             findobject_types.add(tname)  # Instance getter needs FindObjectOfType
+    # `static Own Instance;` declared by a class of this file: a singleton
+    # *field* -- null until assigned, not found (see the getter). Only a
+    # `Type.Instance` use from elsewhere used to make it a singleton, and its
+    # own `Instance = this` then reached C as `Type_Instance() = i`.
+    singleton_field_types = set()
+    own_types = set(re.findall(r"\bclass\s+(\w+)", scan))
+    for m in re.finditer(r"\bstatic\s+(?:readonly\s+)?(\w+)\s+([Ii]nstance)\s*[;=]",
+                         scan):
+        if m.group(1) in own_types:
+            apis.add("Singleton.Instance")
+            singleton_instance_types.add(m.group(1))
+            singleton_field_types.add(m.group(1))
+            findobject_types.add(m.group(1))
     # Keyboard lives in UnityEngine.InputSystem — only when in scope.
     has_input_system = bool(
         re.search(r"using\s+UnityEngine\.InputSystem\b", scan)
@@ -6133,9 +6197,11 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("File.OpenText")
     if re.search(r"(?:System\.IO\.)?File\.Copy\s*\(", scan):
         apis.add("File.Copy")
-    # C# string + value must not become C pointer arithmetic.
+    # C# string + value must not become C pointer arithmetic. A literal on
+    # either side: `name + " hp"` (the literal second) was missed, and its
+    # concatenation helper never emitted -- `undeclared '_str_plus_s'`.
     if re.search(
-            r'"\s*\+|'
+            r'"\s*\+|\+\s*"|'
             r"(?<![\w])Application\.(?:dataPath|persistentDataPath|"
             r"productName)\s*\+",
             scan):
@@ -6214,9 +6280,11 @@ def analyze_script(path, text=None, shallow=False):
         r"(?:^|[^\w.])(?:\w+\s*\.\s*)?transform\s*\.\s*SetParent\s*\(|"
         r"(?<![.\w])\w+\s*\.\s*SetParent\s*\(",
         scan))
+    # `Translate` reads the rotation (Space.Self turns the delta by it; see
+    # _lower_translate): the class keeps a live rotation, as for Rotate.
     writes_rot = bool(re.search(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
-        r"(?:Rotate|LookAt)\s*\(", scan) or re.search(
+        r"(?:Rotate|LookAt|Translate)\s*\(", scan) or re.search(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
         r"(?:eulerAngles|rotation|localRotation)\b",
         scan))
@@ -6320,6 +6388,7 @@ def analyze_script(path, text=None, shallow=False):
         "addcomponent_types": addcomponent_types,
         "findobject_types": findobject_types,
         "singleton_instance_types": singleton_instance_types,
+        "singleton_field_types": singleton_field_types,
         "classes": classes,
         "interfaces": interfaces,
         "literals": [int(x) for x in re.findall(r"(?<![\w.])(\d+)", scan)
@@ -7456,7 +7525,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
     if this and this in singleton_types:
         oidn = _c_ident(this)
         text = cs2cpp.code_sub(
-            r"(?<![\w.])instance\s*=",
+            r"(?<![\w.])[Ii]nstance\s*=(?!=)",
             "%s_instance =" % oidn, text)
         text = cs2cpp.code_sub(
             r"(?<![\w.])Instance\b(?!\s*\()",
@@ -12625,9 +12694,14 @@ def _emit_engine_find_object_of_type(
             p("            return %s_instance;" % idn)
             p("        %s_instance = -1;" % idn)
             p("    }")
-            p("    %s_instance = Object_FindObjectOfType_%s(1);"
-              % (idn, idn))
-            p("    return %s_instance;" % idn)
+            if cname in (plan.get("singleton_field_types") or ()):
+                # a static field: null until assigned, and null again once
+                # its object is destroyed -- Unity's == null -- not found
+                p("    return -1;")
+            else:
+                p("    %s_instance = Object_FindObjectOfType_%s(1);"
+                  % (idn, idn))
+                p("    return %s_instance;" % idn)
             p("}")
             p("")
 
@@ -16662,6 +16736,8 @@ def emit_engine(plan, analyses, used_apis):
         or want_getcomponent or want_findobject
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy
         or want_instantiate or want_gcic or want_live_rt
+        # `name` reads the object's GameObject name (_lower_own_name)
+        or "MonoBehaviour.name" in used_apis
         # SpriteEffects2D: effects are per GameObject
         or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0]))
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
@@ -16932,6 +17008,9 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float engine_input_axis_Horizontal;")
         p("extern float engine_input_axis_Vertical;")
         p("extern int engine_input_button_Jump;")
+        for _b in plan.get("input_buttons") or ():
+            if _b != "Jump":
+                p("extern int engine_input_button_%s;" % _button_ident(_b))
         p("extern unsigned char engine_input_key[256];")
     if want_keyboard:
         p("extern int engine_keyboard_connected;")
@@ -17191,11 +17270,37 @@ def emit_engine(plan, analyses, used_apis):
         p("    return 0.f;")
         p("}")
         p("")
-    if "Input.GetButton" in used_apis:
+    if any(a in used_apis for a in _BUTTON_APIS):
+        # Unity's buttons, by name: held this frame, pressed this frame
+        # (Down), released this frame (Up). The host sets each name's
+        # global; it is latched once a frame (_engine_buttons_latch), so
+        # Down / Up hold for the whole frame. Only "Jump" used to exist --
+        # any other name was silently never pressed -- and Down / Up
+        # emptied the method.
+        names = list(plan.get("input_buttons") or ["Jump"])
+        nb = len(names)
+        p("static const char *const _btn_name[%d] = { %s };"
+          % (nb, ", ".join('"%s"' % n for n in names)))
+        p("static int _btn_cur[%d], _btn_prev[%d];" % (nb, nb))
+        p("static void _engine_buttons_latch(void) {")
+        for k, n in enumerate(names):
+            p("    _btn_prev[%d] = _btn_cur[%d]; _btn_cur[%d] = engine_input_button_%s != 0;"
+              % (k, k, k, _button_ident(n)))
+        p("}")
+        p("static int _btn_index(const char *name) {")
+        p("    int k;")
+        p("    if (!name) return -1;")
+        p("    for (k = 0; k < %d; k++) if (strcmp(name, _btn_name[k]) == 0) return k;" % nb)
+        p("    return -1;")
+        p("}")
         p("static int Input_GetButton(const char *name) {")
-        p("    if (name && strcmp(name, \"Jump\") == 0)")
-        p("        return engine_input_button_Jump;")
-        p("    return 0;")
+        p("    int k = _btn_index(name); return k >= 0 && _btn_cur[k];")
+        p("}")
+        p("static int Input_GetButtonDown(const char *name) {")
+        p("    int k = _btn_index(name); return k >= 0 && _btn_cur[k] && !_btn_prev[k];")
+        p("}")
+        p("static int Input_GetButtonUp(const char *name) {")
+        p("    int k = _btn_index(name); return k >= 0 && !_btn_cur[k] && _btn_prev[k];")
         p("}")
         p("")
     if "Input.GetKey" in used_apis:
@@ -17279,6 +17384,13 @@ def emit_engine(plan, analyses, used_apis):
             p("    return out;")
             p("}")
         p("/* Call sites pick _str_plus_{i,f,c,s} at rewrite (no C11 generics). */")
+        p(_CS_STRING_HELPER_MARKER)
+        p("")
+    else:
+        # Where pack() puts the runtime helpers the methods used: always, not
+        # only with string concatenation. Without it, an engine with no `+`
+        # on a string lost every helper -- `_cs_euler_z` for a live rotation
+        # read, say -- and failed to compile, `undeclared identifier`.
         p(_CS_STRING_HELPER_MARKER)
         p("")
     if want_data_path:
@@ -18107,6 +18219,8 @@ def emit_engine(plan, analyses, used_apis):
         p("    _engine_scene_apply_pending();")
     if want_keyboard:
         p("    _engine_keyboard_latch();")
+    if any(a in used_apis for a in _BUTTON_APIS):
+        p("    _engine_buttons_latch();")
     if plan.get("want_scroll"):
         p("    _engine_scroll_latch();")
     if plan.get("want_gamepad"):
@@ -20214,6 +20328,23 @@ def _emit_vector2_struct(p, godot=False):
     p("    if (t > 1.f) t = 1.f;")
     p("    return Vector2_make(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);")
     p("}")
+    p("static Vector2 Vector2_LerpUnclamped(Vector2 a, Vector2 b, float t) {")
+    p("    return Vector2_make(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);")
+    p("}")
+    p("/* Unity's: the target when within reach (or there), else that far along")
+    p("   the way; a negative step moves away. */")
+    p("static Vector2 Vector2_MoveTowards(Vector2 c, Vector2 t, float d) {")
+    p("    float dx = t.x - c.x, dy = t.y - c.y, sq = dx * dx + dy * dy, m;")
+    p("    if (sq == 0.f || (d >= 0.f && sq <= d * d)) return t;")
+    p("    m = sqrtf(sq);")
+    p("    return Vector2_make(c.x + dx / m * d, c.y + dy / m * d);")
+    p("}")
+    p("static Vector2 Vector2_Min(Vector2 a, Vector2 b) {")
+    p("    return Vector2_make(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y);")
+    p("}")
+    p("static Vector2 Vector2_Max(Vector2 a, Vector2 b) {")
+    p("    return Vector2_make(a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y);")
+    p("}")
     p("/* Unity ==: squared distance under kEpsilon (1e-5) squared. */")
     p("static int Vector2_eq(Vector2 a, Vector2 b) {")
     p("    float dx = a.x - b.x, dy = a.y - b.y;")
@@ -20611,7 +20742,8 @@ _UNITY_API_SCENE = [
     _B("Camera.main.transform.position.z", "Camera_main_pos_z", "value"),
     _B("Camera.main.nearClipPlane", "Camera_main_nearClipPlane", "value"),
     _B("Camera.main.farClipPlane", "Camera_main_farClipPlane", "value"),
-] + [_B("Input." + m, "Input_" + m) for m in ("GetAxis", "GetButton", "GetKey")]
+] + [_B("Input." + m, "Input_" + m) for m in (
+    "GetAxis", "GetButtonDown", "GetButtonUp", "GetButton", "GetKey")]
 
 _UNITY_API_LOG = [
     _B("Debug.LogWarning", "Debug_Log", "value", _UE),
@@ -22565,7 +22697,16 @@ def _string_helpers_c(used):
            if h in _CS_STRING_HELPER_C]
     rt = [runtime.helper_c(h) for h in runtime.closure(
         {h for h in used if runtime.is_runtime_helper(h)})]
-    return "\n".join([_CS_STRING_HELPER_PRELUDE] + own + rt) + "\n"
+    # The prelude (`_cs_throw`, the scratch slots, ..) serves the string
+    # helpers and the runtime helpers that call into it -- a parse that
+    # throws -- but not one that does not: `_cs_euler_z` alone needs none of
+    # it. pack() includes <stdio.h> when the prelude goes in.
+    defined = set(re.findall(r"\b(\w+)\s*\(", _CS_STRING_HELPER_PRELUDE))
+    needs = bool(own) or any(
+        re.search(r"\b(?:%s)\s*\(" % "|".join(map(re.escape, defined)), c)
+        for c in rt) if defined else bool(own)
+    prelude = [_CS_STRING_HELPER_PRELUDE] if needs else []
+    return "\n".join(prelude + own + rt) + "\n"
 
 
 def _lower_string_members(text, string_idents, plan):
@@ -22887,6 +23028,186 @@ def _own_string_locals(text, string_idents, int_idents, stores=(),
     return "".join(out)
 
 
+_TRANSLATE_N = [0]
+
+
+def _split_top_args(s):
+    parts, depth, cur = [], 0, []
+    for c in s:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur).strip())
+    return parts
+
+
+def _lower_translate(text):
+    """`transform.Translate(..);` -> a position update, in C# the rest of
+    the lowering already handles.
+
+    Unity's Translate moves by the delta in the object's own axes
+    (`Space.Self`, the default) or the world's (`Space.World`). Self turns
+    the delta by the object's z rotation, read as it is now (eulerAngles.z,
+    so an object that rotates moves along its new heading) -- a 2D pack:
+    rotation about x / y is not part of it. The delta is `(x, y[, z])`, a
+    `new Vector3 / Vector2(..)`, or any Vector2 expression, evaluated once.
+    Not a statement (Translate returns void, so it always is in C#) or an
+    overload this does not know: left as it was, for the stub check.
+    """
+    import tools.cpprust as cpprust
+    scan = cs2cpp._blank(text)
+    edits = []
+    for m in re.finditer(r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*Translate\s*\(",
+                         scan):
+        close = cpprust._match_paren(scan, m.end() - 1)
+        if close is None or not re.match(r"\s*;", scan[close + 1:]):
+            continue
+        semi = close + 1 + re.match(r"\s*;", scan[close + 1:]).end()
+        args = _split_top_args(text[m.end():close])
+        world = False
+        if args and re.match(r"^(?:UnityEngine\s*\.\s*)?Space\s*\.\s*(World|Self)$",
+                             args[-1]):
+            world = args[-1].endswith("World")
+            args = args[:-1]
+        n = _TRANSLATE_N[0]
+        _TRANSLATE_N[0] += 1
+        pre = []
+        if len(args) in (2, 3):
+            dx, dy = args[0], args[1]
+        elif len(args) == 1:
+            a = args[0].strip()
+            vm = re.match(r"^new\s+(?:UnityEngine\s*\.\s*)?Vector[23]\s*\(", a)
+            inner = None
+            if vm:
+                end = cpprust._match_paren(a, vm.end() - 1)
+                if end == len(a) - 1:
+                    inner = _split_top_args(a[vm.end():end])
+            if inner and len(inner) >= 2:
+                dx, dy = inner[0], inner[1]
+            else:
+                pre.append("Vector2 _tr%d = %s;" % (n, a))
+                dx, dy = "_tr%d.x" % n, "_tr%d.y" % n
+        else:
+            continue
+        x, y = "_trx%d" % n, "_try%d" % n
+        pre.append("float %s = (float)(%s);" % (x, dx))
+        pre.append("float %s = (float)(%s);" % (y, dy))
+        if world:
+            move = "transform.position += new Vector3(%s, %s, 0f);" % (x, y)
+        else:
+            a, c, sn = "_tra%d" % n, "_trc%d" % n, "_trs%d" % n
+            # C's cosf / sinf, not Mathf's: the Mathf helpers are emitted
+            # for what the *source* calls, and this is not in the source
+            pre.append("float %s = transform.eulerAngles.z * 0.0174532925f;" % a)
+            pre.append("float %s = cosf(%s);" % (c, a))
+            pre.append("float %s = sinf(%s);" % (sn, a))
+            move = ("transform.position += new Vector3(%s * %s - %s * %s, "
+                    "%s * %s + %s * %s, 0f);" % (x, c, y, sn, x, sn, y, c))
+        rep = "{ " + " ".join(pre + [move]) + " }"
+        rep += "\n" * text[m.start():semi].count("\n")
+        edits.append((m.start(), semi, rep))
+    for a, b, rep in reversed(edits):
+        text = text[:a] + rep + text[b:]
+    return text
+
+
+def _lower_own_name(text, cl, idn):
+    """`name` / `this.name` / `gameObject.name`: this object's GameObject
+    name (`MonoBehaviour.name`), read. Left alone where `name` is the
+    class's own field or a local or parameter of the method, and when it is
+    assigned (renaming the object is not packed). It reached C as an
+    undeclared `name`."""
+    if any(f.get("name") == "name" for f in cl.get("fields") or []):
+        return text
+    scan = cs2cpp._blank(text)
+    if re.search(r"(?<![\w.])[A-Za-z_][\w.<>\[\]]*\s+name\s*[=;,)]", scan):
+        return text                       # a local or parameter `name`
+    return cs2cpp.code_sub(
+        r"(?<![\w.])(?:this\s*\.\s*|gameObject\s*\.\s*)?name\b(?!\s*=(?!=))(?!\s*\()",
+        "GameObject_name(_engine_go_of_%s(i))" % idn, text)
+
+
+def _lower_other_position_values(text, cl):
+    """`target.position` -- a Transform field, local or parameter, or an
+    element of a Transform array -- read as a vector value, in a 2D pack:
+    `Vector2_make(target.position.x, target.position.y)`, through the
+    component reads that were already lowered. As a value it stopped at
+    `).position`, a member of the field's read, and emptied the method."""
+    names = set(f["name"] for f in cl.get("fields") or []
+                if (f.get("ty") or "").replace("UnityEngine.", "") in ("Transform", "Transform[]"))
+    names |= set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Transform(?:\s*\[\s*\])?"
+                            r"\s+(\w+)\s*[=;,)]", cs2cpp._blank(text)))
+    if not names:
+        return text
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    recv = r"(?<![\w.])(?:this\s*\.\s*)?(?:%s)(?:\s*\[[^\[\]]*\])?" % alt
+    return cs2cpp.code_sub(
+        r"(%s)\s*\.\s*position\b(?!\s*\.)(?!\s*[-+*/]?=(?!=))" % recv,
+        lambda m: "Vector2_make(%s.position.x, %s.position.y)" % (
+            m.group(1).strip(), m.group(1).strip()), text)
+
+
+_POSVAL_N = [0]
+
+
+def _lower_position_values(text):
+    """`transform.position` as a vector value, in a 2D pack.
+
+    Only its components (`.x`), `+=` and `= new Vector3(..)` were lowered;
+    as a value -- `Vector2 p = transform.position;`,
+    `Vector2.MoveTowards(transform.position, ..)`, `transform.position =
+    Vector3.Lerp(..)` -- it was left, and the method emptied. A read is now
+    `Vector2_make(x, y)`; a write evaluates the vector once and assigns
+    `new Vector3(v.x, v.y, z)` through the existing path, keeping z (a 2D
+    pack's camera keeps its -10).
+    """
+    import tools.cpprust as cpprust
+    scan = cs2cpp._blank(text)
+    edits = []
+    for m in re.finditer(r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*position\s*=(?!=)\s*",
+                         scan):
+        if re.match(r"new\b", scan[m.end():]):
+            continue                         # the existing `new Vector3` path
+        end = scan.find(";", m.end())
+        if end < 0:
+            continue
+        # the `;` that ends this statement: not one inside parentheses
+        depth, j = 0, m.end()
+        while j < len(scan):
+            if scan[j] in "([{":
+                depth += 1
+            elif scan[j] in ")]}":
+                depth -= 1
+            elif scan[j] == ";" and depth == 0:
+                break
+            j += 1
+        if j >= len(scan):
+            continue
+        n = _POSVAL_N[0]
+        _POSVAL_N[0] += 1
+        rhs = text[m.end():j].strip()
+        rep = ("{ Vector2 _pv%d = %s; transform.position = new Vector3(_pv%d.x, "
+               "_pv%d.y, transform.position.z); }" % (n, rhs, n, n))
+        rep += "\n" * text[m.start():j + 1].count("\n")
+        edits.append((m.start(), j + 1, rep))
+    for a, b, r in reversed(edits):
+        text = text[:a] + r + text[b:]
+    # reads: not a component, not an assignment target; a cast to Vector2 /
+    # Vector3 in front goes (C cannot cast a struct to its own type)
+    return cs2cpp.code_sub(
+        r"(?:\(\s*(?:UnityEngine\s*\.\s*)?Vector[23]\s*\)\s*)?"
+        r"(?<![\w.])(?:this\s*\.\s*)?transform\s*\.\s*position\b"
+        r"(?!\s*\.)(?!\s*[-+*/]?=(?!=))",
+        "Vector2_make(transform.position.x, transform.position.y)", text)
+
+
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
@@ -22896,6 +23217,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
+    text = _lower_translate(text)
+    if plan.get("two_d") and _class_has_position(cl):
+        text = _lower_position_values(text)
+    if plan.get("two_d"):
+        text = _lower_other_position_values(text, cl)
+    text = _lower_own_name(text, cl, idn)
     # Another object's position through a reference, before this object's
     # own `transform.position` is lowered (which would take its receiver).
     text = _handle_positions(text, plan, _reference_holds(text, cl, plan,
@@ -23402,9 +23729,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    if plan.get("two_d"):
+        # A 2D pack keeps positions in x / y: Vector3's interpolations are
+        # Vector2's there, as Vector3.Distance already was.
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])Vector3\s*\.\s*(Lerp|LerpUnclamped|MoveTowards)\s*\(",
+            r"Vector2_\1(", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\s*\.\s*(Angle|SignedAngle|ClampMagnitude|Dot|"
-        r"Distance)\s*\(", r"Vector2_\1(", text)
+        r"Distance|Lerp|LerpUnclamped|MoveTowards|Min|Max)\s*\(",
+        r"Vector2_\1(", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\s*\.\s*Scale\s*\(", "Vector2_mulv(", text)
     text = _rewrite_vector2_ctor_normalized(text)
@@ -23733,6 +24067,10 @@ def emit_data(plan, used_apis=None):
         p("float engine_input_axis_Horizontal = 0.f;")
         p("float engine_input_axis_Vertical = 0.f;")
         p("int engine_input_button_Jump = 0;")
+        # every button a script names: the host sets it held (1) or not
+        for _b in plan.get("input_buttons") or ():
+            if _b != "Jump":
+                p("int engine_input_button_%s = 0;" % _button_ident(_b))
         p("unsigned char engine_input_key[256]; /* host zeros / sets */")
     if want_keyboard:
         # Host sets connected=1 when a keyboard is present (GLFW: always).
@@ -25949,6 +26287,17 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     used_apis = set()
     for a in analyses:
         used_apis |= a["apis"]
+    # the button names scripts read (Input.GetButton / Down / Up)
+    _bn = set()
+    for a in analyses:
+        for c in a.get("classes") or []:
+            _bn |= set(re.findall(
+                r'Input\s*\.\s*GetButton(?:Down|Up)?\s*\(\s*"([^"]+)"',
+                c.get("file_text") or ""))
+    if _bn:
+        plan_buttons = sorted(_bn | {"Jump"})
+    else:
+        plan_buttons = None
     for api, reason in sorted(_REFUSED_API.items()):
         if api not in used_apis:
             continue
@@ -25985,6 +26334,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
             "definition for 'main'")
     _progress("planning layouts (%d objects)" % len(objects))
     plan = plan_layouts(objects, analyses)
+    if plan_buttons:
+        plan["input_buttons"] = plan_buttons
     if _godot.is_godot_project(root):
         plan["godot"] = _godot.physics_settings(root)
     else:
@@ -26072,6 +26423,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     fot_types |= sing_types
     plan["findobject_types"] = sorted(fot_types)
     plan["singleton_instance_types"] = sorted(sing_types)
+    plan["singleton_field_types"] = sorted(
+        {t for a in analyses for t in (a.get("singleton_field_types") or ())})
     plan["lights"] = list(lights)
     plan["light_count"] = len(lights)
     plan["scene_hierarchy"] = list(hierarchy)
@@ -26273,6 +26626,12 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
             + "\n\n".join(json_defs) + "\n"
     if _CS_STRING_HELPER_MARKER in engine:
         engine = engine.replace(_CS_STRING_HELPER_MARKER + "\n", helpers_c, 1)
+    if _CS_STRING_HELPER_PRELUDE in helpers_c \
+            and "#include <stdio.h>" not in engine:
+        # the prelude reports through stdio; the string block that used to
+        # be its only home includes it, an engine without one does not
+        k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
+        engine = engine[:k] + "#include <stdio.h>\n" + engine[k:]
     # C# string locals are coost fastrings (`_own_string_locals`). Only an
     # engine that has one needs coost: splice its string core in after the
     # C headers, for cpprust to lower with the rest.
