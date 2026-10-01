@@ -23813,7 +23813,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                              "ParticleSystem_get_isPlaying",
                              "ParticleSystem_get_isEmitting",
                              "ParticleSystem_get_isPaused",
-                             "ParticleSystem_get_isStopped"}
+                             "ParticleSystem_get_isStopped",
+                             "LineRenderer_get_enabled",
+                             "LineRenderer_get_loop",
+                             "LineRenderer_get_useWorldSpace"}
                          | (_godot.BOOL_CALLS if plan.get("godot") else set())
                          | {
                              k for k, v in (plan.get("_method_ret_kinds_local")
