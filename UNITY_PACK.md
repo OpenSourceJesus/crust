@@ -1392,3 +1392,28 @@ marked `needs_systems` and skip unless its scene, art and ProjectSettings
 have been dropped in locally. Its golden cases go to a local file beside
 the cache and are checked when present.
 
+
+
+## Unity-2D-Destruction
+
+[crustos/Unity-2D-Destruction](https://github.com/crustos/Unity-2D-Destruction)
+is the crust port of the Unity 2D Destruction library (its runtime scripts; the
+Editor code is not part of it). Clone it beside crust; the fast tests then
+check it (`TestUnity2DDestruction` in `tools/unity_pack_test_fast.py`, or set
+`UNITY_2D_DESTRUCTION`).
+
+The parts:
+
+* **Scripts** (`Explodable`, `SpriteExploder`, `ClipperHelper`): MonoBehaviours,
+  through unity_pack. `Explodable` is `[MaxInstances(255)]`
+  (`Scripts/MaxInstancesAttribute.cs`, a marker Unity ignores).
+* **Unity-delaunay** and **clipper_library**: the fracture geometry, through the
+  C# subset (CSRUST.md). Its graph classes need reference semantics -- arena
+  classes, `[MaxInstances(N)]`, a reference a plain pointer.
+* **Physics**: each fragment is a Rigidbody2D with a PolygonCollider2D, simulated
+  by [crustos/box2d](https://github.com/crustos/box2d) (Box2D-Packed).
+
+Status: 7 runtime files translate; every other one is refused with a
+diagnostic. The next blockers, most common first: `string` (`ToString`),
+translating the library's files as one unit (a type used across files),
+`List.FindAll`, an object initializer assigned to a field.
