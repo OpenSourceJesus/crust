@@ -146,23 +146,24 @@ def _raise_unknown_component_type(t, analyses, ops=("AddComponent", "GetComponen
     """Unknown / refused component type → Unity CS0246 at the type token."""
     analyses = analyses or []
     for a in analyses:
-        path = a.get("path") or ""
-        text = None
-        for c in a.get("classes") or []:
-            if c.get("file_text") is not None:
-                text = c["file_text"]
-                break
-        if text is None and path and os.path.isfile(path):
-            text = _read(path)
-        if not text:
-            continue
-        scan = cs2cpp._blank(text)
-        for op in ops:
-            m = re.search(
-                r"%s\s*<\s*(?:[\w.]*\.)?(%s)\s*>" % (op, re.escape(t)),
-                scan)
-            if m:
-                _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
+        apath = a.get("path") or ""
+        # each class's own text with its own path: the first class's text
+        # under the analysis's path reported a use in SpriteExploder.cs at
+        # Explodable.cs(188,727), a line that file does not have
+        sources = [(c.get("path") or apath, c["file_text"])
+                   for c in a.get("classes") or [] if c.get("file_text") is not None]
+        if not sources and apath and os.path.isfile(apath):
+            sources = [(apath, _read(apath))]
+        for path, text in sources:
+            if not text:
+                continue
+            scan = cs2cpp._blank(text)
+            for op in ops:
+                m = re.search(
+                    r"%s\s*<\s*(?:[\w.]*\.)?(%s)\s*>" % (op, re.escape(t)),
+                    scan)
+                if m:
+                    _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
     if analyses:
         path = analyses[0].get("path") or "<cs>"
         raise PackError("%s(1,1): error CS0246: %s" % (
@@ -613,6 +614,7 @@ _PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
 import tools.unity_pack_particles as _parts
 import tools.unity_pack_curves as _curves
 import tools.unity_pack_lines as _lines
+import tools.unity_pack_mesh as _mesh
 
 
 
@@ -2348,7 +2350,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"SphereCollider|Animation|Animator|Canvas|AudioSource|"
             r"HingeJoint2D|DistanceJoint2D|SpringJoint2D|FixedJoint2D|"
             r"SliderJoint2D|WheelJoint2D|FrictionJoint2D|RelativeJoint2D|"
-            r"TargetJoint2D|ParticleSystem|LineRenderer):",
+            r"TargetJoint2D|ParticleSystem|LineRenderer|MeshFilter|MeshRenderer|Mesh):",
             block)
         if km:
             kind = km.group(1)
@@ -2751,6 +2753,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["light2d"] = _l2d
         if kind == "ParticleSystem":
             rec["particle_system"] = _parts.parse_particle_system(block)
+        if kind == "Mesh":
+            try:
+                rec["mesh"] = _mesh.parse_mesh(block)
+            except _mesh.MeshError as e:
+                raise PackError("Mesh &%s: %s" % (file_id, e))
         if kind == "LineRenderer":
             try:
                 rec["line_renderer"] = _lines.parse_line_renderer(block)
@@ -2988,6 +2995,34 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                   + [f for arr in (rec.get("object_ref_arrays") or {}).values()
                      for f in arr]}
 
+    # Transforms inside a tree an Animation / Animator animates: a curve's path
+    # may pass through any of them (`S1/S2/../S40`, a worm's segments), and a
+    # path resolves through packed objects only -- so one with nothing but a
+    # Transform stays a packed row. Dropped, its curves were not played.
+    _xf_father, _xf_of_go, _animated_go = {}, {}, set()
+    for rec in by_id.values():
+        raw = rec.get("raw") or ""
+        if rec.get("kind") == "Transform":
+            fm = re.search(r"(?m)^\s+m_Father:\s*\{fileID:\s*(-?\d+)\}", raw)
+            gm = re.search(r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
+            _xf_father[str(rec.get("file_id"))] = fm.group(1) if fm else "0"
+            if gm:
+                _xf_of_go[gm.group(1)] = str(rec.get("file_id"))
+        elif rec.get("kind") in ("Animation", "Animator"):
+            gm = re.search(r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
+            if gm:
+                _animated_go.add(gm.group(1))
+    _animated_xf = {_xf_of_go[g] for g in _animated_go if g in _xf_of_go}
+    anim_tree_xf = set()
+    for xf in _xf_father:
+        f, seen = _xf_father.get(xf, "0"), set()
+        while f not in ("0", None) and f not in seen:
+            if f in _animated_xf:
+                anim_tree_xf.add(xf)
+                break
+            seen.add(f)
+            f = _xf_father.get(f, "0")
+
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
     for go in gos:
@@ -3040,6 +3075,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         joints2d = []
         psys = None
         line_r = None
+        mesh_f = None
+        mesh_r = None
         lights2d = []
         rb3d = None
         col2d = None
@@ -3128,6 +3165,26 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 psys = dict(k["particle_system"], file_id=k.get("file_id"))
             if k.get("line_renderer"):
                 line_r = dict(k["line_renderer"], file_id=k.get("file_id"))
+            if k.get("kind") == "MeshFilter":
+                _mm = re.search(r"(?m)^\s+m_Mesh:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*(\w+))?",
+                                k.get("raw") or "")
+                if _mm and _mm.group(2) is None:
+                    _mrec = by_id.get(_mm.group(1)) or {}
+                    if _mrec.get("mesh"):
+                        mesh_f = (_mm.group(1), _mrec["mesh"])
+                elif _mm and _mm.group(2):
+                    raise PackError(
+                        "GameObject `%s`: a MeshFilter's mesh asset (guid %s) is not "
+                        "packed yet; a mesh saved in the scene is"
+                        % (go.get("name"), _mm.group(2)))
+            if k.get("kind") == "MeshRenderer":
+                _raw = k.get("raw") or ""
+                _mat = re.search(r"(?ms)^\s+m_Materials:\s*\n\s*-\s*\{[^}]*guid:\s*(\w+)", _raw)
+                _so = re.search(r"(?m)^\s+m_SortingOrder:\s*(-?\d+)", _raw)
+                _en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", _raw)
+                mesh_r = {"mat_guid": _mat.group(1) if _mat else None,
+                          "order": int(_so.group(1)) if _so else 0,
+                          "enabled": int(_en.group(1)) if _en else 1}
             if k.get("light2d"):
                 lights2d.append(dict(k["light2d"]))
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
@@ -3389,7 +3446,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 and not col3d and not player and not canvas
                 and (not has_mb or ui_scaffold_mb)
                 and not (rect is None and xf_id is not None
-                         and {str(xf_id), go_fid} & mb_ref_ids)):
+                         and {str(xf_id), go_fid} & mb_ref_ids)
+                and not (xf_id is not None and str(xf_id) in anim_tree_xf)
+                and not (mesh_f and mesh_r)):
             # Plain RectTransform parents (layout containers without a
             # MonoBehaviour) must stay so ContentSizeFitter /
             # AspectRatioFitter / layout groups can read parent size.
@@ -3512,6 +3571,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "joints2d": joints2d,
             "particle_system": psys,
             "line_renderer": line_r,
+            "mesh_draw": ({"key": mesh_f[0], "mesh": mesh_f[1], "mat_guid": mesh_r["mat_guid"],
+                           "order": mesh_r["order"]}
+                          if mesh_f and mesh_r and mesh_r["enabled"] else None),
             "lights2d": lights2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -4647,7 +4709,9 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     """
     analyses = analyses or []
     bases_map = plan.get("mb_bases") or _collect_mb_bases(analyses)
-    known = (set(plan.get("classes") or {})
+    # MeshFilter / MeshRenderer are packed (unity_pack_mesh): a script may
+    # ask for one; making a mesh at runtime is what is not packed yet
+    known = (set(plan.get("classes") or {}) | {"MeshFilter", "MeshRenderer", "Renderer"}
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS | _COLLIDER2D_TYPES
              | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
@@ -5479,6 +5543,97 @@ def _rewrite_vector2_ctor_normalized(text):
     return "".join(out)
 
 
+def _emit_unity_world_xf(p, plan, class_ids):
+    """`_engine_world_basis`: an object's world rotation and scale, the 2x2
+    matrix R(angle) S(scale) composed up its parents -- Unity's
+    parent * (T R S). A child's world position was its parents' positions
+    summed: a rotated or scaled parent did not turn or stretch its
+    children's offsets (a worm's segments stayed in a straight line however
+    its curves turned them). The local angle is the live rotation where the
+    class keeps one (`_C_rot_z/w`, animated or turned by a script), else the
+    authored one; the scale likewise (`_C_scale_x/y`, else authored)."""
+    live_rot = set(plan.get("live_rot_classes") or [])
+    live_scale = set(plan.get("live_scale_classes") or [])
+    plan["_world_basis"] = True
+    p("static void _engine_world_basis(int class_id, unsigned inst, float *b, int depth);")
+    for cname in sorted(class_ids):
+        cl = plan["classes"][cname]
+        if not _class_has_position(cl):
+            continue
+        idn = _c_ident(cname)
+        insts = cl.get("instances") or []
+        n = max(1, int(cl.get("n") or len(insts) or 1))
+        if cname not in live_rot:
+            qs = [tuple((o.get("local_rot") or o.get("rot") or (0, 0, 0, 1))[2:4])
+                  for o in insts] + [(0.0, 1.0)] * (n - len(insts))
+            if any(abs(q[0]) > 1e-7 for q in qs):
+                p("static const float _%s_lq[%d][2] = { %s };" % (idn, n, ", ".join(
+                    "{ %rf, %rf }" % (float(q[0]), float(q[1])) for q in qs)))
+                cl["_lq"] = True
+        if cname not in live_scale:
+            ss = [tuple((o.get("local_scale") or (1, 1, 1))[:2]) for o in insts] + \
+                 [(1.0, 1.0)] * (n - len(insts))
+            if any(abs(v[0] - 1) > 1e-7 or abs(v[1] - 1) > 1e-7 for v in ss):
+                p("static const float _%s_ls[%d][2] = { %s };" % (idn, n, ", ".join(
+                    "{ %rf, %rf }" % (float(v[0]), float(v[1])) for v in ss)))
+                cl["_ls"] = True
+    p("static void _engine_world_basis(int class_id, unsigned inst, float *b, int depth) {")
+    p("    float qz = 0.f, qw = 1.f, sx = 1.f, sy = 1.f, c, s, l[4];")
+    p("    int pc = -1; unsigned pi = 0u;")
+    p("    if (depth > 64) { b[0] = 1.f; b[1] = 0.f; b[2] = 0.f; b[3] = 1.f; return; }")
+    p("    switch (class_id) {")
+    for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+        cl = plan["classes"][cname]
+        if not _class_has_position(cl):
+            continue
+        idn = _c_ident(cname)
+        p("    case %d:" % cid)
+        if cname in live_rot:
+            p("        qz = _%s_rot_z[inst]; qw = _%s_rot_w[inst];" % (idn, idn))
+        elif cl.get("_lq"):
+            p("        qz = _%s_lq[inst][0]; qw = _%s_lq[inst][1];" % (idn, idn))
+        if cname in live_scale:
+            p("        sx = _%s_scale_x[inst]; sy = _%s_scale_y[inst];" % (idn, idn))
+        elif cl.get("_ls"):
+            p("        sx = _%s_ls[inst][0]; sy = _%s_ls[inst][1];" % (idn, idn))
+        p("        pc = _%s_xf_parent_class[inst]; pi = _%s_xf_parent_inst[inst];"
+          % (idn, idn))
+        p("        break;")
+    p("    default: break;")
+    p("    }")
+    p("    /* the z rotation of quaternion (0, 0, qz, qw): cos and sin of 2 half-angles */")
+    p("    c = qw * qw - qz * qz; s = 2.f * qz * qw;")
+    p("    l[0] = c * sx; l[1] = -s * sy; l[2] = s * sx; l[3] = c * sy;")
+    p("    if (pc < 0) { b[0] = l[0]; b[1] = l[1]; b[2] = l[2]; b[3] = l[3]; return; }")
+    p("    { float pb[4]; _engine_world_basis(pc, pi, pb, depth + 1);")
+    p("      b[0] = pb[0] * l[0] + pb[1] * l[2]; b[1] = pb[0] * l[1] + pb[1] * l[3];")
+    p("      b[2] = pb[2] * l[0] + pb[3] * l[2]; b[3] = pb[2] * l[1] + pb[3] * l[3]; }")
+    p("}")
+    p("/* a world offset from the parent -> the local position that puts the")
+    p("   child there: the parent's world basis inverted (a zero scale has no")
+    p("   inverse; the offset is kept as it is) */")
+    p("static void _engine_world_to_local(int pc, unsigned pi, float dx, float dy,")
+    p("                                   float *lx, float *ly) {")
+    p("    float b[4], det;")
+    p("    _engine_world_basis(pc, pi, b, 0);")
+    p("    det = b[0] * b[3] - b[1] * b[2];")
+    p("    if (det > -1e-12f && det < 1e-12f) { *lx = dx; *ly = dy; return; }")
+    p("    *lx = (b[3] * dx - b[1] * dy) / det;")
+    p("    *ly = (-b[2] * dx + b[0] * dy) / det;")
+    p("}")
+    p("")
+
+
+_ENGINE_TRI_TYPEDEF = (
+    "typedef struct EngineTri {\n"
+    "    float x[3], y[3]; /* world */\n"
+    "    float u[3], v[3]; /* the texture's, 0..1 */\n"
+    "    float r, g, b, a;\n"
+    "    int tex; /* engine_texture_* index; -1 if none */\n"
+    "    int sorting_layer, sorting_order; /* as EngineDraw's */\n"
+    "} EngineTri;\n")
+
+
 _WORLD_POS_PROTO = ("static void _engine_world_pos(int class_id, unsigned inst,"
                     " float *x, float *y, float *z, int depth);")
 
@@ -5984,6 +6139,9 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"\.\s*(?:reactionForce|GetReactionForce|linearOffset|target)\b",
                  scan) and re.search(r"Joint2D\b", scan):
         apis.add("Vector2")
+    # `go.transform.parent = ..`: SetParent through a GameObject
+    if re.search(r"(?<![\w.])\w+\s*\.\s*transform\s*\.\s*parent\s*=(?!=)", scan):
+        apis.add("transform.SetParent")
     # `name` / `gameObject.name`: the GameObject name table (a local of that
     # name only costs the table)
     if re.search(r"(?<![\w.])(?:this\s*\.\s*|gameObject\s*\.\s*)?name\b(?!\s*\()",
@@ -13545,6 +13703,9 @@ def _emit_godot_global_helpers(class_ids, p, plan):
         p("    _engine_world_pos(c, i, &x, &y, &z, 0);")
         p("    return %s;" % ax)
         p("}")
+    if not bases:
+        p("static void _engine_world_to_local(int pc, unsigned pi, float dx, float dy,"
+          " float *lx, float *ly);")
     p("static void _engine_set_world(int c, unsigned i, float wx, float wy,"
       " float wz) {")
     p("    int pc = -1;")
@@ -13570,6 +13731,10 @@ def _emit_godot_global_helpers(class_ids, p, plan):
     p("        lx = dx;")
     p("        ly = dy;")
     p("        lz = wz - pz;")
+    if not bases:
+        # Unity: the parent's world rotation and scale undone on the offset
+        # (_emit_unity_world_xf); it was the offset as it is
+        p("        _engine_world_to_local(pc, pi, dx, dy, &lx, &ly);")
     if bases:
         p("        if (b) {")
         p("            float det = b[0] * b[3] - b[1] * b[2];")
@@ -14160,6 +14325,8 @@ def _emit_engine_world_positions(
                 p("static const unsigned _%s_xf_parent_inst[%d] = { %s };"
                   % (idn, n, ", ".join(pis)))
         p("")
+        if not _godot_bases(plan):
+            _emit_unity_world_xf(p, plan, class_ids)
         p("/* Live m_Father — world position follows parent at runtime. */")
         p("static void _engine_world_pos(int class_id, unsigned inst,")
         p("                             float *x, float *y, float *z,")
@@ -14203,9 +14370,16 @@ def _emit_engine_world_positions(
             p("            *z = pz + lz;")
             p("            return;")
             p("        }")
-        p("        *x = px + lx;")
-        p("        *y = py + ly;")
-        p("        *z = pz + lz;")
+        if not _godot_bases(plan):
+            # the parent's world rotation and scale turn the local offset
+            p("        { float pb[4]; _engine_world_basis(pc, pi, pb, depth + 1);")
+            p("          *x = px + pb[0] * lx + pb[1] * ly;")
+            p("          *y = py + pb[2] * lx + pb[3] * ly;")
+            p("          *z = pz + lz; }")
+        else:
+            p("        *x = px + lx;")
+            p("        *y = py + ly;")
+            p("        *z = pz + lz;")
         p("    }")
         p("}")
         p("")
@@ -14310,8 +14484,14 @@ def _emit_engine_world_positions(
             p("            if (_engine_go_xf(parent, &pc, &pi))")
             p("                _engine_world_pos(pc, pi, &px, &py, &pz, 0);")
             p("        }")
-            p("        _engine_set_local_pos_go(child,")
-            p("            wx - px, wy - py, wz - pz);")
+            if _godot_bases(plan):
+                p("        _engine_set_local_pos_go(child,")
+                p("            wx - px, wy - py, wz - pz);")
+            else:
+                p("        { float lx = wx - px, ly = wy - py; int pc2 = -1; unsigned pi2 = 0u;")
+                p("          if (parent >= 0 && _engine_go_xf(parent, &pc2, &pi2))")
+                p("              _engine_world_to_local(pc2, pi2, wx - px, wy - py, &lx, &ly);")
+                p("          _engine_set_local_pos_go(child, lx, ly, wz - pz); }")
             p("    }")
             p("}")
             p("")
@@ -14358,8 +14538,8 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
         p("    return Vector2_make(x, y);")
         p("}")
-        p("/* position = Vector2: z is 0 (Vector2 → Vector3); local = world")
-        p("   minus the parent's world position (translation-only hierarchy). */")
+        p("/* position = Vector2: z is 0 (Vector2 → Vector3); local = the parent's")
+        p("   world rotation and scale undone on the offset from its position. */")
         p("static void Transform_set_position2(int go, Vector2 v) {")
         p("    int c = -1;")
         p("    unsigned n = 0u;")
@@ -14368,7 +14548,12 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    if (_engine_go_parent[go] >= 0")
         p("        && _engine_go_xf(_engine_go_parent[go], &c, &n))")
         p("        _engine_world_pos(c, n, &px, &py, &pz, 0);")
-        p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, 0.f - pz);")
+        if _godot_bases(plan):
+            p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, 0.f - pz);")
+        else:
+            p("    { float lx = v.x - px, ly = v.y - py;")
+            p("      if (c >= 0) _engine_world_to_local(c, n, v.x - px, v.y - py, &lx, &ly);")
+            p("      _engine_set_local_pos_go(go, lx, ly, 0.f - pz); }")
         p("}")
     if not (want_live_rot and plan.get("handle_rot")):
         p("")
@@ -16738,6 +16923,8 @@ def emit_engine(plan, analyses, used_apis):
         or want_instantiate or want_gcic or want_live_rt
         # `name` reads the object's GameObject name (_lower_own_name)
         or "MonoBehaviour.name" in used_apis
+        # a mesh draws while its GameObject is active (unity_pack_mesh)
+        or bool(plan.get("mesh_draws"))
         # SpriteEffects2D: effects are per GameObject
         or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0]))
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
@@ -18287,6 +18474,9 @@ def emit_engine(plan, analyses, used_apis):
     p("    int go; /* its GameObject (-1: unknown): the 2D effects' table */")
     p("} EngineDraw;")
     p("")
+    p(_ENGINE_TRI_TYPEDEF)
+    _mesh.emit_collect(p, plan, class_ids, _c_ident,
+                       bool(plan.get("_world_basis")))
     if want_draw_sort:
         p("static int _engine_draw_cmp(const void *a, const void *b) {")
         p("    const EngineDraw *da = (const EngineDraw *)a;")
@@ -18448,6 +18638,9 @@ def _emit_engine_draw_h_base():
         "    int go; /* its GameObject (-1: unknown): the 2D effects' table */\n"
         "} EngineDraw;\n"
         "\n"
+        + _ENGINE_TRI_TYPEDEF + "\n"
+        "/* MeshFilter / MeshRenderer triangles, world space, active only */\n"
+        "int engine_collect_tris(EngineTri *out, int max);\n"
         "void engine_tick(void);\n"
         "int engine_class_count(void);\n"
         "int engine_collect_draws(EngineDraw *out, int max);\n"
@@ -23154,6 +23347,32 @@ def _lower_other_position_values(text, cl):
             m.group(1).strip(), m.group(1).strip()), text)
 
 
+def _lower_go_parent_assign(text, cl):
+    """`frag.transform.parent = null;` / `= other.transform;` on a GameObject
+    -- a `foreach (GameObject frag in ..)` variable, a local or a field:
+    Unity's SetParent(p, worldPositionStays: true), the GameObject being the
+    index it is packed as. Explodable.explode frees its fragments so, and
+    the method was emptied."""
+    gos = set(re.findall(r"(?<![\w.])GameObject\s+(\w+)\s*(?:[=;,)]|\bin\b)",
+                         cs2cpp._blank(text)))
+    gos |= {f["name"] for f in cl.get("fields") or [] if f.get("ty") == "GameObject"}
+    if not gos:
+        return text
+    alt = "|".join(re.escape(g) for g in sorted(gos, key=len, reverse=True))
+    # and `frag.SetActive(b)`, on the same GameObject
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\s*\.\s*SetActive\s*\(([^()]*)\)" % alt,
+        lambda m: "GameObject_SetActive(%s, (%s) ? 1 : 0)" % (m.group(1), m.group(2).strip()),
+        text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\s*\.\s*transform\s*\.\s*parent\s*=(?!=)\s*null\s*;" % alt,
+        lambda m: "Transform_SetParent(%s, -1, 1);" % m.group(1), text)
+    return cs2cpp.code_sub(
+        r"(?<![\w.])(%s)\s*\.\s*transform\s*\.\s*parent\s*=(?!=)\s*(%s)\s*\.\s*transform\s*;"
+        % (alt, alt),
+        lambda m: "Transform_SetParent(%s, %s, 1);" % (m.group(1), m.group(2)), text)
+
+
 _POSVAL_N = [0]
 
 
@@ -23223,6 +23442,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     if plan.get("two_d"):
         text = _lower_other_position_values(text, cl)
     text = _lower_own_name(text, cl, idn)
+    text = _lower_go_parent_assign(text, cl)
     # Another object's position through a reference, before this object's
     # own `transform.position` is lowered (which would take its receiver).
     text = _handle_positions(text, plan, _reference_holds(text, cl, plan,
@@ -26446,6 +26666,17 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     _ensure_texture_guids(
         plan["textures"], _anim_sprite_guids(objects),
         asset_guids)
+    # a MeshRenderer's material's _MainTex (tools/unity_pack_mesh.py)
+    for _o in objects:
+        _md = _o.get("mesh_draw")
+        if not _md or not _md.get("mat_guid"):
+            continue
+        _mp = asset_guids.get(_md["mat_guid"])
+        _tg = _mesh.material_main_tex(_read(_mp)) if _mp and os.path.isfile(_mp) else None
+        if _tg:
+            _ensure_texture_guids(plan["textures"], [_tg], asset_guids)
+            _md["tex_id"] = next((k for k, t in enumerate(plan["textures"])
+                                  if t.get("guid") == _tg), -1)
     if plan.get("_gpu_batch"):
         # Sprite lights' cookies, in the texture table (so the atlas)
         _cookies = [L.get("cookie_guid") for o in objects
@@ -26530,6 +26761,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     _build_joint2d_table(plan)
     _parts.build_particle_table(plan)
     _curves.build_table(plan)
+    _mesh.build_table(plan, objects)
     try:
         _lines.build_table(plan)
     except _lines.LineError as e:
