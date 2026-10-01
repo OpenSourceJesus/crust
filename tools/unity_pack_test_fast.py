@@ -712,6 +712,51 @@ class TestOtherPosition(unittest.TestCase):
 
 
 
+
+class TestParentRotationScale(unittest.TestCase):
+    """A child's world position is parent * (T R S): its offset turned by
+    the parent's world rotation and stretched by its scale. It was the
+    parents' positions summed -- a rotated or scaled parent left its
+    children where an unrotated one would."""
+
+    def _scene(self, rot_deg, scale):
+        import math
+        q = (0.0, 0.0, math.sin(math.radians(rot_deg) / 2), math.cos(math.radians(rot_deg) / 2))
+        src = script("Kid", 'Debug.Log("w " + transform.position.x + " " + transform.position.y);')
+        root = tempfile.mkdtemp(prefix="upf-xf-")
+        self.addCleanup(shutil.rmtree, root, True)
+        d = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(d)
+        with open(os.path.join(d, "Kid.cs"), "w") as f:
+            f.write(src)
+        with open(os.path.join(d, "Kid.cs.meta"), "w") as f:
+            f.write("guid: %032x\n" % 1)
+        scene = ("%%YAML 1.1\n--- !u!1 &10\nGameObject:\n  m_Name: Parent\n  m_Component:\n"
+                 "  - component: {fileID: 11}\n--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                 "  m_LocalRotation: {x: 0, y: 0, z: %r, w: %r}\n  m_LocalPosition: {x: 3, y: 0, z: 0}\n"
+                 "  m_LocalScale: {x: %r, y: %r, z: 1}\n  m_Children:\n  - {fileID: 21}\n  m_Father: {fileID: 0}\n"
+                 "--- !u!1 &20\nGameObject:\n  m_Name: Kid\n  m_Component:\n  - component: {fileID: 21}\n"
+                 "  - component: {fileID: 22}\n--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+                 "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                 "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Children: []\n  m_Father: {fileID: 11}\n"
+                 "--- !u!114 &22\nMonoBehaviour:\n  m_GameObject: {fileID: 20}\n"
+                 "  m_Script: {fileID: 11500000, guid: %032x}\n" % (q[2], q[3], scale, scale, 1))
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(scene)
+        lines = run_frames(self, pack(self, root))
+        return [float(v) for v in [l for l in lines if l.startswith("w ")][0].split()[1:]]
+
+    @needs_cc
+    def test_unity_semantics(self):
+        # the parent at (3, 0); the child at local (1, 0)
+        for rot, scale, want in ((0, 1, (4, 0)), (90, 1, (3, 1)),
+                                 (0, 2, (5, 0)), (90, 2, (3, 2))):
+            x, y = self._scene(rot, scale)
+            self.assertAlmostEqual(x, want[0], places=4, msg=(rot, scale))
+            self.assertAlmostEqual(y, want[1], places=4, msg=(rot, scale))
+
+
 DESTRUCTION = os.environ.get("UNITY_2D_DESTRUCTION") or os.path.join(
     os.path.dirname(ROOT), "Unity-2D-Destruction")
 needs_destruction = unittest.skipUnless(
