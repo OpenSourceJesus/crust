@@ -4659,7 +4659,8 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
     ``Renderer`` resolves to ``SpriteRenderer``. ``.Length`` → ``.size()``.
     """
     gcic = set(plan.get("getcomponentsinchildren_types") or [])
-    if not re.search(r"GetComponentsInChildren\s*<", text):
+    if not re.search(r"GetComponentsInChildren\s*<|Object_FindObjectsOfType_",
+                     text):
         return text
     classes = plan.get("classes") or {}
     cl = classes.get(this_class) or {
@@ -4760,6 +4761,10 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
             out.append(call)
         i = after
     text = "".join(out)
+    # T[] name = FindObjectsOfType<T>() (lowered already): the same vector
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\.)?\w+\s*\[\s*\]\s+(\w+)"
+        r"(\s*=\s*Object_FindObjectsOfType_)", r"std::vector<int> \1\2", text)
     # Also catch ref-array fields assigned earlier as Class_field names.
     for f in cl.get("ref_array_fields") or []:
         vector_names.add(f["name"])
@@ -5942,6 +5947,12 @@ def analyze_script(path, text=None, shallow=False):
             r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*(\w+)\s*>",
             scan):
         apis.add("FindObjectOfType")
+        findobject_types.add(m.group(1))
+    for m in re.finditer(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectsOfType\s*<\s*(\w+)\s*>",
+            scan):
+        apis.add("FindObjectOfType")
+        apis.add("FindObjectsOfType<%s>" % m.group(1))
         findobject_types.add(m.group(1))
     for m in re.finditer(
             r"(?<![\w.])(\w+)\s*\.\s*(?:Instance|instance)\b", scan):
@@ -7365,6 +7376,11 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
             r"\s*\(\s*false\s*\)" % re.escape(tname),
             "Object_FindObjectOfType_%s(0)" % oidn, text)
+        text = cs2cpp.code_sub(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectsOfType\s*<\s*%s\s*>"
+            r"\s*\(\s*(true|false|1|0)?\s*\)" % re.escape(tname),
+            lambda m, o=oidn: "Object_FindObjectsOfType_%s(%d)" % (
+                o, m.group(1) in ("true", "1")), text)
     for ocname, pairs in methods_by.items():
         oidn = _c_ident(ocname)
         overloaded = _overload_method_names([m for _c, m in pairs])
@@ -12440,14 +12456,22 @@ def _emit_engine_get_components_in_children(
 
 def _emit_engine_find_object_of_type(
         findobject_packed, p, plan, singleton_instance_types, want_destroy,
-        want_findobject, want_ui):
-    """emit_engine: Object.FindObjectOfType<T> and Type.Instance."""
+        want_findobject, want_ui, many_types=()):
+    """emit_engine: Object.FindObjectOfType<T> and Type.Instance, and
+    FindObjectsOfType<T> (every live one, as a vector) for `many_types`."""
     if want_findobject and findobject_packed:
         p("/* Object.FindObjectOfType<T> — first live component index */")
-        for cname in findobject_packed:
+        for cname, many in [(c, m) for c in findobject_packed
+                            for m in ((False, True) if c in many_types
+                                      else (False,))]:
             idn = _c_ident(cname)
-            p("static int Object_FindObjectOfType_%s(int includeInactive) {"
-              % idn)
+            if many:
+                p("static std::vector<int> Object_FindObjectsOfType_%s("
+                  "int includeInactive) {" % idn)
+                p("    std::vector<int> out;")
+            else:
+                p("static int Object_FindObjectOfType_%s(int includeInactive) {"
+                  % idn)
             p("    int go, ci;")
             if not want_ui:
                 p("    (void)includeInactive;")
@@ -12462,9 +12486,9 @@ def _emit_engine_find_object_of_type(
                 p("        if (!includeInactive")
                 p("            && !_engine_go_active_in_hierarchy(go))")
                 p("            continue;")
-            p("        return ci;")
+            p("        %s;" % ("out.push_back(ci)" if many else "return ci"))
             p("    }")
-            p("    return -1;")
+            p("    return %s;" % ("out" if many else "-1"))
             p("}")
             p("")
         for cname in sorted(singleton_instance_types):
@@ -17433,7 +17457,9 @@ def emit_engine(plan, analyses, used_apis):
     # active-hierarchy helpers when want_ui).
     _emit_engine_find_object_of_type(
             findobject_packed, p, plan, singleton_instance_types, want_destroy,
-            want_findobject, want_ui)
+            want_findobject, want_ui,
+            {a.split("<", 1)[1][:-1] for a in used_apis
+             if a.startswith("FindObjectsOfType<")})
 
     p("static float f16_to_f32(uint16_t h) {")
     p("    unsigned s = (h >> 15) & 1u;")
