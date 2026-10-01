@@ -47,6 +47,10 @@ Pinned in `tests/test_csrust.py` (`TestSemantics`).
 | properties with accessors: `get { .. } set { .. }`, `get => e;`, `T P => e;` | `get_P()` / `set_P(T value)` (§7) |
 | `x.P++`, `--x.P`, `x.P += e` on a property | `x.set_P(x.get_P() + ..)` (§7) |
 | `static` fields, `Type.Field`, bare static calls | file-scope `Type_Field`, `Type_Method(..)` (§7) |
+| `Dictionary<K,V>`: `d[k]`, `d[k] = v`, `Count`, `ContainsKey`, `Remove`, `Clear`, `Add` | `std::map`; a missing key aborts, as C# throws (§8) |
+| an interface-typed parameter | a reference: the object is borrowed (§8) |
+| a class-typed field initializer, `: base(args)` | the constructor initializer list (§8) |
+| `List<List<T>>`, `Dictionary<K, List<V>>`, `new Box<Box<T>>()` | nested containers and generics (§8) |
 | fields with no initializer | zeroed before the constructor body, as in C# (§7) |
 | `<<`, `>>`, `<<=`, `>>=` | count masked to the operand's width, as in C# (§7) |
 | `delegate` | `typedef` function pointer |
@@ -55,7 +59,9 @@ Pinned in `tests/test_csrust.py` (`TestSemantics`).
 | `using X = Y;` | kept; `using System;` dropped |
 | `--emit-decls` | same class digest as C++ (CPPRPY.md) |
 
-**Out** (refused in C# terms before conversion): `string` (§7), `base.M()`,
+**Out** (refused in C# terms before conversion): `Dictionary` members other
+than those above (`Keys`, `Values`, `TryGetValue`, ..), an interface-typed
+local, field or return, `: this(..)` constructor chaining, `string` (§7), `base.M()`,
 `is`, named arguments, generic *methods*, a base-typed local holding a
 derived object (`A a = new B()`, which an owned value would slice), a static
 field that needs code at startup (an array, `List` or class, or one
@@ -68,21 +74,10 @@ top-level statements, `Span<T>` / `ReadOnlySpan<T>`, array initializers
 declaration, `new T[n]` for a non-primitive `T`, `LayoutKind.Explicit`,
 enum methods (`ToString`, `Parse`, `HasFlag` …).
 
-Not refused yet, and failing instead — gaps, not design. Each produces C
-that does not compile, not C that runs wrong:
-
-- a list of lists (`List<List<int>>`), or a `Dictionary` whose values are
-  lists — the C++ half cannot copy a vector of vectors;
-- `Dictionary` members (`Count`, `ContainsKey`, `Remove`); indexing works,
-  but reading a missing key would insert a default where C# throws, so it
-  wants the same receiver resolution `List` has before it is lowered;
-- an interface-typed parameter (`int Total(IShape a)`) — passed by value;
-- a nested class used in a field initializer of its outer class;
-- `new Box<Box<int>>()` — `new` of a nested generic.
-
-(A class with a constructor used to leave unassigned fields uninitialised,
-and an identity cast `(In)x` was listed here; the first is fixed (§7), and
-the second works.)
+No known gaps fail instead of being refused. The last list here — lists of
+lists, `Dictionary` members, interface parameters, a class-typed field
+initializer, `new` of a nested generic, uninitialised fields, an identity
+cast to a struct — is lowered now (§7, §8) or already worked.
 
 Top-level statements are refused rather than lowered because C# requires
 them *before* every type declaration (CS8803) and C needs them after: a
@@ -384,6 +379,38 @@ wraps past `int.MaxValue` into an infinite one.
 
 `unchecked` stays refused: it is the default behaviour, now what you get.
 `checked` would need an overflow test per operation, and is refused too.
+
+## Dictionaries, interfaces, initializers and nesting (§8)
+
+Each found by running the same program under Mono and through csrust.
+
+**`Dictionary`.** C#'s indexer *reads* throw `KeyNotFoundException` on a
+missing key; `std::map`'s `operator[]` inserts a default. So only a plain
+assignment, `d[k] = v`, goes through `operator[]` (insert or overwrite,
+which is what C# does too); every other use reads through the supplied
+map's `at_ptr`, which aborts on a missing key -- including `d[k] += v` and
+`d[k]++`, which read first. Before, `d[7]` was silently 0. `Add` aborts on a
+key already present, as C# throws; `Remove` reports whether a key went.
+Receivers are typed the way `List`'s are, so `this.d`, a field, and a
+dictionary's own values (`d[k].Add(x)`) all resolve.
+
+**Interfaces.** An interface parameter is a reference: the caller lends the
+object, as a C# reference does, and calls dispatch through the vtable. By
+value it was an abstract struct C could not convert to. Storage of an
+interface type -- a local, a field, a return -- is refused: an owned value
+has one concrete type here.
+
+**Initializer lists.** A class-typed field initialized with arguments,
+`Inner i = new Inner(3);`, is constructed in every constructor's initializer
+list (a constructor is made when there is none), in declaration order.
+`: base(args)` becomes `: Base(args)`; it used to reach the C++ half
+unlowered. `: this(args)` is refused: the C++ half has no delegating
+constructors.
+
+**Nesting.** `new Box<Box<int>>()` matches generic arguments three levels
+deep; a nested `foreach` without braces keeps its inner loop; and the C++
+half's containers hold containers (CPPRUST.md), so `List<List<int>>` and
+`Dictionary<int, List<int>>` copy, assign and free correctly.
 
 ## Layout
 

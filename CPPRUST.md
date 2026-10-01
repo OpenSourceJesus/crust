@@ -1182,10 +1182,10 @@ one this file declares, so its qualifier is simply removed.
 |---|---|---|
 | `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` `compare` `substr` `find` `rfind` `erase` `+` `+=` |
 | | substrings | `find_str` `find_str_from` `rfind_str` `contains` `starts_with` `ends_with` |
-| `vector<T>` | scalars, pointers, plain data | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` `insert` `erase` `begin` `end` |
+| `vector<T>` | scalars, pointers, plain data, and classes with a copy constructor -- `vector<vector<int>>` | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` `insert` `erase` `begin` `end` |
 | `ownvector<T>` | classes that own something | same, minus `get`/`set` |
 | `pair<K,V>` | two values | `first` `second` |
-| `map<K,V>` | keyed lookup, **sorted** | `size` `empty` `clear` `[]` `find` `count` `erase` `lower_bound` `at_index` `begin` `end` |
+| `map<K,V>` | keyed lookup, **sorted** | `size` `empty` `clear` `[]` `find` `count` `erase` (returns the count removed) `at_ptr` (aborts on a missing key) `lower_bound` `at_index` `begin` `end` |
 | `set<T>` | membership, **sorted** | `size` `empty` `clear` `insert` `erase` `find` `count` `lower_bound` `begin` `end` |
 | `unordered_map` / `unordered_set` | — | aliases of the above; nothing here hashes |
 | `priority_queue<T>` | max-heap | `size` `empty` `clear` `push` `pop` `top` `[]` |
@@ -1901,6 +1901,36 @@ requires, `int Class::n = 5;`, is made `static` to match and becomes the
 definition; a bound stays with it (`static int hist[4];`). Before, one with
 an initializer was taken for a constant (`n++` hit a read-only variable)
 and one without sat inside the struct.
+
+### Containers of containers
+
+An element that is itself a container is an object, and each place an
+element is copied, assigned or reached treats it as one:
+
+- `vector` copies an element through its copy constructor (`__cpp_addr`
+  is resolved where the copy is emitted -- left for a later pass, it was
+  refused there as an unaddressable call result), and its `operator=`
+  destroys the elements it replaces rather than forgetting them, which
+  leaked each inner vector.
+- `v[i][j]` subscripts the element through its own `operator[]`; the chain
+  stopped after the first subscript, leaving a C subscript on a struct.
+  `(*p.get(k))[i]` and `(*p.get(k)).m()` -- a call returning a pointer,
+  dereferenced in place -- continue the same way.
+- `v[i] = x` and `m[k] = x` with a class element assign through
+  `operator=`, as an array element does. A struct copy left the container
+  and `x` owning one buffer, freed twice.
+- `v[i].push_back(std::move(x))` takes the move overload with the source by
+  reference, as on a named receiver; materialised, it took the address of a
+  statement expression.
+- `pair` holds both halves by value, so a container used as a `map` value
+  has to be complete before the `pair` around it, while `vector<pair<..>>`
+  needs `pair` first. The supplied headers are spliced in the order the
+  program needs: containers before `pair` when a `map` or `pair` takes one
+  as an argument, `pair` first otherwise. A program needing both orders at
+  once is refused by the ordering check.
+- Assigning a template's temporary, `h.c = Cell<int>();`, is hoisted like a
+  class's; the template arguments between the name and the parenthesis hid
+  it, and it reached C as a call to a type.
 
 ### Static methods
 
