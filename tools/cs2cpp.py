@@ -5137,6 +5137,10 @@ WRAPV_PRAGMA = '_Pragma("GCC optimize(\\"wrapv\\")") '
 
 def translate(text, path="<cs>"):
     """Rewrite a C# subset source into the C++ subset. Raises CsError."""
+    # `#if !CRUST .. #endif`: code a library keeps for Unity alone (debug
+    # text, editor hooks). CRUST is defined, as UNITY_STANDALONE is for
+    # unity_pack; inactive regions are blanked, lines kept.
+    text = blank_inactive_pp_regions(text, {"CRUST"})
     text = _lower_arena_classes(text)
     text = _lower_unchecked(text)
     text = _lower_ref_out(text)

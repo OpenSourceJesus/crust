@@ -731,8 +731,10 @@ class TestUnity2DDestruction(unittest.TestCase):
     BASE = "unity2DDestruction/Assets/2D_Destruction"
     TRANSLATE = (
         "Scripts/MaxInstancesAttribute.cs",
+        "Unity-delaunay/Delaunay/Edge.cs",
         "Unity-delaunay/Delaunay/ICoord.cs",
         "Unity-delaunay/Delaunay/LR.cs",
+        "Unity-delaunay/geom/Circle.cs",
         "Unity-delaunay/geom/LineSegment.cs",
         "Unity-delaunay/geom/Polygon.cs",
         "Unity-delaunay/geom/Winding.cs",
