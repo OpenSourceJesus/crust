@@ -29,6 +29,7 @@ __all__ = [
     '_DEFAULT_MAT2D',
     '_DEFAULT_MAT3D',
     '_PHYSICS_COMPONENTS',
+    '_COLLIDER2D_TYPES',
     '_build_collider2d_tables',
     '_build_collider3d_tables',
     '_build_rigidbody_tables',
@@ -145,6 +146,10 @@ def _wrap_log_collision2d_tostring(text, param):
 
 
 _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
+
+# The abstract 2D collider: a handle is its `_Collider2D_*` index, the same
+# index a collision / trigger handler's parameter carries.
+_COLLIDER2D_TYPES = frozenset(("Collider2D",))
 
 
 # MonoBehaviour 2D collision messages (Unity Physics2D).

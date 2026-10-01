@@ -4503,7 +4503,7 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     bases_map = plan.get("mb_bases") or _collect_mb_bases(analyses)
     known = (set(plan.get("classes") or {})
              | _ADDABLE_BUILTINS
-             | _PHYSICS_COMPONENTS
+             | _PHYSICS_COMPONENTS | _COLLIDER2D_TYPES
              | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
              | _UI_GETCOMPONENT_TYPES
              | _TRANSFORM_GETCOMPONENT_TYPES
@@ -5593,7 +5593,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
     def _known_component(comp):
         return (comp in (plan.get("classes") or {})
-                or comp in _PHYSICS_COMPONENTS
+                or comp in _PHYSICS_COMPONENTS or comp in _COLLIDER2D_TYPES
                 or comp in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or comp in _ADDABLE_BUILTINS
                 or comp in _UI_GETCOMPONENT_TYPES
@@ -9221,6 +9221,23 @@ def _emit_engine_gameobject_tables(
         p("    return go;")
         p("}")
         p("")
+    if (getcomponent_types & _COLLIDER2D_TYPES) and want_go_tables:
+        # ponytail: first collider on the GO, a linear scan of the table
+        p("/* GetComponent<Collider2D> — the GO's first collider index */")
+        if plan.get("collider2d"):
+            p("static int _col2d_go(int ci);")
+            p("static int GameObject_GetComponent_Collider2D(int go) {")
+            p("    int ci;")
+            p("    for (ci = 0; ci < _Collider2D_count; ci = ci + 1)")
+            p("        if (_col2d_go(ci) == go) return ci;")
+            p("    return -1;")
+            p("}")
+        else:
+            p("static int GameObject_GetComponent_Collider2D(int go) {")
+            p("    (void)go;")
+            p("    return -1;")
+            p("}")
+        p("")
     # Live uGUI GetComponent maps (mutable; seeded from authored presence).
     ui_gc = sorted(
         (getcomponent_types & _UI_GETCOMPONENT_TYPES)
@@ -12366,7 +12383,7 @@ def _emit_engine_get_components_in_children(
             # Need a GetComponent map / packed class / subclass / Transform.
             has_map = (
                 bool(collectors)
-                or tname in _PHYSICS_COMPONENTS
+                or tname in _PHYSICS_COMPONENTS or tname in _COLLIDER2D_TYPES
                 or tname in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or tname in _ADDABLE_BUILTINS
                 or tname in _UI_GETCOMPONENT_TYPES
