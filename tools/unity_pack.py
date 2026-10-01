@@ -583,6 +583,7 @@ _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
 # ParticleSystem: read, simulated and drawn (tools/unity_pack_particles.py).
 _PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
 import tools.unity_pack_particles as _parts
+import tools.unity_pack_curves as _curves
 
 
 
@@ -2974,6 +2975,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         mb_ids = []
         vec2_fields = {}
         vec3_fields = {}
+        anim_curves = {}
         sprite = None
         ui_image = None
         ui_button = None
@@ -3023,6 +3025,15 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 object_ref_arrays.update(k.get("object_ref_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
+                # AnimationCurve fields: keys and wrap modes, serialized
+                # inline (tools/unity_pack_curves.py).
+                try:
+                    anim_curves.update(
+                        _curves.parse_curve_fields(k.get("raw") or ""))
+                except _curves.CurveError as e:
+                    raise PackError(
+                        "GameObject `%s`: an AnimationCurve field holds %s"
+                        % (go.get("name") or "?", e))
                 g = k.get("guid")
                 if g and g in guid_to_script:
                     # Prefer authored Slider (_Slider) over companion
@@ -3421,6 +3432,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "active": active,
             "fields": fields,
             "str_fields": str_fields,
+            "anim_curves": anim_curves,
             "object_refs": object_refs,
             "object_ref_arrays": object_ref_arrays,
             "mb_ids": mb_ids,
@@ -8073,6 +8085,10 @@ def plan_layouts(objects, analyses, two_d=None):
                     members.append((fname, "uint16_t", 16, "f16"))
                 else:
                     members.append((fname, "float", 32, "f32"))
+            elif ty == "AnimationCurve":
+                # A row of the scene's curve table (unity_pack_curves.py),
+                # full width: it indexes every curve, not this class's.
+                members.append((fname, "int", 32, "idx:AnimationCurve"))
             elif ty == "string":
                 # Not a struct member: a table of owned strings beside the
                 # instance array (`string_fields`). It used to fall through
@@ -16953,6 +16969,7 @@ def emit_engine(plan, analyses, used_apis):
     if plan.get("_ia_code"):
         p(plan["_ia_code"])
     _parts.emit_api(p, plan)
+    _curves.emit_c(p, plan)
     import tools.unity_pack_common as _cmx
     if _cmx.GPU_BATCH[0]:
         import tools.unity_pack_gpu2d as _gfx
@@ -23063,6 +23080,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?!\s*[-+*/]?=[^=])",
             lambda m: "_%s_scale_%s[i]" % (_sidn, m.group(1)), text)
     text = _parts.lower_api(text, cl, plan, _c_ident)
+    text = _curves.lower_api(text, cl, plan, _c_ident)
     text = _lower_joint2d_api(text, cl, plan, site)
     text = _lower_rb2d_api(text, cl, plan, site)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
@@ -24280,6 +24298,9 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:Rigidbody":
                     parts.append(str(_rb_field_init_index(
                         plan, o, name, "3d")))
+                elif kind == "idx:AnimationCurve":
+                    parts.append(str(int((plan.get("anim_curve_index") or {})
+                                         .get((cname, inst_i, name), -1))))
                 elif str(kind)[4:] == "ParticleSystem":
                     fid = (o.get("object_refs") or {}).get(name)
                     parts.append(str(int((plan.get("ps_by_file_id") or {})
@@ -26096,6 +26117,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     plan["rb2d_by_file_id"] = rb2d_by_fid
     _build_joint2d_table(plan)
     _parts.build_particle_table(plan)
+    _curves.build_table(plan)
     # Rigidbody2D rotation: a body Box2D-Packed may turn -- not static, not
     # FreezeRotation -- turns its owner's Transform, which then keeps a live
     # rotation (drawn rotated). Unity mode; the glue locked it before.
