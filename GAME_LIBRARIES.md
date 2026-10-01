@@ -153,6 +153,19 @@ falling from holes into a pool under blue Light2Ds; red and yellow Light2Ds
 at a big hole top left; every worm and bat root marked `GpuHierarchy`. Sizes
 are flags (`--worms`, `--segments`, `--bats`, `--holes`). **exists**
 
+The same cave, from the same scene model, for the other two tools: `--godot`
+writes a Godot 4 project to `/tmp/godot_cave_scene` (Node2D chains, Sprite2Ds,
+an AnimationPlayer a root whose tracks address each segment's `rotation` by
+node path, PointLight2Ds, CPUParticles2D drips, a Camera2D; pixels and y down:
+positions are `(x, -y) * 64`, rotations and curve keys negated, in radians),
+and `--blender` writes `/tmp/blender_cave_scene/build_cave.py`, a bpy script
+that builds it (empties for the hierarchy, UV spheres for the bodies, keyed
+z rotations looping by a Cycles modifier, coloured point lights, a particle
+emitter a hole) and saves `cave.blend` when a `blender` binary is on the
+PATH. In Godot the mark is a C# `GpuHierarchy` on the roots; in Blender a
+`GpuHierarchy` custom property. **exists** (godot_pack does not yet pack
+AnimationPlayer, PointLight2D or CPUParticles2D.)
+
 It packs (1,111 objects, depth 41, 595 draws a frame), and its first result is
 a gap on the CPU side: the worms' curves are not played. Curve paths resolve
 through packed objects only, and a segment that has nothing but a Transform
@@ -160,9 +173,18 @@ through packed objects only, and a segment that has nothing but a Transform
 not packed -- the path stops at `S1`. That was silent; unity_pack now warns,
 naming the curve. So the order is:
 
-1. **The CPU baseline**: transform-only objects that an animation curve's path
-   passes through are packed, so the curves play; measure the per-frame cost
-   of evaluating them and composing depth-40 chains.
+1. **The CPU baseline** -- **exists.** Transform-only objects inside an
+   animated tree are packed, so all 520 curves play; and a child's world
+   position now composes its parents' rotation and scale (Unity's
+   parent * T R S) -- it was their positions summed, so a worm stayed a
+   straight line however its curves turned it, and any rotated or scaled
+   parent left its children misplaced. World-position writes invert the same
+   composition. Measured headless (`-O2`, one core): 0.03 ms a frame for the
+   curves, 1.6 ms a frame to compose world positions for 595 sprites. That
+   composition is naive -- each sprite walks its chain to the root, and each
+   step re-derives its parent's basis from the root, so a depth-40 chain costs
+   O(depth^2) -- so the comparison has three sides: this, a CPU pass that
+   composes each node once a frame in parent-before-child order, and the GPU.
 2. **The GPU path** for marked trees: the tree flattened in parent-before-child
    order (parent index, local position / rotation / scale, curve key ranges),
    uploaded once; each frame a compute shader evaluates the curves at the
@@ -170,6 +192,37 @@ naming the curve. So the order is:
    draw from them. The CPU does nothing for the tree.
 3. **Compare**: the same scene with the mark honoured and ignored, the same
    transforms (to a tolerance), and the time each takes.
+
+### Handing a tree back: `Release()`, and destruction
+
+A marked tree's transforms live on the GPU, so code that is about to *read*
+them must first hand the tree back. `GpuHierarchy.Release()` does that:
+crust evaluates the tree once on the CPU, from the same curves at the same
+time -- the animation is data, so the result is the same without reading
+anything back from the GPU, and there is no stall -- and the tree stays on
+the CPU from then on. In Unity, `Release()` does nothing. **planned** (the
+contract exists; crust's side waits for the GPU path)
+
+Destruction is the case that needs it. In
+[Unity-2D-Destruction](https://github.com/crustos/Unity-2D-Destruction),
+`GpuHierarchy` lives in the library (`Scripts/GpuHierarchy.cs`, beside
+`MaxInstancesAttribute`), and `Explodable.explode()` calls `Release()` on a
+`GpuHierarchy` in its parents before fracturing reads the source's position,
+rotation and scale. The fragments then become Box2D bodies the CPU simulates;
+what the GPU can still take is drawing them -- their count is bounded, so
+their transforms go up as one fixed-size array a frame and draw in one batch.
+**exists** (the library side)
+
+`tools/gen_cave_scene.py --destructible` generates that benchmark: the cave
+with Unity-2D-Destruction's runtime library copied in (the fork cloned beside
+crust, or `UNITY_2D_DESTRUCTION`), each GPU-marked bat explodable
+(Rigidbody2D, BoxCollider2D, Explodable with runtime Voronoi fracturing), and
+a `Quake` script that explodes one every half second -- an animated
+GPU tree handed back to the CPU mid-flight, then shattered. **exists**.
+unity_pack refuses it today at `Explodable.cs`'s `MeshFilter`: runtime
+fragments are textured meshes, which unity_pack does not pack yet. That is
+the next step for this benchmark: `MeshFilter` / `MeshRenderer` as textured
+triangles in the engine's draw batch.
 
 ### More of the same kind
 
