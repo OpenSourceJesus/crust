@@ -1413,7 +1413,9 @@ The parts:
 * **Physics**: each fragment is a Rigidbody2D with a PolygonCollider2D, simulated
   by [crustos/box2d](https://github.com/crustos/box2d) (Box2D-Packed).
 
-Status: 7 runtime files translate; every other one is refused with a
-diagnostic. The next blockers, most common first: `string` (`ToString`),
-translating the library's files as one unit (a type used across files),
-`List.FindAll`, an object initializer assigned to a field.
+Status: 9 runtime files translate; every other one is refused with a
+diagnostic. The library keeps its debug `ToString`s behind `#if !CRUST`
+(csrust defines `CRUST` and drops inactive regions). The next blockers, most
+common first: translating the library's files as one unit (an interface or
+type used across files), `List.Sort` with a comparison, `new Halfedge[n]`
+across files, `List.AddRange`.

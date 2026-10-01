@@ -91,6 +91,10 @@ that names `C` -- "before first use", which C# allows a class without a static
 constructor; one with a static constructor may run it sooner than C# would. A
 non-scalar static without an initializer starts empty, where C# has null.
 
+**Preprocessor**: `CRUST` is defined; `#if` / `#elif` / `#else` regions
+that are inactive are dropped (lines kept), so a library can keep Unity-only
+code -- debug `ToString`s, editor hooks -- behind `#if !CRUST`.
+
 **Out** (refused in C# terms before conversion): `Dictionary` members other
 than those above (`Keys`, `Values`, `TryGetValue`, ..), an interface-typed
 local, field or return, `: this(..)` constructor chaining, `string` (§7), `base.M()`,
