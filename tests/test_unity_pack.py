@@ -847,6 +847,42 @@ class TestUnityEngineGaps(unittest.TestCase):
                 "DestroyImmediate(go, true); Object.DestroyImmediate(f(a, b));"),
             "Destroy(go); Destroy(f(a, b));")
 
+    def test_linecast_lowers_to_box2d_raycast(self):
+        # Unity's DefaultRaycastLayers leaves out Ignore Raycast (layer 2)
+        self.assertEqual(
+            unity_pack._lower_physics2d_queries(
+                "h = Physics2D.Linecast(a, b); "
+                "bool hit = Physics2D.Linecast(a, b, m).collider != null;"),
+            "h = Physics2D_Linecast(a, b, (~4)); "
+            "bool hit = (RaycastHit2D_collider(Physics2D_Linecast(a, b, (int)(m))) >= 0);")
+
+    @needs_box2d
+    def test_queries_link_without_2d_physics(self):
+        # no Rigidbody2D or Collider2D in the scene: the glue is built for the query
+        root = self._mini({"Player.cs": """using UnityEngine;
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    void Start() {
+        bool was = Physics2D.queriesStartInColliders;
+        Physics2D.queriesStartInColliders = false;
+        RaycastHit2D h = Physics2D.Raycast(Vector2.zero, Vector2.down, 5);
+        Debug.Log("ray " + (h.collider != null) + " " + was + " " + Physics2D.queriesStartInColliders);
+    }
+}
+"""})
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, out, force=True, box2d_root=_BOX2D_ROOT)
+            # builds box2d/libbox2d.a; `make` then links the headless player
+            unity_pack.build_player_executable(out, "Mini", box2d_root=_BOX2D_ROOT)
+        r = subprocess.run(["make", "-C", out, "game"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, (r.stderr or r.stdout)[-2000:])
+        run = subprocess.run([os.path.join(out, "game"), "-logFile", "-"],
+                             capture_output=True, text=True, cwd=out, timeout=60)
+        self.assertIn("ray False True False", run.stdout)
+
     def test_polygon_collider_triangles(self):
         # a clockwise L of area 3, closed by repeating its first corner
         ell = [(0, 0), (0, 2), (1, 2), (1, 1), (2, 1), (2, 0), (0, 0)]

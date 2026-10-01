@@ -6159,7 +6159,8 @@ def analyze_script(path, text=None, shallow=False):
     # Physics2D queries: Box2D-Packed's, over a Vector2; a hit's collider is
     # read for its GameObject.
     if re.search(r"\bPhysics2D\s*\.\s*(?:(?:Raycast|OverlapCircle|OverlapPoint)"
-                 r"(?:All)?|Linecast)\s*\(", scan):
+                 r"(?:All)?|Linecast)\s*\(|\bPhysics2D\s*\.\s*"
+                 r"queriesStartInColliders\b", scan):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
@@ -17034,10 +17035,10 @@ def emit_engine(plan, analyses, used_apis):
     p("   group can find them. */")
     if _plan_needs_vector2(plan, used_apis):
         _emit_vector2_struct(p, godot=bool(plan.get("godot")))
-    if "Physics2D.query" in used_apis and plan.get("rigidbody2d") is not None:
-        plan["physics2d_queries"] = True
+    if "Physics2D.query" in used_apis:
         p("/* Physics2D.Raycast / OverlapCircle / OverlapPoint: Box2D-Packed")
         p("   queries (physics_box2d.c); a collider index, -1 for none. */")
+        p("extern int engine_box2d_queries_start_in_colliders;")
         p("int engine_box2d_raycast(float ox, float oy, float dx, float dy,")
         p("    float distance, unsigned int mask, float *out);")
         p("int engine_box2d_raycast_all(float ox, float oy, float dx, float dy,")
@@ -20904,6 +20905,8 @@ _UNITY_API_CORE = [
     _B("Time.fixedDeltaTime", "Time_fixedDeltaTime", "value"),
     _B("Time.time", "Time_time", "value"),
     _B("Cursor.visible", "Cursor_visible", "value", _UE),
+    _B("Physics2D.queriesStartInColliders",
+       "engine_box2d_queries_start_in_colliders", "value", _UE),
     _B("Screen.width", "Screen_width", "value"),
     _B("Screen.height", "Screen_height", "value"),
     _B("Application.dataPath", "Application_dataPath", "getter", _UE),
@@ -23803,7 +23806,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                               | _string_store_names(plan)
                               | plan.get("_string_lists_local", set()))
     text = _format_bools(text, _bool_names(cl, body, site)
-                         | {"Cursor_visible", "true", "false"},
+                         | {"Cursor_visible", "true", "false",
+                            "engine_box2d_queries_start_in_colliders"},
                          _string_helper_names("bool") | {
                              "_engine_go_active_in_hierarchy",
                              "GameObject_activeSelf",
