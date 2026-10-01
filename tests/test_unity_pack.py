@@ -847,6 +847,15 @@ class TestUnityEngineGaps(unittest.TestCase):
                 "DestroyImmediate(go, true); Object.DestroyImmediate(f(a, b));"),
             "Destroy(go); Destroy(f(a, b));")
 
+    def test_linecast_lowers_to_box2d_raycast(self):
+        # Unity's DefaultRaycastLayers leaves out Ignore Raycast (layer 2)
+        self.assertEqual(
+            unity_pack._lower_physics2d_queries(
+                "h = Physics2D.Linecast(a, b); "
+                "bool hit = Physics2D.Linecast(a, b, m).collider != null;"),
+            "h = Physics2D_Linecast(a, b, (~4)); "
+            "bool hit = (RaycastHit2D_collider(Physics2D_Linecast(a, b, (int)(m))) >= 0);")
+
     def test_polygon_collider_triangles(self):
         # a clockwise L of area 3, closed by repeating its first corner
         ell = [(0, 0), (0, 2), (1, 2), (1, 1), (2, 1), (2, 0), (0, 0)]
