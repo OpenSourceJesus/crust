@@ -2018,3 +2018,192 @@ class TestDigest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _run_main(cs, opt="-O0"):
+    """Lower a C# program whose `static int Main()` is the check, build it
+    at @opt and return Main's result."""
+    c = lower(cs)
+    tmp = tempfile.mkdtemp(prefix="csrust-")
+    try:
+        path = os.path.join(tmp, "t.c")
+        with open(path, "w") as f:
+            f.write(c + "\nint main(void) { return Program_Main(); }\n")
+        exe = os.path.join(tmp, "t")
+        proc = subprocess.run([_CC, "-w", opt, "-o", exe, path, "-lm"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise AssertionError("generated C did not compile:\n%s\n%s"
+                                 % (proc.stderr.decode("utf-8", "replace"), c))
+        return subprocess.run([exe], timeout=20).returncode
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@needs_cc
+class TestMonoParity(unittest.TestCase):
+    """Programs checked against Mono: each `Main` returns 0 under `mono`, and
+    must here. Each one was found returning something else, or not
+    compiling, by running the same source under both."""
+
+    def test_static_methods_and_fields(self):
+        # static calls went through a `this` that a static method lacks,
+        # and `static int n;` sat inside the struct
+        self.assertEqual(_run_main("""
+public class Counter {
+    public static int Count;
+    public static readonly int R = 4;
+    public Counter() { Count++; }
+    public static int Twice() { return Count * 2; }
+}
+public class Program {
+    static int Fib(int n) { return n < 2 ? n : Fib(n - 1) + Fib(n - 2); }
+    public static int Main() {
+        Counter a = new Counter(); Counter b = new Counter();
+        if (Counter.Count != 2) return 1;
+        Counter.Count += 3; if (Counter.Twice() != 10) return 2;
+        if (Counter.R != 4) return 3;
+        if (Fib(15) != 610) return 4;
+        return 0;
+    }
+}
+"""), 0)
+
+    def test_fields_start_at_zero(self):
+        # a constructor that set one field left the others as stack garbage;
+        # so did a class with no constructor once it held a List; and a
+        # class with initializers but no constructor was zeroed in place of
+        # constructed, losing them
+        self.assertEqual(_run_main("""
+using System.Collections.Generic;
+public class P { public int a; public long b; public bool c; public double d;
+                 public P(int x) { a = x; } }
+public class M { public int a; public List<int> xs = new List<int>(); }
+public class Q { public int A { get; set; } public int n; public Q(int k) { n = k; } }
+public class W { public int w = 3; public long k = 5; }
+public class Program {
+    public static int Main() {
+        P p = new P(5);
+        if (p.a != 5 || p.b != 0 || p.c || p.d != 0.0) return 1;
+        M m = new M(); if (m.a != 0) return 2;
+        Q q = new Q(1); if (q.A != 0) return 3;
+        W w = new W(); if (w.w != 3 || w.k != 5) return 4;
+        return 0;
+    }
+}
+"""), 0)
+
+    def test_properties_with_accessors(self):
+        self.assertEqual(_run_main("""
+public class C {
+    private int _n;
+    private int w = 3;
+    public int N {
+        get { return _n; }
+        set { _n = value * 2; }
+    }
+    public int W { get => w; private set => w = value; }
+    public int Area => w * 2;
+    public int A { get; set; } = 7;
+}
+public class Program {
+    public static int Main() {
+        C c = new C();
+        c.N = 3; if (c.N != 6) return 1;
+        if (c.W != 3 || c.Area != 6) return 2;
+        if (c.A != 7) return 3;
+        c.A++; c.A += 2; --c.A; if (c.A != 9) return 4;
+        c.N += 1; if (c.N != 14) return 5;
+        if (c.N == 13) return 6;
+        return 0;
+    }
+}
+"""), 0)
+
+    def test_integer_arithmetic_wraps_and_shifts_mask_under_O2(self):
+        # C# wraps and masks shift counts; C leaves both undefined, and gcc
+        # -O2 folded `1 << 33` to 0 and turned a wrapping loop infinite
+        src = """
+public class Program {
+    public static int Main() {
+        int big = 2147483647; int w = big + 1;
+        if (w != -2147483648) return 1;
+        int one = 1; int n = 33; long L = 1; byte bt = 1;
+        if ((one << n) != 2) return 2;
+        if ((L << 65) != 2) return 3;
+        if ((bt << n) != 2) return 4;
+        if ((one << n + 1) != 4) return 5;
+        int v = 1; v <<= n; if (v != 2) return 6;
+        if ((-64 >> n) != -32) return 7;
+        int c = 0;
+        for (int i = 2147483600; i > 0; i += 100) c++;
+        if (c != 1) return 8;
+        return 0;
+    }
+}
+"""
+        for opt in ("-O0", "-O2"):
+            self.assertEqual(_run_main(src, opt), 0, opt)
+
+    def test_unbraced_foreach(self):
+        self.assertEqual(_run_main("""
+using System.Collections.Generic;
+public class Program {
+    public static int Main() {
+        List<int> xs = new List<int>(); xs.Add(3); xs.Add(4);
+        int s = 0;
+        foreach (int v in xs) s += v;
+        return s == 7 ? 0 : 1;
+    }
+}
+"""), 0)
+
+    def test_default_parameter_on_a_static_method(self):
+        self.assertEqual(_run_main("""
+public class Program {
+    static int F(int a, int b = 5) { return a + b; }
+    public static int Main() { return (F(1) == 6 && F(1, 2) == 3) ? 0 : 1; }
+}
+"""), 0)
+
+
+class TestRefusedInCSharpTerms(unittest.TestCase):
+    """Each reached the C compiler as invalid C; each is now refused, in C#
+    terms, at its C# line."""
+
+    def check(self, body, fragment, line):
+        msg = refusal(body)
+        self.assertIn(fragment, msg)
+        self.assertIn("test.cs:%d:" % line, msg)
+
+    def test_string(self):
+        self.check("public class P {\n  public int F() { string s = \"a\"; return 0; }\n}\n",
+                   "`string` is not in the C# subset", 2)
+
+    def test_base_call(self):
+        self.check("public class A { public virtual int F() { return 1; } }\n"
+                   "public class B : A { public override int F() { return base.F(); } }\n",
+                   "`base.F`", 2)
+
+    def test_is(self):
+        self.check("public class A { }\npublic class P {\n"
+                   "  public bool F(A a) { return a is A; } }\n", "`is`", 3)
+
+    def test_named_arguments(self):
+        self.check("public class P { static int F(int a) { return a; }\n"
+                   "  static int G() { return F(a: 1); } }\n", "named arguments", 2)
+
+    def test_generic_method(self):
+        self.check("public class P {\n  static T Id<T>(T x) { return x; } }\n",
+                   "generic method `Id<..>`", 2)
+
+    def test_slicing_into_a_base(self):
+        self.check("public class A { }\npublic class B : A { }\npublic class P {\n"
+                   "  public void F() { A a = new B(); } }\n",
+                   "would hold only the `A` part", 4)
+
+    def test_static_needing_startup_code(self):
+        self.check("public class P {\n  public static int[] T = new int[3];\n}\n",
+                   "static field `P.T` of type `int[]`", 2)
+        self.check("public class P {\n  static int F() { return 1; }\n"
+                   "  public static int X = F();\n}\n", "is initialised by `F()`", 3)

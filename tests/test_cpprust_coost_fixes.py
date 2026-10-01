@@ -804,3 +804,43 @@ public:
 };
 int main(void) { Q q; q.k = 1; return (q.get(0).v == 0 && q.get(2).v == 3) ? 0 : 1; }
 """)
+
+
+class TestStaticMembers(Base):
+    """`static` members beyond `static const`. A bare call from a static
+    method went through a `this` that does not exist, one from an instance
+    method passed `this` as an extra argument, and a mutable static data
+    member was left inside the struct or made a constant."""
+
+    def test_calls_and_data(self):
+        self.assertRuns("""
+class Base { public: static int twice(int x) { return 2 * x; } };
+class P : public Base {
+public:
+    static int calls;
+    static int total;
+    static int hist[4];
+    static const int cap = 8;
+    static int Fib(int n) { calls++; return n < 2 ? n : Fib(n - 1) + Fib(n - 2); }
+    int k;
+    int G() { hist[1] = 3; return Fib(5) + k + twice(1); }
+};
+int P::calls = 0;
+int P::total;
+int P::hist[4];
+int main(void) {
+    P p; p.k = 1;
+    int a = P::Fib(10);
+    int b = p.G();
+    int c = p.Fib(3);
+    P::total += 4;
+    return (a == 55 && b == 8 && c == 2 && P::calls > 100 && P::hist[1] == 3
+            && P::total == 4 && P::cap == 8) ? 0 : 1;
+}
+""")
+
+    def test_static_with_initializer_is_assignable(self):
+        self.assertRuns("""
+class C { public: static int n = 5; static void bump() { n++; } };
+int main(void) { C::bump(); C::bump(); return C::n == 7 ? 0 : 1; }
+""")
