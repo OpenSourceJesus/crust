@@ -844,3 +844,91 @@ int main(void) {
 class C { public: static int n = 5; static void bump() { n++; } };
 int main(void) { C::bump(); C::bump(); return C::n == 7 ? 0 : 1; }
 """)
+
+
+class TestContainersOfOwningElements(Base):
+    """A container whose element is itself a container. Copying a vector of
+    vectors was refused inside the supplied vector; assigning one leaked
+    the elements it replaced; `g[i][j]` stopped after one subscript;
+    `map<int, vector<int>>` was refused for its instantiation order, and
+    assigning into it was a struct copy freed twice. Run under ASan, so a
+    leak or a double free fails the test."""
+
+    def assertClean(self, src):
+        out = self.lower(src)
+        tmp = tempfile.mkdtemp()
+        try:
+            c = os.path.join(tmp, "t.c")
+            with open(c, "w") as f:
+                f.write(out)
+            exe = os.path.join(tmp, "t")
+            r = subprocess.run(["gcc", "-w", "-fsanitize=address,undefined",
+                                c, "-o", exe], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            p = subprocess.run([exe], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_vector_of_vectors(self):
+        self.assertClean("""
+#include <vector>
+static int f(void) {
+    std::vector<std::vector<int> > g;
+    for (int i = 0; i < 4; i++) { std::vector<int> r; for (int j = 0; j <= i; j++) r.push_back(i * 10 + j); g.push_back(r); }
+    g[2][1] = 99;
+    if (g[2][1] != 99 || g[3][3] != 33) return 1;
+    std::vector<std::vector<int> > h(g);
+    h[0][0] = -1; g[1].push_back(5);
+    if (g[0][0] != 0 || h[1].size() != 2 || g[1].size() != 3) return 2;
+    std::vector<std::vector<int> > k;
+    std::vector<int> one; one.push_back(1); k.push_back(one);
+    k = g;
+    if (k.size() != 4 || k[2][1] != 99) return 3;
+    g.pop_back(); g.erase(g.begin());
+    if (g.size() != 2 || g[0][0] != 10) return 4;
+    std::vector<std::vector<std::vector<int> > > c3;
+    std::vector<std::vector<int> > mid; mid.push_back(one); c3.push_back(mid);
+    c3[0][0][0] = 7;
+    return c3[0][0][0] == 7 ? 0 : 5;
+}
+int main(void) { return f(); }
+""")
+
+    def test_map_of_vectors_and_vector_of_pairs(self):
+        self.assertClean("""
+#include <map>
+#include <vector>
+int main(void) {
+    std::map<int, std::vector<int> > d;
+    std::vector<int> v; v.push_back(5);
+    d[1] = v; d[1].push_back(6);
+    if (d[1].size() != 2 || d[1][0] != 5 || v.size() != 1) return 1;
+    return 0;
+}
+""")
+        self.assertClean("""
+#include <vector>
+#include <utility>
+int main(void) { std::vector<std::pair<int, int> > v; std::pair<int, int> p;
+    p.first = 1; p.second = 2; v.push_back(p); return v[0].second == 2 ? 0 : 1; }
+""")
+
+    def test_map_at_ptr_and_erase(self):
+        self.assertRuns("""
+#include <map>
+int main(void) {
+    std::map<int, int> m; m[1] = 10; m[2] = 20;
+    if (*m.at_ptr(2) != 20) return 1;
+    *m.at_ptr(1) += 5; if (m[1] != 15) return 2;
+    return (m.erase(2) == 1 && m.erase(2) == 0 && m.size() == 1) ? 0 : 3;
+}
+""")
+
+    def test_assigning_a_template_temporary(self):
+        self.assertRuns("""
+template <class T> class Cell { public: T v; Cell() { v = 0; } };
+class H { public: Cell<int> c; };
+int main(void) { H h; h.c = Cell<int>(); h.c.v = 4; Cell<int> l; l = Cell<int>();
+                 return (h.c.v == 4 && l.v == 0) ? 0 : 1; }
+""")

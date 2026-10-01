@@ -2207,3 +2207,133 @@ class TestRefusedInCSharpTerms(unittest.TestCase):
                    "static field `P.T` of type `int[]`", 2)
         self.check("public class P {\n  static int F() { return 1; }\n"
                    "  public static int X = F();\n}\n", "is initialised by `F()`", 3)
+
+
+@needs_cc
+class TestMonoParityII(unittest.TestCase):
+    """Part II, checked against Mono the same way. A throw in C# is an
+    abort here: the program ends either way, and nothing reads a value that
+    is not there."""
+
+    DICT = """
+using System.Collections.Generic;
+public class Program {
+    public static int Main() {
+        Dictionary<int, int> d = new Dictionary<int, int>();
+        %s
+    }
+}
+"""
+
+    def test_dictionary_members(self):
+        self.assertEqual(_run_main(self.DICT % """
+        d[1] = 10; d[2] = 20; d[1] = 11;
+        if (d.Count != 2 || d[1] != 11) return 1;
+        if (!d.ContainsKey(2) || d.ContainsKey(3)) return 2;
+        if (!d.Remove(2) || d.Remove(2)) return 3;
+        d[1] += 3; d[1]++; if (d[1] != 15) return 4;
+        d.Add(7, 1); if (d[7] != 1) return 5;
+        d.Clear(); if (d.Count != 0) return 6;
+        return 0;"""), 0)
+
+    def test_dictionary_missing_key_fails(self):
+        # a read, a compound assignment, and a duplicate `Add` all throw in
+        # C#; through `operator[]` the first two were silently 0
+        for body in ("int v = d[7]; return 3;", "d[5] += 3; return 3;",
+                     "d.Add(1, 1); d.Add(1, 2); return 3;"):
+            self.assertNotIn(_run_main(self.DICT % body), (0, 3), body)
+
+    def test_interface_parameters_borrow(self):
+        self.assertEqual(_run_main("""
+public interface IShape { int Area(); int Grow(int k); }
+public class Sq : IShape { public int s; public Sq(int x) { s = x; }
+    public int Area() { return s * s; } public int Grow(int k) { s += k; return s; } }
+public class Program {
+    static int Bump(IShape a, int k) { return a.Grow(k); }
+    static int Twice(IShape a) { return Bump(a, 1) + a.Area(); }
+    public static int Main() {
+        Sq q = new Sq(3);
+        if (Bump(q, 2) != 5 || q.s != 5) return 1;
+        if (Twice(q) != 6 + 36) return 2;
+        return 0;
+    }
+}
+"""), 0)
+
+    def test_field_initializers_and_base_constructor(self):
+        self.assertEqual(_run_main("""
+public class Inner { public int v; public Inner(int x) { v = x; } }
+public class A { public int a; public A(int x) { a = x; } }
+public class B : A {
+    public Inner p = new Inner(5);
+    public int b;
+    public B(int x) : base(x + 1) { b = x + p.v; }
+}
+public class Outer {
+    public class Nested { public int v; public Nested(int x) { v = x; } }
+    public Nested n = new Nested(3);
+}
+public class Program {
+    public static int Main() {
+        B o = new B(2);
+        if (o.a != 3 || o.b != 7) return 1;
+        Outer t = new Outer(); if (t.n.v != 3) return 2;
+        return 0;
+    }
+}
+"""), 0)
+
+    def test_new_of_nested_generics(self):
+        self.assertEqual(_run_main("""
+public struct Box<T> { public T v; }
+public struct Pair<A, B> { public A a; public B b; }
+public class Cell<T> { public T v; public Cell() { } }
+public class Program {
+    public static int Main() {
+        Box<Box<int>> bb = new Box<Box<int>>(); bb.v.v = 5;
+        Pair<int, Box<long>> pr = new Pair<int, Box<long>>(); pr.b.v = 7;
+        Cell<Cell<int>> cc = new Cell<Cell<int>>(); cc.v = new Cell<int>(); cc.v.v = 4;
+        return (bb.v.v == 5 && pr.b.v == 7 && cc.v.v == 4) ? 0 : 1;
+    }
+}
+"""), 0)
+
+    def test_lists_of_lists_and_dictionaries_of_lists(self):
+        self.assertEqual(_run_main("""
+using System.Collections.Generic;
+public class Program {
+    public static int Main() {
+        List<List<int>> g = new List<List<int>>();
+        g.Add(new List<int>()); g.Add(new List<int>());
+        g[0].Add(7); g[1].Add(8); g[1].Add(9);
+        int s = 0; foreach (List<int> row in g) foreach (int x in row) s += x;
+        if (s != 24 || g[1][1] != 9) return 1;
+        g.RemoveAt(0); if (g.Count != 1 || g[0].Count != 2) return 2;
+        Dictionary<int, List<int>> d = new Dictionary<int, List<int>>();
+        d[1] = new List<int>(); d[1].Add(5);
+        if (d[1].Count != 1 || d[1][0] != 5) return 3;
+        return 0;
+    }
+}
+"""), 0)
+
+
+class TestRefusedInCSharpTermsII(unittest.TestCase):
+    def check(self, body, fragment, line):
+        msg = refusal(body)
+        self.assertIn(fragment, msg)
+        self.assertIn("test.cs:%d:" % line, msg)
+
+    def test_dictionary_member_not_lowered(self):
+        self.check("using System.Collections.Generic;\npublic class P { public int F() {\n"
+                   "  Dictionary<int, int> d = new Dictionary<int, int>();\n"
+                   "  return d.Keys.Count; } }\n", "`Dictionary.Keys`", 4)
+
+    def test_interface_local(self):
+        self.check("public interface I { int F(); }\npublic class C : I { public int F() { return 1; } }\n"
+                   "public class P { public int G() { C c = new C(); I i = c; return 0; } }\n",
+                   "`I i`: an interface-typed", 3)
+
+    def test_constructor_chaining_to_this(self):
+        self.check("public class A { public int a;\n  public A(int x) { a = x; }\n"
+                   "  public A() : this(4) { } }\n", "`: this(..)`", 3)
