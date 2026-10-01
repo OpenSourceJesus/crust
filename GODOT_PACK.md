@@ -19,6 +19,13 @@ x=220
 `project.godot` does the same thing. As with Unity, what is not in the
 subset is refused where it is written, never dropped.
 
+That includes a method the script translator cannot lower yet: in a Godot
+project it is an error at its line (`error CS8000`), where a Unity project
+still gets a warning and an empty method (see *Stubs are diagnostics* in
+[UNITY_PACK.md](UNITY_PACK.md)). A lambda, a tuple or a static call nothing
+lowers used to empty its method here too, with only that warning.
+`--strict` is the default; `pack(strict=False)` asks for the warning.
+
 ## Scenes
 
 `.tscn`, `.tres` and `project.godot` share one reader for Godot's text

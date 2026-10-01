@@ -989,6 +989,15 @@ on), `Pause`, `Clear`, `Emit(n)`, `isPlaying`, `isEmitting`, `isPaused`,
 local or `GetComponent<ParticleSystem>()`. The other modules (over-lifetime
 curves, noise, collision, sub-emitters, trails) and the renderer's material
 are not read; `AddComponent<ParticleSystem>` stays refused.
+A call through the *type*, `ParticleSystem.Emit(..)`, is refused as csc
+refuses it: CS0120 for an instance member (`Emit`, `Play`, ..: it needs an
+object), CS0117 for a member the type does not have -- unless a field or
+local is itself named `ParticleSystem` (C#'s "Color Color" rule), when it is
+the field's. The check had been switched off when particles became real,
+and such a call emptied its method with only a warning. A project with a
+ParticleSystem also failed to compile until now: the simulation's
+`cosf` / `sinf` needed `<math.h>`, which was included by a feature list
+particles were not on; any C math call now includes it.
 
 **Authored zeros.** A value authored as 0 is kept where 0 is not the
 default: a Rigidbody2D's `m_GravityScale`, an Animation / Animator's speed
@@ -1255,7 +1264,9 @@ Assets/Scripts/Menu.cs(3,19): warning CS8000: `Menu.Start` is not lowered yet
 ```
 
 With `pack(strict=True)` / `--strict` it is an error, and every stub is
-recorded in `plan["stubs"]`.
+recorded in `plan["stubs"]`. A **Godot** project is strict by default
+(GODOT_PACK.md promises nothing is dropped); `strict=False` asks for the
+warning there too.
 
 Deciding what is left is split the same way as the lowering. This file
 asks the Unity questions — an `Instantiate` overload or `GetComponents<T>`
