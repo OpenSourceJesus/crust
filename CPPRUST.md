@@ -1894,6 +1894,23 @@ Treating one as an ordinary field put `static const int cap;` *inside* the
 struct -- which is not C -- and moved the initialiser into the constructor,
 so every instance re-assigned a constant.
 
+A `static` data member *without* `const` is a class variable: emitted at
+file scope as `static T Class_name;` (zero, as static storage is), with the
+in-class initializer if there is one. The out-of-line definition C++
+requires, `int Class::n = 5;`, is made `static` to match and becomes the
+definition; a bound stays with it (`static int hist[4];`). Before, one with
+an initializer was taken for a constant (`n++` hit a read-only variable)
+and one without sat inside the struct.
+
+### Static methods
+
+A static method has no receiver, so a bare call to one inside the class goes
+through the class -- `helper(x)` becomes `Class::helper(x)`, then
+`Class_helper(x)` -- for an inherited static too. Through `this` it came out
+as `this->helper(..)` in a static method, which has no `this`, and as
+`Class_helper(this, ..)` in an instance method, one argument too many.
+`obj.helper(x)` drops the receiver for the same reason.
+
 ### `constexpr`
 
 Dropped, on a member and at file scope alike. It asks for compile-time

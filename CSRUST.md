@@ -43,14 +43,23 @@ Pinned in `tests/test_csrust.py` (`TestSemantics`).
 | `[StructLayout(Sequential/Auto, Pack, Size)]` | checked; a layout-changing `Pack` → `_Pragma("pack(..)")` pair (§2) |
 | `MemoryMarshal` over an unmanaged struct | byte-copy helpers (§2) |
 | `var`, `foreach`, `this.`, `null` | the written type (`var x = new T(..)`) or `auto`, range-`for`, `this->`, `NULL` |
-| auto-properties `{ get; set; }` | field + `get_` / `set_` |
+| auto-properties `{ get; set; }`, with `= init;` | field + `get_` / `set_` |
+| properties with accessors: `get { .. } set { .. }`, `get => e;`, `T P => e;` | `get_P()` / `set_P(T value)` (§7) |
+| `x.P++`, `--x.P`, `x.P += e` on a property | `x.set_P(x.get_P() + ..)` (§7) |
+| `static` fields, `Type.Field`, bare static calls | file-scope `Type_Field`, `Type_Method(..)` (§7) |
+| fields with no initializer | zeroed before the constructor body, as in C# (§7) |
+| `<<`, `>>`, `<<=`, `>>=` | count masked to the operand's width, as in C# (§7) |
 | `delegate` | `typedef` function pointer |
 | `x => …` lambdas | C++ lambdas |
 | `throw` / `catch` | `raise` / `except` (checked model) |
 | `using X = Y;` | kept; `using System;` dropped |
 | `--emit-decls` | same class digest as C++ (CPPRPY.md) |
 
-**Out** (refused in C# terms before conversion): `async`/`await`, LINQ,
+**Out** (refused in C# terms before conversion): `string` (§7), `base.M()`,
+`is`, named arguments, generic *methods*, a base-typed local holding a
+derived object (`A a = new B()`, which an owned value would slice), a static
+field that needs code at startup (an array, `List` or class, or one
+initialised by a call or `new`), `async`/`await`, LINQ,
 `yield`, `dynamic`, `event`, multidimensional arrays, `ref`/`out`/`in`
 parameters, `$"…"`, file-scoped namespaces, `??` / `?.`, `char`, `lock`,
 `decimal`, `partial`, `goto`, `params`, `stackalloc`, `checked`/`unchecked`,
@@ -59,12 +68,21 @@ top-level statements, `Span<T>` / `ReadOnlySpan<T>`, array initializers
 declaration, `new T[n]` for a non-primitive `T`, `LayoutKind.Explicit`,
 enum methods (`ToString`, `Parse`, `HasFlag` …).
 
-Not refused yet, and failing or misbehaving instead — gaps, not design:
-a list of lists (`List<List<int>>`) cannot be declared, because the C++
-half cannot copy a vector of vectors; a class *with* a constructor leaves
-the fields it does not assign uninitialised, where C# zeroes them (a class
-or struct with no constructor and plain fields is zeroed); and an identity
-cast to a struct type, `(In)x`, is not C.
+Not refused yet, and failing instead — gaps, not design. Each produces C
+that does not compile, not C that runs wrong:
+
+- a list of lists (`List<List<int>>`), or a `Dictionary` whose values are
+  lists — the C++ half cannot copy a vector of vectors;
+- `Dictionary` members (`Count`, `ContainsKey`, `Remove`); indexing works,
+  but reading a missing key would insert a default where C# throws, so it
+  wants the same receiver resolution `List` has before it is lowered;
+- an interface-typed parameter (`int Total(IShape a)`) — passed by value;
+- a nested class used in a field initializer of its outer class;
+- `new Box<Box<int>>()` — `new` of a nested generic.
+
+(A class with a constructor used to leave unassigned fields uninitialised,
+and an identity cast `(In)x` was listed here; the first is fixed (§7), and
+the second works.)
 
 Top-level statements are refused rather than lowered because C# requires
 them *before* every type declaration (CS8803) and C needs them after: a
@@ -320,6 +338,52 @@ well — the subset used to pass it to C, which rejects it). Everything
 matches outside strings and comments. `TestLowerBody` pins each family
 under both models; unity_pack's packed output is checked end to end by
 `tools/unity_pack_golden.py`.
+
+## Fields, statics, properties and integers (§7)
+
+Found by running the same programs under Mono and through csrust; each was
+C that compiled and computed something else, or C that did not compile.
+
+**Fields start at zero.** C# zeroes every field before field initializers
+and the constructor body run. A scalar field (primitive or enum) with no
+initializer gets ` = 0`, which the C++ half turns into an assignment at the
+top of every constructor — C#'s order. A constructor that set one field
+left the rest as stack garbage before; so did a class with no constructor
+once it held a `List`. A type with any field initializer is not plain data
+(§2), since it has code to run: zeroed in place of constructed, `new C()`
+lost its initializers.
+
+**Statics.** A static field is a file-scope variable `Type_Field`; `Type.F`
+and a bare `F` inside the class name it. A static whose initialization would
+need code at startup is refused (above): C has no static constructors. Bare
+calls between static methods go through the type, not a `this` that a
+static method does not have (a C++-half fix; see CPPRUST.md).
+
+**Properties.** An accessor-bodied property is rewritten in place to the
+same `get_P` / `set_P` pair an auto-property gets, keeping every newline.
+`x.P op= e`, `x.P++` and `++x.P` read, compute and write through them when
+the receiver is a plain name chain. `x.P == y` is a read (it was taken for
+an assignment).
+
+**Integers.** C# arithmetic wraps and a shift count is taken modulo the
+operand's width; in C both are undefined, and an optimiser uses that: gcc
+-O2 folded `1 << 33` to 0 (C# gives 2) and compiled a loop whose counter
+wraps past `int.MaxValue` into an infinite one.
+
+- Shifts are masked in the source: `x << n` becomes
+  `x << ((n) & (int)(sizeof((x) + 0) * 8 - 1))`. `sizeof((x) + 0)` is the
+  width after C's integer promotion, the same promotion C# applies, so a
+  `byte` shifts modulo 32 in both; `sizeof` does not evaluate `x`. A `>>`
+  that closes two generic lists (`Box<Box<int>>`) is told apart by the
+  `Name<` it closes; when unsure it is left unmasked, never broken.
+- Overflow is made defined by the compiler: the C csrust emits begins with
+  `_Pragma("GCC optimize(\"wrapv\")")`, gcc's `-fwrapv` from there to the
+  end of the translation unit. shivyc drops the pragma, and wraps anyway.
+  **clang ignores it: build with `-fwrapv` there.** It goes on the C, not
+  the C++ — a declaration sharing its line was misread by the C++ half.
+
+`unchecked` stays refused: it is the default behaviour, now what you get.
+`checked` would need an overflow test per operation, and is refused too.
 
 ## Layout
 
