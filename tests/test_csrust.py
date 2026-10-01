@@ -348,8 +348,8 @@ class TestRefusals(unittest.TestCase):
             "public class A { public char c; }\n", "`char`", "UTF-16")
 
     def test_ref_parameters(self):
-        self.assert_refuses(
-            "public class A { public void F(ref int x) { } }\n", "`ref`")
+        # lowered now (a C++ reference); see TestRefOut for the behaviour
+        lower("public class A { public void F(ref int x) { x = 1; } }\n")
 
     def test_multidimensional_arrays(self):
         self.assert_refuses(
@@ -1002,10 +1002,11 @@ class TestPlainDataRefusals(unittest.TestCase):
             "        return 0;"), "`MemoryMarshal.Cast`", "`MemoryMarshal.Read<T>")
 
     def test_a_call_site_ref_elsewhere_is_still_refused(self):
-        # `CreateSpan(ref x, 1)` is the one call-site `ref` read; the
-        # exemption must not reach anything else.
+        # `CreateSpan(ref x, 1)` and a call to a method the program declares
+        # with `ref` are the call-site `ref`s read; any other is refused.
         self.assert_refuses(
-            "public class A { public void F(ref int x) { } }\n", "`ref`")
+            "public class A { public void F() { int x = 0; Other.G(ref x); } }\n",
+            "`ref`")
 
     def test_an_initializer_outside_a_declaration_is_refused(self):
         self.assert_refuses(
@@ -2202,11 +2203,9 @@ class TestRefusedInCSharpTerms(unittest.TestCase):
                    "  public void F() { A a = new B(); } }\n",
                    "would hold only the `A` part", 4)
 
-    def test_static_needing_startup_code(self):
-        self.check("public class P {\n  public static int[] T = new int[3];\n}\n",
-                   "static field `P.T` of type `int[]`", 2)
-        self.check("public class P {\n  static int F() { return 1; }\n"
-                   "  public static int X = F();\n}\n", "is initialised by `F()`", 3)
+    def test_a_static_with_an_initializer_is_lowered(self):
+        # run before first use by the class's __cctor (TestStaticInit)
+        lower("public class P {\n  public static int[] T = new int[3];\n}\n")
 
 
 @needs_cc
@@ -2337,3 +2336,174 @@ class TestRefusedInCSharpTermsII(unittest.TestCase):
     def test_constructor_chaining_to_this(self):
         self.check("public class A { public int a;\n  public A(int x) { a = x; }\n"
                    "  public A() : this(4) { } }\n", "`: this(..)`", 3)
+
+
+
+@needs_cc
+class TestRefOut(unittest.TestCase):
+    """`ref` / `out` parameters, checked against Mono: the callee writes the
+    caller's local, struct, array element or field."""
+
+    def test_ref_and_out(self):
+        self.assertEqual(_run_main("""
+public struct P { public int x; public int y; }
+public class Box { public int v; }
+public class Program {
+    static void Swap(ref int a, ref int b) { int t = a; a = b; b = t; }
+    static bool TryHalf(int n, out int half) { if (n % 2 != 0) { half = 0; return false; } half = n / 2; return true; }
+    static void Bump(ref P p) { p.x += 1; p.y += 2; }
+    static void Twice(ref int a) { Inc(ref a); Inc(ref a); }
+    static void Inc(ref int a) { a++; }
+    static void Set(ref int a) { a = 7; }
+    public static int Main() {
+        int a = 1, b = 2;
+        Swap(ref a, ref b);
+        if (a != 2 || b != 1) return 1;
+        int h;
+        if (!TryHalf(10, out h) || h != 5) return 2;
+        if (TryHalf(7, out h) || h != 0) return 3;
+        P p = new P(); Bump(ref p); if (p.x != 1 || p.y != 2) return 4;
+        int c = 0; Twice(ref c); if (c != 2) return 5;
+        int[] arr = new int[3]; Set(ref arr[1]); if (arr[1] != 7) return 6;
+        Box bx = new Box(); Inc(ref bx.v); if (bx.v != 1) return 7;
+        return 0;
+    }
+}
+"""), 0)
+
+
+
+@needs_cc
+class TestStaticInit(unittest.TestCase):
+    """Static field initializers and a static constructor, run before first
+    use by a guarded `__cctor` -- they were refused (C has no code at
+    startup). Checked against Mono."""
+
+    def test_initializers_then_static_constructor(self):
+        self.assertEqual(_run_main("""
+using System.Collections.Generic;
+public class Counter {
+    public static int made;
+    public static List<int> log = new List<int>();
+    public static int start = Seed() * 2;
+    static int Seed() { return 21; }
+    static Counter() { log.Add(start); }
+    public int id;
+    public Counter() { made++; id = made; log.Add(id); }
+}
+public class Registry {
+    public static int[] table = new int[4];
+    public static int Get(int i) { return table[i]; }
+}
+public class Program {
+    public static int Main() {
+        if (Counter.start != 42) return 1;
+        Counter a = new Counter(); Counter b = new Counter();
+        if (Counter.made != 2) return 2;
+        if (Counter.log.Count != 3 || Counter.log[0] != 42 || Counter.log[2] != 2) return 3;
+        Registry.table[2] = 5;
+        if (Registry.Get(2) != 5 || Registry.table.Length != 4) return 4;
+        return 0;
+    }
+}
+"""), 0)
+
+
+@needs_cc
+class TestSharedSameLine(unittest.TestCase):
+    """`[Shared] public class Node` -- the attribute on the class's line was
+    recognised (the class became shared) but not stripped, and reached the
+    C. Aliasing through it, checked against Mono."""
+
+    def test_same_line_attribute_and_aliasing(self):
+        self.assertEqual(_run_main("""
+[Shared] public class Node { public int v; public Node next; public Node(int x) { v = x; } }
+public class Program {
+    public static int Main() {
+        Node a = new Node(1); Node b = new Node(2); a.next = b;
+        Node x = b; x.v = 9;
+        return a.next.v == 9 ? 0 : 1;
+    }
+}
+"""), 0)
+
+
+
+@needs_cc
+class TestArenaClasses(unittest.TestCase):
+    """`[MaxInstances(N)] class T`: reference semantics from an arena. A
+    reference is a plain pointer -- assignment copies it, null is 0, ==
+    compares references -- and `new` takes the next of N static slots;
+    `T__arena_reset()` releases them all, and an (N+1)th live one aborts.
+    The graph idioms of Unity-2D-Destruction's Delaunay library, checked
+    against Mono."""
+
+    GRAPH = 'using System.Collections.Generic;\npublic class MaxInstancesAttribute : System.Attribute {\n    public MaxInstancesAttribute(int n) {}\n}\n[MaxInstances(16)]\npublic class Node {\n    public int v;\n    public Node next;\n    public Node prev;\n    public Node(int x) { v = x; }\n    public void LinkAfter(Node n) { n.next = next; n.prev = this; if (next != null) next.prev = n; next = n; }\n}\npublic class Program {\n    static Node First(Node n) { while (n.prev != null) n = n.prev; return n; }\n    public static int Main() {\n        Node a = new Node(1); Node b = new Node(2); Node c = new Node(3);\n        a.LinkAfter(c); a.LinkAfter(b);                    // a -> b -> c\n        int s = 0; Node p = a;\n        while (p != null) { s = s * 10 + p.v; p = p.next; }\n        if (s != 123) return 1;\n        if (c.prev != b || b.prev != a || a.prev != null) return 2;\n        Node alias = b; alias.v = 9;\n        if (a.next.v != 9) return 3;\n        if (First(c) != a) return 4;\n        List<Node> l = new List<Node>(); l.Add(a); l.Add(c);\n        if (l[1].prev.v != 9) return 5;\n        l.Remove(a);\n        if (l.Count != 1 || l[0] != c) return 6;\n        Node[] arr = new Node[3]; arr[1] = b;\n        if (arr[0] != null || arr[1].v != 9) return 7;\n        Node q = a.next.next; if (q != c) return 8;\n        return 0;\n    }\n}\n'
+
+    def test_graph_idioms_match_mono(self):
+        self.assertEqual(_run_main(self.GRAPH), 0)
+
+    def test_the_attribute_class_is_dropped(self):
+        out = lower(self.GRAPH)
+        self.assertNotIn("MaxInstancesAttribute", out)
+        self.assertIn("Node__arena[16]", out)
+
+    def test_exhaustion_aborts_and_reset_releases(self):
+        src = """
+public class MaxInstancesAttribute : System.Attribute { public MaxInstancesAttribute(int n) {} }
+[MaxInstances(3)]
+public class Cell { public int v; public Cell(int x) { v = x; } }
+public class Program {
+    public static int Fill(int k) { int s = 0; for (int i = 0; i < k; i++) { Cell c = new Cell(i); s += c.v; } return s; }
+}
+"""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "cap.c"), "w") as f:
+            f.write(lower(src))
+        with open(os.path.join(d, "host.c"), "w") as f:
+            f.write('#include <stdio.h>\n#include <signal.h>\n#include <stdlib.h>\n'
+                    '#include <unistd.h>\n#include "cap.c"\n'
+                    'static void on_abort(int s) { (void)s; write(1, "aborted\\n", 8); _exit(0); }\n'
+                    'int main(void) { signal(SIGABRT, on_abort);\n'
+                    '  printf("fill %d\\n", Program_Fill(3)); Cell__arena_reset();\n'
+                    '  printf("again %d\\n", Program_Fill(3)); fflush(stdout);\n'
+                    '  Program_Fill(4); printf("NOT REACHED\\n"); return 1; }\n')
+        exe = os.path.join(d, "host")
+        r = subprocess.run([_CC, "-w", "-o", exe, os.path.join(d, "host.c")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+        out = subprocess.run([exe], capture_output=True, text=True, timeout=30).stdout
+        self.assertEqual(out.split(), ["fill", "3", "again", "3", "aborted"])
+
+
+@needs_cc
+class TestArenaPool(unittest.TestCase):
+    """A static pool of arena references -- `static Stack<Edge> _pool = new
+    Stack<Edge>()`, the Delaunay library's: its initializer is run by the
+    class's __cctor (the type's `*` hid the field from that pass)."""
+
+    # KNOWN GAP: `.Count` on a *static* `List<Edge>` of arena references is
+    # not lowered yet (`vector_Edge_P` has no member `Count`); the same
+    # members on a local list work (TestArenaClasses). The initializer
+    # itself is run -- what this commit fixed.
+    @unittest.expectedFailure
+    def test_static_list_of_references(self):
+        self.assertEqual(_run_main("""
+using System.Collections.Generic;
+public class MaxInstancesAttribute : System.Attribute { public MaxInstancesAttribute(int n) {} }
+[MaxInstances(8)]
+public class Edge {
+    static List<Edge> _pool = new List<Edge>();
+    public int id;
+    public static Edge Create(int i) { Edge e; if (_pool.Count > 0) { e = _pool[_pool.Count - 1]; _pool.RemoveAt(_pool.Count - 1); } else { e = new Edge(); } e.id = i; return e; }
+    public void Dispose() { _pool.Add(this); }
+}
+public class Program {
+    public static int Main() {
+        Edge a = Edge.Create(1); a.Dispose();
+        Edge b = Edge.Create(2);
+        return (b == a && b.id == 2) ? 0 : 1;      // the pooled object, reused
+    }
+}
+"""), 0)

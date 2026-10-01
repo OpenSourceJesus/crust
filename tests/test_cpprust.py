@@ -1342,7 +1342,7 @@ int f(EngineDraw *o) { return 0; }
         out = cpprust.translate("""
 int f(void) { std::vector<std::string*> v; return v[0]->size(); }
 """)
-        self.assertIn("string_size((*vector_string__index(&v, 0)))", out)
+        self.assertIn("string_size((*vector_string_P__index(&v, 0)))", out)
 
 
 class TestCppOwningElements(unittest.TestCase):
@@ -1366,7 +1366,9 @@ void f(void) {
     delete a;
 }
 """)
-        self.assertIn("vector_string_push_back(&v, a)", out)
+        # vector<string *> is vector_string_P: `vector_string` is
+        # vector<string>'s name, and the two used to collide
+        self.assertIn("vector_string_P_push_back(&v, a)", out)
         self.assertIn("string_drop(a); free(a);", out)
 
 

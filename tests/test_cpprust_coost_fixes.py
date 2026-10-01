@@ -932,3 +932,16 @@ class H { public: Cell<int> c; };
 int main(void) { H h; h.c = Cell<int>(); h.c.v = 4; Cell<int> l; l = Cell<int>();
                  return (h.c.v == 4 && l.v == 0) ? 0 : 1; }
 """)
+
+
+class TestChainThroughFields(Base):
+    """`a.get()->next.get()`: a call after a class-typed field continues
+    from the field's type. The chain stopped at the field, and the call
+    reached C unlowered."""
+
+    def test_call_after_a_field(self):
+        self.assertRuns("""
+class In { public: int v; In() { v = 4; } int get() { return v; } };
+class Out { public: In in; Out() { } Out *self() { return this; } };
+int main(void) { Out o; return o.self()->in.get() == 4 ? 0 : 1; }
+""")
