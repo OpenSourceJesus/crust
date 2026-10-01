@@ -976,6 +976,21 @@ the pack can read is reported. Interactions, processors, action assets and
 PlayerInput are not read. (A multi-name field declaration, `int a, b;`,
 still declares the first name alone.)
 
+**AnimationCurve** (tools/unity_pack_curves.py): a script's curve field,
+`public AnimationCurve speed;`, is read from the scene -- its keys (time,
+value, in / out slope) and its wrap modes -- into one table of every curve,
+and `speed.Evaluate(t)` / `speed.length` are Unity's: between two keys the
+cubic Hermite with tangents `outSlope * dt` and `inSlope * dt`; an infinite
+slope (a constant key) holds the left value; before the first key and after
+the last, Clamp (Once, ClampForever, Default) holds the end value, Loop
+repeats and PingPong mirrors; no keys is 0, one key its value. A key with
+weighted tangents is refused at the scene: a weighted segment is a Bezier its
+weights reshape, another curve. The field used to be packed as a reference to
+a class named `AnimationCurve` -- always null. The checks are Unity's own
+built-ins: `EaseInOut(0,0,1,1)` is smoothstep (`Evaluate(0.25)` = 0.15625),
+`Linear` the line. Not yet: editing a curve from a script (`AddKey`, `keys`,
+`MoveKey`), and a curve anywhere but a script field.
+
 **ParticleSystem** (tools/unity_pack_particles.py): the component's main,
 emission and shape modules are read -- lifetime, speed, size and color (a
 constant, or random between two; a curve's scalar), gravity modifier,
