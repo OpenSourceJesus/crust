@@ -830,6 +830,17 @@ class TestUnityEngineGaps(unittest.TestCase):
     method, or a read of its packed field, through a reference; and
     transform.position under a parent is the world position."""
 
+    def test_vector2_members_are_helpers(self):
+        from tools import unity_pack_vectors as vec
+        out = vec.lower_vector2_ops(
+            "float m = w.magnitude + Random_insideUnitCircle().normalized.x;",
+            params="Vector2 w")
+        self.assertIn("Vector2_magnitude(w)", out)
+        self.assertIn("Vector2_normalized(Random_insideUnitCircle()).x", out)
+        # a float's member stays as it was
+        self.assertEqual(vec.lower_vector2_ops("float a = f.magnitude;"),
+                         "float a = f.magnitude;")
+
     def _mini(self, scripts, scene_edit=None):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)

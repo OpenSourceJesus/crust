@@ -5830,6 +5830,8 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
+    if re.search(r"\bVector2Int\b", scan):
+        apis.add("Vector2Int")
     # The Input System's Gamepad.current: the host's gamepad.
     if re.search(r"(?<![\w.])Gamepad\s*\.\s*current\b", text):
         apis.add("Gamepad.current")
@@ -18520,7 +18522,8 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
     text = sub(r"\(\s*Vector2\s*\)\s*(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
                lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
     # Implicit Vector3 → Vector2 inside calls whose result is a Vector2.
-    text = sub(r"(?<![\w.])Vector2\s*\.\s*Distance\s*\(", "Vector2_Distance(",
+    # ponytail: Vector3.Distance as the 2D distance; a packed position's z is 0
+    text = sub(r"(?<![\w.])Vector[23]\s*\.\s*Distance\s*\(", "Vector2_Distance(",
                text)
     text = sub(r"(?<![\w.])(Vector2\s+\w+\s*=\s*)Vector3\s*\.\s*Lerp\s*\(",
                r"\1Vector2_Lerp(", text)
@@ -18607,6 +18610,9 @@ def _rewrite_vector2_eq(text, fns):
         m2 = re.compile(call).match(text, got[1] + op.end())
         got2 = m2 and _match_call_args(text, m2.end() - 1)
         if not got2:
+            continue
+        # `a == b - c`: the right operand is all of `b - c` (lower_vector2_ops)
+        if re.match(r"\s*[-+*/%](?![=])", text[got2[1]:]):
             continue
         text = "%s%sVector2_eq(%s, %s)%s" % (
             text[:m.start()], "!" if op.group(1) == "!=" else "",
@@ -19953,8 +19959,8 @@ def _plan_needs_vector2(plan, used_apis=None):
 
 
 def _plan_needs_vector2int(plan, used_apis=None):
-    if used_apis and "Dictionary" in used_apis:
-        pass  # may still need scan of tys
+    if used_apis and "Vector2Int" in used_apis:
+        return True
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2int_fields"):
             return True
@@ -23139,6 +23145,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Vector2\s*\.\s*(Angle|SignedAngle|ClampMagnitude|Dot|"
+        r"Distance)\s*\(", r"Vector2_\1(", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Vector2\s*\.\s*Scale\s*\(", "Vector2_mulv(", text)
     text = _rewrite_vector2_ctor_normalized(text)
     # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
     def _fold_v2_axis_ctors(src, axis_fn, axis):
@@ -23204,6 +23215,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Vector2Int\s*\(",
         "Vector2Int(", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])Vector2Int\s*\.\s*one\b",
+                           "Vector2Int(1, 1)", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])Vector2Int\s*\.\s*zero\b",
+                           "Vector2Int(0, 0)", text)
     for vf in cl.get("vec3_fields") or []:
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
