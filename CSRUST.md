@@ -446,6 +446,98 @@ deep; a nested `foreach` without braces keeps its inner loop; and the C++
 half's containers hold containers (CPPRUST.md), so `List<List<int>>` and
 `Dictionary<int, List<int>>` copy, assign and free correctly.
 
+## Strings with `--coost` (§9)
+
+Without `--coost`, `string` is refused (§7). With it, `string` is lowered to
+[coost](https://github.com/crustos/coost)'s `fastring` -- the model unity_pack
+uses for a script's strings (UNITY_PACK.md, "Strings") -- by
+`tools/cs2cpp_strings.py`, which runs first and leaves text with no `string`,
+`char` or char literal in it:
+
+```
+python3 tools/csrust.py Lib.cs -o lib.c --coost ../coost      # or --coost auto
+```
+
+`auto` is `$COOST_ROOT`, or a `coost` directory beside this repository.
+
+| C# | lowered |
+|----|---------|
+| field `string s;`, local `string s = e;` | `fastring s;` (owned), `s.assign_cstr(e)` |
+| parameter `string p`, return `string F()` | `const char *` (borrowed) |
+| `s = e`, `s += e` | `assign_cstr`, `append_cstr` / `append_int` / `append_double` / `append_char` |
+| `a == b`, `a != b` | `_cs_str_eq(a, b)`; against `null`, `_cs_str_empty(a)` |
+| `"a" + n + b` | `_cs_cat_s(_cs_cat_i("a", n), b)`, each operand typed |
+| `s.Length`, `s[i]` | `s.size()` / `strlen(p)`; `_cs_at(..)`, bounds-checked (`abort()`) |
+| `'a'`, `char` | `97`, `int` -- a byte (ASCII / Latin-1), not a UTF-16 unit |
+| `string.Empty`, `string.IsNullOrEmpty(s)` | `""`, `_cs_str_empty(s)` |
+
+A string that is *returned* or *concatenated* lives in one of sixteen scratch
+slots, valid until sixteen more concatenations: right for a value used within
+its statement. A string that is *kept* is copied into a `fastring`. A literal
+field initializer (`string prefix = "x";`) runs in every constructor.
+`1 + 2 + "x"` is `"3x"`, as in C#. A `null` string reads as `""`.
+
+The pass types each operand from the file's fields, parameters and locals. An
+operand it cannot type, in an expression with a string in it, is refused by
+name and line, not guessed at.
+
+`Dictionary<string, V>` is `_cs_smap<V>` (a template in the prelude): a sorted
+array of `fastring` keys, binary-searched with `strcmp`, with a `const char *`
+key -- so a literal, a parameter or a concatenation is a key as it stands, and
+a key is copied in when it is added. It takes the members csrust's dictionary
+lowering already has (indexing, `Count`, `ContainsKey`, `Remove`, `Clear`,
+`Add`); an indexer read of a missing key aborts, as C# throws; keys compare
+ordinally. `V` may be a number or an object (an arena class is a pointer);
+`Dictionary<string, string>` is not lowered yet.
+
+**Not lowered yet**, and refused: `string[]` and `List<string>`; `Split`,
+`Substring`, `Trim` and the other members; `$"..."`; `const string`; an automatic `string` property;
+`ref`/`out` strings; and a field typed in *another file* (a member access on
+a class the file does not declare -- the one-unit translation).
+
+`fastring` allocates from the heap, so a string is not a fixed-size arena
+member. An arena's `reset` drops each object, and so frees its strings.
+
+`tests/test_csrust_strings.py` lowers, builds and runs a Futile-shaped fixture
+(`tests/fixtures/strings/FutileLite1.cs`) under gcc and under shivyc.
+
+## `ref` / `out`, and several files as one unit (§10)
+
+`ref` / `out` parameters were always lowered (a C++ reference, passed as a
+pointer), but a call to a method declared in *another file* was refused
+("the call site spells the keyword too and nothing reads it"): the callee's
+signature is what says an `&` goes there, and one file does not have it. So
+csrust takes several files and translates them together:
+
+```
+python3 tools/csrust.py Matrix.cs Sprite.cs Layer.cs -o game.c [--coost PATH]
+```
+
+or `csrust.translate_unit([(path, text), ..])`. The files are cut into
+top-level types, each base class is put above its subclasses (a cycle of
+bases, or a type declared twice, is refused), and the text is joined. An error
+names the file and line the author wrote (`FMatrix.cs:250:`), not a line of the
+joined text. `tools/cs2cpp_unit.py`.
+
+`ref` / `out` of a plain value, a struct, a field, an array element, and of an
+arena class (`out Layer l`, a reference to the caller's pointer: `Layer* *l`
+inside, `(*l)->n` for a member) all write the caller's variable
+(`tests/test_csrust_unit.py` runs each under gcc and shivyc).
+
+**Struct definitions first, then every body.** cpprust used to emit each
+class's method bodies right after its struct, so a *field* read through a
+pointer to a class declared later (`this->layer->n`, `Layer` below) met an
+incomplete type -- and two classes that read each other's fields (a base and
+the subclass that points back at it) could not be ordered at all. csrust now
+asks cpprust for `bodies_last`: every struct definition, in order, then every
+body, with a prototype for any function that did not have one (`Pool_drop`).
+A call across the same pair always worked (prototypes come first); a field
+now does too. Off for C++ (`cpprust.translate(..., bodies_last=True)` to ask),
+so its layout is unchanged. `tests/test_csrust_unit.py`, `TestBodiesLast`.
+
+Not lowered: `Array.Resize(ref a, n)` and `d.TryGetValue(k, out v)` (library
+calls, not methods of the program).
+
 ## Layout
 
 | file | role |
