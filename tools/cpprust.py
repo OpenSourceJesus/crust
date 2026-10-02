@@ -4302,10 +4302,40 @@ def _sub_code(pat, repl, text):
     out, pos = [], 0
     for m in re.finditer(pat, look):
         out.append(text[pos:m.start()])
-        out.append(repl(m))
+        out.append(repl(_RealMatch(m, text)))
         pos = m.end()
     out.append(text[pos:])
     return "".join(out)
+
+
+class _RealMatch(object):
+    """A match found in the blanked copy, read from the real text.
+
+    The offsets are the same in both, but the *groups* of the blanked copy
+    have their literals and comments turned to spaces: a callback that
+    rebuilt output from `m.group(2)` emitted `new FLabel("         ")` for
+    `new FLabel("Franchise")`.
+    """
+
+    def __init__(self, m, text):
+        self._m = m
+        self._text = text
+
+    def group(self, *which):
+        if not which:
+            which = (0,)
+        got = []
+        for w in which:
+            a, b = self._m.span(w)
+            got.append(None if a < 0 else self._text[a:b])
+        return got[0] if len(got) == 1 else tuple(got)
+
+    def groups(self, default=None):
+        return tuple(default if self._m.span(i)[0] < 0 else self.group(i)
+                     for i in range(1, self._m.re.groups + 1))
+
+    def __getattr__(self, name):
+        return getattr(self._m, name)
 
 
 def _sub_code_and_macros(pat, repl, text):
@@ -4649,6 +4679,26 @@ def _scalar_ref_names(params):
     return out
 
 
+def _pointer_ref_names(params):
+    """Names of parameters declared as a reference to a pointer (`T* &x`).
+
+    The pointer is what the callee writes, so after `T* &x` is lowered to
+    `T* *x` every use of `x` goes through `*x`: `x = p` is `(*x) = p`, and
+    `x->m` (or C#'s `x.m`) is `(*x)->m`, which a bare `(*x).m` would not be.
+    """
+    out = []
+    for part in _split_top(params or ""):
+        if "&" not in part or "*" not in part:
+            continue
+        words = [w for w in part.replace("&", " & ").replace("*", " * ").split()
+                 if w != "const"]
+        if "&" in words and "*" in words:
+            amp = words.index("&")
+            if words[amp - 1] == "*" and len(words) > amp + 1:
+                out.append(words[amp + 1])
+    return out
+
+
 def _class_ref_names(params, names):
     """Names of parameters declared as a reference to a class (`T &` or
     `T &&`). Each is a pointer once lowered."""
@@ -4824,8 +4874,9 @@ def _lower_refs(text, names):
         r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&&\s*(\w+)" % alt,
         lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     # Everything else: a reference parameter.
+    # (`T* &x`, a reference to a pointer, is `T* *x`.)
     text = _sub_code(
-        r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt,
+        r"(?<![\w.&])((?:const\s+)?(?:%s)(?:\s*\*)?)\s*&(?!&)\s*(\w+)" % alt,
         lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     return text
 
@@ -5842,6 +5893,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # go through, so `int &k` lowered to `int *k` left the body comparing
         # a value against a pointer.
         scalar_refs = _scalar_ref_names(params)
+        pointer_refs = _pointer_ref_names(params)
         class_refs = _class_ref_names(params, names)
         params = _lower_refs(params, _with_scalars(names))
         # `this` is a pointer, exactly as an `impl` method's `self` is --
@@ -5865,6 +5917,12 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             inner = _sub_code(
                 r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
                 lambda _m: "(*%s)" % rname, inner)
+        for rname in pointer_refs:
+            # One pass, so the text written is never scanned again: a bare
+            # `x` is `(*x)`, and `x.m` / `x->m` is `(*x)->m`.
+            inner = _sub_code(
+                r"(?<![\w.>&])%s(?![\w])(\s*(?:\.|->)(?=\s*[A-Za-z_]))?" % re.escape(rname),
+                lambda _m: ("(*%s)->" if _m.group(1) else "(*%s)") % rname, inner)
         inner = _addr_of_class_refs(inner, class_refs)
         inner = _implicit_this(inner, mnames, static_calls, cname)
         # Bare member names inside a body refer to fields; qualify them.
@@ -13168,7 +13226,12 @@ def _pack_state_at(text, pos):
 def _by_value_names(ret):
     """The type a field holds by value, or None for a pointer/reference."""
     t = ret.strip()
-    if "*" in t or "&" in t:
+    # A pointer or reference *field*: look outside the template arguments.
+    # `vector<Layer *>` is a vector held by value; its elements are pointers.
+    top, prev = t, None
+    while prev != top:
+        prev, top = top, re.sub(r"<[^<>]*>", "", top)
+    if "*" in top or "&" in top:
         return None
     t = re.sub(r"^(?:(?:const|volatile|mutable|struct|class)\s+)+", "", t)
     # Normalised, not deleted: `unsigned char` is two words, and
@@ -13190,7 +13253,7 @@ def _unit_name(tsub, name):
         return None
 
 
-def _order_plan(classes, insts_all, slot, tsub, path):
+def _order_plan(classes, insts_all, slot, tsub, path, bodies_last=False):
     """For `any_order`: the units each class needs moved above it.
 
     A *unit* is what a struct definition belongs to: a class, by name, or a
@@ -13306,9 +13369,10 @@ def _order_plan(classes, insts_all, slot, tsub, path):
         # Method bodies are emitted with the class, so a later unit they
         # use by value is needed complete here too -- `Program` written
         # first, declaring a `Row` declared below it, is the usual C# file.
-        for dep in method_deps(cls):
-            if dep != cls.name:
-                place(dep, idx, [cls.name], out)
+        if not bodies_last:             # (bodies come after every struct)
+            for dep in method_deps(cls):
+                if dep != cls.name:
+                    place(dep, idx, [cls.name], out)
         if out:
             plan[idx] = out
     return plan, moved
@@ -13317,8 +13381,16 @@ def _order_plan(classes, insts_all, slot, tsub, path):
 def translate(text, path="<cpp>", owning=None, basedir=None,
               incdirs=(), defines=(), clang=None, rtti=False, decls=(),
               decls_out=None, contracts=False, mem_safe=False,
-              any_order=False):
+              any_order=False, bodies_last=False):
     """Translate a C++ subset source to C. Raises CppError on anything else.
+
+    `bodies_last` (with `any_order`): every struct definition first, in
+    order, then every body. C wants a struct complete where a body reads a
+    field through a pointer to it (`this->layer->n`), and a class written
+    above the one it points at is the ordinary case -- worse, two classes that
+    point at each other cannot be ordered at all. Prototypes are already
+    emitted ahead of everything, so only the definitions have to be ordered.
+    Off by default, so C++ keeps the layout it has; `csrust` turns it on.
 
     `any_order` lets a class hold, by value, a class or container declared
     *below* it -- which C# allows and C++ does not. The struct definitions
@@ -13811,8 +13883,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # by value. Planned from the same slots the instantiations use.
     plan, moved = {}, {}
     if any_order:
-        plan, moved = _order_plan(classes, insts_all, slot, tsub, path)
+        plan, moved = _order_plan(classes, insts_all, slot, tsub, path,
+                                  bodies_last)
     hoist_text, hoist_slots = {}, []
+    late_bodies = []            # (class start, text): `bodies_last`
     starts = dict((c.name, s0) for (s0, _e, c) in classes)
 
     def emit_one(cls, targs):
@@ -13831,6 +13905,16 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                                "it (a cpprust bug)" % cname)
             hoist_text[unit] = "\n".join(defs[:k[0] + 1]) + "\n"
             defs = defs[k[0] + 1:]
+        elif bodies_last and any_order:
+            k = [j for j, d in enumerate(defs)
+                 if d.startswith("struct %s {" % cname)]
+            if k:
+                late_bodies.append((starts.get(cls.name),
+                                    "\n".join(defs[k[0] + 1:]) + "\n"))
+                defs = defs[:k[0] + 1]
+        if unit in moved and bodies_last and any_order:
+            late_bodies.append((starts.get(cls.name), "\n".join(defs) + "\n"))
+            defs = []
         # Trailing newline: two instantiations of the same template are
         # emitted back to back, and without it the last line of one runs
         # into the first line of the next.
@@ -13875,6 +13959,25 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # brace is on, and the newline that ends it is counted like any
         # other.
         pieces.append(_src_mark(_src_line(text, end)))
+    if late_bodies:
+        # A function used above where its body now is needs a prototype, and
+        # some were never given one because class order made it unnecessary
+        # (`Pool_drop`, run where a `Pool` local goes out of scope).
+        have = set(re.findall(r"(\w+)\s*\(", " ".join(fwd_protos)))
+        for _at, body in late_bodies:
+            for d in body.split("\n"):
+                m = re.match(r"(static\s+(?:inline\s+)?[^;={}()]*?\b(\w+)\s*\([^()]*\))\s*\{", d)
+                if m and m.group(2) not in have:
+                    have.add(m.group(2))
+                    fwd_protos.append(m.group(1) + ";")
+        # After every struct definition, before the text that follows the last
+        # class. Each carries an anchor naming the line its class was written
+        # on, so a diagnostic still counts from the right place.
+        for at_start, body in late_bodies:
+            if at_start is not None:
+                pieces.append(_src_mark(_src_line(text, at_start)))
+            pieces.append(body)
+        pieces.append(_src_mark(_src_line(text, prev)))
     pieces.append(text[prev:])
     for pi, units, start in hoist_slots:
         # Each moved definition carries an anchor naming the line its class

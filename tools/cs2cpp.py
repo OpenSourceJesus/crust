@@ -227,7 +227,13 @@ def _strip_modifiers(text):
     diagnostic from a later pass usable.
     """
     pat = r"(?<![\w])(%s)(?=[\s])" % "|".join(_DROPPED_MODIFIERS)
-    return cpprust._sub_code(pat, lambda m: " " * len(m.group(0)), text)
+    text = cpprust._sub_code(pat, lambda m: " " * len(m.group(0)), text)
+    # `static class C`: C# says every member is static; C++ has no such class,
+    # and the `static` left in front of it was carried to the first static
+    # member: `static static int C_n;`, which C rejects.
+    return cpprust._sub_code(
+        r"(?<![\w.])static(?=\s+(?:partial\s+)?(?:class|struct)\b)",
+        lambda m: " " * len(m.group(0)), text)
 
 
 def _find_types(text):
@@ -2012,7 +2018,7 @@ def _mark_except_functions(text):
     # tests write; deeper nests still carry `raise` into a later cpprust
     # diagnostic, which is the escape hatch for a cs2cpp bug.
     return re.sub(
-        r"((?:[\w:<>,\s\*\&]+)\s+\w+\s*\([^)]*\)\s*)"
+        r"((?:[\w:<>,\*\&]+\s+)+\w+\s*\([^)]*\)\s*)"
         r"\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
         maybe, text)
 
@@ -2234,7 +2240,7 @@ def _lower_ctor_initializers(text, table, path):
     return text
 
 
-def _check_strings(text, path):
+def _check_strings(text, path, coost=False):
     """Refuse `string` as a type.
 
     Not in the owned object model yet: the C++ half's `string` cannot lower
@@ -2245,6 +2251,12 @@ def _check_strings(text, path):
     a string type of its own, `_cs_string`; see `lower_local_types`.)
     """
     m = re.search(r"(?<![\w.])string(?![\w])", _blank(text))
+    if m is not None and coost:
+        raise CsError(
+            "%s`string` here is a form the coost string mode does not lower "
+            "yet (see cs2cpp_strings.py: it covers fields, locals, parameters, "
+            "returns, `==`, `!=`, `+`, `.Length` and `s[i]`)."
+            % _at(path, text, m.start()))
     if m is not None:
         raise CsError(
             "%s`string` is not in the C# subset yet: concatenation, `==` and "
@@ -2619,7 +2631,7 @@ def _lower_auto_properties(text):
     line grows, which is the same trade `template<…>` already makes.
     """
     prop = re.compile(
-        r"(?<![\w.])([\w:<>,\s\*\&]+?)\s+(\w+)\s*\{\s*get\s*;\s*"
+        r"(?<![\w.])([\w:<>,\*\&][\w:<>,\s\*\&]*?)\s+(\w+)\s*\{\s*get\s*;\s*"
         r"(?:(?:public|private|protected|internal)\s+)?set\s*;\s*\}"
         r"(?:\s*=\s*([^;{}]+);)?")
     names = []
@@ -3203,7 +3215,7 @@ def _type_table(text):
                 (m.group(2), re.sub(r"\s+", "", m.group(1)))
                 for m in re.finditer(
                     r"(?<![\w.])static\s+(?:readonly\s+)?([A-Za-z_][\w.]*"
-                    r"(?:\s*<[^;=(){}]*>)?(?:\s*\[\s*\])*)\s+([A-Za-z_]\w*)\s*[;=]",
+                    r"(?:\s*<[^;=(){}]*>)?(?:\s*\[\s*\])*)\*?\s+([A-Za-z_]\w*)\s*[;=]",
                     scan[brace + 1:close]))
         table[name] = info
     return table
@@ -4336,7 +4348,9 @@ def _method_span(scan, brace, close, pos):
 def _declared_in(scan, lo, hi, name):
     """The declared type of `name` between `lo` and `hi`, or None."""
     found = None
-    pat = (r"(?<![\w.])([A-Za-z_][\w.]*(?:\s*<[^;{}()=]*>)?(?:\s*\[\s*\])*)"
+    # `\*?`: an arena class is a pointer by now (`Box* b`), and the type of `b`
+    # is `Box`.
+    pat = (r"(?<![\w.])([A-Za-z_][\w.]*(?:\s*<[^;{}()=]*>)?(?:\s*\[\s*\])*)\*?"
            r"\s+%s\s*(?=[=;,)]|in\b)" % re.escape(name))
     for m in re.finditer(pat, scan[lo:hi]):
         if m.group(1) in _NOT_A_TYPE:
@@ -4423,7 +4437,10 @@ def _expr_type(chain, pos, scan, table, types, depth=0):
             kv = _dict_types(typ)
             typ = kv[1] if kv is not None else _element_type(typ)
         else:
-            typ = _field_type(table, typ, part)
+            # An arena class is a pointer by now (`Box*`): the class, for the
+            # table, is `Box`. Without this, `b.items.Count` was not seen as a
+            # list's and reached C as a member that does not exist.
+            typ = _field_type(table, typ.rstrip("*").strip(), part)
     return typ
 
 
@@ -4528,6 +4545,11 @@ def _dict_types(t):
     """(K, V) for a `Dictionary<K, V>` / `SortedList<K, V>` type, in its C#
     or its lowered `std::map` spelling; None otherwise."""
     t = _norm_type(t)
+    # coost-mode `Dictionary<string, V>` (cs2cpp_strings._SMAP): a map with a
+    # `const char *` key, so the members lowered below apply unchanged.
+    sm = re.match(r"^_cs_smap<(.+)>$", t)
+    if sm is not None:
+        return "_cs_str", sm.group(1).strip()
     m = re.match(r"^(?:System\.Collections\.Generic\.|std::)?"
                  r"(?:Dictionary|SortedList|map)<(.+)>$", t)
     if m is None:
@@ -4607,8 +4629,10 @@ def _lower_dict_members(text, table, path):
             # `d[k].Add(x)`: the value is a receiver. `p->m()` rather than
             # `(*p).m()`, which is the same in C++ and the form the C++ half
             # chains a call through.
+            # (an arena class value is a pointer, and at_ptr points to *that*)
             edits.append((rstart, close + 1 + dot.end(),
-                          "%s.at_ptr(%s)->" % (recv, key)))
+                          ("(*%s.at_ptr(%s))->" if dict_of(scan, rstart, chain)[1].endswith("*")
+                           else "%s.at_ptr(%s)->") % (recv, key)))
         else:
             edits.append((rstart, close + 1, "(*%s.at_ptr(%s))" % (recv, key)))
     for a, b, rep in sorted(edits, reverse=True):
@@ -5088,8 +5112,11 @@ def _lower_ref_out(text):
     this (_REFUSED_PARAM_MODS).
     """
     scan = _blank(text)
+    # The type may end in `*`: an arena class is a pointer by now
+    # (_lower_arena_classes ran first), and `out T x` must become `T* &x` -- a
+    # reference to the caller's pointer -- not stay a pointer passed by value.
     param = re.compile(r"(?<=[(,])(\s*)(?:ref|out)\s+([A-Za-z_][\w.]*(?:\s*<[^()<>]*>)?"
-                       r"(?:\s*\[\s*\])*)\s+([A-Za-z_]\w*)(?=\s*[,)=])")
+                       r"(?:\s*\[\s*\])*\s*\*?)\s+([A-Za-z_]\w*)(?=\s*[,)=])")
     declared = set()
     for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s*\(([^()]*)\)\s*(?:\{|=>|;)", scan):
         if param.search("(" + m.group(2) + ")"):
@@ -5135,12 +5162,24 @@ def _lower_unchecked(text):
 WRAPV_PRAGMA = '_Pragma("GCC optimize(\\"wrapv\\")") '
 
 
-def translate(text, path="<cs>"):
-    """Rewrite a C# subset source into the C++ subset. Raises CsError."""
+def translate(text, path="<cs>", coost=False):
+    """Rewrite a C# subset source into the C++ subset. Raises CsError.
+
+    `coost`: lower `string` to coost's fastring (cs2cpp_strings.py). The
+    caller then gives cpprust the coost include path; the text returned
+    starts with the include block and the helpers the code calls.
+    """
     # `#if !CRUST .. #endif`: code a library keeps for Unity alone (debug
     # text, editor hooks). CRUST is defined, as UNITY_STANDALONE is for
     # unity_pack; inactive regions are blanked, lines kept.
     text = blank_inactive_pp_regions(text, {"CRUST"})
+    if coost:
+        import tools.cs2cpp_strings as cs_strings
+        try:
+            text = cs_strings.lower(text, path)
+        except cs_strings.StrError as e:
+            raise CsError("%s:%s: %s" % (os.path.basename(path), e.offset or 1,
+                                         e.message))
     text = _lower_arena_classes(text)
     text = _lower_unchecked(text)
     text = _lower_ref_out(text)
@@ -5183,7 +5222,7 @@ def translate(text, path="<cs>"):
     # pass, so an initializer's `P = 1` becomes `x.P = 1` in time to be
     # turned into `x.set_P(1)` like any other.
     text = _lower_memory_marshal(text, table, path, need)
-    _check_strings(text, path)
+    _check_strings(text, path, coost)
     _check_unsupported_forms(text, table, path)
     text = _borrow_interface_params(text, table, path)
     # Before initializers: `xs.Add(new T { .. })` becomes a declaration.
@@ -5229,6 +5268,12 @@ def translate(text, path="<cs>"):
     text = _terminate(text)
     # After that: the helpers need each struct's final `};` to follow.
     text = _emit_plain_helpers(text, need)
+    if coost:
+        import tools.cs2cpp_strings as cs_strings
+        # `_cs_str` stood for `const char *` while the passes above ran: they
+        # refuse `char` and rewrite `const`, and neither means this.
+        text = re.sub(r"(?<![\w])_cs_str(?![\w])", "const char *", text)
+        text = cs_strings.prelude(text) + text
     return text
 
 
