@@ -15935,6 +15935,208 @@ _FOLLOW_WAYPOINTS_CS = (
 )
 
 
+class TestBox2DTerrainChunk(unittest.TestCase):
+    """DTerrain's Box2DChunkCollider: a script, no authored collider, whose
+    boxes become Box2D-Packed shapes of a static body (collider kind 5)."""
+
+    _CHUNK = (
+        "using UnityEngine;\n"
+        "public class Box2DChunkCollider : MonoBehaviour {\n"
+        "    public int MaxShapes = 64;\n"
+        "    private int frame;\n"
+        "    void Update() {\n"
+        "        frame = frame + 1;\n"
+        "        if (frame == 1) {\n"
+        "            Box2DTerrain.Begin(gameObject);\n"
+        "            for (int k = 0; k < 10; k++) {\n"
+        "                Box2DTerrain.AddBox(gameObject, k - 4.5f, -0.5f, 0.5f, 0.5f);\n"
+        "            }\n"
+        "            Box2DTerrain.End(gameObject);\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "public static class Box2DTerrain {\n"
+        "    public static void Begin(GameObject go) { }\n"
+        "    public static void AddBox(GameObject go, float cx, float cy, float hw, float hh) { }\n"
+        "    public static void End(GameObject go) { }\n"
+        "}\n")
+    _CHAIN = (
+        "using UnityEngine;\n"
+        "public class Box2DChainChunkCollider : MonoBehaviour {\n"
+        "    private int frame;\n"
+        "    void Update() {\n"
+        "        frame = frame + 1;\n"
+        "        if (frame == 1) {\n"
+        "            Box2DTerrain.BeginChains(gameObject);\n"
+        "            Box2DTerrain.ChainBegin(gameObject, 1);\n"
+        "            Box2DTerrain.ChainPoint(gameObject, -5f, -1f);\n"
+        "            Box2DTerrain.ChainPoint(gameObject, 5f, -1f);\n"
+        "            Box2DTerrain.ChainPoint(gameObject, 5f, 0f);\n"
+        "            Box2DTerrain.ChainPoint(gameObject, -5f, 0f);\n"
+        "            Box2DTerrain.EndChains(gameObject);\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "public static class Box2DTerrain {\n"
+        "    public static void BeginChains(GameObject go) { }\n"
+        "    public static void ChainBegin(GameObject go, int loop) { }\n"
+        "    public static void ChainPoint(GameObject go, float x, float y) { }\n"
+        "    public static void EndChains(GameObject go) { }\n"
+        "}\n")
+
+    _OPEN_CHAIN = (
+        "using UnityEngine;\n"
+        "public class Box2DChainChunkCollider : MonoBehaviour {\n"
+        "    private int frame;\n"
+        "    void Update() {\n"
+        "        frame = frame + 1;\n"
+        "        if (frame == 1) {\n"
+        "            Box2DTerrain.BeginChains(gameObject);\n"
+        "            Box2DTerrain.ChainBegin(gameObject, 0);\n"
+        "            Box2DTerrain.ChainPoint(gameObject, 5f, 0f);\n"
+        "            Box2DTerrain.ChainPoint(gameObject, -5f, 0f);\n"
+        "            Box2DTerrain.EndChains(gameObject);\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "public static class Box2DTerrain {\n"
+        "    public static void BeginChains(GameObject go) { }\n"
+        "    public static void ChainBegin(GameObject go, int loop) { }\n"
+        "    public static void ChainPoint(GameObject go, float x, float y) { }\n"
+        "    public static void EndChains(GameObject go) { }\n"
+        "}\n")
+
+    _BALL = (
+        "using UnityEngine;\n"
+        "public class Ball : MonoBehaviour {\n"
+        "    private int n;\n"
+        "    void Update() {\n"
+        "        n = n + 1;\n"
+        "        if (n == 58) { Debug.Log(\"y=\" + transform.position.y); }\n"
+        "    }\n"
+        "}\n")
+
+    def _project(self, chunk_rotation="{x: 0, y: 0, z: 0, w: 1}", chunk=None):
+        root = tempfile.mkdtemp(prefix="upack-terrain-")
+        self.addCleanup(shutil.rmtree, root, True)
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        chunk_name, chunk_src = chunk or ("Box2DChunkCollider", self._CHUNK)
+        for name, src, guid in ((chunk_name, chunk_src, "7e44a1"),
+                                ("Ball", self._BALL, "7e44a2")):
+            with open(os.path.join(scripts, name + ".cs"), "w") as f:
+                f.write(src)
+            with open(os.path.join(scripts, name + ".cs.meta"), "w") as f:
+                f.write("guid: %s%s\n" % (guid, "0" * (32 - len(guid))))
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Chunk\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_LocalRotation: " + chunk_rotation + "\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: " + "7e44a1" + "0" * 26
+                + "}\n  MaxShapes: 64\n"
+                +
+                "--- !u!1 &10\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 3, z: 0}\n"
+                "--- !u!50 &12\nRigidbody2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+                "  m_LinearDamping: 0\n"
+                "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
+                "--- !u!114 &14\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + "7e44a2" + "0" * 26
+                + "}\n")
+        return root
+
+    @needs_box2d
+    def test_a_ball_rests_on_boxes_the_script_supplies(self):
+        root = self._project()
+        out = tempfile.mkdtemp(prefix="upack-terrain-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(root, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertTrue(plan.get("physics2d_terrain"))
+        self.assertEqual([c["kind"] for c in plan["collider2d"]], [1, 5])
+        with open(os.path.join(out, "physics_box2d.c")) as f:
+            self.assertIn("void b2u_terrain_set(", f.read())
+        with open(os.path.join(out, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("engine_terrain_end(", eng)
+        update = eng[eng.index("Box2DChunkCollider_Update(unsigned i) {"):]
+        update = update[:update.index("\n}\n")]
+        self.assertNotIn("Box2DTerrain__", update)
+        exe = unity_pack.build_player_executable(
+            out, os.path.basename(root), box2d_root=_BOX2D_ROOT)
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        y = float(run.stdout.split("y=")[1].split()[0])
+        # radius 0.5 on a top at y = 0
+        self.assertAlmostEqual(y, 0.5, delta=0.06)
+
+    def _ball_y(self, chunk):
+        root = self._project(chunk=chunk)
+        out = tempfile.mkdtemp(prefix="upack-terrain-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(root, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertEqual([c["kind"] for c in plan["collider2d"]], [1, 5])
+        self.assertTrue(plan.get("terrain2d_chains"))
+        with open(os.path.join(out, "physics_box2d.c")) as f:
+            self.assertIn("void b2u_terrain_set_chains(", f.read())
+        with open(os.path.join(out, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("engine_terrain_chain_point(1, (int)i,", eng)
+        self.assertIn("engine_terrain_chains_end(1, (int)i)", eng)
+        # the Update body calls the engine, not the hook class's empty stubs
+        update = eng[eng.index("_Update(unsigned i) {"):]
+        update = update[:update.index("\n}\n")]
+        self.assertNotIn("Box2DTerrain__", update)
+        exe = unity_pack.build_player_executable(
+            out, os.path.basename(root), box2d_root=_BOX2D_ROOT)
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return float(run.stdout.split("y=")[1].split()[0])
+
+    @needs_box2d
+    def test_a_ball_rests_on_a_chain_loop_the_script_supplies(self):
+        # the slab y -1..0 as a loop, the ground on the left of the way
+        y = self._ball_y(("Box2DChainChunkCollider", self._CHAIN))
+        self.assertAlmostEqual(y, 0.5, delta=0.06)
+
+    @needs_box2d
+    def test_a_ball_rests_on_an_open_chain(self):
+        # one edge from x = 5 to x = -5: along -x the air is on the right, up
+        y = self._ball_y(("Box2DChainChunkCollider", self._OPEN_CHAIN))
+        self.assertAlmostEqual(y, 0.5, delta=0.06)
+
+    @needs_box2d
+    def test_a_turned_chunk_turns_its_boxes(self):
+        # 180 degrees about z: the floor under y = 0 is a slab over it, whose
+        # top is at y = 1, so the ball rests at 1.5 and not 0.5
+        root = self._project("{x: 0, y: 0, z: 1, w: 0}")
+        out = tempfile.mkdtemp(prefix="upack-terrain-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        unity_pack.pack(root, out, force=True, box2d_root=_BOX2D_ROOT)
+        exe = unity_pack.build_player_executable(
+            out, os.path.basename(root), box2d_root=_BOX2D_ROOT)
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        y = float(run.stdout.split("y=")[1].split()[0])
+        self.assertAlmostEqual(y, 1.5, delta=0.06)
+
+
 class TestBox2DPhysicsBackend(unittest.TestCase):
     """2D physics is Box2D-Packed; OnCollisionEnter/Stay/Exit2D still come
     from unity_pack after the step. See box2d_unity.py in the Box2D-Packed
