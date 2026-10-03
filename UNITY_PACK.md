@@ -1419,3 +1419,15 @@ diagnostic. The library keeps its debug `ToString`s behind `#if !CRUST`
 common first: translating the library's files as one unit (an interface or
 type used across files), `List.Sort` with a comparison, `new Halfedge[n]`
 across files, `List.AddRange`.
+
+**Terrain chunks.** A script named `Box2DChunkCollider` or `Box2DChainChunkCollider` (DTerrain's) gets a
+collider row of kind 5 with no authored shape: a static body at its GameObject, turned with the GameObject's
+rotation as packed, whose shapes the script sets at run time through a static class `Box2DTerrain`. Boxes:
+`Box2DTerrain.Begin(gameObject)`, `AddBox(gameObject, centerX, centerY, halfW, halfH)` for each, `End(gameObject)`.
+Chains: `BeginChains(gameObject)`, per chain `ChainBegin(gameObject, loop)` and `ChainPoint(gameObject, x, y)`
+for each point, `EndChains(gameObject)`; the ground is on the left of the way. The calls stream, so no array
+is needed (`new float[n]` is not lowered); unity_pack stages them and hands them to Box2D-Packed's
+`b2u_terrain_set` / `b2u_terrain_set_chains` (see UNITY_PACK.md there). Coordinates are relative to the
+GameObject. Counts are bounded: `plan["terrain2d_max_shapes"]`, `_max_chains` and `_max_points`; what is past
+them is cut. The class `Box2DTerrain` and its empty bodies are for Unity to compile; unity_pack replaces the calls.
+
