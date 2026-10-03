@@ -1182,8 +1182,11 @@ one this file declares, so its qualifier is simply removed.
 |---|---|---|
 | `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` `compare` `substr` `find` `rfind` `erase` `+` `+=` |
 | | substrings | `find_str` `find_str_from` `rfind_str` `contains` `starts_with` `ends_with` |
-| `vector<T>` | scalars, pointers, plain data, and classes with a copy constructor -- `vector<vector<int>>` | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` `insert` `erase` `begin` `end` |
+| `vector<T>` | scalars, pointers, plain data, and classes with a copy constructor -- `vector<vector<int>>` | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` `insert` `erase` `begin` `end` `data` |
 | `ownvector<T>` | classes that own something | same, minus `get`/`set` |
+
+`data()` is the buffer itself (`T *`, null until the vector has held something), so a vector can be handed to a C function: `fill(v.data(), v.size())`. It is what a
+binding to C needs for every array parameter (CC#'s `T[]` and `List<T>` are `vector`).
 | `pair<K,V>` | two values | `first` `second` |
 | `map<K,V>` | keyed lookup, **sorted** | `size` `empty` `clear` `[]` `find` `count` `erase` (returns the count removed) `at_ptr` (aborts on a missing key) `lower_bound` `at_index` `begin` `end` |
 | `set<T>` | membership, **sorted** | `size` `empty` `clear` `insert` `erase` `find` `count` `lower_bound` `begin` `end` |
@@ -2254,3 +2257,27 @@ template argument. A member access through a pointer-valued expression -- a
 subscript or a call's result -- lowers `.f` to `->f`, as it already did for a
 named pointer, and a call after a class-typed field (`a.get()->next.get()`)
 continues the chain from the field's type.
+
+### Pointer references, and `new` inside a call (found compiling arena classes from CC#)
+
+Two shapes an arena class uses constantly, both silent or invalid before:
+
+* **`T *&` parameters.** `static void swap(Node *&a, Node *&b)` lowers to `Node **`, with its uses as `(*a)`. A call from a plain pointer variable now takes the
+  address (`swap(&x, &y)`); before, it passed `x` itself, the callee read the object's first word as the pointer, and swapped the objects' fields instead of the
+  variables. Only an argument that is itself a `T *&` is passed on as it is (`&(*a)`). The scope symbol of such a parameter carries the value 2 where other
+  pointers carry True.
+* **`new T(..)` as an argument.** A call that is rewritten by reference copies its arguments through, so a `new` inside them was never lowered
+  (`o->Add(new Part(3))` reached the C as `Owner_Add(o, new Part(3))`). Calls with a receiver, `Cls::f(..)` calls and a `new` with a `new` of its own argument now wait
+  until the inner `new` is an allocator call, the way a call with a nested method call already did. Tested on the literal-blanked text, so a string that says "new X" is
+  not one.
+
+Free functions with a `T *&` parameter still lower their *bodies* without the dereference (methods are fine): a known gap, not covered here.
+
+Two more, found translating a whole 2D runtime from CC# (`tests/test_cpprust_extras.py`, `TestStaticCallInPointerReturningArgs`, `TestNewInAStringArgument`):
+
+* **A static call among the arguments of a method that returns a pointer.** `N *d = a->Make(R::Next());`: once lowered, a method returning `T *` is a free function returning `T *`,
+  rewritten with its arguments copied through whole, so the nested `R::Next()` was never visited and reached the C as `N_Make(a, R::Next())`. The call now waits until a static call the static-call
+  branch *will* lower has been lowered, under that branch's own conditions (a known static method of that arity, no `new` in its arguments), so a call that cannot be lowered does not stall the outer one.
+* **"new" inside a string literal.** `_args_hold_new` decides whether a call must wait for a nested `new T(..)`, on text in which comments are blanked but string literals are not, so
+  `o->Say("at the new place")` waited for an allocation that was not there and stayed unlowered. The literal is blanked first. (`printf("new Part(1)")` always worked: a free function never asks.) CC# builds every string
+  literal as a temporary with `append_cstr`, so any literal saying "new <word>" in a call's arguments hit it.
