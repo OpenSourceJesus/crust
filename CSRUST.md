@@ -535,6 +535,28 @@ A call across the same pair always worked (prototypes come first); a field
 now does too. Off for C++ (`cpprust.translate(..., bodies_last=True)` to ask),
 so its layout is unchanged. `tests/test_csrust_unit.py`, `TestBodiesLast`.
 
+A `List` or an object passed `ref` is lent, not copied: `Fill(ref List<P> rects, ref List<Col> cols)`
+fills the caller's list, and `rects.Add(p)`, `rects.Count`, `cols[i].Items.Count` and `o.Points.Add(x)` through
+`ref Out o` are the members the list and the class have, as for a local. (A parameter without `ref` is a
+copy, as every owned value here is, and a big list passed that way is copied each call.) The type of a
+parameter is read with balanced type arguments, so `List<A> a, List<B> b` are two lists and not one.
+A byte-order mark at the start of a file is dropped, as Visual Studio puts one in every C# file; it kept the
+first `using ..;` out of the unit's cleanup and into the C.
+
+**Operators.** A binary operator is written as C# has it, `static R operator +(R a, int b) { .. }`, and is
+lowered to the member cpprust takes, `R operator +(int b)`, whose left operand is the object: `a.X` is
+`this->X` and a bare `a` is `(*this)`. This holds for `+ - * / % | & ^` and the comparisons `== != < > <= >=`.
+The right operand of the declaring type is a `const R &`; any other is by value, and the `_v` / `_vv` doors
+that let `a + b + c` nest take it as the operator does. A local initialised from an operator result
+(`V c = a + b;`) is a `V` afterwards, so `c == g` and `c + a` are lowered too. Call sites are cpprust's:
+operands are plain names of the declared types, so `a + b + c`, `d - a` and `if (c == g)` lower, and a
+literal or an expression as an operand (`r + 2`, `c == new V(1, 2)`) does not -- name it first. A
+scalar right operand is declared and compiles, but a call site `r + k` is not yet lowered; call a method.
+One overload per operator and class (`+` twice, with different right operands, would name one function twice).
+A left operand that is not the declaring type (`int + R`) and the unary operators are refused, in C# terms.
+Inside the body the right operand of the declaring type is a `const R &`: use it through its members
+(`b.X`); passing the whole of it to a by-value parameter is not lowered, as for any `const T &` parameter.
+
 Not lowered: `Array.Resize(ref a, n)` and `d.TryGetValue(k, out v)` (library
 calls, not methods of the program).
 
