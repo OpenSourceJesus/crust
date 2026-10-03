@@ -14802,6 +14802,80 @@ def _emit_engine_colliders_2d(
         p("    *out_y = py + s * ox + c * oy;")
         p("}")
         p("")
+        if plan.get("physics2d_terrain"):
+            cap = max(1, int(plan.get("terrain2d_max_shapes") or 1))
+            p("/* Terrain chunk (kind 5): the script streams a chunk's boxes")
+            p("   (Begin, AddBox..., End) and Box2D-Packed replaces the shapes")
+            p("   of the collider that class / instance owns (physics_box2d.c) */")
+            p("void b2u_terrain_set(int ci, const float *boxes, int n);")
+            p("static float _terrain_stage[%d];" % (4 * cap))
+            p("static int _terrain_n;")
+            p("void engine_terrain_begin(int cls, int inst) {")
+            p("    _terrain_n = 0;")
+            p("}")
+            p("void engine_terrain_add(int cls, int inst, float cx, float cy,")
+            p("    float hw, float hh) {")
+            p("    if (_terrain_n >= %d) return;" % cap)
+            p("    _terrain_stage[4 * _terrain_n] = cx;")
+            p("    _terrain_stage[4 * _terrain_n + 1] = cy;")
+            p("    _terrain_stage[4 * _terrain_n + 2] = hw;")
+            p("    _terrain_stage[4 * _terrain_n + 3] = hh;")
+            p("    _terrain_n = _terrain_n + 1;")
+            p("}")
+            p("void engine_terrain_end(int cls, int inst) {")
+            p("    int ci;")
+            p("    for (ci = 0; ci < _Collider2D_count; ci = ci + 1)")
+            p("        if (_Collider2D_owner_class[ci] == cls &&")
+            p("            _Collider2D_owner_inst[ci] == inst) {")
+            p("            b2u_terrain_set(ci, _terrain_stage, _terrain_n);")
+            p("            return;")
+            p("        }")
+            p("}")
+            p("")
+            if plan.get("terrain2d_chains"):
+                mc = max(1, int(plan.get("terrain2d_max_chains") or 64))
+                mp = max(2, int(plan.get("terrain2d_max_points") or 1024))
+                p("/* Terrain chains: BeginChains, per chain ChainBegin(loop) and")
+                p("   ChainPoint(x, y) for each point, EndChains */")
+                p("void b2u_terrain_set_chains(int ci, const float *pts,")
+                p("    const int *starts, const int *counts, const int *loops,")
+                p("    int n);")
+                p("static float _terrain_cpts[%d];" % (2 * mp))
+                p("static int _terrain_cstart[%d];" % mc)
+                p("static int _terrain_ccount[%d];" % mc)
+                p("static int _terrain_cloop[%d];" % mc)
+                p("static int _terrain_cn;")
+                p("static int _terrain_cp;")
+                p("void engine_terrain_chains_begin(int cls, int inst) {")
+                p("    _terrain_cn = 0;")
+                p("    _terrain_cp = 0;")
+                p("}")
+                p("void engine_terrain_chain_begin(int cls, int inst, int loop) {")
+                p("    if (_terrain_cn >= %d) return;" % mc)
+                p("    _terrain_cstart[_terrain_cn] = _terrain_cp;")
+                p("    _terrain_ccount[_terrain_cn] = 0;")
+                p("    _terrain_cloop[_terrain_cn] = loop;")
+                p("    _terrain_cn = _terrain_cn + 1;")
+                p("}")
+                p("void engine_terrain_chain_point(int cls, int inst, float x,")
+                p("    float y) {")
+                p("    if (_terrain_cn <= 0 || _terrain_cp >= %d) return;" % mp)
+                p("    _terrain_cpts[2 * _terrain_cp] = x;")
+                p("    _terrain_cpts[2 * _terrain_cp + 1] = y;")
+                p("    _terrain_cp = _terrain_cp + 1;")
+                p("    _terrain_ccount[_terrain_cn - 1] = _terrain_ccount[_terrain_cn - 1] + 1;")
+                p("}")
+                p("void engine_terrain_chains_end(int cls, int inst) {")
+                p("    int ci;")
+                p("    for (ci = 0; ci < _Collider2D_count; ci = ci + 1)")
+                p("        if (_Collider2D_owner_class[ci] == cls &&")
+                p("            _Collider2D_owner_inst[ci] == inst) {")
+                p("            b2u_terrain_set_chains(ci, _terrain_cpts, _terrain_cstart,")
+                p("                _terrain_ccount, _terrain_cloop, _terrain_cn);")
+                p("            return;")
+                p("        }")
+                p("}")
+                p("")
         if want_collision2d_msgs:
             nc = max(1, len(col2d_list))
             max_pairs = max(1, nc * (nc - 1) // 2)
@@ -17338,6 +17412,19 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _Collider2D_bounciness[%d];" % nc)
         p("extern const int _Collider2D_friction_combine[%d];" % nc)
         p("extern const int _Collider2D_bounce_combine[%d];" % nc)
+        if plan.get("physics2d_terrain"):
+            # a terrain chunk's boxes, streamed from the script (Box2DTerrain);
+            # defined with _col2d_center, called from the script bodies
+            p("void engine_terrain_begin(int cls, int inst);")
+            p("void engine_terrain_add(int cls, int inst, float cx, float cy,")
+            p("    float hw, float hh);")
+            p("void engine_terrain_end(int cls, int inst);")
+            if plan.get("terrain2d_chains"):
+                p("void engine_terrain_chains_begin(int cls, int inst);")
+                p("void engine_terrain_chain_begin(int cls, int inst, int loop);")
+                p("void engine_terrain_chain_point(int cls, int inst, float x,")
+                p("    float y);")
+                p("void engine_terrain_chains_end(int cls, int inst);")
     if want_col3d:
         n3c = max(1, len(col3d_list))
         p("extern const int _Collider3D_count;")
@@ -22265,6 +22352,45 @@ def _query_vec2(arg):
     return arg.strip()
 
 
+def _lower_terrain_boxes(text, cl, plan):
+    """A terrain chunk's shapes (DTerrain's Box2DChunkCollider), a stream of
+    calls so no array is needed:
+
+        Box2DTerrain.Begin(gameObject);
+        Box2DTerrain.AddBox(gameObject, centerX, centerY, halfW, halfH);  // each
+        Box2DTerrain.End(gameObject);
+
+    as the engine's `engine_terrain_begin / _add / _end(class, instance, ..)`:
+    the boxes are staged, and End hands them to Box2D-Packed's
+    `b2u_terrain_set` on the collider row (kind 5) this instance owns."""
+    if "Box2DTerrain" not in text:
+        return text
+    cid = sorted(plan["classes"]).index(cl["name"])
+    who = r"(?:this\s*\.\s*)?(?:gameObject|this)"
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Box2DTerrain(?:\s*\.\s*|__)(Begin|End)\s*\(\s*" + who +
+        r"\s*\)",
+        lambda m: "engine_terrain_%s(%d, (int)i)" % (m.group(1).lower(), cid),
+        text)
+    # a chunk's boundary as chains: BeginChains, then per chain ChainBegin(loop)
+    # and ChainPoint(x, y) for each point, then EndChains
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Box2DTerrain(?:\s*\.\s*|__)(BeginChains|EndChains)\s*\(\s*"
+        + who + r"\s*\)",
+        lambda m: "engine_terrain_%s(%d, (int)i)" % (
+            "chains_begin" if m.group(1) == "BeginChains" else "chains_end",
+            cid), text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Box2DTerrain(?:\s*\.\s*|__)(ChainBegin|ChainPoint)\s*\(\s*"
+        + who + r"\s*,\s*",
+        lambda m: "engine_terrain_%s(%d, (int)i, " % (
+            "chain_begin" if m.group(1) == "ChainBegin" else "chain_point",
+            cid), text)
+    return cs2cpp.code_sub(
+        r"(?<![\w.])Box2DTerrain(?:\s*\.\s*|__)AddBox\s*\(\s*" + who + r"\s*,\s*",
+        lambda m: "engine_terrain_add(%d, (int)i, " % cid, text)
+
+
 def _lower_physics2d_queries(text):
     """`Physics2D.Raycast(origin, direction[, distance])`, `OverlapCircle(
     point, radius)` and `OverlapPoint(point)`, as the engine's (Box2D-Packed
@@ -23440,6 +23566,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _own_string_params(body, site)
+    # before `gameObject` is lowered: the terrain calls take it as written
+    text = _lower_terrain_boxes(text, cl, plan)
     text = _lower_translate(text)
     if plan.get("two_d") and _class_has_position(cl):
         text = _lower_position_values(text)

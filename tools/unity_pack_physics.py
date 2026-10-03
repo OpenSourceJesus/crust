@@ -419,6 +419,13 @@ def _triangulate_paths(paths):
     return tris
 
 
+#: Scripts that are a terrain chunk's collider: kind 5 in the collider table
+#: (Box2D-Packed's terrain chunk, box2d_unity._with_terrain).
+TERRAIN_COLLIDER_CLASSES = ("Box2DChunkCollider", "Box2DChainChunkCollider")
+TERRAIN_KIND = 5
+TERRAIN_DEFAULT_SHAPES = 256
+
+
 def _build_collider2d_tables(plan):
     """Authored Box / Circle / CapsuleCollider2D → packed contact table."""
     cols = []
@@ -431,6 +438,18 @@ def _build_collider2d_tables(plan):
         cid = class_ids[cname]
         for i, o in enumerate(cl.get("instances") or []):
             c = o.get("collider2d")
+            if not c and cname in TERRAIN_COLLIDER_CLASSES:
+                # destructible terrain: the chunk's shapes come from the
+                # script at run time (Box2DTerrain.SetBoxes), no authored shape
+                c = {"kind": "terrain", "enabled": 1}
+                # the chunk's body turns with its GameObject (fixed at pack
+                # time, as an authored collider's rotation is)
+                q = o.get("rot") or (0.0, 0.0, 0.0, 1.0)
+                qx, qy, qz, qw = q[0], q[1], q[2], q[3]
+                # the planar angle of local +X (unity_pack._quat_z_rad)
+                rz = math.atan2(2.0 * (qx * qy + qw * qz),
+                                1.0 - 2.0 * (qy * qy + qz * qz))
+                c["cos_z"], c["sin_z"] = math.cos(rz), math.sin(rz)
             if not c or not c.get("enabled", 1):
                 continue
             rb_i = rb_of.get((cname, i))
@@ -438,9 +457,18 @@ def _build_collider2d_tables(plan):
             if rb_i is not None:
                 body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
             kind = {"box": 0, "capsule_v": 2, "capsule_h": 3,
-                    "polygon": 4}.get(c.get("kind"), 1)
+                    "polygon": 4, "terrain": TERRAIN_KIND}.get(c.get("kind"), 1)
             if kind == 4:
                 plan["physics2d_polygons"] = True
+            if kind == TERRAIN_KIND:
+                # a terrain chunk is a static body with no Rigidbody2D
+                rb_i, body = None, 2
+                plan["physics2d_terrain"] = True
+                if cname == "Box2DChainChunkCollider":
+                    plan["terrain2d_chains"] = True
+                plan["terrain2d_max_shapes"] = max(
+                    int(plan.get("terrain2d_max_shapes") or 0),
+                    int(o.get("max_shapes") or TERRAIN_DEFAULT_SHAPES))
             cols.append({
                 "tris": c.get("tris") or [],
                 "name": o.get("name") or "obj",
