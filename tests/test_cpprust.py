@@ -8,6 +8,36 @@ import tools.cpprust as cpprust
 import tools.cpp_auto as cpp_auto
 
 
+class TestCppLocalFromOperator(unittest.TestCase):
+    """`T c = a + b;` on a plain-data class: `c` is a `T` afterwards.
+
+    The plain-data branch of a declaration copied the line and returned without
+    recording the local's class, so a later `c == g` or `c + a` met an object cpprust
+    did not know and reached C as a raw operator on two structs."""
+
+    SRC = """
+struct V {
+    int X = 0; int Y = 0;
+    V(int x, int y) { X = x; Y = y; }
+    V operator +(const V &b) { return V(X + b.X, Y + b.Y); }
+    bool operator ==(const V &b) { return X == b.X && Y == b.Y; }
+};
+int Go() {
+    V a(1, 2); V b(10, 20); V g(11, 22);
+    V c = a + b;
+    int same = 0;
+    if (c == g) same = 1;
+    V d = c + a;
+    return same * 100 + d.X;
+}
+"""
+
+    def test_a_local_from_an_operator_result_is_a_value_of_its_class(self):
+        c = cpprust.translate(self.SRC)
+        self.assertIn("V__cmpeq(&c, &g)", c)
+        self.assertIn("V__binadd(&c, &a)", c)
+
+
 class TestCppClass(unittest.TestCase):
     def test_struct_and_methods(self):
         out = cpprust.translate("""

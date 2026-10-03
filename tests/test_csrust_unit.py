@@ -232,5 +232,213 @@ class TestPlanning(unittest.TestCase):
         self.assertIsNone(cpprust._by_value_names("Layer &"))
 
 
+class TestListThroughRefAndGenerics(unittest.TestCase):
+    """`List` members on a `ref` parameter, and generic parameters side by side.
+
+    A `ref List<T> xs` is `std::vector<T> &xs` by the time list members are
+    lowered, and `_declared_in` did not see through the `&`, so `xs.Count`,
+    `xs.Add(x)` and `xs[i].Items.Count` reached C as members of a vector that
+    do not exist. Its type arguments were also greedy: with two generic
+    parameters, the second read as `List<A> a, List<B>`.
+    """
+
+    BODY = (
+        "using System.Collections.Generic;\n"
+        "public struct P { public int X; public P(int x) { X = x; } }\n"
+        "public class Col { public int N; public List<int> Items = new List<int>();\n"
+        "    public Col(int n) { N = n; } }\n"
+        "public class Out { public List<int> Points = new List<int>(); public int Mark; }\n"
+        "public static class Entry {\n"
+        "    // ref List: Count, Add, index then a field's List\n"
+        "    static void Fill(ref List<P> rects, ref List<Col> cols) {\n"
+        "        int first = rects.Count;\n"
+        "        for (int i = 0; i < cols.Count; i++) {\n"
+        "            P p = new P(i + first + cols[i].Items.Count);\n"
+        "            rects.Add(p);\n"
+        "        }\n"
+        "    }\n"
+        "    // two generic parameters, none ref: the second must be its own List<Col>\n"
+        "    static int Sum(List<P> rects, List<Col> cols) {\n"
+        "        int t = 0;\n"
+        "        for (int i = 0; i < cols.Count; i++) t = t + cols[i].N + cols[i].Items.Count;\n"
+        "        for (int i = 0; i < rects.Count; i++) t = t + rects[i].X;\n"
+        "        return t;\n"
+        "    }\n"
+        "    // ref class: a list of its own, through the reference\n"
+        "    static void Collect(ref Out o, ref List<P> rects) {\n"
+        "        for (int i = 0; i < rects.Count; i++) o.Points.Add(rects[i].X);\n"
+        "        o.Mark = o.Points.Count;\n"
+        "    }\n"
+        "    public static int Go() {\n"
+        "        List<P> rects = new List<P>();\n"
+        "        List<Col> cols = new List<Col>();\n"
+        "        Col a = new Col(10); a.Items.Add(1); a.Items.Add(2);\n"
+        "        Col b = new Col(20);\n"
+        "        cols.Add(a); cols.Add(b);\n"
+        "        Fill(ref rects, ref cols);\n"
+        "        Fill(ref rects, ref cols);\n"
+        "        // rects: 0+0+2, 1+0+0 then 0+2+2, 1+2+0  ->  2 1 4 3\n"
+        "        Out o = new Out();\n"
+        "        Collect(ref o, ref rects);\n"
+        "        return Sum(rects, cols) * 100 + o.Mark;\n"
+        "    }\n"
+        "}\n")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = csrust.translate(cls.BODY, path="t.cs")
+
+    def test_ref_list_members_are_lowered(self):
+        self.assertNotIn(".Count", self.c)
+        self.assertNotIn(".Add(", self.c)
+
+    def test_two_generic_parameters_each_have_their_own_type(self):
+        # the second was `List<P> rects, List<Col>`, so `cols.Count` stayed.
+        # Sum's parameters are not `ref`: only this one would show it
+        body = self.c[self.c.index("static int Entry_Sum(vector_P rects, vector_Col cols) {"):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("vector_Col_size(&cols)", body)
+        self.assertIn("vector_P_size(&rects)", body)
+        # needs the element type of `cols`: `cols[i].Items.Count`
+        self.assertIn("vector_int_size(&(*vector_Col__index(&cols, i)).Items)", body)
+        self.assertNotIn(".Count", body)
+
+    @needs_cc
+    def test_it_runs_with_the_callers_lists_filled(self):
+        # Sum = (10 + 20) + 2 items + (2 + 1 + 4 + 3) = 42; Mark = 4
+        self.assertEqual(run_c(self.c, "int main(void) { return Entry_Go() == 4204 ? 0 : 1; }"), 0)
+
+    def test_declared_in_reads_the_type_of_each_parameter(self):
+        scan = "void F(List<A> a, List<B> b, Dictionary<int, List<int>> d, ref List<C> c) { }"
+        self.assertEqual(cs2cpp._declared_in(scan, 0, len(scan), "b"), "List<B>")
+        self.assertEqual(cs2cpp._declared_in(scan, 0, len(scan), "d"), "Dictionary<int,List<int>>")
+        scan = "void F(std::vector<int> &xs, List<B> &ys) { }"
+        self.assertEqual(cs2cpp._declared_in(scan, 0, len(scan), "ys"), "List<B>")
+
+
+class TestByteOrderMark(unittest.TestCase):
+    """A file that starts with a byte-order mark (every C# file Visual Studio saves).
+
+    `using ..;` is dropped at the start of a line, and the mark sat in front of the
+    first one, so it reached the C (`\\ufeffusing System.Collections.Generic;`)."""
+
+    A = "\ufeffusing System.Collections.Generic;\nusing System;\npublic class A { public int N() { return 7; } }\n"
+    B = "\ufeffusing System.Collections.Generic;\npublic class B { public int M() { A a = new A(); return a.N() + 1; } }\n"
+
+    def test_a_unit_has_no_mark_and_no_using(self):
+        c = csrust.translate_unit([("A.cs", self.A), ("B.cs", self.B)])
+        self.assertNotIn("\ufeff", c)
+        self.assertNotIn("using ", c)
+
+    def test_one_file_has_no_mark_and_no_using(self):
+        c = csrust.translate(self.A, path="A.cs")
+        self.assertNotIn("\ufeff", c)
+        self.assertNotIn("using ", c)
+
+    @needs_cc
+    def test_a_unit_with_marks_runs(self):
+        c = csrust.translate_unit([("A.cs", self.A), ("B.cs", self.B)])
+        self.assertEqual(run_c(c, "int main(void) { B b; return B_M(&b) == 8 ? 0 : 1; }"), 0)
+
+
+class TestOperators(unittest.TestCase):
+    """C#'s `static T operator +(T a, B b)` as cpprust's member `T operator +(B b)`.
+
+    C++ has no static operator, and the C# form went through as one: the C had
+    `static static R R__binadd(R *this, R r, int a)` (the first operand a second
+    parameter that nothing passed) and a `_vv` / `_v` wrapper that took the right
+    operand as the left's own type, so `operator +(R, int)` called its function with a
+    pointer for the int."""
+
+    SCALAR = (
+        "public struct R {\n"
+        "    public int Min; public int Max;\n"
+        "    public R(int a, int b) { Min = a; Max = b; }\n"
+        "    public static R operator +(R r, int a) { return new R(r.Min + a, r.Max + a); }\n"
+        "    public static R operator -(R r, int a) { return new R(r.Min - a, r.Max - a); }\n"
+        "}\n"
+        "public static class Entry { public static int Go() { return 0; } }\n")
+
+    VEC = (
+        "public struct V {\n"
+        "    public int X; public int Y;\n"
+        "    public V(int x, int y) { X = x; Y = y; }\n"
+        "    public static V operator +(V a, V b) { return new V(a.X + b.X, a.Y + b.Y); }\n"
+        "    public static bool operator ==(V a, V b) { return a.X == b.X && a.Y == b.Y; }\n"
+        "    public static bool operator !=(V a, V b) { return a.X != b.X || a.Y != b.Y; }\n"
+        "    // a bare `a` is the object itself\n"
+        "    public static V operator -(V a, V b) { V t = Twice(a); return new V(t.X - b.X, t.Y - b.Y); }\n"
+        "    static V Twice(V a) { return new V(a.X * 2, a.Y * 2); }\n"
+        "}\n"
+        "public static class Entry {\n"
+        "    public static int Go() {\n"
+        "        V a = new V(1, 2);\n"
+        "        V b = new V(10, 20);\n"
+        "        V c = a + b;            // a local from an operator result ...\n"
+        "        V d = a + b + c;        // a chain\n"
+        "        V e = d - a;\n"
+        "        V g = new V(11, 22);\n"
+        "        int same = 0;\n"
+        "        if (c == g) same = 1;   // ... is still a V: the comparison is lowered\n"
+        "        if (c != g) same = same + 100;\n"
+        "        return d.X + e.Y + same;\n"
+        "    }\n"
+        "}\n")
+
+    def test_no_static_operator_and_no_doubled_static(self):
+        c = csrust.translate(self.SCALAR, path="R.cs")
+        self.assertNotIn("static static", c)
+        self.assertIn("R__binadd(R *this, int a)", c)
+        self.assertIn("R__binsub(R *this, int a)", c)
+
+    def test_the_wrapper_takes_the_operand_the_operator_takes(self):
+        c = csrust.translate(self.SCALAR, path="R.cs")
+        self.assertIn("R__binadd_v(R lhs, int o)", c)
+        self.assertNotIn("R__binadd_v(R lhs, const R *o)", c)
+
+    @needs_cc
+    def test_the_c_compiles_with_pointer_and_int_mismatches_as_errors(self):
+        # gcc 13 only warns about passing a pointer for an int, gcc 14 refuses
+        import shutil, subprocess, tempfile
+        c = csrust.translate(self.SCALAR, path="R.cs")
+        tmp = tempfile.mkdtemp(prefix="csrust-op-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "t.c")
+        with open(path, "w") as f:
+            f.write(c)
+        proc = subprocess.run(["gcc", "-c", "-Wall", "-Wno-unused", "-Wno-unused-function",
+                               "-Werror=incompatible-pointer-types", "-Werror=int-conversion",
+                               path, "-o", os.path.join(tmp, "t.o")],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+
+    @needs_cc
+    def test_symmetric_chained_compared_and_bare_operand_run(self):
+        # c = (11, 22); d = a + b + c = (22, 44); e = d - a = 2d - a = (43, 86)
+        # same: c == g -> 1, c != g -> not; d.X + e.Y + same = 22 + 86 + 1
+        c = csrust.translate(self.VEC, path="V.cs")
+        self.assertEqual(run_c(c, "int main(void) { return Entry_Go() == 109 ? 0 : 1; }"), 0)
+
+    def test_a_left_operand_that_is_not_the_declaring_type_is_refused(self):
+        text = ("public struct R { public int N;\n"
+                "    public static R operator +(int a, R r) { R x = r; return x; } }\n")
+        with self.assertRaises(cs2cpp.CsError) as cm:
+            csrust.translate(text, path="R.cs")
+        self.assertIn("left operand", str(cm.exception))
+
+    def test_a_unary_operator_is_refused_in_csharp_terms(self):
+        text = ("public struct R { public int N;\n"
+                "    public static R operator -(R r) { R x = r; return x; } }\n")
+        with self.assertRaises(cs2cpp.CsError) as cm:
+            csrust.translate(text, path="R.cs")
+        self.assertIn("operator -", str(cm.exception))
+
+    def test_a_const_parameter_is_not_made_static(self):
+        # `_lower_constants` turns a member `const` into `static const`; the operand
+        # `const R &b` that `_lower_operators` writes is a parameter, not a member
+        c = cs2cpp.translate(self.VEC, path="V.cs")
+        self.assertNotIn("static const V", c)
+
+
 if __name__ == "__main__":
     unittest.main()
