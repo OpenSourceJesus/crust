@@ -586,6 +586,211 @@ void f(void) { int_vector v; v.push_back(1); }
         self.assertNotIn("typedef vector_int vector_int;", out)
 
 
+class TestVectorData(Base):
+    """`std::vector::data()`: the buffer, so a vector can be handed to C.
+
+    Found binding a C library (`pb2_abi(out.data())`) from CC#, whose `T[]` and `List<T>` are `std::vector`: the lowered vector had
+    `begin()` and `ptr(i)` but no `data()`, so the call stayed a C member access on a struct that has no such member and gcc stopped.
+    It is a member of every real std::vector, which is what makes it a gap in the subset and not a feature of the caller.
+    """
+
+    def test_scalar_vector_has_data(self):
+        out = self.assertLowers("""
+#include <vector>
+extern void fill(int *p, int n);
+void f(void) { std::vector<int> v(4); fill(v.data(), v.size()); }
+""", "vector_int_data")
+        self.assertIn("int * vector_int_data(vector_int *this)", out)
+
+    def test_data_is_the_buffer_not_a_copy(self):
+        out = self.assertLowers("""
+#include <vector>
+void f(void) { std::vector<int> v; v.push_back(1); int *p = v.data(); *p = 2; }
+""", "return this->vd;")
+
+    def test_owning_vector_has_data(self):
+        self.assertLowers("""
+#include <vector>
+class Box { public: int n; Box() { n = 0; } Box(const Box &o) { n = o.n; } ~Box() { n = -1; } };
+void f(void) { std::vector<Box> v; Box *p = v.data(); }
+""", "data(")
+
+
+class TestPointerReferenceArgs(Base):
+    """A `T *&` parameter, called with a plain `T *` variable.
+
+    Found compiling arena classes from CC# (a reference to an arena object is a `T *`, and a C# `ref` parameter of that type is `T *&`).
+    The parameter lowered correctly, to `T **`, with its uses as `(*a)`. The CALL did not take the address: `fix_args` skipped the `&` for any
+    argument that was itself a pointer, which is right for a lowered `T &` argument and wrong for a `T *x` bound to `T *&`. gcc -w accepted
+    it, and the callee treated the first word of the object as the pointer and swapped the objects' fields instead of the variables.
+    """
+
+    SRC = """
+class Node { public: int v; Node(int x) { v = x; } };
+class P {
+public:
+    static void swap_nodes(Node *&a, Node *&b) { Node *t = a; a = b; b = t; }
+    static void twice(Node *&a, Node *&b) { swap_nodes(a, b); swap_nodes(a, b); }
+    static int run() {
+        Node *x = new Node(1);
+        Node *y = new Node(2);
+        swap_nodes(x, y);
+        twice(x, y);
+        return x->v;
+    }
+};
+"""
+
+    def test_a_plain_pointer_gets_its_address(self):
+        out = self.assertLowers(self.SRC, "P_swap_nodes(&x, &y);", "P_twice(&x, &y);")
+        self.assertNotIn("P_swap_nodes(x, y)", out)
+
+    def test_a_pointer_reference_passed_on_is_already_that_address(self):
+        # inside `twice`, `a` is `Node **`: `&(*a)` is `a` itself, not the address of the parameter
+        out = self.assertLowers(self.SRC, "P_swap_nodes(&(*a), &(*b));")
+        self.assertNotIn("P_swap_nodes(&a, &b)", out)
+
+    def test_a_class_reference_is_still_passed_on_as_it_is(self):
+        # the case the old rule was for: `Node &r` is lowered to `Node *r`, and passing it to another `Node &` takes no `&`
+        out = self.assertLowers("""
+class Node { public: int v; Node(int x) { v = x; } };
+class P {
+public:
+    static void bump(Node &n) { n.v = n.v + 1; }
+    static void bump_twice(Node &n) { bump(n); bump(n); }
+};
+""", "P_bump(n);")
+        self.assertNotIn("P_bump(&n)", out)
+
+
+class TestNewInCallArguments(Base):
+    """`new T(..)` written as an argument of a method call.
+
+    Found compiling arena classes from CC#: `owner.Add(new Part(3))` and `list.Add(new Part(3))` are everyday C#. A call that is rewritten by
+    reference consumes its arguments, so the `new` inside was never visited and reached the C as `Owner_Add(o, new Part(3))`, which is not C.
+    (Free-function arguments, `return`, conditions and assignments were all fine; only calls with a receiver, a `::` qualifier, or a `new`
+    of their own were not.) Such a call now waits until the `new` has been lowered, as one with a nested method call already did.
+    """
+
+    BASE = """
+class Part { public: int w; static const int __max_instances = 8; Part(int x) { w = x; } };
+class Wrap { public: Part *p; static const int __max_instances = 8; Wrap(Part *q) { p = q; } };
+class Owner { public: int n; Owner *Add(Part *p) { n = n + p->w; return this; }
+              static int Count(Part *p) { return p->w; } };
+"""
+
+    def lowered(self, tail):
+        out = self.assertLowers(self.BASE + tail, "Part__alloc(")
+        self.assertNotIn("new Part", out)
+        self.assertNotIn("new Wrap", out)
+        return out
+
+    def test_method_call_argument(self):
+        self.lowered("int f(Owner *o) { o->Add(new Part(3)); return 0; }")
+
+    def test_each_call_of_a_chain(self):
+        out = self.lowered("int f(Owner *o) { o->Add(new Part(3))->Add(new Part(4)); return 0; }")
+        self.assertIn("Owner_Add(Owner_Add(o, Part__alloc(3)), Part__alloc(4))", out)
+
+    def test_static_call_argument(self):
+        self.lowered("int f(void) { return Owner::Count(new Part(3)); }")
+
+    def test_new_inside_new(self):
+        out = self.lowered("Wrap *f(void) { return new Wrap(new Part(3)); }")
+        self.assertIn("Wrap__alloc(Part__alloc(3))", out)
+
+    def test_container_push_back(self):
+        self.lowered("#include <vector>\nint f(void) { std::vector<Part *> v; v.push_back(new Part(3)); return v.size(); }")
+
+    def test_a_string_that_says_new_is_not_a_new(self):
+        out = self.assertLowers(self.BASE + 'int f(Owner *o) { printf("new Part(1)"); o->Add(new Part(2)); return 0; }',
+                                'printf("new Part(1)")', "Owner_Add(o, Part__alloc(2))")   # the literal is untouched; the real new is lowered
+        self.assertNotIn("Add(o, new Part", out)
+
+
+class TestNewInAStringArgument(Base):
+    """A string literal that says "new place" is not a `new`.
+
+    Found when a conformance program's check message ("... landed at the new place") was the argument of a method call: the call waits for a nested
+    `new` to be lowered first, the wait was decided on text in which string literals still stand, and `new place` looks exactly like `new T`, so the
+    call was never lowered (`_s22.append_cstr(..)` reached gcc). The free-function branch never asked, which is why `printf("new Part(1)")` worked
+    and a method call with the same literal did not.
+    """
+
+    BASE = """
+class Owner { public: int n; Owner *Say(const char *s) { return this; } Owner *Add(int *p) { return this; }
+              static int Len(const char *s) { return 1; } };
+"""
+
+    def lowered(self, body, *needles):
+        out = self.assertLowers(self.BASE + "int f(Owner *o) { " + body + " return 0; }", *needles)
+        self.assertNotIn("o->", out)
+        return out
+
+    def test_method_call(self):
+        self.lowered('o->Say("at the new place");', 'Owner_Say(o, "at the new place")')
+
+    def test_chain(self):
+        self.lowered('o->Say("a new thing")->Say("another new one");', 'Owner_Say(Owner_Say(o, "a new thing"), "another new one")')
+
+    def test_static_call(self):
+        self.lowered('Owner::Len("the new place");', 'Owner_Len("the new place")')
+
+    def test_a_real_new_beside_the_word_in_a_string_is_still_lowered(self):
+        out = self.assertLowers(self.BASE + 'class Part { public: int w; static const int __max_instances = 4; Part(int x) { w = x; } };\n'
+                                'int f(Owner *o) { o->Say("new Part"); return 0; }', 'Owner_Say(o, "new Part")')
+        self.assertNotIn("new Part(", out)
+
+
+class TestStaticCallInPointerReturningArgs(Base):
+    """`N *d = a->Make(R::Next());`: a static call among the arguments of a method that returns a pointer.
+
+    Found translating the 2D runtime from CC#: `scene.NewNode(Log.Next() % 3 == 0 ? null : n)` is everyday C#. A method returning `T *` is, once
+    lowered, a free function returning `T *`, and such a function is rewritten with its arguments copied through whole and the scan resuming past
+    the closing paren, so a `Cls::f(..)` nested in them was never visited, on this pass or any later one, and reached the C as `N_Make(a, R::Next())`.
+    (A method returning an int was fine: only a pointer result makes it a chain head.) gcc stops at the `::`, so it was loud, but nothing could
+    be written around it except hoisting the call into a local. The call now waits until the static call is lowered, under the same conditions
+    that branch uses, so a call it cannot lower (an unknown class, a wrong arity) does not make the outer one wait for ever.
+    """
+
+    BASE = """
+class R { public: static int s; static int Next() { s = s * 5 + 1; return s & 32767; } static int Add(int a, int b) { return a + b; } };
+int R::s = 0;
+class N { public: int V; N(int v) { V = v; } N *Make(int k) { return new N(k); } N *Self() { return this; } };
+"""
+
+    def lowered(self, body):
+        out = self.assertLowers(self.BASE + "int f(N *a) { " + body + " return 0; }", "R_Next()")
+        self.assertNotIn("R::", out)
+        return out
+
+    def test_declaration(self):
+        out = self.lowered("N *d = a->Make(R::Next());")
+        self.assertIn("N_Make(a, R_Next())", out)
+
+    def test_statement(self):
+        self.lowered("a->Make(R::Next());")
+
+    def test_assignment(self):
+        self.lowered("N *d = 0; d = a->Make(R::Next());")
+
+    def test_nested_static_calls(self):
+        out = self.lowered("N *d = a->Make(R::Add(R::Next(), R::Next()));")
+        self.assertIn("R_Add(R_Next(), R_Next())", out)
+
+    def test_inside_a_conditional_argument(self):
+        self.lowered("N *d = a->Make(R::Next() % 3 == 0 ? 1 : 2);")
+
+    def test_chain_continues_from_the_pointer_result(self):
+        out = self.lowered("N *d = a->Make(R::Next())->Self();")
+        self.assertIn("N_Self(N_Make(a, R_Next()))", out)
+
+    def test_a_static_call_that_cannot_be_lowered_does_not_stall_the_call(self):
+        # an unknown class: the static branch will never lower it, so the outer call must still be rewritten (not wait out the passes)
+        out = self.lower(self.BASE + "int f(N *a) { N *d = a->Make(Unknown::Next()); return 0; }")
+        self.assertIn("N_Make(a, ", out)
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 
