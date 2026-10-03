@@ -4255,15 +4255,29 @@ def _parse_param(text, names):
         return None
     if toks[0] not in names:
         return None
-    return (toks[0], "*" in toks[:-1] or is_ref, name)
+    star = "*" in toks[:-1]
+    # `T *&x` is a reference to a pointer: lowered to `T **x`, one indirection further than `T &x` (`T *x`). The flag stays truthy, as
+    # every user of it asks only "is this a pointer", but 2 says "a pointer to a pointer" for the one place that must tell them apart.
+    return (toks[0], 2 if (star and is_ref) else (star or is_ref), name)
+
+
+class _RefSet(set):
+    """The by-reference parameter positions of one function, remembering which of them are references to a pointer (`T *&`)."""
+    ptr = frozenset()
 
 
 def _ref_positions(params, names):
     """Indices of the parameters in `params` that are taken by reference."""
-    out = set()
+    out = _RefSet()
+    ptr = set()
     for idx, p in enumerate(_split_top(params or "")):
-        if "&" in p and _parse_param(p, names) is not None:
-            out.add(idx)
+        if "&" in p:
+            got = _parse_param(p, names)
+            if got is not None:
+                out.add(idx)
+                if got[1] == 2:
+                    ptr.add(idx)
+    out.ptr = frozenset(ptr)
     return out
 
 
@@ -9988,6 +10002,23 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo,
 _NESTED_CHAIN = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
 
 
+#: `new T` inside an argument list. The branches that rewrite a call copy its arguments through, so a `new` in them was never lowered
+#: (`o->Add(new Part(3))` reached the C as `Owner_Add(o, new Part(3))`); such a call waits, like one with a nested method call, and is
+#: rewritten on the next pass once the `new` is an allocator call. Tested on the literal-blanked copy, so a string that says "new X" is not one.
+_NEW_EXPR = re.compile(r"(?<![\w.])new\s+[A-Za-z_]")
+
+
+def _args_hold_new(blanked):
+    """Does this argument list still hold a `new` to be lowered first?
+
+    `blanked` is comment-blanked text, which keeps string literals as written, so the literal's body is blanked here: `"at the new place"` is
+    not an allocation. Read as one, the call waited for a `new` that was never going to be lowered and so stayed unlowered, which in the C
+    reached gcc as `s.append_cstr(..)` on a struct (CC# builds every string literal that way, so any literal saying "new <word>" in a call's
+    arguments hit it).
+    """
+    return _NEW_EXPR.search(_blank_strings(blanked)) is not None
+
+
 def _defers_to_nested(raw, scopes, lookup):
     """Does this argument list still hold a method call to be lowered first?
 
@@ -10303,6 +10334,27 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     cont_re = re.compile(r"\s*(?:\.|->)\s*(\w+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
     static_re = re.compile(r"(?<![\w.>:])(\w+)\s*::\s*(\w+)\s*\(")
+
+    def static_pending(raw):
+        """Does this argument list still hold a `Cls::f(..)` the static-call branch below will lower?
+
+        A free function returning `T *` (which is what a lowered method returning one is) is rewritten with its
+        arguments copied through whole, the scan resuming past its closing paren, so a static call nested in them
+        was never visited on this pass or any later one and reached the C as `N_Make(a, R::Next())`. Only a call
+        that branch WILL lower counts, tested with its own conditions (a known static method of that arity, no
+        `new` among its arguments): anything else would make the outer call wait for a rewrite that never comes.
+        """
+        blanked = _blank_directives(_strip_comments(raw))
+        for mm in static_re.finditer(blanked):
+            cands = (cinfo.get(mm.group(1)) or {}).get("methods", {}).get(mm.group(2)) or {}
+            op = mm.end() - 1
+            close = _match_paren(blanked, op)
+            if close is None:
+                continue
+            ent = cands.get(_arity(raw[op + 1:close]))
+            if ent is not None and ent.get("static") and not _args_hold_new(blanked[op + 1:close]):
+                return True
+        return False
     # `new T(..)` / `new T`, and `delete e` / `delete[] e`. The array forms
     # are matched so they can be reported: they are not simply unsupported
     # syntax, they are the shapes whose lowering would need an element count
@@ -10459,6 +10511,8 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             nxt = _match_paren(look, nm.end() - 1)
             if nxt is None:
                 return expr, pos
+            if _args_hold_new(look[nm.end():nxt]):
+                return expr, pos          # lowered first; the rest of the chain is picked up on the next pass
             # `v[i].push_back(std::move(x))`: the move overload, with the
             # operand passed by reference -- as the receiver-call branch
             # does. Through the copy overload it became `&({ .. })`, the
@@ -10538,7 +10592,11 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 continue
             sym = lookup(scopes, a) if re.match(r"^\w+$", a) else None
             if sym is not None and sym[1]:
-                continue          # already a pointer
+                # Already a pointer -- a lowered `T &` argument is passed on as it is. But a `T *&` parameter wants the address OF a pointer: a
+                # plain `T *x` bound to it needs `&x` (passed as it was, the callee read the object's first word as the pointer and wrote
+                # through it), and only an argument that is itself a `T *&` (flag 2) is already that address.
+                if not (idx in getattr(refs, "ptr", ()) and sym[1] != 2):
+                    continue
             why = _unaddressable_arg(a)
             if why is not None:
                 raise CppError(
@@ -10694,6 +10752,10 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 # the chain has already been built.
                 rconst = bool(lookup(scopes, ("const", m.group(1)))) \
                     and not chain[:-1]
+                if _args_hold_new(look[op + 1:close]):
+                    out.append(text[i])        # wait: descend into the arguments, lower the `new`, rewrite this call next pass
+                    i += 1
+                    continue
                 raw = text[op + 1:close]
                 mvarg = _move_operand(raw.strip())
                 if mvarg is not None and \
@@ -11178,6 +11240,10 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 if close is not None:
                     raw = text[op + 1:close]
                     end = close + 1
+                    if _args_hold_new(look[op + 1:close]):
+                        out.append(text[i])    # `new A(new B)`: the inner one is lowered first, this one next pass
+                        i += 1
+                        continue
             ar = _arity(raw)
             ctors = cinfo[tname]["ctors"]
             if not ctors and ar == 0:
@@ -11297,7 +11363,7 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             if close is not None:
                 _ar = _arity(text[op + 1:close])
                 _ent = _cands.get(_ar)
-            if _ent is not None and _ent.get("static"):
+            if _ent is not None and _ent.get("static") and not _args_hold_new(look[op + 1:close]):
                 args = fix_args(text[op + 1:close], _ent["refs"], scopes)
                 out.append("%s(%s)" % (_ent["fn"], args))
                 i = close + 1
@@ -11308,7 +11374,8 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             op = m.end() - 1
             close = _match_paren(look, op)
             if close is not None and not _defers_to_nested(
-                    text[op + 1:close], scopes, lookup):
+                    text[op + 1:close], scopes, lookup) \
+                    and not static_pending(text[op + 1:close]):
                 fn = m.group(1)
                 args = fix_args(text[op + 1:close], free_refs.get(fn), scopes)
                 expr = "%s(%s)" % (fn, args)
@@ -11691,6 +11758,9 @@ public:
     }
     T &operator[](int i) { return vd[i]; }
     T *begin() { return vd; }
+    /* The buffer, for a call into C: `pb2_step(v.data(), v.size())`. Null while
+       the vector has never held anything, as std::vector's may be. */
+    T *data() { return vd; }
     T *end() { return vd + vn; }
     /* Reverse iteration, with the same pointer-as-iterator design: `rbegin`
        is the last element and `rend` is one *before* the first, so the loop
@@ -11743,6 +11813,7 @@ public:
     /* The same pointer-as-iterator design `vector` and `map` use: `it->f`,
        `++it` and `it != end()` are then plain C on a plain pointer. */
     T *begin() { return od; }
+    T *data() { return od; }
     T *end() { return od + on; }
     T *rbegin() { return od + on - 1; }
     T *rend() { return od - 1; }
