@@ -365,9 +365,16 @@ def _lower_constants(text):
     """
     for _kind, _name, _start, brace, close in reversed(_find_types(text)):
         body = text[brace + 1:close]
+        scan = _blank(body)
+
+        def member_const(m):
+            # not a parameter's `const R &b` (the operators _lower_operators writes):
+            # that is a type qualifier, and `static const R &b` is not a parameter
+            if scan.count("(", 0, m.start()) != scan.count(")", 0, m.start()):
+                return m.group(0)
+            return "static const"
         body = cpprust._sub_code(
-            r"(?<![\w])const(?=\s+[A-Za-z_])",
-            lambda m: "static const", body)
+            r"(?<![\w])const(?=\s+[A-Za-z_])", member_const, body)
         text = text[:brace + 1] + body + text[close:]
     return text
 
@@ -4345,13 +4352,22 @@ def _method_span(scan, brace, close, pos):
     return None
 
 
+#: `<...>` with up to three levels of nesting (`Dictionary<int, List<List<int>>>`), no
+#: `;{}()=` inside: type arguments that end at their own closing bracket.
+_GENERIC_ARGS = (r"<(?:[^<>;{}()=]|<(?:[^<>;{}()=]|<[^<>;{}()=]*>)*>)*>")
+
+
 def _declared_in(scan, lo, hi, name):
     """The declared type of `name` between `lo` and `hi`, or None."""
     found = None
     # `\*?`: an arena class is a pointer by now (`Box* b`), and the type of `b`
     # is `Box`.
-    pat = (r"(?<![\w.])([A-Za-z_][\w.]*(?:\s*<[^;{}()=]*>)?(?:\s*\[\s*\])*)\*?"
-           r"\s+%s\s*(?=[=;,)]|in\b)" % re.escape(name))
+    # `&`: a `ref` / `out` parameter is `T &name` by now (`_lower_ref_out`).
+    # The type arguments are balanced (`_GENERIC_ARGS`): `[^;{}()=]*` ran on across
+    # `List<P> a, List<C> b` and read `b` as a `List<P> a, List<C>`.
+    pat = (r"(?<![\w.])([A-Za-z_][\w.]*(?:\s*%s)?(?:\s*\[\s*\])*)"
+           r"(?:\*?\s+|\s*&\s*)%s\s*(?=[=;,)]|in\b)"
+           % (_GENERIC_ARGS, re.escape(name)))
     for m in re.finditer(pat, scan[lo:hi]):
         if m.group(1) in _NOT_A_TYPE:
             continue
@@ -5099,6 +5115,82 @@ def _lower_arena_classes(text):
     return text
 
 
+_BINARY_OPERATORS = ("+", "-", "*", "/", "%", "|", "&", "^",
+                     "==", "!=", "<", ">", "<=", ">=")
+
+
+def _lower_operators(text, path):
+    """`static R operator +(R a, int b) { .. }` as the member `R operator +(int b) { .. }`.
+
+    C# declares a user-defined operator `static`, with both operands as
+    parameters; C++ has no static operator, and cpprust lowers a *member*
+    `operator +` (to `R__binadd(R *this, ..)`, with the `_vv` door that lets
+    `a + b + c` compose). So the left operand, which C# requires to be the
+    declaring type, becomes `this`: `a.X` is `this->X` and a bare `a` is
+    `(*this)`. An operand of the declaring type on the right is `const R &`,
+    which is how cpprust takes it.
+
+    Refused, in C# terms, rather than left to fail in C: an operator whose
+    first operand is not the declaring type (`int + R`: C++ has no member
+    for it), and a unary operator.
+    """
+    scan = _blank(text)
+    edits = []
+    for kind, tname, start, brace, close in _find_types(text):
+        if kind not in ("class", "struct"):
+            continue
+        body = scan[brace + 1:close]
+        for m in re.finditer(
+                r"(?<![\w])static\s+([\w.<>]+)\s+operator\s*"
+                r"(==|!=|<=|>=|\+|-|\*|/|%|\||&|\^|<|>|!|~|\+\+|--)\s*\(", body):
+            at = brace + 1 + m.start()
+            # directly in this type, not in a nested one
+            inner = [t for t in _find_types(text) if t[2] > start and t[4] < close
+                     and t[3] < at < t[4]]
+            if inner:
+                continue
+            op = m.group(2)
+            popen = brace + 1 + m.end() - 1
+            pclose = cpprust._match_paren(scan, popen)
+            params = [a for a in split_call_args(text[popen + 1:pclose]) if a.strip()]
+            if op not in _BINARY_OPERATORS or len(params) != 2:
+                raise CsError(
+                    "%s`operator %s` with %d operand%s is not in the C# subset yet: only the binary "
+                    "operators %s are. Write a method." % (
+                        _at(path, text, at), op, len(params), "" if len(params) == 1 else "s",
+                        " ".join(_BINARY_OPERATORS)))
+            pm = [re.match(r"^\s*([\w.<>\[\]]+)\s+(\w+)\s*$", a) for a in params]
+            if None in pm:
+                raise CsError("%s`operator %s`: the operands are `Type name` here."
+                              % (_at(path, text, at), op))
+            (lt, ln), (rt, rn) = pm[0].groups(), pm[1].groups()
+            if lt != tname:
+                raise CsError(
+                    "%s`operator %s (%s, %s)`: the left operand is `%s`, not the declaring type `%s`. "
+                    "A C++ operator is a member, so its left operand is the object: reorder the "
+                    "operands, or write a method." % (_at(path, text, at), op, lt, rt, lt, tname))
+            bopen = scan.find("{", pclose)
+            bclose = cpprust._match_brace(scan, bopen)
+            if bopen < 0 or bclose is None:
+                continue
+            fbody = text[bopen:bclose + 1]
+            sbody = scan[bopen:bclose + 1]
+            # `a.X` -> `this->X`, a bare `a` -> `(*this)`
+            def left(mm):
+                return "this->" if mm.group(0).endswith(".") else "(*this)"
+            sub = []
+            for mm in re.finditer(r"(?<![\w.])%s(?![\w])(\s*\.)?" % re.escape(ln), sbody):
+                sub.append((mm.start(), mm.end(), "this->" if mm.group(1) else "(*this)"))
+            for a, b, rep in sorted(sub, reverse=True):
+                fbody = fbody[:a] + rep + fbody[b:]
+            # `const R &`, the one spelling cpprust's call sites pass a pointer for
+            rparam = ("const %s &%s" % (rt, rn)) if rt == tname else ("%s %s" % (rt, rn))
+            edits.append((at, bclose + 1, "%s operator %s(%s) %s" % (m.group(1), op, rparam, fbody)))
+    for a, b, rep in sorted(edits, reverse=True):
+        text = text[:a] + rep + text[b:]
+    return text
+
+
 def _lower_ref_out(text):
     """`ref` / `out` parameters: the callee writes the caller's variable.
 
@@ -5183,6 +5275,7 @@ def translate(text, path="<cs>", coost=False):
     text = _lower_arena_classes(text)
     text = _lower_unchecked(text)
     text = _lower_ref_out(text)
+    text = _lower_operators(text, path)
     # Before a single character is rewritten, so every message names a C#
     # construct at a C# line.
     _check_refusals(text, path)

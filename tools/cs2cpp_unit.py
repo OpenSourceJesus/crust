@@ -52,6 +52,9 @@ def _bases_of(scan, start, brace):
 
 def chunks_of(path, text):
     """Cut one file into chunks, one per top-level type."""
+    # A byte-order mark is not text: Visual Studio writes one to every C# file, and
+    # left in front of `using ..;` it kept that line from being dropped.
+    text = text.lstrip("\ufeff")
     text = cs2cpp.blank_inactive_pp_regions(text, {"CRUST"})
     types = cs2cpp._find_types(text)
     top, end = [], -1

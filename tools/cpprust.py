@@ -6239,12 +6239,22 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             if cret == cname and dtor is None:
                 vfn = "%s_v" % fn
                 info["binop"][op]["vfn"] = vfn
-                mprotos.append("static %s %s(%s lhs, const %s *o);"
-                               % (cname, vfn, cname, cname))
+                # The right operand as the operator takes it: a pointer to its class
+                # (this one, or the other's), or the scalar itself. `R operator+(int)`
+                # had a `const R *o` here, passed on as an int.
+                _va = info["binop"][op]["arg"]
+                if _va is None or _va == cname:
+                    _vt, _vp = "const %s *o" % cname, "o"
+                elif _va in known:
+                    _vt, _vp = "const %s *o" % _va, "o"
+                else:
+                    _vt, _vp = "%s o" % _va, "o"
+                mprotos.append("static %s %s(%s lhs, %s);"
+                               % (cname, vfn, cname, _vt))
                 (tail if emitting_outline[0] else out).append(
-                    "static %s %s(%s lhs, const %s *o) "
-                    "{ return %s(&lhs, o); }"
-                    % (cname, vfn, cname, cname, fn))
+                    "static %s %s(%s lhs, %s) "
+                    "{ return %s(&lhs, %s); }"
+                    % (cname, vfn, cname, _vt, fn, _vp))
             # A *both* by-value door, which is what a tree needs.
             #
             # `_v` above lets a chain nest to the left, because that is the
@@ -8120,7 +8130,10 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             src = _copy_source(rhs, ctype, scopes, type_info)
             if src is None and not info["dtor"] and not info["copy"]:
                 out.append(m.group(0))       # plain data: a bitwise copy is
-                i = m.end()                  # exactly what C++ would do
+                # exactly what C++ would do. And `vname` is a `ctype` from here on:
+                # without it `T c = a + b; c == g` and `c + a` were not lowered.
+                scopes[-1].vals[vname] = ctype
+                i = m.end()
                 continue
             if src is None and (_is_call_result(rhs)
                                 or _is_binop_result(rhs, scopes, type_info, ctype)):

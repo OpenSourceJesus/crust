@@ -43,7 +43,7 @@ def translate(text, path="<cs>", owning=None, basedir=None, incdirs=(),
     unless a caller insists.
     """
     root = find_coost(coost) if coost else None
-    cpp = cs2cpp.translate(text, path=path, coost=bool(root))
+    cpp = cs2cpp.translate(text.lstrip("\ufeff"), path=path, coost=bool(root))
     if root:
         incdirs = list(incdirs) + [os.path.join(root, "include"), root]
     c = cpprust.translate(
@@ -207,7 +207,7 @@ def main():
     try:
         sources = []
         for p in args:
-            with open(p) as f:
+            with open(p, encoding="utf-8-sig") as f:   # no byte-order mark in the text
                 sources.append((p, f.read()))
     except IOError as e:
         sys.stderr.write("csrust: cannot read %s: %s\n" % (e.filename or src, e))
