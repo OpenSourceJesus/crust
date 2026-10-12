@@ -384,6 +384,10 @@ def desugar_collections(text, counter=None):
 
 _DEFAULTS = {"int": "0", "short": "0", "byte": "0", "long": "0", "uint": "0",
              "float": "0f", "double": "0f", "bool": "false", "string": '""'}
+#: a `T[,]` element: a primitive, or a class (its default null). Unity's
+#: value structs (default not null) are left for the stub check.
+_MD_ELEM = (r"(?!(?:Vector[234](?:Int)?|Color(?:32)?|Rect(?:Int)?|Quaternion|"
+            r"Bounds(?:Int)?|Matrix4x4|var)\b)[A-Za-z_]\w*")
 
 
 def _class_body_open(scan, k):
@@ -421,12 +425,12 @@ def desugar_multidim(text):
         foreach            the list's, row-major
 
     A field with an initializer is filled at the start of `Awake` (made if
-    the class has none). Elements: int, float, bool, string; an array
+    the class has none). Elements: int, float, bool, string, a class
+    (`WorldPiece[,]`, null-filled); an array
     literal (`{ {1, 2}, .. }`) or a `T[,]` parameter is left for the stub
     check. Every line stays on its line."""
     scan = cs2cpp._blank(text)
-    decl = re.compile(r"(?<![\w.])(int|short|byte|long|uint|float|double|bool|"
-                      r"string)\s*\[\s*((?:,\s*)+)\]\s+(\w+)")
+    decl = re.compile(r"(?<![\w.])(%s)\s*\[\s*((?:,\s*)+)\]\s+(\w+)" % _MD_ELEM)
     arrays = {}                           # name -> (elem, rank, is_field)
     for m in decl.finditer(scan):
         rank = m.group(2).count(",") + 1
@@ -446,7 +450,7 @@ def desugar_multidim(text):
         total = " * ".join(ds)
         return ("%s.Clear(); %s for (int _cs_k = 0; _cs_k < %s; _cs_k = "
                 "_cs_k + 1) %s.Add(%s);" % (name, sets, total, name,
-                                            _DEFAULTS.get(elem, "0")))
+                                            _DEFAULTS.get(elem, "null")))
 
     awake_fills = {}                      # class `{` index -> fills
     dim_fields = {}                       # class `{` index -> declarations
@@ -454,9 +458,9 @@ def desugar_multidim(text):
     for _pass in range(64):
         scan = cs2cpp._blank(text)
         m = re.search(r"(?<![\w.])((?:(?:public|private|protected|internal|"
-                      r"static|readonly)\s+)*)(int|short|byte|long|uint|float|"
-                      r"double|bool|string)\s*\[\s*((?:,\s*)+)\]\s+(%s)\s*"
-                      r"(=\s*new\s+\w+\s*\[([^\]]*)\]\s*)?;" % alt, scan)
+                      r"static|readonly)\s+)*)(%s)\s*\[\s*((?:,\s*)+)\]\s+(%s)\s*"
+                      r"(=\s*new\s+\w+\s*\[([^\]]*)\]\s*)?;" % (_MD_ELEM, alt),
+                      scan)
         if not m:
             break
         mods, elem, name = m.group(1) or "", m.group(2), m.group(4)

@@ -471,6 +471,18 @@ def lower_api(text, cl, plan, c_ident):
                              r"(?=\s*[=;,)])", cs2cpp._blank(text))):
         recvs[r"(?<![\w.])%s" % re.escape(nm)] = nm
     recvs[re.escape(call)] = call
+    # another class's field, read through its accessor: `Lasso_get_lineRenderer(Lasso_Instance())`
+    lr_fields = [(c_ident(cn), f["name"]) for cn, pc in (plan.get("classes") or {}).items()
+                 for f in pc.get("fields") or [] if f.get("ty") == "LineRenderer"]
+    for cid, fn in lr_fields:      # (or its row's member: `Drawer_AT(Drawer_get_other(i)).lr`)
+        text = cs2cpp.code_sub(r"(?<![\w.])%s_AT(\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))\s*\.\s*%s\b"
+                               % (re.escape(cid), re.escape(fn)),
+                               lambda m, cid=cid, fn=fn: "%s_get_%s%s" % (cid, fn, m.group(1)), text)
+    acc = "|".join(re.escape("%s_get_%s" % (cid, fn)) for cid, fn in lr_fields)
+    for m in re.finditer(r"(?<![\w.])(?:%s)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)" % acc
+                         if acc else r"(?!)",
+                         cs2cpp._blank(text)):
+        recvs[re.escape(text[m.start():m.end()])] = "(int)" + text[m.start():m.end()]
     text = cs2cpp.code_sub(r"(?<![\w.<])(?:UnityEngine\s*\.\s*)?LineRenderer(?=\s+\w+\s*[=;])",
                            "int", text)
     for pat, rx in recvs.items():

@@ -178,6 +178,7 @@ _VEC_FUNCS = frozenset((
     "GodotVec_Abs",
     "RectTransform_get_anchoredPosition", "RectTransform_get_localPosition",
     "RectTransform_get_sizeDelta", "Transform_get_position2",
+    "Rigidbody2D_worldCenterOfMass",
     "Camera_main_ScreenToWorldPoint", "Mouse_current_position",
     "Rect_center", "Rect_max", "Rect_min", "Rect_size",
     "Vector2_ClampMagnitude", "Random_insideUnitCircle"))

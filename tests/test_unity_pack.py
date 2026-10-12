@@ -10054,6 +10054,10 @@ class TestSystems(unittest.TestCase):
         shutil.copy(font_path, os.path.join(fonts, "Font.asset"))
         with open(os.path.join(fonts, "Font.asset.meta"), "w") as f:
             f.write("guid: %s\n" % font_guid)
+        # a Dynamic font Unity saved with its glyphs cleared draws from this
+        ttf = font_path.replace(" SDF.asset", ".ttf")
+        for ext in ("", ".meta"):
+            shutil.copy(ttf + ext, os.path.join(fonts, "Font.ttf" + ext))
         with open(os.path.join(scripts, "Host.cs"), "w") as f:
             f.write(
                 "using UnityEngine;\n"
@@ -12501,7 +12505,18 @@ class TestSystems(unittest.TestCase):
                 "        gameObject.SetActive(false);\n"
                 "        Unknown.DoThing();\n"
                 "    }\n"
-                "    void Update() {}\n"
+                "    public bool dead;\n"
+                "    void Update() { Hide(); }\n"
+                "    void Start() {\n"
+                "        if (dead)\n"
+                "            return;\n"
+                "        gameObject.SetActive(false);\n"
+                "        Unknown.DoThing();\n"
+                "    }\n"
+                "    void Hide() {\n"
+                "        gameObject.SetActive(false);\n"
+                "        Unknown.DoThing();\n"
+                "    }\n"
                 "}\n"
             )
         with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
@@ -12533,6 +12548,12 @@ class TestSystems(unittest.TestCase):
             eng = f.read()
         self.assertIn("static void Menu_Awake(unsigned i)", eng)
         self.assertIn("GameObject_SetActive(_engine_go_of_Menu(i), (0))", eng)
+        # a stub's SetActive keeps the early return before it; outside
+        # Awake / Start / OnEnable none is kept (a stubbed Death's HUD hide)
+        start = eng.split("static void Menu_Start(unsigned i) {")[1].split("\n}")[0]
+        self.assertRegex(start, r"if \(Menu_get_dead\(i\)\) return;\s*GameObject_SetActive")
+        hide = eng.split("static void Menu_Hide(unsigned i) {")[1].split("\n}")[0]
+        self.assertNotIn("SetActive", hide)
         # Awake through the lifecycle message; one that deactivated its
         # GameObject is not enabled (no OnEnable, no Update)
         self.assertIn("Menu_Awake(n);", eng)
@@ -16264,11 +16285,16 @@ class TestBox2DInactiveChildCollider(unittest.TestCase):
     inactive child's collider is out of the simulation (Slime Jump's player
     stood on the 1-unit box of a disabled child)."""
 
-    def _pack_run(self, ball_src, scene):
+    def _pack_run(self, ball_src, scene, physics2d_settings=None):
         """Pack a Ball script and a scene, then 90 frames headless:
         (plan, stdout). A window player runs until closed."""
         root = tempfile.mkdtemp(prefix="upack-child-")
         self.addCleanup(shutil.rmtree, root, True)
+        if physics2d_settings:
+            os.makedirs(os.path.join(root, "ProjectSettings"))
+            with open(os.path.join(root, "ProjectSettings",
+                                   "Physics2DSettings.asset"), "w") as f:
+                f.write(physics2d_settings)
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
         with open(os.path.join(scripts, "Ball.cs"), "w") as f:
@@ -16361,6 +16387,63 @@ class TestBox2DInactiveChildCollider(unittest.TestCase):
             "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 0.4, y: 0.2}\n")
         _plan, out = self._pack_run(ball, scene)
         self.assertIn("t True True False True", out)
+
+    @needs_box2d
+    def test_queries_skip_triggers(self):
+        # Slime Jump's Sign: a trigger in front of Player's wall Linecast,
+        # with m_QueriesHitTriggers: 0 the ray reaches the floor (top y=0)
+        ray = ("using UnityEngine;\npublic class Ball : MonoBehaviour {\n"
+               "    void Start() {\n"
+               "        RaycastHit2D h = Physics2D.Raycast(new Vector2(0, 5), Vector2.down, 10);\n"
+               "        Debug.Log(\"d=\" + h.distance);\n    }\n}\n")
+        _plan, out = self._pack_run(ray, self._FLOOR + (
+            "--- !u!1 &10\nGameObject:\n  m_Name: Sign\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 0, y: 2, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+            "--- !u!61 &12\nBoxCollider2D:\n  m_GameObject: {fileID: 10}\n"
+            "  m_Enabled: 1\n  m_IsTrigger: 1\n"
+            "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 1, y: 1}\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: Caster\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 21}\n"
+            "  - component: {fileID: 22}\n"
+            "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+            "  m_LocalPosition: {x: 5, y: 5, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+            "--- !u!114 &22\nMonoBehaviour:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Script: {fileID: 11500000, guid: 7e44a2" + "0" * 26 + "}\n"),
+            physics2d_settings="Physics2DSettings:\n  m_QueriesHitTriggers: 0\n")
+        self.assertAlmostEqual(float(out.split("d=")[1].split()[0]), 5, 1)
+
+    @needs_box2d
+    def test_trigger_handler_reads_other_position(self):
+        # Slime Jump's Hazard: OnCollisionEnter2D -> OnTriggerEnter2D(coll.collider)
+        ball = ("using UnityEngine;\npublic class Ball : MonoBehaviour {\n"
+                "    void OnTriggerEnter2D(Collider2D other) {\n"
+                "        if (other.isTrigger) return;\n"
+                "        Vector2 d = other.transform.position - transform.position;\n"
+                "        Debug.Log(\"dy=\" + d.y);\n    }\n"
+                "    void OnCollisionEnter2D(Collision2D coll) { OnTriggerEnter2D(coll.collider); }\n"
+                "    void Unparent() { transform.SetParent(null); }\n}\n")
+        _plan, out = self._pack_run(ball, self._FLOOR + (
+            "--- !u!1 &10\nGameObject:\n  m_Name: Ball\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n  - component: {fileID: 13}\n"
+            "  - component: {fileID: 14}\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 0, y: 3, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+            "--- !u!50 &12\nRigidbody2D:\n  m_GameObject: {fileID: 10}\n"
+            "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+            "  m_LinearDamping: 0\n"
+            "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n"
+            "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+            "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
+            "--- !u!114 &14\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+            "  m_Script: {fileID: 11500000, guid: 7e44a2" + "0" * 26 + "}\n"))
+        self.assertAlmostEqual(float(out.split("dy=")[1].split()[0]), -1, delta=0.1)
 
     @needs_box2d
     def test_ball_ignores_inactive_childs_box(self):
