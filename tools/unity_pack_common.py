@@ -346,7 +346,8 @@ def _ui_local_rect_wh(o, by_xf, screen_w, screen_h, cache):
     if o.get("canvas") and not (
             parent is not None and (
                 parent.get("rect") is not None or parent.get("canvas"))):
-        cache[key] = (sw, sh)
+        u = float(o.get("canvas_units") or 1.0)
+        cache[key] = (sw * u, sh * u)
         return cache[key]
     if parent is not None and (
             parent.get("rect") is not None or parent.get("canvas")):

@@ -66,10 +66,10 @@ def _apply_sprite_sorting(objects, sorting_layers):
     id_to_idx = {}
     for i, L in enumerate(sorting_layers or []):
         id_to_idx[int(L["unique_id"])] = i
-    for o in objects:
-        sp = o.get("sprite")
-        if not sp:
-            continue
+    # an empty TMP text's sprite waits in ui_tmp until a script sets it
+    sprites = [sp for o in objects for sp in (
+        o.get("sprite"), (o.get("ui_tmp") or {}).get("empty_sprite")) if sp]
+    for sp in sprites:
         lid = int(sp.get("sorting_layer_id") or 0)
         if lid in id_to_idx:
             sp["sorting_layer"] = id_to_idx[lid]

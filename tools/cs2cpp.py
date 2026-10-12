@@ -5687,9 +5687,9 @@ def methods_in(body, bscan, body_abs=0):
     head = re.compile(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
-            r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(")
+            r"([\w.<>]+(?:\[[ \t]*\])?)[ \t]+(\w+)[ \t]*\(")
     for m in head.finditer(bscan):
-        ret, name = m.group(1).strip(), m.group(2)
+        ret, name = re.sub(r"\s+", "", m.group(1)), m.group(2)
         # `else if (...) {` → ret=else, name=if — not a method.
         if ret in _NOT_METHOD or name in _NOT_METHOD:
             continue

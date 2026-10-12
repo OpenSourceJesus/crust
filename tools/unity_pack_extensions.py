@@ -514,12 +514,22 @@ def desugar_project(files):
         own[n] = [(0, 1 << 30)]
     static_spans = {(info["path"], info["span"]) for info in classes.values()}
 
-    def copyable(cls, name, targs):
+    def copyable(cls, name, targs, nargs=None):
+        """The one method a call selects: by type arguments, then -- among
+        overloads -- by argument count; None when that is not one."""
         ms = [m for m in classes[cls]["methods"].get(name, [])
               if len(m.gens) == len(targs)]
+        if len(ms) > 1 and nargs is not None:
+            ms = [m for m in ms if _arity(re.sub(r"^this\s+", "", m.params))[0]
+                  <= nargs <= _arity(re.sub(r"^this\s+", "", m.params))[1]]
         if len(ms) != 1 or ms[0].uses_state:
             return None
         return ms[0]
+
+    def overload(cls, name, m):
+        """`__o<k>`, the k-th of several same-named methods; else ""."""
+        ms = classes[cls]["methods"].get(name, [])
+        return "__o%d" % ms.index(m) if len(ms) > 1 else ""
 
     def rewrite_static_calls(t, requests):
         """`Cls.M<T>(..)` -> `Cls__M__T(..)` for what gets copied."""
@@ -533,13 +543,19 @@ def desugar_project(files):
                 break
             cls, name = m.group(1), m.group(2)
             targs = _split_targs(t[m.start(3):m.end(3)] if m.group(3) else "")
-            meth = copyable(cls, name, targs)
-            if meth is None or (meth.single and not meth.gens) \
+            cp = _match(scan, m.end() - 1, "(", ")")
+            nargs = None if cp is None else len(
+                [a for a in cs2cpp._split_top_level(t[m.end():cp], angle=True)
+                 if a.strip()])
+            meth = copyable(cls, name, targs, nargs)
+            if meth is None or (meth.single and not meth.gens
+                                and not overload(cls, name, meth)) \
                     or (meth.is_ext and name in NATIVE_EXTENSIONS):
                 start = m.end()
                 continue
-            mangled = _mangle(cls, name, targs)
-            requests.append((cls, name, tuple(targs)))
+            ov = overload(cls, name, meth)
+            mangled = _mangle(cls, name, targs) + ov
+            requests.append((cls, name, tuple(targs), nargs if ov else None))
             t = t[:m.start()] + mangled + "(" + t[m.end():]
             start = m.start() + len(mangled)
         # consts
@@ -553,14 +569,14 @@ def desugar_project(files):
                         "%s__%s" % (cls, k), t)
         return t
 
-    def copy_text(cls, name, targs):
+    def copy_text(cls, name, targs, nargs=None):
         if name == "#const":
             decl = classes[cls]["consts"][targs[0]]
             return "private " + re.sub(
                 r"\b%s\b" % re.escape(targs[0]), "%s__%s" % (cls, targs[0]),
                 re.sub(r"^(?:(?:public|private|internal)\s+)", "", decl),
                 count=1)
-        m = copyable(cls, name, list(targs))
+        m = copyable(cls, name, list(targs), nargs)
         body = m.body
         params = re.sub(r"^this\s+", "", m.params)
         ret = m.ret
@@ -578,7 +594,8 @@ def desugar_project(files):
             body = cs2cpp.code_sub(r"(?<![\w.])%s(?![\w(])" % re.escape(k),
                                    "%s.%s" % (cls, k), body)
         return "private static %s %s(%s) %s" % (
-            ret, _mangle(cls, name, targs), params, body)
+            ret, _mangle(cls, name, targs) + overload(cls, name, m), params,
+            body)
 
     out = {}
     for p, t in texts.items():

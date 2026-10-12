@@ -486,6 +486,22 @@ public class Drawer : MonoBehaviour {
         # Unity's new line: two points at the origin (no quad), then the one set
         self.assertEqual(len([l for l in lines if l.startswith("Q ")]), 1)
 
+    @needs_cc
+    def test_through_a_singleton_field(self):
+        # Slime Jump's Player.Death: `if (Lasso.instance.lineRenderer.enabled)`
+        rope = ("using UnityEngine;\npublic class Rope : MonoBehaviour {\n"
+                "    public static Rope instance;\n    public LineRenderer lr;\n"
+                "    void Awake() { instance = this; }\n}\n")
+        user = ("using UnityEngine;\npublic class User : MonoBehaviour {\n"
+                "    void Start() {\n        bool was = Rope.instance.lr.enabled;\n"
+                "        Rope.instance.lr.enabled = false;\n"
+                "        Debug.Log(\"was=\" + was + \" now=\" + Rope.instance.lr.enabled);\n    }\n}\n")
+        lr = ("--- !u!120 &{fid}\nLineRenderer:\n  m_GameObject: {{fileID: {go}}}\n  m_Enabled: 1\n"
+              "  m_Positions:\n  - {{x: 0, y: 0, z: 0}}\n  - {{x: 1, y: 0, z: 0}}\n  m_UseWorldSpace: 1\n")
+        out = run_frames(self, pack(self, project(self, {"Rope": rope, "User": user}, [
+            ("Rope", lr, "  lr: {fileID: 103}\n"), ("User",)])), 1)
+        self.assertIn("was=True now=False", out)
+
     def test_gradient_reference(self):
         import tools.unity_pack_lines as ul
         g = {"mode": 0, "colors": [(0.0, 1.0, 1.0, 1.0), (1.0, 1.0, 0.0, 0.0)],
@@ -865,11 +881,11 @@ public class Mgr : MonoBehaviour {
         # not strict: strict refuses the shader and TMP statements instead
         out = pack(self, root, strict=False)
         self.assertIn("x 8 v 4 s 5", run_frames(self, out, 1))
-        # frame 6: x < 0 runs the TMP write
+        # frame 6: x < 0 runs the TMP write; `label` is unassigned
         with self.assertRaises(AssertionError) as cm:
             run_frames(self, out, 6)
-        self.assertIn("Mgr.cs:12: `TMP_Text.text` is not lowered",
-                      str(cm.exception))
+        self.assertIn("NullReferenceException", str(cm.exception))
+        self.assertIn("Mgr.cs:12", str(cm.exception))
 
 
 class TestEmbeddedStruct(unittest.TestCase):
@@ -3485,6 +3501,25 @@ class TestCameraField(unittest.TestCase):
         # screen's width, 2/3 of its height (letterboxed)
         self.assertEqual(run_frames(self, out, 1), ["c 2 1 1 2"])
 
+    @needs_cc
+    def test_camera_under_a_parent_follows_its_own_transform(self):
+        # Slime Jump's Game Camera: a child whose own script moves it
+        root = project(self, {
+            "Rig": script("Rig", "transform.position = new Vector3(0, 0, transform.position.z);"),
+            "Cam": script("Cam", "transform.position = new Vector3(7, 2, transform.position.z);")},
+            [("Rig",), ("Cam", self.CAMERA)])
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(scene) as f:
+            text = f.read()
+        with open(scene, "w") as f:
+            f.write(text.replace("  m_LocalPosition: {x: 1, y: 0, z: 0}\n",
+                                 "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                                 "  m_Father: {fileID: 101}\n"))
+        out = pack(self, root)
+        self.assertEqual(run_frames(self, out, 2, body=(
+            "EngineCamera cams[4]; int n = engine_collect_cameras(cams, 4);\n"
+            '  printf("cam %d %g %g\\n", n, cams[0].x, cams[0].y);')), ["cam 1 7 2"])
+
     def test_a_camera_the_engine_does_not_drive_stays_a_stub(self):
         # Cam0's camera is not the scene's: Cam1 holds the MainCamera tag
         with self.assertRaisesRegex(unity_pack.PackError, "CS8000: `Cam.Update` is not lowered"):
@@ -3836,6 +3871,108 @@ class TestTilemapTiles(unittest.TestCase):
             ["w 8", "w 4", "w 16"])
 
 
+class TestStretchedImageBake(unittest.TestCase):
+    def test_never_past_the_source(self):
+        """A Simple Image's rect far larger than its sprite (Slime Jump's
+        Background) bakes at most the sprite's pixels, not the rect's."""
+        w, h, rgba = unity_pack._bake_stretched_rgba(
+            bytes(range(16)), 2, 2, 40000.0, 1.0)
+        self.assertEqual((w, h, len(rgba)), (2, 1, 8))
+
+    def test_bakes_at_screen_pixels(self):
+        """Slime Jump's 29010×14505 CanvasScaler: a 6000×3000-unit panel
+        bakes at screen pixels (pixel_scale), still draws at rect size."""
+        img = {"xf_id": 2, "father_id": 1, "pos": (0, 0, 0),
+               "rect": {"anchor_min": (0.5, 0.5), "anchor_max": (0.5, 0.5),
+                        "size_delta": (6000.0, 3000.0)},
+               "ui_image": {"has_sprite": True, "builtin": True,
+                            "image_type": 1}}
+        objs = [{"xf_id": 1, "canvas": {"render_mode": 0}}, img]
+        unity_pack._bake_ui_images(objs, [], 29010, 14505, pixel_scale=0.1)
+        sp = img["sprite"]
+        self.assertEqual((sp["tex_w"], sp["tex_h"]), (600, 300))
+        self.assertAlmostEqual(sp["nhw"], 3000.0 / 29010)
+
+
+class TestCanvasCamera(unittest.TestCase):
+    def test_pass_of_the_canvas_camera(self):
+        """Screen Space Camera: no camera renders as Overlay (Slime Jump's
+        Game Manager canvas); a camera's canvas draws in that camera's pass
+        only (Game Camera's, not World Map Camera's)."""
+        img = lambda cam: {"xf_id": 2, "father_id": 1, "pos": (0, 0, 0),
+                           "rect": {"size_delta": (10.0, 10.0)},
+                           "ui_image": {"has_sprite": True, "builtin": True}}
+        plan = {"cameras": [{"cam_file_id": "5"},
+                            {"cam_file_id": "7", "renders": False},
+                            {"cam_file_id": "9"}]}
+        for cam, layer in ((0, -1), (9, -4), (7, -2)):
+            o = img(cam)
+            unity_pack._bake_ui_images(
+                [{"xf_id": 1, "canvas": {"render_mode": 1,
+                                         "camera_file_id": cam}}, o],
+                [], 1920, 960)
+            self.assertEqual(unity_pack._draw_layer(plan, None, o["sprite"]),
+                             layer)
+
+    def test_own_canvas_scaler(self):
+        """A root canvas whose CanvasScaler gives it a tenth of the layout
+        screen's units: a 100-unit child is 1000 layout units wide."""
+        by_xf = {"1": {"xf_id": 1, "canvas": {"render_mode": 0},
+                       "canvas_units": 0.1},
+                 "2": {"xf_id": 2, "father_id": 1,
+                       "rect": {"size_delta": (100.0, 50.0)}}}
+        r = unity_pack._ui_screen_rect(by_xf["2"], by_xf, 2000, 1000, {})
+        self.assertEqual((round(r[2]), round(r[3])), (1000, 500))
+
+
+class TestInlinedHelperFloats(unittest.TestCase):
+    @needs_cc
+    def test_inlined_body_literals(self):
+        """Slime Jump's MathfExtensions.Remap: the inlined Lerp's `1f`."""
+        ext = ("public static class MathfX {\n"
+               "    public static float Lerp(float a, float b, float t) {"
+               " return (1f - t) * a + b * t; }\n"
+               "    public static float Remap(float i0, float i1, float o0,"
+               " float o1, float v) {\n"
+               "        float t = (v - i0) / (i1 - i0);\n"
+               "        return Lerp(o0, o1, t);\n    }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    void Start() { Debug.Log(\"r \" + Mathf.RoundToInt("
+               "MathfX.Remap(0, 10, 0, 100, 5))); }\n}\n")
+        root = project(self, {"MathfX": ext, "Mgr": mgr}, [("Mgr",)])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("r 50", out)
+
+
+class TestWorldScene(unittest.TestCase):
+    @needs_cc
+    def test_world_shapes(self):
+        """What Slime Jump's World scene reached: `zone.Gen()` beside two
+        static `Gen(..)`, `instance.moveInput = amt` (a float) beside
+        another class's Vector2 `moveInput`, and a `float[]` field (a
+        vector of its numbers per instance; the pack still builds)."""
+        zone = ("using UnityEngine;\npublic class Zone : MonoBehaviour {\n"
+                "    public int n;\n"
+                "    public static int Gen(int k) { return k; }\n"
+                "    public static int Gen(float k) { return 0; }\n"
+                "    public int Gen() { n = n + 1; return n; }\n}\n")
+        mapc = ("using UnityEngine;\npublic class Map : MonoBehaviour {\n"
+                "    public Vector2 moveInput;\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public static Mgr instance;\n    public Zone zone;\n"
+               "    public float[] vols = new float[0];\n    float moveInput;\n"
+               "    float v;\n"
+               "    void Awake() { instance = this; }\n"
+               "    void SetMove(float amt) { instance.moveInput = amt; }\n"
+               "    void Vol() { v = vols[0]; }\n"
+               "    void Start() { SetMove(3); zone.Gen(); Debug.Log(\"g \""
+               " + zone.Gen() + \" m \" + moveInput); }\n}\n")
+        root = project(self, {"Zone": zone, "Map": mapc, "Mgr": mgr}, [
+            ("Mgr", None, "  zone: {fileID: 112}\n"), ("Zone",), ("Map",)])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("g 2 m 3", out)
+
+
 class TestOtherInstanceMap(unittest.TestCase):
     def test_members_on_the_row(self):
         """Slime Jump's `vortex.affectedByVortexVelocitiesDict.Clear()`:
@@ -3846,6 +3983,528 @@ class TestOtherInstanceMap(unittest.TestCase):
             (), {}, {"V_d"})
         self.assertEqual(
             out, "V_d[v].clear(); n = V_d[v].size(); V_d[v].erase(k);")
+
+
+class TestWorldPieceStreaming(unittest.TestCase):
+    """Slime Jump's World.SetPieces / DoUpdate / GetSurroundingPieces,
+    music left out: a `WorldPiece[,]` table, a `params WorldPiece[]`
+    method returning an array, another piece's `WorldPiece[]` field, a
+    `new List<T>(field)` copy, Rect extension methods. Three inactive
+    10-wide pieces; the camera sees piece 0 and, grown by the load range,
+    piece 1's edge -- so 0 and 1 load, 2 stays off, as in Unity."""
+
+    S = {"RectExt": """using UnityEngine;
+public static class RectExt {
+    public static bool Intersects (this Rect a, Rect b, bool equal = true) {
+        return a.xMin <= b.xMax && a.xMax >= b.xMin && a.yMin <= b.yMax && a.yMax >= b.yMin; }
+    public static bool Intersects (this Rect a, Rect b, float pad, float pad2, bool equal = true) {
+        return false; }
+    public static Rect Grow (this Rect rect, Vector2 amount) {
+        Vector2 center = rect.center; rect.size += amount; rect.center = center; return rect; }
+}
+""", "WorldPiece": """using UnityEngine;
+public class WorldPiece : MonoBehaviour {
+    public Vector2Int location;
+    public Rect worldBoundsRect;
+    public WorldPiece[] piecesToLoadAndUnloadWithMe = new WorldPiece[0];
+}
+""", "Cam": """using UnityEngine;
+public class Cam : MonoBehaviour {
+    public Transform trs;
+    public Rect viewRect;
+    public static Cam instance;
+    void Awake () { instance = this; viewRect.size = new Vector2(8, 4); viewRect.center = trs.position; }
+}
+""", "World": """using UnityEngine;
+using System.Collections.Generic;
+public class World : MonoBehaviour {
+    public Dictionary<Vector2Int, WorldPiece> piecesDict = new Dictionary<Vector2Int, WorldPiece>();
+    public WorldPiece[,] pieces;
+    public Vector2Int maxPieceLocation;
+    public Transform piecesParent;
+    public Transform player;
+    public GameObject p0;
+    public GameObject p1;
+    public GameObject p2;
+    public List<WorldPiece> activePieces = new List<WorldPiece>();
+    public float[] vols = new float[0];
+    WorldPiece piecePlayerIsIn;
+    void Start () {
+        Debug.Log("vols " + vols.Length + " " + vols[1]);
+        pieces = new WorldPiece[maxPieceLocation.x + 1, maxPieceLocation.y + 1];
+        piecePlayerIsIn = null;
+        for (int i = 0; i < piecesParent.childCount; i ++) {
+            WorldPiece piece = piecesParent.GetChild(i).GetComponent<WorldPiece>();
+            piecesDict.Add(piece.location, piece);
+            pieces[piece.location.x, piece.location.y] = piece;
+            if (piecePlayerIsIn == null && piece.worldBoundsRect.Contains(player.position))
+                piecePlayerIsIn = piece;
+        }
+    }
+    void Update () {
+        List<WorldPiece> prevActivePieces = new List<WorldPiece>(activePieces);
+        activePieces.Clear();
+        LoadPiece (piecePlayerIsIn);
+        WorldPiece[] surroundingPieces = GetSurroundingPieces(piecePlayerIsIn);
+        for (int i = 0; i < surroundingPieces.Length; i ++) {
+            WorldPiece surroundingPiece = surroundingPieces[i];
+            Rect loadCheckRect = surroundingPiece.worldBoundsRect.Grow(Vector2.one * 2);
+            if (prevActivePieces.Contains(surroundingPiece))
+                loadCheckRect = loadCheckRect.Grow(Vector2.one * 2);
+            if (Cam.instance.viewRect.Intersects(loadCheckRect)) {
+                LoadPiece (surroundingPiece);
+                for (int i2 = 0; i2 < surroundingPiece.piecesToLoadAndUnloadWithMe.Length; i2 ++)
+                    LoadPiece (surroundingPiece.piecesToLoadAndUnloadWithMe[i2]);
+            }
+        }
+        for (int i = 0; i < prevActivePieces.Count; i ++) {
+            WorldPiece prevActivePiece = prevActivePieces[i];
+            if (!activePieces.Contains(prevActivePiece))
+                prevActivePiece.gameObject.SetActive(false);
+        }
+        Debug.Log("on " + (p0.activeSelf ? 1 : 0) + (p1.activeSelf ? 1 : 0)
+            + (p2.activeSelf ? 1 : 0) + " prev " + prevActivePieces.Count);
+    }
+    void LoadPiece (WorldPiece piece) {
+        piece.gameObject.SetActive(true);
+        activePieces.Add(piece);
+    }
+    public virtual WorldPiece[] GetSurroundingPieces (params WorldPiece[] innerPieces) {
+        List<WorldPiece> output = new List<WorldPiece>();
+        for (int i = 0; i < innerPieces.Length; i ++) {
+            WorldPiece piece = innerPieces[i];
+            if (piece.location.x < maxPieceLocation.x)
+                output.Add(pieces[piece.location.x + 1, piece.location.y]);
+            if (piece.location.x > 0)
+                output.Add(pieces[piece.location.x - 1, piece.location.y]);
+            for (int i2 = 0; i2 < innerPieces.Length; i2 ++)
+                output.Remove(innerPieces[i2]);
+        }
+        return output.ToArray();
+    }
+}
+"""}
+
+    def _scene(self, guid):
+        def go(fid, name, comps, active=1):
+            return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_IsActive: %d\n"
+                    "  m_Component:\n%s" % (fid, name, active, "".join(
+                        "  - component: {fileID: %d}\n" % c for c in comps)))
+
+        def xf(fid, gof, father=0, x=0, z=0, kids=()):
+            return ("--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_Father: {fileID: %d}\n"
+                    "  m_LocalPosition: {x: %d, y: 0, z: %d}\n"
+                    "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                    "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Children:\n%s"
+                    % (fid, gof, father, x, z, "".join(
+                        "  - {fileID: %d}\n" % k for k in kids) or "  []\n"))
+
+        def mb(fid, gof, cls, fields=""):
+            return ("--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_Enabled: 1\n  m_Script: {fileID: 11500000, guid: %s,"
+                    " type: 3}\n%s" % (fid, gof, guid[cls], fields))
+
+        s = "%YAML 1.1\n" + go(1000, "Pieces", [1001]) + xf(
+            1001, 1000, kids=[201, 211, 221])
+        for k in range(3):
+            f = 200 + 10 * k
+            s += go(f, "Piece%d" % k, [f + 1, f + 2], active=0)
+            s += xf(f + 1, f, father=1001, x=10 * k)
+            s += mb(f + 2, f, "WorldPiece",
+                    "  location: {x: %d, y: 0}\n  worldBoundsRect:\n"
+                    "    serializedVersion: 2\n    x: %d\n    y: -5\n"
+                    "    width: 10\n    height: 10\n"
+                    "  piecesToLoadAndUnloadWithMe:\n  - {fileID: %d}\n"
+                    % (k, 10 * k - 5, f + 2))
+        s += go(300, "World", [301, 302]) + xf(301, 300)
+        s += mb(302, 300, "World", "  maxPieceLocation: {x: 2, y: 0}\n"
+                "  piecesParent: {fileID: 1001}\n  player: {fileID: 401}\n"
+                "  p0: {fileID: 200}\n  p1: {fileID: 210}\n  p2: {fileID: 220}\n"
+                "  vols:\n  - 0.5\n  - 2.25\n")
+        s += go(400, "Player", [401]) + xf(401, 400)
+        s += go(500, "Cam", [501, 502]) + xf(501, 500, z=-10)
+        return s + mb(502, 500, "Cam", "  trs: {fileID: 501}\n")
+
+    @needs_cc
+    def test_pieces_near_the_camera_load(self):
+        root = tempfile.mkdtemp(prefix="upf-")
+        self.addCleanup(shutil.rmtree, root, True)
+        sd = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(sd)
+        guid = {n: "%032x" % (k + 1) for k, n in enumerate(sorted(self.S))}
+        for n, src in self.S.items():
+            with open(os.path.join(sd, n + ".cs"), "w") as f:
+                f.write(src)
+            with open(os.path.join(sd, n + ".cs.meta"), "w") as f:
+                f.write("guid: %s\n" % guid[n])
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(self._scene(guid))
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("vols 2 2.25", out)
+        self.assertEqual([l for l in out if l.startswith("on ")],
+                         ["on 110 prev 0", "on 110 prev 3"])
+
+
+class TestInterfaceRefs(unittest.TestCase):
+    """Slime Jump's Hazard: `IDestructable d = other.GetComponentInParent
+    <IDestructable>(); if (d != null) d.TakeDamage(dmg, dir, null);` -- an
+    interface reference names its implementor's class and instance, and a
+    call through it reaches that class's method."""
+
+    SRC = {
+        "IHurt": "using UnityEngine;\npublic interface IHurt {\n"
+                 "    void Hurt(float amount, Victim by);\n}\n",
+        "Victim": "using UnityEngine;\npublic class Victim : MonoBehaviour, IHurt {\n"
+                  "    public float hp = 3;\n    public void Hurt(float amount, Victim by) {\n"
+                  "        hp -= amount; Debug.Log(\"victim \" + hp + \" \" + (by == null)); }\n}\n",
+        "Rock": "using UnityEngine;\npublic class Rock : MonoBehaviour, IHurt {\n"
+                "    public void Hurt(float amount, Victim by) { Debug.Log(\"rock \" + amount); }\n}\n",
+    }
+
+    def _root(self, apply_arg="d"):
+        spike = ("using UnityEngine;\npublic class Spike : MonoBehaviour {\n"
+                 "    public GameObject target;\n    public Victim v;\n    int _f;\n"
+                 "    void Update() { _f++; if (_f > 1) return;\n"
+                 "        IHurt d = target.GetComponentInParent<IHurt>();\n"
+                 "        if (d != null) Apply(%s, 2);\n    }\n"
+                 "    void Apply(IHurt d, float amount) { d.Hurt(amount, null); }\n}\n"
+                 % apply_arg)
+        return project(self, dict(self.SRC, Spike=spike), [
+            ("Victim",), ("Rock",),
+            ("Spike", None, "  target: {fileID: 100}\n  v: {fileID: 102}\n"),
+            ("Spike", None, "  target: {fileID: 110}\n  v: {fileID: 102}\n")])
+
+    @needs_cc
+    def test_dispatch(self):
+        out = run_frames(self, pack(self, self._root()), 2)
+        self.assertEqual(sorted(out), ["rock 2", "victim 1 True"])
+
+    def test_a_class_handle_for_an_interface_stubs(self):
+        with self.assertRaisesRegex(unity_pack.PackError,
+                                    r"CS8000: `Spike.Update`.*ToIHurt\("):
+            pack(self, self._root("v"))
+
+
+class TestSerializedFloats(unittest.TestCase):
+    """Slime Jump's Spike: `damage: Infinity` -- and `1e-05` -- as Unity
+    serializes them, not dropped to the field's default 0."""
+
+    @needs_cc
+    def test_infinity_and_exponent(self):
+        src = ("using UnityEngine;\npublic class Spike : MonoBehaviour {\n"
+               "    public float damage; public float tiny; public float bad;\n"
+               "    void Start() { Debug.Log(\"d \" + (damage > 1e30f) + \" t \" + (tiny * 100000f)"
+               " + \" n \" + (bad != bad)); }\n}\n")
+        out = run_frames(self, pack(self, project(self, {"Spike": src}, [
+            ("Spike", None, "  damage: Infinity\n  tiny: 1e-05\n  bad: NaN\n")])), 1)
+        self.assertEqual(out, ["d True t 1 n True"])
+
+
+class TestRigidbody2DLocal(unittest.TestCase):
+    """Slime Jump's Player.Death: `Rigidbody2D r = go.GetComponent<..>();`
+    then `r.worldCenterOfMass` (Box2D-Packed's body centre)."""
+
+    @needs_cc
+    def test_world_center_of_mass(self):
+        rb = ("--- !u!50 &{fid}\nRigidbody2D:\n  m_GameObject: {{fileID: {go}}}\n"
+              "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n")
+        src = script("P", "Rigidbody2D r = gameObject.GetComponent<Rigidbody2D>(); "
+                     "Vector2 c = r.worldCenterOfMass - (Vector2) transform.position; "
+                     "Debug.Log(\"c \" + c.x + \" \" + c.y);")
+        glue = ("void engine_box2d_step(void) { }\n"
+                "void engine_rb2d_world_com(int rb, float *x, float *y) { *x = 7.f + rb; *y = 3.f; }\n")
+        out = run_frames(self, pack(self, project(self, {"P": src}, [("P", rb)])), 1, pre=glue)
+        self.assertEqual(out, ["c 7 3"])
+
+
+class TestStaticPropertyIncrement(unittest.TestCase):
+    """Slime Jump's `GameManager.DeathCount ++;`: a one-statement getter
+    (inlined for reads) and a two-statement setter -- the setter of the
+    getter's value plus one, not `(expr)++`."""
+
+    @needs_cc
+    def test_increment_through_the_setter(self):
+        gm = ("using UnityEngine;\npublic class Gm : MonoBehaviour {\n"
+              "    public static int saves;\n"
+              "    public static int Count { get { return P.store; } set { P.store = value; saves ++; } }\n}\n")
+        src = script("P", "Gm.Count ++; Gm.Count ++; Debug.Log(\"n \" + Gm.Count + \" \" + Gm.saves);",
+                     "    public static int store;")
+        out = run_frames(self, pack(self, project(self, {"P": src, "Gm": gm}, [("P",), ("Gm",)])), 1)
+        self.assertEqual(out, ["n 2 2"])
+
+
+class TestInstantiateUnpackedChild(unittest.TestCase):
+    """Slime Jump's Player.Respawn: `Instantiate(hpBarTrs.GetChild(0).gameObject,
+    hpBarTrs)` of a child with no script. The method lowers; the clone stops
+    the player if it runs (crust clones packed scripts' rows only)."""
+
+    CHILD = ("--- !u!1 &900\nGameObject:\n  m_Name: Heart\n  m_Component:\n"
+             "  - component: {fileID: 901}\n--- !u!4 &901\nTransform:\n"
+             "  m_GameObject: {fileID: 900}\n  m_Father: {fileID: 101}\n"
+             "  m_LocalPosition: {x: 0, y: 0, z: 0}\n")
+
+    def _out(self, n):
+        root = project(self, {"P": script("P", "Debug.Log(\"a\"); if (n > 0) Instantiate(bar.GetChild(0).gameObject, bar); "
+                                               "Debug.Log(\"b\");", "    public Transform bar;\n    public int n;")},
+                       [("P", None, "  bar: {fileID: 101}\n  n: %d\n" % n)])
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(self.CHILD)
+        return pack(self, root)
+
+    @needs_cc
+    def test_not_reached_runs(self):
+        self.assertEqual(run_frames(self, self._out(0), 1), ["a", "b"])
+
+    @needs_cc
+    def test_reached_stops(self):
+        out = self._out(1)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v); Time_deltaTime = 1.f / 60.f;"
+                    " engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe, os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"), os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 70)
+        self.assertIn("`Heart` has no packed script to clone", run.stderr)
+
+
+class TestGetterTransformEuler(unittest.TestCase):
+    """Slime Jump's Player.Respawn: `fw.trs.eulerAngles = Vector3.forward *
+    fw.initRot;` through another object's Transform field."""
+
+    @needs_cc
+    def test_euler_z_set(self):
+        o = ("using UnityEngine;\npublic class O : MonoBehaviour {\n"
+             "    public Transform trs;\n    public float initRot;\n}\n")
+        src = script("P", "transform.SetParent(null); O o = ot; o.trs.eulerAngles = Vector3.forward * o.initRot; "
+                     "o.trs.position = new Vector2(1f, 2f); "
+                     "Quaternion q = o.trs.rotation; Debug.Log(\"q \" + q.z.ToString(\"F3\") + \" \" + q.w.ToString(\"F3\"));",
+                     "    public O ot;")
+        out = run_frames(self, pack(self, project(self, {"P": src, "O": o}, [
+            ("P", None, "  ot: {fileID: 112}\n"), ("O", None, "  trs: {fileID: 111}\n  initRot: 90\n")])), 1)
+        self.assertEqual(out, ["q 0.707 0.707"])
+
+
+class TestShallowUnstoredField(unittest.TestCase):
+    """Slime Jump's Player.Respawn: `fw.currWaypointTrs = fw.waypoints[k].trs;`
+    on a FollowWaypoints, a class crust packs no methods of (only on a prefab)
+    whose `List<Waypoint>` it does not store. The statement stops the player
+    if it runs; the method around it lowers."""
+
+    W = ("using UnityEngine;\nusing System.Collections.Generic;\n"
+         "public class W : MonoBehaviour {\n"
+         "    [System.Serializable] public struct Wp { public Transform trs; }\n"
+         "    public List<Wp> pts = new List<Wp>();\n    public Transform cur;\n"
+         "    void Awake() { cur = pts[0].trs; }\n}\n")
+
+    @needs_cc
+    def test_statement_traps_method_lowers(self):
+        src = script("P", "W w = ws; if (n > 0) { w.cur = w.pts[0].trs; } Debug.Log(\"ok\");",
+                     "    public W ws;\n    public int n;")
+        root = project(self, {"P": src, "W": self.W}, [("P", None, "  n: 0\n")])
+        pd = os.path.join(root, "Assets", "Prefabs")
+        os.makedirs(pd)
+        with open(os.path.join(pd, "Wp.prefab"), "w") as f:
+            f.write("%%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Wp\n  m_Component:\n"
+                    "  - component: {fileID: 2}\n  - component: {fileID: 3}\n"
+                    "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                    "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, guid: %032x}\n" % 2)
+        with open(os.path.join(pd, "Wp.prefab.meta"), "w") as f:
+            f.write("guid: %032x\n" % 99)
+        self.assertEqual(run_frames(self, pack(self, root, strict=False), 1), ["ok"])
+
+
+class TestInstantiateFieldParent(unittest.TestCase):
+    """Slime Jump's Player.Death: `Explodable c = Instantiate(explodable, null);`
+    -- a scene object's component field, cloned with a parent argument."""
+
+    @needs_cc
+    def test_clone_of_a_component_field(self):
+        boom = ("using UnityEngine;\npublic class Boom : MonoBehaviour {\n"
+                "    public float v;\n}\n")
+        src = script("P", "Boom c = Instantiate(b, null); c.transform.position = new Vector3(5f, 2f, 0f); "
+                     "c.v = 3f; Debug.Log(\"c \" + c.transform.position.x + \" \" + c.v + \" b \" + b.v"
+                     " + \" \" + b.transform.position.x);", "    public Boom b;")
+        out = run_frames(self, pack(self, project(self, {"P": src, "Boom": boom}, [
+            ("P", None, "  b: {fileID: 112}\n"), ("Boom", None, "  v: 1\n")])), 1)
+        self.assertEqual(out, ["c 5 3 b 1 1"])
+
+    @needs_cc
+    def test_clone_placed_at_a_transform_field(self):
+        boom = ("using UnityEngine;\npublic class Boom : MonoBehaviour {\n}\n")
+        src = script("P", "trs.position = new Vector3(4f, 6f, 0f); Boom c = Instantiate(b, null); "
+                     "c.transform.position = trs.position; "
+                     "Debug.Log(\"c \" + c.transform.position.x + \" \" + c.transform.position.y);",
+                     "    public Boom b;\n    public Transform trs;")
+        out = run_frames(self, pack(self, project(self, {"P": src, "Boom": boom}, [
+            ("P", None, "  b: {fileID: 112}\n  trs: {fileID: 101}\n"), ("Boom", None, "")])), 1)
+        self.assertEqual(out, ["c 4 6"])
+
+    @needs_cc
+    def test_list_field_of_the_clone_to_array(self):
+        boom = ("using UnityEngine;\nusing System.Collections.Generic;\n"
+                "public class Boom : MonoBehaviour {\n"
+                "    public List<GameObject> frags = new List<GameObject>();\n"
+                "    public void Go() { frags.Add(gameObject); frags.Add(gameObject); }\n}\n")
+        src = script("P", "Boom c = Instantiate(b, null); c.Go(); fs = c.frags.ToArray(); "
+                     "Debug.Log(\"n \" + fs.Length + \" \" + b.frags.Count + \" \" + (fs[1] == c.gameObject));",
+                     "    public Boom b;\n    GameObject[] fs = new GameObject[0];")
+        out = run_frames(self, pack(self, project(self, {"P": src, "Boom": boom}, [
+            ("P", None, "  b: {fileID: 112}\n"), ("Boom", None, "")])), 1)
+        self.assertEqual(out, ["n 2 0 True"])
+
+
+class TestTmpTextSet(unittest.TestCase):
+    """Slime Jump's Sign: `label.text = msg;` with *msg* an authored string
+    (a quoted YAML scalar Unity wrapped over lines) on a TMP authored
+    empty. The text is baked at pack time (newlines, word wrap, auto
+    size) and swapped in; null empties it; a text nobody baked stops."""
+
+    def test_empty_text_keeps_canvas_layer(self):
+        # Tips Text under Tips Panel: drawn on the canvas's sorting layer
+        from tools.unity_pack_sprites import _apply_sprite_sorting
+        es = {"sorting_layer_id": 77, "sorting_order": 1}
+        _apply_sprite_sorting([{"ui_tmp": {"empty_sprite": es}}],
+                              [{"unique_id": 0}, {"unique_id": 77}])
+        self.assertEqual(es["sorting_layer"], 1)
+
+    FONT = os.path.join(ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+                        "Others", "Fonts", "Montserrat-Regular SDF.asset")
+    SIGN = """using UnityEngine;
+using TMPro;
+public class Sign : MonoBehaviour {
+    public string msg;
+    public TMP_Text label;
+    int f;
+    void Update () {
+        f++;
+        if (f == 1) { label.text = msg; Debug.Log("set " + msg); }
+        if (f == 2) label.text = null;
+        if (f == 4) { msg = "zz"; label.text = msg; }
+    }
+}
+"""
+
+    def setUp(self):
+        if not os.path.isfile(self.FONT):
+            self.skipTest("Montserrat-Regular SDF font missing")
+
+    def test_rasterize_lines(self):
+        font = unity_pack._load_tmp_font_asset(self.FONT)
+
+        def bands(w, h, rgba):
+            ink = [any(rgba[(y * w + x) * 4 + 3] for x in range(w))
+                   for y in range(h)]
+            return sum(1 for y in range(h) if ink[y] and (y == 0 or not ink[y - 1]))
+        w, h, rgba, _sx, _sy = unity_pack._rasterize_tmp_text(
+            font, "Hold A\nHold W", 1000, (1, 1, 1, 1), 300, 200, 2, 512, 0,
+            wrap=True, auto_size=(0, 1000))
+        # auto size fits the box (ink may overhang the advance a pixel)
+        self.assertLessEqual(max(abs(w - 300), abs(h - 200)), 2)
+        self.assertEqual(bands(w, h, rgba), 2)
+        w, h, rgba, _sx, _sy = unity_pack._rasterize_tmp_text(
+            font, "Hold Hold", 40, (1, 1, 1, 1), 120, 120, 1, 256, 0, wrap=True)
+        self.assertEqual(bands(w, h, rgba), 2)  # wrapped at the space
+
+    def _scene(self, sign_guid, font_guid):
+        tmp = "f4688fdb7df04437aeb418b961361dc5"
+        return (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Main Camera\n"
+            "  m_TagString: MainCamera\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+            "--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n"
+            "  orthographic: 1\n  orthographic size: 5\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Canvas\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n"
+            "--- !u!224 &11\nRectTransform:\n"
+            "  m_GameObject: {fileID: 10}\n  m_Father: {fileID: 0}\n"
+            "  m_AnchorMin: {x: 0, y: 0}\n  m_AnchorMax: {x: 1, y: 1}\n"
+            "  m_SizeDelta: {x: 0, y: 0}\n  m_Pivot: {x: 0.5, y: 0.5}\n"
+            "--- !u!223 &12\nCanvas:\n  m_GameObject: {fileID: 10}\n"
+            "  m_Enabled: 1\n  m_RenderMode: 0\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: Tip\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 21}\n"
+            "  - component: {fileID: 22}\n"
+            "--- !u!224 &21\nRectTransform:\n"
+            "  m_GameObject: {fileID: 20}\n  m_Father: {fileID: 11}\n"
+            "  m_AnchorMin: {x: 0.5, y: 0.5}\n  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+            "  m_AnchoredPosition: {x: 0, y: 0}\n"
+            "  m_SizeDelta: {x: 300, y: 200}\n  m_Pivot: {x: 0.5, y: 0.5}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "--- !u!114 &22\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 20}\n  m_Enabled: 1\n"
+            "  m_Script: {fileID: 11500000, guid: " + tmp + "}\n"
+            "  m_text: \n"
+            "  m_fontAsset: {fileID: 11400000, guid: " + font_guid
+            + ", type: 2}\n"
+            "  m_fontSize: 36\n  m_enableAutoSizing: 1\n"
+            "  m_fontSizeMin: 0\n  m_fontSizeMax: 32767\n"
+            "  m_fontColor: {r: 1, g: 1, b: 1, a: 1}\n"
+            "  m_HorizontalAlignment: 2\n  m_VerticalAlignment: 512\n"
+            "  m_TextWrappingMode: 1\n  m_overflowMode: 0\n"
+            "--- !u!1 &30\nGameObject:\n  m_Name: Sign\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 31}\n"
+            "  - component: {fileID: 32}\n"
+            "--- !u!4 &31\nTransform:\n  m_GameObject: {fileID: 30}\n"
+            "  m_Father: {fileID: 0}\n"
+            "--- !u!114 &32\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 30}\n  m_Enabled: 1\n"
+            "  m_Script: {fileID: 11500000, guid: " + sign_guid + "}\n"
+            "  msg: 'Hold A and D to move.\n\n    Hold W to jump.'\n"
+            "  label: {fileID: 22}\n")
+
+    @needs_cc
+    def test_sign(self):
+        root = tempfile.mkdtemp(prefix="upf-")
+        self.addCleanup(shutil.rmtree, root, True)
+        sd = os.path.join(root, "Assets", "Scripts")
+        fd = os.path.join(root, "Assets", "Fonts")
+        os.makedirs(sd)
+        os.makedirs(fd)
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        sign_guid, font_guid = "%032x" % 1, "%032x" % 2
+        shutil.copy(self.FONT, os.path.join(fd, "Font.asset"))
+        # a Dynamic font Unity saved with its glyphs cleared draws from this
+        ttf = self.FONT.replace(" SDF.asset", ".ttf")
+        for ext in ("", ".meta"):
+            shutil.copy(ttf + ext, os.path.join(fd, "Font.ttf" + ext))
+        for path, guid, src in (("Scripts/Sign.cs", sign_guid, self.SIGN),
+                                ("Fonts/Font.asset", font_guid, None)):
+            if src:
+                with open(os.path.join(root, "Assets", path), "w") as f:
+                    f.write(src)
+            with open(os.path.join(root, "Assets", path + ".meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(self._scene(sign_guid, font_guid))
+        out = pack(self, root)
+        draws = ("EngineDraw b[16]; int n = engine_collect_draws(b, 16), k;"
+                 " for (k = 0; k < n; k++) printf(\"d %d\\n\", b[k].tex);")
+        d = [[l for l in run_frames(self, out, f, draws) if l[:2] == "d "]
+             for f in (0, 1, 2)]
+        self.assertEqual(len(d[0]), 1)
+        self.assertNotEqual(d[1], d[0])         # the text's bake
+        self.assertEqual(d[2], d[0])            # null: empty again
+        log = run_frames(self, out, 1)
+        k = log.index("set Hold A and D to move.")
+        self.assertEqual(log[k + 1], "Hold W to jump.")
+        with self.assertRaises(AssertionError) as cm:
+            run_frames(self, out, 4)
+        self.assertIn("Sign.cs:11: `TMP_Text.text` is not lowered",
+                      str(cm.exception))
 
 
 if __name__ == "__main__":

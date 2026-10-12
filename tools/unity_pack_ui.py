@@ -98,7 +98,9 @@ __all__ = [
     '_rewrite_toggle_is_on',
     '_slider_normalized',
     '_snapshot_ui_rects_onto_hierarchy',
+    '_ui_bake_pixel_scale',
     '_ui_layout_screen',
+    '_ui_mark_canvas_units',
     '_ui_mb_call_resolve',
     '_ui_own_scale',
     '_ui_preserve_aspect_draw_size',
@@ -210,14 +212,50 @@ def _ui_layout_screen(root, objects):
     An enabled CanvasScaler then converts that pixel rect to canvas units
     (pixelRect / scaleFactor), matching Screen Space Camera + scaler.
     """
-    sw, sh = player_screen(root)
-    view = _authored_camera_view_size(objects)
-    if view is not None:
-        sw, sh = _camera_script_view_pixels(sw, sh, view[0], view[1])
+    sw, sh = _ui_screen_pixels(root, objects)
     scaler = _find_canvas_scaler(objects)
     if scaler and int(scaler.get("enabled", 1)):
         return _canvas_scaler_layout_pixels(sw, sh, scaler)
     return sw, sh
+
+
+def _ui_screen_pixels(root, objects):
+    """Player pixel rect (letterboxed by an authored CameraScript viewSize)."""
+    sw, sh = player_screen(root)
+    view = _authored_camera_view_size(objects)
+    if view is not None:
+        sw, sh = _camera_script_view_pixels(sw, sh, view[0], view[1])
+    return sw, sh
+
+
+def _ui_mark_canvas_units(root, objects):
+    """``canvas_units`` on each Canvas with an enabled CanvasScaler: its
+    root size (Unity: pixelRect / its scaleFactor) over the layout
+    screen's (the first scaler's), so its children lay out in its own
+    units -- Slime Jump's Game Camera canvas (1920×960) beside the Game
+    Manager's (29010×14505)."""
+    pw, ph = _ui_screen_pixels(root, objects)
+
+    def sf(cs):
+        s = _canvas_scaler_scale_factor(pw, ph, cs)
+        return s if s >= 1e-6 else 1.0
+    g = _find_canvas_scaler(objects)
+    gsf = sf(g) if g and int(g.get("enabled", 1)) else 1.0
+    for o in objects:
+        cs = o.get("canvas_scaler")
+        if o.get("canvas") and cs and int(cs.get("enabled", 1)):
+            o["canvas_units"] = gsf / sf(cs)
+
+
+def _ui_bake_pixel_scale(root, objects):
+    """Screen pixels per canvas unit for UI bakes, capped at 1.
+
+    A CanvasScaler reference far above the screen (Slime Jump: 29010×14505)
+    makes canvas units tiny; baking at unit size gives 13000 px textures.
+    """
+    _pw, ph = _ui_screen_pixels(root, objects)
+    _lw, lh = _ui_layout_screen(root, objects)
+    return min(1.0, float(ph) / max(1.0, float(lh)))
 
 
 def _camera_script_rect(screen_w, screen_h, view_w, view_h):
@@ -738,6 +776,10 @@ def _parse_ui_tmp(block, asset_guids):
     # 0 Overflow, 1 Ellipsis, 2 Masking, 3 Truncate, …
     ov = re.search(r"(?m)^\s+m_overflowMode:\s*(\d+)", block)
     has_font = bool(font_guid and font_guid in (asset_guids or {}))
+
+    def num(key, d):
+        m = re.search(r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % key, block)
+        return float(m.group(1)) if m else d
     return {
         "text": text,
         "font_guid": font_guid,
@@ -751,6 +793,13 @@ def _parse_ui_tmp(block, asset_guids):
         "v_align": int(va.group(1)) if va else 256,
         "overflow_mode": int(ov.group(1)) if ov else 0,
         "enabled": int(en.group(1)) if en else 1,
+        # TMP 3: m_enableWordWrapping; TMP 4: m_TextWrappingMode (0 off)
+        "wrap": int(num("m_TextWrappingMode",
+                        num("m_enableWordWrapping", 0.0))) != 0,
+        "auto_size": int(num("m_enableAutoSizing", 0.0)) != 0,
+        "size_min": num("m_fontSizeMin", 18.0),
+        "size_max": num("m_fontSizeMax", 72.0),
+        "line_spacing": num("m_lineSpacing", 0.0),
     }
 
 
@@ -945,6 +994,7 @@ def _snapshot_ui_rects_onto_hierarchy(objects, hierarchy):
         if o.get("canvas"):
             h["has_canvas"] = True
             h["canvas_root"] = 1 if _go_is_canvas_root(o, by_xf) else 0
+            h["canvas_units"] = float(o.get("canvas_units") or 1.0)
         elif rect is not None and "canvas_root" not in h:
             h["canvas_root"] = 0
 
@@ -958,6 +1008,7 @@ def _build_rect_transforms(plan):
     has = [0] * n
     canvas = [0] * n
     canvas_root = [0] * n
+    canvas_units = [1.0] * n
     amin_x = [0.5] * n
     amin_y = [0.5] * n
     amax_x = [0.5] * n
@@ -971,7 +1022,7 @@ def _build_rect_transforms(plan):
     sx = [1.0] * n
     sy = [1.0] * n
 
-    def _seed(gi, rect, local_scale, is_canvas, is_root):
+    def _seed(gi, rect, local_scale, is_canvas, is_root, units=None):
         if gi is None or int(gi) < 0 or int(gi) >= n:
             return
         gi = int(gi)
@@ -980,6 +1031,8 @@ def _build_rect_transforms(plan):
         has[gi] = 1
         if is_canvas:
             canvas[gi] = 1
+        if units:
+            canvas_units[gi] = float(units)
         if is_root:
             canvas_root[gi] = 1
         r = rect or {}
@@ -1009,7 +1062,8 @@ def _build_rect_transforms(plan):
             h.get("rect"),
             h.get("local_scale"),
             bool(h.get("has_canvas")),
-            int(h.get("canvas_root") or 0) != 0)
+            int(h.get("canvas_root") or 0) != 0,
+            h.get("canvas_units"))
     # Packed instances may carry the same rect (post-layout); overlay.
     for cl in (plan.get("classes") or {}).values():
         for o in cl.get("instances") or []:
@@ -1035,13 +1089,14 @@ def _build_rect_transforms(plan):
                 o.get("rect"),
                 o.get("local_scale") or o.get("scale"),
                 bool(o.get("canvas")),
-                is_root)
+                is_root, o.get("canvas_units"))
     if not any(has):
         return None
     return {
         "has": has,
         "canvas": canvas,
         "canvas_root": canvas_root,
+        "canvas_units": canvas_units,
         "amin_x": amin_x,
         "amin_y": amin_y,
         "amax_x": amax_x,
@@ -1253,6 +1308,74 @@ def _apply_scrollbar_visuals(objects):
 _TMP_FONT_CACHE = {}
 
 
+def _tmp_font_from_source(path, text, point):
+    """A Dynamic TMP font asset saved with no glyphs (Unity clears them on
+    build, m_ClearDynamicDataOnBuild): TMP renders them from the source
+    font at runtime, so they come from that font at the asset's sampling
+    *point* size -- a coverage atlas (``"coverage"``), not an SDF one.
+    None when the source font or Pillow (FreeType) is not there.
+
+    ponytail: Latin, Latin-1 and general punctuation only; the source font
+    is found by its .meta beside the asset."""
+    g = re.search(r"m_SourceFontFileGUID:\s*([0-9a-fA-F]{32})", text)
+    d = os.path.dirname(path)
+    src = next((os.path.join(d, n[:-5]) for n in sorted(os.listdir(d))
+                if g and n.endswith(".meta")
+                and re.search(r"guid:\s*%s\b" % g.group(1),
+                              _read(os.path.join(d, n)))), None)
+    if not src or not os.path.isfile(src):
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        face = ImageFont.truetype(src, max(1, int(round(point))))
+    except (ImportError, OSError):
+        return None
+    def ink(ch):
+        x0, y0, x1, y1 = face.getbbox(ch, anchor="ls")
+        im = Image.new("L", (max(1, x1 - x0), max(1, y1 - y0)))
+        ImageDraw.Draw(im).text((-x0, -y0), ch, font=face, fill=255,
+                                anchor="ls")
+        return (x0, y0, x1, y1), im
+    notdef = ink("\uffff")
+    notdef = (notdef[0], notdef[1].tobytes())
+    cps = list(range(32, 127)) + list(range(160, 256)) + list(
+        range(0x2010, 0x2027))
+    glyphs, chars, cells = {}, {}, []
+    for cp in cps:
+        ch = chr(cp)
+        (x0, y0, x1, y1), im = ink(ch)
+        if cp != 32 and ((x0, y0, x1, y1), im.tobytes()) == notdef:
+            continue
+        chars[cp] = cp
+        glyphs[cp] = {"w": float(x1 - x0), "h": float(y1 - y0),
+                      "bx": float(x0), "by": float(-y0),
+                      "adv": float(face.getlength(ch)),
+                      "rx": 0, "ry": 0, "rw": x1 - x0, "rh": y1 - y0}
+        if x1 > x0 and y1 > y0:
+            cells.append((cp, im))
+    aw, x, y, row_h, places = 2048, 0, 0, 0, {}
+    for cp, im in cells:
+        if x + im.width > aw:
+            x, y, row_h = 0, y + row_h + 1, 0
+        places[cp] = (x, y)
+        x, row_h = x + im.width + 1, max(row_h, im.height)
+    ah = max(1, y + row_h)
+    atlas = bytearray(aw * ah)
+    for cp, im in cells:
+        gx, gy = places[cp]
+        glyphs[cp]["rx"], glyphs[cp]["ry"] = gx, gy
+        px = im.tobytes()
+        # row ry + k is the glyph's k-th row up from its bottom, as the
+        # rasterizer samples a TMP atlas
+        for k in range(im.height):
+            r = im.height - 1 - k
+            atlas[(gy + k) * aw + gx:(gy + k) * aw + gx + im.width] = \
+                px[r * im.width:(r + 1) * im.width]
+    return {"path": path, "point_size": float(point), "atlas_w": aw,
+            "atlas_h": ah, "atlas": bytes(atlas), "chars": chars,
+            "glyphs": glyphs, "coverage": True}
+
+
 def _load_tmp_font_asset(path):
     """Parse authored TMP Font Asset YAML → atlas + glyph metrics."""
     abspath = os.path.abspath(path)
@@ -1270,14 +1393,20 @@ def _load_tmp_font_asset(path):
     atlas_w = int(aw.group(1) if aw else (tw.group(1) if tw else 0))
     atlas_h = int(ah.group(1) if ah else (th.group(1) if th else 0))
     td = re.search(r"_typelessdata:\s*([0-9a-fA-F]+)", text)
-    if not td or atlas_w < 1 or atlas_h < 1:
-        _TMP_FONT_CACHE[abspath] = None
-        return None
-    hexdata = td.group(1)
     expect = atlas_w * atlas_h * 2  # Alpha8 → 2 hex chars per byte
-    if len(hexdata) < expect:
-        _TMP_FONT_CACHE[abspath] = None
-        return None
+    if not td or atlas_w < 1 or atlas_h < 1 or len(td.group(1)) < expect:
+        font = None
+        if re.search(r"(?m)^\s+m_AtlasPopulationMode:\s*1\b", text):
+            font = _tmp_font_from_source(
+                abspath, text, float(point.group(1)) if point else 90.0)
+        if font:
+            font.update({
+                "ascent": float(ascent.group(1)) if ascent else 0.0,
+                "descent": float(descent.group(1)) if descent else 0.0,
+                "line_height": float(line_h.group(1)) if line_h else 0.0})
+        _TMP_FONT_CACHE[abspath] = font
+        return font
+    hexdata = td.group(1)
     try:
         atlas = bytes.fromhex(hexdata[:expect])
     except ValueError:
@@ -1322,61 +1451,111 @@ def _load_tmp_font_asset(path):
     return font
 
 
+def _tmp_lines(font, text, scale, box_w, wrap):
+    """*text* as lines of glyphs at *scale*: split at newlines and, when
+    *wrap*, at the last space before a line passes *box_w* (a word wider
+    than the box breaks between characters, as TMP does).
+
+    ponytail: rich-text tags are drawn as text; no kerning."""
+    out = []
+    for para in text.split("\n"):
+        cur, w = [], 0.0
+        for ch in para:
+            gi = font["chars"].get(ord(ch))
+            g = font["glyphs"].get(gi) if gi is not None else None
+            if not g:
+                continue
+            cur.append((ch, g))
+            w += float(g["adv"]) * scale
+            if wrap and w > box_w + 1e-3 and len(cur) > 1:
+                k = max((j for j, (c, _g) in enumerate(cur) if c == " "),
+                        default=-1)
+                head, cur = (cur[:k], cur[k + 1:]) if k > 0 else (
+                    cur[:-1], cur[-1:])
+                out.append(head)
+                w = sum(float(g["adv"]) * scale for _c, g in cur)
+        out.append(cur)
+    lines = []
+    for ln in out:
+        while ln and ln[-1][0] == " ":
+            ln = ln[:-1]
+        lines.append(([g for _c, g in ln],
+                      sum(float(g["adv"]) * scale for _c, g in ln)))
+    return lines
+
+
 def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
-                        h_align, v_align, overflow_mode=0):
+                        h_align, v_align, overflow_mode=0, wrap=False,
+                        auto_size=None, line_spacing=0.0):
     """Bake plain TMP string into an RGBA bitmap (y=0 bottom, OpenGL).
 
     Returns ``(bw, bh, rgba, shift_x, shift_y)`` where shift is the offset of
     the expanded bitmap center from the authored RectTransform center (pixels,
     +x right / +y up). Overflow mode 0 (TMP Overflow) expands the bake so
     glyphs that extend past the rect are not clipped — Unity still draws
-    them; Truncate/Ellipsis/Masking keep the rect clip.
+    them; Truncate/Ellipsis/Masking keep the rect clip. Newlines break
+    lines; *wrap* wraps at the box width; *auto_size* ``(min, max)`` is
+    the largest size whose lines fit the box (TMP Auto Size).
     """
     bw0 = max(1, int(round(float(box_w))))
     bh0 = max(1, int(round(float(box_h))))
     if not font or not text:
         return bw0, bh0, bytes(bytearray(bw0 * bh0 * 4)), 0.0, 0.0
     ps = float(font["point_size"]) or 1.0
-    scale = float(font_size) / ps
-    glyphs = []
-    total_w = 0.0
-    for ch in text:
-        gi = font["chars"].get(ord(ch))
-        if gi is None:
-            continue
-        g = font["glyphs"].get(gi)
-        if not g:
-            continue
-        glyphs.append(g)
-        total_w += float(g["adv"]) * scale
-    ascent = float(font["ascent"]) * scale
-    descent = float(font["descent"]) * scale  # typically negative
-    visual_h = ascent - descent
-    # Horizontal: 1 left, 2 center, 4 right (TMP bit flags).
-    if h_align & 4:
-        pen_x0 = float(bw0) - total_w
-    elif h_align & 2:
-        pen_x0 = (float(bw0) - total_w) * 0.5
-    else:
-        pen_x0 = 0.0
+
+    def layout(size):
+        scale = float(size) / ps
+        lines = _tmp_lines(font, text, scale, float(bw0), wrap)
+        asc = float(font["ascent"]) * scale
+        desc = float(font["descent"]) * scale  # typically negative
+        lh = (float(font.get("line_height") or 0.0) * scale or asc - desc) \
+            + float(line_spacing) * float(size) * 0.01
+        return scale, lines, asc, desc, lh, asc - desc + lh * (len(lines) - 1)
+
+    if auto_size:
+        # ponytail: bisection on the size (TMP steps its own way; the
+        # sizes agree to ~0.05pt)
+        lo, hi = float(auto_size[0]), float(auto_size[1])
+        hi = min(hi, float(bh0) * ps / max(
+            float(font["ascent"]) - float(font["descent"]), 1e-6))
+        for _ in range(24):
+            mid = (lo + hi) * 0.5
+            _s, lns, _a, _d, _l, th = layout(mid)
+            if th <= bh0 and all(w <= bw0 + 1e-3 for _g, w in lns):
+                lo = mid
+            else:
+                hi = mid
+        font_size = lo
+    scale, lines, ascent, descent, lh, visual_h = layout(font_size)
     # Vertical: 256 top, 512 middle, 1024 bottom — relative to authored rect.
     if v_align & 1024:
-        baseline0 = -descent
+        top = visual_h
     elif v_align & 512:
-        baseline0 = (float(bh0) - visual_h) * 0.5 - descent
+        top = (float(bh0) + visual_h) * 0.5
     else:
-        baseline0 = float(bh0) - ascent
+        top = float(bh0)
+    placed = []  # (glyph, pen x, baseline) in authored-rect pixels
+    for j, (glyphs, total_w) in enumerate(lines):
+        # Horizontal: 1 left, 2 center, 4 right (TMP bit flags).
+        if h_align & 4:
+            pen = float(bw0) - total_w
+        elif h_align & 2:
+            pen = (float(bw0) - total_w) * 0.5
+        else:
+            pen = 0.0
+        for g in glyphs:
+            placed.append((g, pen, top - ascent - lh * j))
+            pen += float(g["adv"]) * scale
     # Glyph AABB in authored-rect pixel space (may extend past edges).
     min_x = 0.0
     min_y = 0.0
     max_x = float(bw0)
     max_y = float(bh0)
-    pen = pen_x0
-    for g in glyphs:
+    for g, pen, base in placed:
         gw = max(float(g["w"]) * scale, 0.0)
         gh = max(float(g["h"]) * scale, 0.0)
         gx0 = pen + float(g["bx"]) * scale
-        gy1 = baseline0 + float(g["by"]) * scale
+        gy1 = base + float(g["by"]) * scale
         gy0 = gy1 - gh
         if gx0 < min_x:
             min_x = gx0
@@ -1386,7 +1565,6 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
             min_y = gy0
         if gy1 > max_y:
             max_y = gy1
-        pen += float(g["adv"]) * scale
     # Overflow (0): expand. Other modes keep the rect (Unity clips / ellipsis).
     if int(overflow_mode or 0) == 0:
         pad_l = max(0.0, -min_x)
@@ -1400,8 +1578,6 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     # Expanded bitmap center vs authored rect center (screen +y up).
     shift_x = (pad_r - pad_l) * 0.5
     shift_y = (pad_t - pad_b) * 0.5
-    pen_x = pen_x0 + pad_l
-    baseline = baseline0 + pad_b
     out = bytearray(bw * bh * 4)
     aw = int(font["atlas_w"])
     ah = int(font["atlas_h"])
@@ -1410,11 +1586,13 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     cg = float(color[1])
     cb = float(color[2])
     ca = float(color[3])
-    for g in glyphs:
+    for g, pen, base in placed:
         gw = max(float(g["w"]) * scale, 0.0)
         gh = max(float(g["h"]) * scale, 0.0)
-        gx0 = pen_x + float(g["bx"]) * scale
-        gy1 = baseline + float(g["by"]) * scale  # top
+        if gw <= 0.0 or gh <= 0.0:
+            continue  # a space: no ink
+        gx0 = pen + pad_l + float(g["bx"]) * scale
+        gy1 = base + pad_b + float(g["by"]) * scale  # top
         gy0 = gy1 - gh  # bottom
         rx, ry, rw, rh = int(g["rx"]), int(g["ry"]), int(g["rw"]), int(g["rh"])
         # GlyphRect Y is from the top of the (top-first) atlas. Empirically
@@ -1438,7 +1616,8 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
                 iy = ry + int(round(sy))
                 if ix < 0 or iy < 0 or ix >= aw or iy >= ah:
                     continue
-                cov = _sdf_coverage(atlas[iy * aw + ix])
+                cov = (atlas[iy * aw + ix] / 255.0 if font.get("coverage")
+                       else _sdf_coverage(atlas[iy * aw + ix]))
                 if cov <= 0.0:
                     continue
                 o = (py * bw + px) * 4
@@ -1447,7 +1626,6 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
                 out[o + 1] = int(min(255, round(cg * 255.0 * cov)))
                 out[o + 2] = int(min(255, round(cb * 255.0 * cov)))
                 out[o + 3] = int(min(255, round(a * 255.0)))
-        pen_x += float(g["adv"]) * scale
     return bw, bh, bytes(out), shift_x, shift_y
 
 
@@ -2797,6 +2975,19 @@ def _emit_rect_struct(p, want_point_to_normalized=True):
     p("static float Rect_size_y(Rect r) { return r.height; }")
     p("static Vector2 Rect_size(Rect r) {")
     p("    return Vector2_make(r.width, r.height);")
+    p("}")
+    p("static float Rect_xMin(Rect r) { return r.x; }")
+    p("static float Rect_yMin(Rect r) { return r.y; }")
+    p("static float Rect_xMax(Rect r) { return r.x + r.width; }")
+    p("static float Rect_yMax(Rect r) { return r.y + r.height; }")
+    p("/* Rect.Contains(Vector2): min edges in, max edges out (Unity's). */")
+    p("static int Rect_Contains(Rect r, Vector2 v) {")
+    p("    return Vector2_x(v) >= r.x && Vector2_x(v) < r.x + r.width")
+    p("        && Vector2_y(v) >= r.y && Vector2_y(v) < r.y + r.height;")
+    p("}")
+    p("static int Rect_Overlaps(Rect a, Rect b) {")
+    p("    return b.x + b.width > a.x && b.x < a.x + a.width")
+    p("        && b.y + b.height > a.y && b.y < a.y + a.height;")
     p("}")
     p("static Vector2 Rect_min(Rect r) { return Vector2_make(r.x, r.y); }")
     p("static Vector2 Rect_max(Rect r) {")

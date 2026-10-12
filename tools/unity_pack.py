@@ -885,6 +885,10 @@ _KEYBOARD_KEY = re.compile(
 # Project walk
 # ---------------------------------------------------------------------------
 
+#: a serialized number as Unity writes it (`1e-05`, `Infinity`, `NaN` too)
+_YAML_NUM = r"-?(?:\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|Infinity)|NaN"
+
+
 def _yaml_scalar(raw):
     """Strip a simple Unity YAML scalar (optional quotes)."""
     s = raw.strip()
@@ -916,7 +920,8 @@ def player_identity(root):
 def unity_physics_settings(root):
     """Authored Physics2D.gravity, Physics.gravity, Time.fixedDeltaTime.
 
-    And the Time.timeScale a player starts with (TimeManager m_TimeScale).
+    And the Time.timeScale a player starts with (TimeManager m_TimeScale),
+    and Physics2D.queriesHitTriggers (default 1).
     Unity defaults (0,-9.81), (0,-9.81,0), 0.02, 1 when a setting is absent.
     Fixed Timestep is a float in older assets, a rational (m_Count ticks at
     m_Numerator / m_Denominator Hz) in newer ones.
@@ -934,6 +939,9 @@ def unity_physics_settings(root):
                   asset("Physics2DSettings.asset"))
     if m:
         out["gravity2d"] = (float(m.group(1)), float(m.group(2)))
+    m = re.search(r"(?m)^\s*m_QueriesHitTriggers:\s*(\d)",
+                  asset("Physics2DSettings.asset"))
+    out["queries_hit_triggers"] = int(m.group(1)) if m else 1
     m = re.search(r"m_Gravity:\s*\{x:%s,\s*y:%s,\s*z:%s\}" % (num, num, num),
                   asset("DynamicsManager.asset"))
     if m:
@@ -1979,9 +1987,12 @@ def _bake_sliced_rgba(src, sw, sh, border, dst_w, dst_h, ppu_mul=1.0):
 
 
 def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
-    """Stretch source into dst (Simple Image.type)."""
-    dw = max(1, int(round(float(dst_w))))
-    dh = max(1, int(round(float(dst_h))))
+    """Stretch source into dst (Simple Image.type). Never past the source's
+    own size: the quad is drawn at the rect's size whatever the texture's,
+    and a rect tens of thousands of pixels wide (Slime Jump's Background)
+    baked billions of pixels in this loop."""
+    dw = max(1, min(int(round(float(dst_w))), int(sw)))
+    dh = max(1, min(int(round(float(dst_h))), int(sh)))
     out = bytearray(dw * dh * 4)
     for y in range(dh):
         v = (y + 0.5) / float(dh)
@@ -2013,8 +2024,23 @@ def _preserve_aspect_draw_center(cx, cy, rw, rh, fw, fh, pivot):
 
 
 
+def _bake_tmp(tmp, text, font=None):
+    """_rasterize_tmp_text of *text* in the TMP *tmp*'s rect (its "bake",
+    set by _bake_ui_images): ``(w, h, rgba, shift_x, shift_y)`` pixels."""
+    b = tmp["bake"]
+    return _rasterize_tmp_text(
+        font or _load_tmp_font_asset(b["font"]), text, b["size"],
+        (1.0, 1.0, 1.0, 1.0),  # color via sprite tint (m_fontColor)
+        b["box_w"], b["box_h"],
+        int(tmp.get("h_align") or 1),
+        int(tmp.get("v_align") or 256),
+        int(tmp.get("overflow_mode") or 0),
+        wrap=bool(tmp.get("wrap")), auto_size=b.get("auto_size"),
+        line_spacing=float(tmp.get("line_spacing") or 0.0))
+
+
 def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
-                    hierarchy=None):
+                    hierarchy=None, pixel_scale=1.0):
     """Resolve authored uGUI Image / TextMeshProUGUI → world sprites.
 
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
@@ -2031,7 +2057,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
 
     ``hierarchy`` supplies father links for stripped PrefabInstance transforms
     so Canvas sorting walks past button roots that are not packed objects.
+    ``pixel_scale`` (screen pixels per canvas unit, <= 1) sets the texture
+    resolution; draw sizes stay in canvas units.
     """
+    k = min(1.0, max(1e-3, float(pixel_scale)))
     by_xf = {}
     for o in objects:
         xid = o.get("xf_id")
@@ -2131,6 +2160,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         out = dict(sort_c)
         if mode_c is not None:
             out["render_mode"] = int(mode_c.get("render_mode", 0))
+            out["camera_file_id"] = int(mode_c.get("camera_file_id") or 0)
+            # Unity: Screen Space Camera with no camera renders as Overlay
+            if out["render_mode"] == 1 and not out["camera_file_id"]:
+                out["render_mode"] = 0
         elif int(out.get("render_mode", 0)) not in (0, 1):
             # Nested World Space with no SS ancestor: still map as Overlay.
             out["render_mode"] = 0
@@ -2166,6 +2199,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             "sorting_order": so,
             "source": source,
             "ui_mode": int(canvas.get("render_mode") or 0),
+            "ui_cam_file_id": str(canvas.get("camera_file_id") or ""),
             "scale_x": 1.0,
             "scale_y": 1.0,
             "cos_z": 1.0,
@@ -2250,12 +2284,12 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             extra["src_aspect"] = float(src_w) / float(src_h)
         if img_type == 1 and any(b > 0 for b in border):
             tw, th, rgba = _bake_sliced_rgba(
-                src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
+                src_rgba, src_w, src_h, border, rw * k, rh * k, ppu_mul / k)
             draw_w, draw_h = rect_w, rect_h
             draw_cx, draw_cy = float(cx), float(cy)
         else:
             tw, th, rgba = _bake_stretched_rgba(
-                src_rgba, src_w, src_h, draw_w, draw_h)
+                src_rgba, src_w, src_h, draw_w * k, draw_h * k)
         extra["tex_path"] = tex_path
         extra["tex_w"] = tw
         extra["tex_h"] = th
@@ -2282,8 +2316,6 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         tmp = o.get("ui_tmp")
         if not tmp or not tmp.get("has_font") or not int(tmp.get("enabled", 1)):
             continue
-        if not (tmp.get("text") or ""):
-            continue
         canvas = _find_canvas(o)
         if not int(canvas.get("enabled", 1)):
             continue
@@ -2301,15 +2333,33 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         # so glyphs match RectTransform lossyScale (e.g. VLG localScale 0.59).
         lw, lh = _ui_local_rect_wh(o, by_xf, sw, sh, rect_cache)
         fs = float(tmp.get("font_size") or 14.0)
-        if lh > 1e-6:
-            fs = fs * (abs(float(rh)) / float(lh))
-        tw, th, rgba, shift_x, shift_y = _rasterize_tmp_text(
-            font, tmp["text"], fs,
-            (1.0, 1.0, 1.0, 1.0),  # color via sprite tint (m_fontColor)
-            rw, rh,
-            int(tmp.get("h_align") or 1),
-            int(tmp.get("v_align") or 256),
-            int(tmp.get("overflow_mode") or 0))
+        sz = abs(float(rh)) / float(lh) if lh > 1e-6 else 1.0
+        tmp["bake"] = {
+            "font": font_path, "size": fs * sz * k, "box_w": rw * k,
+            "box_h": rh * k, "k": k,
+            "auto_size": ((float(tmp["size_min"]) * sz * k,
+                           float(tmp["size_max"]) * sz * k)
+                          if tmp.get("auto_size") else None)}
+        if not (tmp.get("text") or ""):
+            # Nothing to draw; the row a script's `.text =` would draw in
+            # (`_tmp_text_variants`) is kept aside.
+            keep = (o.get("pos"), o.get("ui_hit"))
+            _apply_layout(
+                o, float(cx), float(cy), rw, rh, canvas, "ui_tmp",
+                (tmp.get("r", 1.0), tmp.get("g", 1.0),
+                 tmp.get("b", 1.0), tmp.get("a", 1.0)),
+                {"builtin": False, "sprite_file_id": 0,
+                 "sprite_guid": "tmpbake:empty", "tex_path": "<tmp:>",
+                 "tex_w": 1, "tex_h": 1, "tex_rgba": bytes(4),
+                 "pixels_per_unit": 100.0, "tmp_empty": True})
+            for key, v in zip(("pos", "ui_hit"), keep):
+                o.pop(key, None)
+                if v is not None:
+                    o[key] = v
+            continue
+        tw, th, rgba, shift_x, shift_y = _bake_tmp(tmp, tmp["text"], font)
+        tex_w, tex_h = tw, th
+        tw, th, shift_x, shift_y = tw / k, th / k, shift_x / k, shift_y / k
         # Overflow expands the bake; keep authored alignment by shifting center.
         draw_cx = float(cx) + float(shift_x)
         draw_cy = float(cy) + float(shift_y)
@@ -2330,8 +2380,8 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
                 "sprite_file_id": 0,
                 "sprite_guid": bake_guid,
                 "tex_path": "<tmp:%s>" % (tmp.get("text") or ""),
-                "tex_w": tw,
-                "tex_h": th,
+                "tex_w": tex_w,
+                "tex_h": tex_h,
                 "tex_rgba": rgba,
                 "pixels_per_unit": 100.0,
                 "draw_sx": float(tw) / rect_w,
@@ -2346,6 +2396,9 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
     # qsort ties then cover the Button while TMP (+1) still shows. Bump
     # each UI sprite above the nearest ancestor UI sprite on the same layer.
     _bump_ui_hierarchy_draw_order(objects, by_xf)
+    for o in objects:
+        if (o.get("sprite") or {}).get("tmp_empty"):
+            o["ui_tmp"]["empty_sprite"] = o.pop("sprite")
 
 
 
@@ -2621,13 +2674,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         gm = re.search(r"guid:\s*([0-9a-fA-F]+)", block)
         if gm:
             rec["guid"] = gm.group(1).lower()
-        for fm in re.finditer(r"(?m)^\s{2}(\w+):\s+(-?\d+(?:\.\d+)?)\s*$",
+        for fm in re.finditer(r"(?m)^\s{2}(\w+):\s+(%s)\s*$" % _YAML_NUM,
                               block):
             key = fm.group(1)
             if key.startswith("m_"):
                 continue
             val = fm.group(2)
-            rec["fields"][key] = float(val) if "." in val else int(val)
+            rec["fields"][key] = float(val) if re.search(r"[.eEIN]", val) else int(val)
         # A LayerMask field: `ground: {serializedVersion: 2, m_Bits: 256}`.
         for fm in re.finditer(r"(?m)^\s{2}(\w+):\s*\{serializedVersion:\s*\d+,"
                               r"\s*m_Bits:\s*(\d+)\s*\}", block):
@@ -2637,11 +2690,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         # (`label: hello`, `'two words'`). Kept apart from `fields`, which
         # holds numbers -- "007" is not 7 -- and read only for fields the
         # script declares `string`.
-        for fm in re.finditer(r"(?m)^\s{2}(\w+):[ \t]*(.*?)[ \t]*$", block):
+        for fm in re.finditer(r"(?m)^\s{2}(\w+):[ \t]*(.*?)[ \t]*$"
+                              + _YAML_FLOW_MORE, block):
             key = fm.group(1)
             if key.startswith("m_"):
                 continue
-            sv = _yaml_scalar_text(fm.group(2))
+            sv = _yaml_scalar_text(_yaml_flow_join(fm.group(2), fm.group(3)))
             if sv is not None:
                 rec.setdefault("str_fields", {})[key] = sv
         # Vector2 serialized fields: name: {x: A, y: B}
@@ -2689,6 +2743,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if not fm.group(1).startswith("m_"):
                 rec.setdefault("object_ref_arrays", {})[fm.group(1)] = \
                     re.findall(r"fileID:\s*(-?\d+)", fm.group(2))
+        # Number arrays: name:\n  - 0.5\n  - 1 ...
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- [-+.\deE]+[ \t]*\n?)+)",
+                block):
+            if not fm.group(1).startswith("m_"):
+                rec.setdefault("num_arrays", {})[fm.group(1)] = [
+                    float(v) for v in re.findall(r"- ([-+.\deE]+)", fm.group(2))]
         sv = _embedded_values(block)
         if sv:
             rec["struct_values"] = sv
@@ -2839,6 +2900,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["ui_eventtrigger"] = _parse_ui_eventtrigger(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
+                tm = re.search(r"(?m)^  m_text:[ \t]*(.*?)[ \t]*$"
+                               + _YAML_FLOW_MORE, block)
+                if tm:
+                    rec["ui_tmp"]["text"] = _yaml_scalar_text(
+                        _yaml_flow_join(tm.group(1), tm.group(2))) or ""
             elif _is_vlayout_mb(block, g):
                 rec["layout_group"] = _parse_hv_layout_group(block, True)
             elif _is_hlayout_mb(block, g):
@@ -3220,6 +3286,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         str_fields = {}
         object_refs = {}
         object_ref_arrays = {}
+        num_arrays = {}
         mb_ids = []
         vec2_fields = {}
         vec3_fields = {}
@@ -3284,6 +3351,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 str_fields.update(k.get("str_fields") or {})
                 object_refs.update(k.get("object_refs") or {})
                 object_ref_arrays.update(k.get("object_ref_arrays") or {})
+                num_arrays.update(k.get("num_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
                 struct_values.update(k.get("struct_values") or {})
@@ -3336,7 +3404,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") == "Canvas" and k.get("canvas"):
                 canvas = dict(k["canvas"])
             if k.get("kind") == "Camera" and k.get("camera"):
-                cam = dict(k["camera"])
+                cam = dict(k["camera"], file_id=k.get("file_id"))
             if k.get("kind") == "Rigidbody2D" and k.get("rigidbody2d"):
                 rb2d = dict(k["rigidbody2d"])
                 rb2d["file_id"] = k.get("file_id")
@@ -3564,6 +3632,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "culling_mask": cam.get("culling_mask", 0xFFFFFFFF),
                 "renders": bool(active and cam.get("enabled", 1)),
                 "depth": cam.get("depth", 0.0),
+                "cam_file_id": str(cam.get("file_id") or ""),
                 "clear": cam.get("clear", True),
                 "viewport": cam.get("viewport", (0.0, 0.0, 1.0, 1.0)),
             })
@@ -3631,8 +3700,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                             pass
                     continue
         if ui_tmp and not has_ui_draw and script is None and sprite is None:
+            # an empty one a script names stays: it may set the text
             if (not rb2d and not rb3d and not col2d and not col3d and not player
-                    and not canvas and not ui_button and not ui_image):
+                    and not canvas and not ui_button and not ui_image
+                    and not ({str(k.get("file_id")) for k in kids}
+                             & mb_ref_ids)):
                 continue
         if (script is None and sprite is None and not has_ui_draw
                 and not rb2d and not rb3d and cam is None and not col2d
@@ -3733,6 +3805,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "anim_curves": anim_curves,
             "object_refs": object_refs,
             "object_ref_arrays": object_ref_arrays,
+            "num_arrays": num_arrays,
             "struct_values": struct_values,
             "mb_ids": mb_ids,
             "mb_enabled": _mb_enabled((prim or {}).get("raw") or ""),
@@ -3803,6 +3876,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "anim_curves": ecurves,
                 "object_refs": dict(k.get("object_refs") or {}),
                 "object_ref_arrays": dict(k.get("object_ref_arrays") or {}),
+                "num_arrays": dict(k.get("num_arrays") or {}),
                 "struct_values": dict(k.get("struct_values") or {}),
                 "mb_ids": [str(k.get("file_id"))],
                 "mb_enabled": _mb_enabled(k.get("raw") or ""),
@@ -4697,12 +4771,18 @@ def _build_go_tags(plan, go_names):
 def _draw_layer(plan, gi, sp=None):
     """`EngineDraw.layer`: the layer of GameObject *gi* (go_names index)
     that the cameras' culling masks test -- or, for a uGUI draw (*sp* its
-    sprite), -1 Screen Space Overlay (drawn after every camera) / -2
-    Screen Space Camera (the main camera's).
+    sprite), -1 Screen Space Overlay (drawn after every camera) / -3 - k
+    Screen Space Camera (its canvas's camera, rendering row k) / -2 (the
+    main camera's, when that camera is not packed).
 
     ponytail: the authored layer; `gameObject.layer =` does not re-cull."""
     if sp and sp.get("source") in ("ui", "ui_tmp"):
-        return -1 if int(sp.get("ui_mode") or 0) == 0 else -2
+        if int(sp.get("ui_mode") or 0) == 0:
+            return -1
+        rows = [c.get("cam_file_id") for c in plan.get("cameras") or []
+                if c.get("renders", True)]
+        cid = sp.get("ui_cam_file_id")
+        return -3 - rows.index(cid) if cid and cid in rows else -2
     gl = plan.get("go_layers") or []
     return int(gl[gi]) if gi is not None and 0 <= int(gi) < len(gl) else 0
 
@@ -4861,6 +4941,14 @@ def _instantiate_budget(analyses, plan):
                 budget[cname] = budget.get(cname, 0) + n
             for t in _prefab_instantiate_fields(c, plan).values():
                 budget[t] = budget.get(t, 0) + n
+            # `Instantiate(field[, parent])`: one clone per instance, as for `this`
+            ftys = {f["name"]: f["ty"].split(".")[-1] for f in c.get("fields") or ()
+                    if not f.get("static")}
+            for m in re.finditer(r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*\(\s*"
+                                 r"(?:this\s*\.\s*)?(\w+)\s*(?:,[^,;()]*)?\)", cs2cpp._blank(bodies)):
+                t = ftys.get(m.group(1))
+                if t in class_n and t not in _ADDABLE_BUILTINS:
+                    budget[t] = budget.get(t, 0) + n
             for t in _child_clone_classes(c, plan):
                 budget[t] = budget.get(t, 0) + n
     return budget
@@ -5294,7 +5382,7 @@ def _rewrite_instantiate(text, plan, this_class):
     stay for the stub detector.
     """
     inst_budget = plan.get("instantiate_budget") or {}
-    if not inst_budget:
+    if not inst_budget and plan.get("go_clone_classes") is None:
         return text
     classes = plan.get("classes") or {}
     cl = classes.get(this_class) or {
@@ -5335,7 +5423,7 @@ def _rewrite_instantiate(text, plan, this_class):
             out.append(text[i:after])
             i = after
             continue
-        if src.startswith("Transform_GetChild(") and plan.get("go_clone_classes"):
+        if src.startswith("Transform_GetChild(") and plan.get("go_clone_classes") is not None:
             out.append(before + "GameObject_Instantiate(%s, %s)" % (src, parent))
             i = after
             continue
@@ -5869,8 +5957,11 @@ def _attach_transform_parents(plan):
                 cam["xf_parent_inst"] = int(pi)
                 any_parent = True
     plan["has_transform_parents"] = any_parent
+    # a camera whose own GameObject is packed follows that (_engine_cam_pos)
+    own = xf_to.get(str(cam.get("xf_id"))) if cam else None
     plan["camera_follows_parent"] = bool(
-        cam and cam.get("xf_parent_class"))
+        cam and cam.get("xf_parent_class") and not (
+            own and _class_has_position(plan["classes"][own[0]])))
 
 
 def _instance_storage_pos(o):
@@ -5983,6 +6074,17 @@ def _resolve_go_field_refs(plan):
                               or elem in plan["classes"]):
                 seeds.setdefault(cname, {})[f["name"]] = rows
     plan["ref_array_seeds"] = seeds
+    # and number arrays' authored numbers, seeded by the same function
+    nums = {}
+    for cname, cl in plan["classes"].items():
+        for f in cl.get("list_fields") or []:
+            rows = [list((o.get("num_arrays") or {}).get(f["name"]) or [])
+                    for o in cl.get("instances") or []] if f.get("array") else []
+            if any(rows):
+                nums.setdefault(cname, {})[f["name"]] = (
+                    _list_elem_c_ty(_list_elem_name(f["ty"]), plan), rows)
+                seeds.setdefault(cname, {})
+    plan["num_array_seeds"] = nums
     _promote_handle_rot_classes(plan)
 
 
@@ -6735,6 +6837,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
     def _known_component(comp):
         return (comp in (plan.get("classes") or {})
+                or comp in (plan.get("interfaces") or {})
                 or comp in _PHYSICS_COMPONENTS or comp in _COLLIDER2D_TYPES
                 or comp in (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
                 or comp == "LineRenderer"
@@ -6757,10 +6860,11 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
     for ch in chains:
         comp = ch.get("component")
-        if (comp in (plan.get("interfaces") or {})
-                or (comp in _RENDERER_LOOKUP_TYPES
-                    and not _known_component(comp))):
+        if comp in (plan.get("interfaces") or {}) and (
+                ch.get("field") or not _iface_implementors(comp, plan)):
             continue                  # left as C#: the method stubs (CS8000)
+        if comp in _RENDERER_LOOKUP_TYPES and not _known_component(comp):
+            continue
         field = ch.get("field")
         axis = ch.get("axis")
         line = _line_at(ch["start"])
@@ -6959,6 +7063,8 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("SpriteRenderer.enabled")
     if re.search(r"\.\s*simulated\s*=(?!=)", scan):
         apis.add("Rigidbody2D.simulated")
+    if re.search(r"\.\s*worldCenterOfMass\b", scan):
+        apis.add("Rigidbody2D.worldCenterOfMass")
     if re.search(r"(?<![\w.])Sprite\b", scan) and re.search(
             r"\.\s*sprite\b", scan):
         apis.add("Renderer.sprite")
@@ -7477,6 +7583,31 @@ def _authored_string(o, name, default):
     return v if isinstance(v, str) else default
 
 
+# The more-indented lines after `key: value` (blank ones between them): a
+# quoted scalar Unity wrapped over several lines.
+_YAML_FLOW_MORE = r"((?:(?:\n[ \t]*)*\n {3,}[^\n]*)*)"
+
+
+def _yaml_flow_join(raw, more):
+    """*raw* and its continuation lines *more* as one line, folded as YAML
+    folds a quoted scalar: a line break is a space, each blank line a
+    newline. Only an unclosed quote continues; anything else is *raw*."""
+    raw = raw.strip()
+    if not more or not raw or raw[0] not in "'\"" or (
+            len(raw) > 1 and raw.endswith(raw[0])
+            and not raw.endswith(raw[0] * 2) or raw.endswith(raw[0] * 3)):
+        return raw
+    out, breaks = raw, 0
+    for line in more.split("\n")[1:]:
+        line = line.strip()
+        if not line:
+            breaks += 1
+            continue
+        out += ("\n" * breaks if breaks else " ") + line
+        breaks = 0
+    return out
+
+
 def _yaml_scalar_text(raw):
     """A Unity YAML scalar as text: plain, 'single' ('' is a quote) or
     "double" (backslash escapes). None for a mapping, a sequence or a
@@ -7700,6 +7831,8 @@ _UNITY_EMIT_MESSAGES = frozenset({
 def _param_c_ty(ty):
     """C type for a C# method parameter. ``T[]`` is a pointer to T's C type."""
     ty = (ty or "").split(".")[-1].strip()
+    if ty.endswith("[]") and _csharp_type_decl_kind(ty[:-2]) == "class":
+        return "std::vector<int>"         # packed indices, by value
     if ty.endswith("[]"):
         elem = _param_c_ty(ty[:-2])
         return elem + ("*" if elem.endswith("*") else " *")
@@ -7710,9 +7843,9 @@ def _param_c_ty(ty):
     if ty in ("byte", "sbyte", "short", "ushort", "int", "uint", "long",
               "ulong", "bool", "char"):
         return "int"
-    if ty == "Vector2":
+    if ty in ("Vector2", "Rect"):
         # The engine's value struct -- it fell to `int` below, a handle.
-        return "Vector2"
+        return ty
     # MonoBehaviour / component / enum handles → packed index.
     return "int"
 
@@ -7913,8 +8046,10 @@ def _ret_c_ty(ret, plan):
     if base in (plan.get("classes") or {}) or base in (
             "GameObject", "Transform"):
         return "int"                      # a packed index / GameObject
-    if base == "Vector2":
-        return "Vector2"                  # the engine's value struct
+    if base in ("Vector2", "Rect"):
+        return base                       # the engine's value struct
+    if base.endswith("[]") and base[:-2] in (plan.get("classes") or {}):
+        return "std::vector<int>"         # packed indices, copied out
     return None
 
 
@@ -7929,7 +8064,7 @@ def _method_ret_kinds(plan):
         idn = _c_ident(cname)
         for _c, m in pairs:
             base = (m.get("ret") or "void").strip().split(".")[-1]
-            if _ret_c_ty(base, plan) in (None, "void"):
+            if _ret_c_ty(base, plan) in (None, "void", "Rect"):
                 continue
             kind = ("s" if base == "string" else "b" if base == "bool"
                     else "f" if base in ("float", "double")
@@ -8024,6 +8159,7 @@ def _rewrite_method_calls(text, call_re, cands, oidn, receiver, overloaded,
         margs = meth.get("args") or ""
         sym = _method_c_symbol(oidn, meth["name"], margs, overloaded)
         a = _call_with_defaults(args, cs2cpp.parse_params(margs)).strip()
+        a = _gather_params_args(a, margs, text)
         out.append("%s(%s%s)" % (sym, receiver, (", " + a) if a else ""))
         if protos is not None:
             plist = _method_c_params(margs)
@@ -8032,6 +8168,47 @@ def _rewrite_method_calls(text, call_re, cands, oidn, receiver, overloaded,
         pos = end
     out.append(text[pos:])
     return "".join(out)
+
+
+def _sub_calls(text, name, fn):
+    """Each `name(args)` call (not a member's), its parentheses matched,
+    as `fn(args)`; calls nested in the arguments first."""
+    pat = re.compile(r"(?<![\w.])%s\s*\(" % re.escape(name))
+    out, pos = [], 0
+    scan = cs2cpp._blank(text)
+    for m in pat.finditer(scan):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(scan, m.end() - 1)
+        if not got:
+            continue
+        end = got[1]
+        args = text[m.end():end - 1]
+        out.append(text[pos:m.start()] + fn(_sub_calls(args, name, fn)))
+        pos = end
+    return "".join(out) + text[pos:]
+
+
+def _gather_params_args(args, margs, text):
+    """A `params Cls[] xs` method's trailing arguments, gathered into the
+    vector its C parameter is. One argument named as an array or vector in
+    *text* is passed whole, as C# does."""
+    params = cs2cpp.parse_params(margs)
+    if not params or not re.search(r"\bparams\s", margs) \
+            or _param_c_ty(params[-1].type) != "std::vector<int>":
+        return args
+    given = cs2cpp.split_call_args(args) if args.strip() else []
+    fixed, rest = given[:len(params) - 1], given[len(params) - 1:]
+    # ponytail: "an array" is only a name declared `T[]` / std::vector<int>
+    # in the body; any other single array-valued expression is wrapped
+    if len(rest) == 1 and re.search(
+            r"(?:\[\s*\]|std::vector<int>\s*&?)\s*%s\s*[,);=]"
+            % re.escape(rest[0].strip()), cs2cpp._blank(text)):
+        return args
+    v = "_cs_vec_new_int()"
+    for r in rest:
+        v = "_cs_vec_push_int(%s, %s)" % (v, r.strip())
+    return ", ".join([g.strip() for g in fixed] + [v])
 
 
 def _returns_void(m):
@@ -8085,6 +8262,9 @@ _VALUE_ELEM_TYPES = frozenset((
     "string", "bool", "byte", "sbyte", "char", "short", "ushort", "int",
     "uint", "long", "ulong", "float", "double", "Vector2", "Vector3",
     "Vector2Int", "Vector3Int", "Color", "Color32", "Rect", "Quaternion"))
+
+
+_NUMBER_ARRAY_ELEMS = frozenset(("float", "double", "int", "bool"))
 
 
 def _array_elem_name(ty):
@@ -8319,7 +8499,8 @@ def _uses_player_prefs(analyses):
 
 def _inline_static_getters(text, cl, plan):
     """Reads of an inlinable static property (``Type.Name``, or bare ``Name``
-    inside *Type*) become ``(expr)``. Assignments are left alone."""
+    inside *Type*) become ``(expr)``. Assignments, ``++`` and ``--`` are
+    left alone."""
     getters = plan.get("static_getters") or {}
     for cname, props in getters.items():
         for pname, expr in props.items():
@@ -8328,7 +8509,8 @@ def _inline_static_getters(text, cl, plan):
                 names.append(re.escape(pname))
             for pat in names:
                 text = cs2cpp.code_sub(
-                    r"(?<![\w.])%s\b(?!\s*(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=))" % pat,
+                    r"(?<!\+\+)(?<!--)(?<![\w.])%s\b"
+                    r"(?!\s*(?:(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=)|\+\+|--))" % pat,
                     "(%s)" % cs2cpp.lower_float_literals(expr), text)
     return text
 
@@ -8438,6 +8620,121 @@ def _collect_interfaces(analyses):
 #: packed class is a vector of indices into that one array; an `IUpdatable[]`
 #: names instances of *different* classes, so each element carries which.
 _IREF_TYPE = "_engine_iref"
+
+#: An interface-typed local or parameter is one int: the implementor's class
+#: id above _IREF_BITS, its instance below; -1 is null.
+# ponytail: 2^20 instances a class, 2^11 classes; a wider int if one outgrows it
+_IREF_BITS = 20
+
+
+def _iface_holds(text, plan, site):
+    """{name: interface} of a body's interface-typed parameters and locals."""
+    ifaces = plan.get("interfaces") or {}
+    holds = {prm.name: prm.type.split(".")[-1]
+             for prm in cs2cpp.parse_params((site or {}).get("args") or "")
+             if prm.type.split(".")[-1] in ifaces}
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_][\w.]*)\s+([A-Za-z_]\w*)\s*[=;]",
+                         cs2cpp._blank(text)):
+        if m.group(1).split(".")[-1] in ifaces:
+            holds[m.group(2)] = m.group(1).split(".")[-1]
+    return holds
+
+
+def _iface_dispatch_sym(iface, mname):
+    return "%s_%s" % (_c_ident(iface), mname)
+
+
+def _iface_method_calls(text, plan, site):
+    """`d.M(a)` on an interface-typed name is the interface's dispatcher,
+    `IFace_M(d, a)` (`_emit_iface_dispatch`); the names are kept for
+    `_null_handle_args`, which lets only them reach an interface slot."""
+    holds = _iface_holds(text, plan, site)
+    plan["_iface_names_cur"] = set(holds)
+    ifaces = plan.get("interfaces") or {}
+    for recv, iface in sorted(holds.items()):
+        for meth in ifaces[iface].get("methods") or []:
+            sym = _iface_dispatch_sym(iface, meth["name"])
+            pat = r"(?<![\w.])%s\s*\.\s*%s\s*\(\s*(\)?)" % (
+                re.escape(recv), re.escape(meth["name"]))
+            if not re.search(pat, cs2cpp._blank(text)):
+                continue
+            plan.setdefault("_iface_used", set()).add((iface, meth["name"]))
+            if site is not None:
+                site.setdefault("protos", set()).add(
+                    _iface_dispatch_proto(iface, meth, plan) + ";")
+            text = cs2cpp.code_sub(
+                pat, lambda m, s=sym, r=recv: "%s(%s%s" % (
+                    s, r, ")" if m.group(1) else ", "), text)
+    return text
+
+
+def _iface_dispatch_proto(iface, meth, plan):
+    ret = _ret_c_ty((meth.get("ret") or "void").split(".")[-1], plan) or "void"
+    prm = _method_c_params(meth.get("args") or "")
+    return "static %s %s(int r%s)" % (
+        ret, _iface_dispatch_sym(iface, meth["name"]), ", " + prm if prm else "")
+
+
+def _emit_iface_dispatch(p, plan):
+    """Each interface method a body calls: a switch on the reference's class
+    to that implementor's packed method; a null reference raises."""
+    by = plan.get("_methods_by") or {}
+    ifaces = plan.get("interfaces") or {}
+    for iface, mname in sorted(plan.get("_iface_used") or ()):
+        meth = next(m for m in ifaces[iface]["methods"] if m["name"] == mname)
+        ret = _ret_c_ty((meth.get("ret") or "void").split(".")[-1], plan) or "void"
+        names = [prm.name for prm in cs2cpp.parse_params(meth.get("args") or "")]
+        p(_iface_dispatch_proto(iface, meth, plan) + " {")
+        p("    /* interface dispatch */")
+        p("    switch (r < 0 ? -1 : r >> %d) {" % _IREF_BITS)
+        for cname in _iface_implementors(iface, plan):
+            ms = [m for _c, m in by.get(cname, [])]
+            over = _overload_method_names(ms)
+            sym = (_method_c_symbol(_c_ident(cname), mname, meth.get("args") or "", True)
+                   if mname in over else "%s_%s" % (_c_ident(cname), mname))
+            call = "%s((unsigned)(r & %du)%s)" % (
+                sym, (1 << _IREF_BITS) - 1, "".join(", " + n for n in names))
+            p("    case %d: %s;" % (_class_id(plan, cname), (
+                "return " + call) if ret != "void" else call + "; return"))
+        p("    }")
+        p("    (void)_engine_nre_ix(4294967295u);")
+        if ret != "void":
+            p("    return (%s)0;" % ret)
+        p("}")
+        p("")
+
+
+def _emit_iface_get_component(p, plan, used_apis, analyses):
+    """GetComponent<IFace> / GetComponentInParent<IFace>: the first
+    implementor on the GameObject (or up its parents), as an interface ref.
+    ponytail: implementors tried in class-name order, not component order"""
+    ifaces = plan.get("interfaces") or {}
+    want = {a.split("<", 1)[1][:-1] for a in used_apis
+            if a.startswith("GetComponentInParent<")} & set(ifaces)
+    for iface in sorted(want | ({t for a in analyses or ()
+                                 for t in a.get("getcomponent_types") or ()}
+                                & set(ifaces))):
+        idn = _c_ident(iface)
+        p("static int GameObject_GetComponent_%s(int go) {" % idn)
+        p("    int ci;")
+        for cname in _iface_implementors(iface, plan):
+            p("    ci = GameObject_GetComponent_%s(go);" % _c_ident(cname))
+            p("    if (ci >= 0) return (%d << %d) | ci;" % (
+                _class_id(plan, cname), _IREF_BITS))
+        p("    return -1;")
+        p("}")
+        if iface in want:
+            p("static int GameObject_GetComponentInParent_%s(int go) {" % idn)
+            p("    int r, guard;")
+            p("    for (guard = 0; go >= 0 && guard < _engine_go_count + 2;"
+              " guard = guard + 1) {")
+            p("        r = GameObject_GetComponent_%s(go);" % idn)
+            p("        if (r >= 0) return r;")
+            p("        go = Transform_get_parent(go);")
+            p("    }")
+            p("    return -1;")
+            p("}")
+        p("")
 
 
 def _static_ref_array(f, plan):
@@ -9086,6 +9383,18 @@ def _f16_bits(f):
     return (sign << 15) | (be << 10) | (mant & 1023)
 
 
+def _f16_exact(v):
+    """Does float *v* survive a binary16 field unchanged (`damage: Infinity`,
+    `1e-05`, `0.1` do not)?"""
+    import math
+    import struct
+    try:
+        f = float(v)
+        return math.isfinite(f) and struct.unpack("<e", struct.pack("<e", f))[0] == f
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 def _bitwidth(lo, hi):
     span = max(abs(int(lo)), abs(int(hi)))
     if span <= 1:
@@ -9447,7 +9756,10 @@ def plan_layouts(objects, analyses, two_d=None):
             elif ty == "bool":
                 members.append((fname, "unsigned", 1, "bits"))
             elif ty == "float":
-                if static:
+                dflt = next((f.get("default") for f in script_fields
+                             if f["name"] == fname), None)
+                if static and all(_f16_exact(v) for v in [dflt or 0] + [
+                        o["fields"][fname] for o in insts if fname in o["fields"]]):
                     members.append((fname, "uint16_t", 16, "f16"))
                 else:
                     members.append((fname, "float", 32, "f32"))
@@ -9495,6 +9807,13 @@ def plan_layouts(objects, analyses, two_d=None):
             if not f.get("static") and not f.get("const")
             and _list_elem_name(f.get("ty") or "")
         ]
+        # a number array (`float[] vols`) is stored as a list of its numbers,
+        # seeded with the authored ones; `array` marks the C# array
+        list_fields += [
+            dict(f, ty="List<%s>" % _array_elem_name(f["ty"]), array=True)
+            for f in script_fields
+            if not f.get("static") and not f.get("const")
+            and _array_elem_name(f.get("ty") or "") in _NUMBER_ARRAY_ELEMS]
         # a vector of indices: an array of values (`string[]`) has no slot
         ref_array_fields = [
             f for f in script_fields
@@ -11099,6 +11418,9 @@ def _emit_engine_live_rect_transforms(
         p("static %sint _engine_rt_canvas_root[%d] = { %s };" % (
             ro, go_rt_n,
             ", ".join(str(int(x)) for x in _rt_i("canvas_root"))))
+        p("static float _engine_rt_canvas_units[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("canvas_units", 1.0))))
         p("static float _engine_rt_amin_x[%d] = { %s };" % (
             go_rt_n, ", ".join("%sf" % repr(float(x))
                                for x in _rt_f("amin_x", 0.5))))
@@ -11141,7 +11463,8 @@ def _emit_engine_live_rect_transforms(
             p("static void _engine_rt_clone(int go, int src) {")
             p("    if (go < 0 || go >= %d || src < 0 || src >= %d) return;"
               % (go_rt_n, go_rt_n))
-            for t in ("has", "canvas", "canvas_root", "amin_x", "amin_y",
+            for t in ("has", "canvas", "canvas_root", "canvas_units",
+                      "amin_x", "amin_y",
                       "amax_x", "amax_y", "apos_x", "apos_y", "sd_x", "sd_y",
                       "pivot_x", "pivot_y", "sx", "sy"):
                 p("    _engine_rt_%s[go] = _engine_rt_%s[src];" % (t, t))
@@ -11187,7 +11510,8 @@ def _emit_engine_live_rect_transforms(
         p("        return;")
         p("    }")
         p("    if (_engine_rt_canvas_root[go]) {")
-        p("        *ow = sw; *oh = sh;")
+        p("        *ow = sw * _engine_rt_canvas_units[go];")
+        p("        *oh = sh * _engine_rt_canvas_units[go];")
         p("        return;")
         p("    }")
         p("    parent = _engine_go_parent[go];")
@@ -13246,6 +13570,7 @@ def _emit_camera_pass(p, plan):
     p("        int l = out[k].layer;")
     p("        int keep = r == -2 ? l == -1")
     p("            : l >= 0 ? (int)((mask >> (l & 31)) & 1u)")
+    p("            : l <= -3 ? r == -1 || r == -3 - l")
     p("            : r == -1 || (l == -2 && r == _engine_cam_main);")
     p("        if (keep) {")
     p("            out[w] = out[k];")
@@ -14263,10 +14588,10 @@ def _emit_engine_instantiate(
                 p("}")
                 p("")
         clone = sorted(plan.get("go_clone_classes") or ())
-        if clone:
+        if plan.get("go_clone_classes") is not None:
             p("/* Instantiate(GameObject, parent): the class that is the GO */")
             p("static int GameObject_Instantiate(int go, int parent_go) {")
-            p("    int c = -1;")
+            p("    int c = -1, packed = 0;")
             p("    if (go < 0 || go >= _engine_go_count) {")
             p('        fprintf(stderr, "ArgumentException: The Object you want'
               ' to instantiate is null.\\n");')
@@ -14276,10 +14601,18 @@ def _emit_engine_instantiate(
             for cname in clone:
                 idn = _c_ident(cname)
                 p("    if (_engine_go_%s[go] >= 0) {" % idn)
+                p("        packed = 1;")
                 p("        c = Object_Instantiate_%s(_engine_go_%s[go], parent_go);"
                   % (idn, idn))
                 p("        if (c >= 0) return _engine_%s_go_of[c];" % idn)
                 p("    }")
+            p("    if (!packed) {")
+            p('        fprintf(stderr, "Instantiate: `%s` has no packed script to'
+              ' clone; crust clones only those, stopping rather than skipping it\\n",'
+              ' _engine_go_name[go]);')
+            p("        exit(70);")
+            p("    }")
+            p("    (void)parent_go;")
             p('    fprintf(stderr, "Instantiate: more than %d live clones of'
               ' %%s; raise [MaxInstances(N)]\\n", _engine_go_name[go]);'
               % _GO_CLONE_POOL)
@@ -15108,6 +15441,20 @@ def _emit_engine_class_groups(
                         why = ("Method group passed as a delegate nothing "
                                "lowered", om["name"])
                         break
+            if why is None:
+                # an instance array of values (World's `float[]
+                # areaMusicsVolumes`) is packed nowhere: a bare name left
+                packed = {mm[0] for mm in cl.get("members") or ()} | {
+                    lf["name"] for lf in cl.get("list_fields") or ()}
+                for f in cl.get("fields") or ():
+                    if (not f.get("static") and f["name"] not in packed
+                            and _array_elem_name(f.get("ty") or "")
+                            in _VALUE_ELEM_TYPES and re.search(
+                                r"(?<![\w.])%s\b" % re.escape(f["name"]),
+                                cs2cpp._blank(body))):
+                        why = ("instance array of values with no packed "
+                               "storage", f["name"])
+                        break
             # MB methods always emit as `static void`. A non-void C# return
             # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
             # still leaves `return 1;` and crust refuses CS0000.
@@ -15193,16 +15540,45 @@ def _emit_engine_class_groups(
                 # inside something that is not -- a lambda passed to a
                 # static helper -- and copying that line brought the C#
                 # into the stub, which crust then refused.
+                # Its control flow comes along: a lowered `if (c)` over it,
+                # a lowered `if (c) return;` before it (Death's `if (dead)
+                # return;` must not let the HUD hide anyway); any other
+                # branch or loop ends the salvage.
+                # Only Awake / Start / OnEnable: a menu hiding itself is the
+                # scene's initial state; a piece of a stubbed Death is not.
                 kt = _engine_types_declared(lines)
-                for line in body.split("\n"):
+                guard = None
+                lifecycle = re.search(r"(?:^|_)(?:Awake|Start|OnEnable)$", m["name"])
+                for line in body.split("\n") if lifecycle else ():
                     s = line.strip()
-                    # nor one on a local the stub no longer declares
-                    if set(re.findall(r"(?<![\w.>])([a-z]\w*)\b(?!\s*\()",
-                                      cs2cpp._blank(s))) - emitted - {"i"}:
+                    bl = cs2cpp._blank(s)
+                    if not s:
                         continue
-                    if "GameObject_SetActive(" in s and \
-                            _unlowered_csharp(s, known_types=kt) is None:
-                        p("    " + s.rstrip(";").rstrip() + ";")
+                    # nor one on a local the stub no longer declares
+                    ok = (not set(re.findall(r"(?<![\w.>])([a-z]\w*)\b(?!\s*\()", bl))
+                          - emitted - {"i", "return"}
+                          and _unlowered_csharp(s, known_types=kt) is None)
+                    head = re.fullmatch(r"if\s*\(.*\)", bl)
+                    if head or re.fullmatch(r"if\s*\(.*\)\s*return\s*;", bl):
+                        if not ok or guard:
+                            break
+                        if head:
+                            guard = s
+                            continue
+                        if rty and rty != "void":
+                            break
+                        p("    " + s)
+                        continue
+                    if guard and bl == "return;" and not (rty and rty != "void"):
+                        p("    %s return;" % guard)
+                        guard = None
+                        continue
+                    if re.search(r"\b(?:if|else|for|foreach|while|do|switch|case|return|"
+                                 r"break|continue|goto|yield)\b|[{}]", bl):
+                        break
+                    if ok and "GameObject_SetActive(" in s:
+                        p("    %s%s;" % (guard + " " if guard else "", s.rstrip(";").rstrip()))
+                    guard = None
                 p("    /* unlowered C# (GetComponentsInChildren / T[] / "
                   "leftover Instantiate / lambda / Type.Method) — stub */")
                 if hy_ok:
@@ -15212,6 +15588,8 @@ def _emit_engine_class_groups(
                     p("    return %s;" % (
                         '""' if rty == "const char *"
                         else "Vector2_make(0.f, 0.f)" if rty == "Vector2"
+                        else "Rect_make(0, 0, 0, 0)" if rty == "Rect"
+                        else "_cs_vec_new_int()" if rty.startswith("std::")
                         else "0"))
             else:
                 for j, line in enumerate(body.split("\n")):
@@ -17525,6 +17903,8 @@ def _lower_rb2d_api(text, cl, plan, site):
     for m in re.finditer(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Rigidbody2D\s+(\w+)\s*[=;]",
                          cs2cpp._blank(text)):
         recvs[r"(?<![\w.])%s" % re.escape(m.group(1))] = m.group(1)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Rigidbody2D(\s+\w+\s*=)",
+                           lambda m: "int" + m.group(1), text)
     recvs[r"(?<![\w.])(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\s*\.\s*)?"
           r"Rigidbody2D\s*>\s*\(\s*\)"] = \
         "GameObject_GetComponent_Rigidbody2D(_engine_go_of_%s(i))" % idn
@@ -17588,6 +17968,10 @@ def _lower_rb2d_api(text, cl, plan, site):
             pat + r"\s*\.\s*position\b",
             lambda m, rx=rx: "Vector2_make(Rigidbody2D_position_x(%s), "
                              "Rigidbody2D_position_y(%s))" % (rx, rx), text)
+        if plan.get("_rb_com"):
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*worldCenterOfMass\b",
+                lambda m, rx=rx: "Rigidbody2D_worldCenterOfMass(%s)" % rx, text)
         for cs, name in props.items():
             text = cs2cpp.code_sub(
                 pat + r"\s*\.\s*%s\s*([-+*/])=\s*([^;]+);" % cs,
@@ -17890,6 +18274,13 @@ def _emit_rb2d_api(p, plan=None):
     p("static void Rigidbody2D_set_position(int rb, float x, float y) {")
     p("    if (_rb2d_ok(rb)) engine_rb2d_set_pos(rb, x, y);")
     p("}")
+    if (plan or {}).get("_rb_com"):
+        p("void engine_rb2d_world_com(int rb, float *x, float *y);")
+        p("static Vector2 Rigidbody2D_worldCenterOfMass(int rb) {")
+        p("    Vector2 v = { 0.f, 0.f };")
+        p("    if (_rb2d_ok(rb)) engine_rb2d_world_com(rb, &v.x, &v.y);")
+        p("    return v;")
+        p("}")
     for prop, table, cty in (("mass", "mass", "float"),
                              ("gravityScale", "gravity_scale", "float"),
                              ("drag", "linear_damping", "float"),
@@ -19011,7 +19402,7 @@ def emit_engine(plan, analyses, used_apis):
     add_budget = plan.get("addcomponent_budget") or {}
     inst_budget = plan.get("instantiate_budget") or {}
     go_spawn_budget = int(plan.get("instantiate_go_budget") or 0)
-    want_instantiate = bool(inst_budget)
+    want_instantiate = bool(inst_budget) or plan.get("go_clone_classes") is not None
     want_inst_parent = "Instantiate.parent" in used_apis
     disallow_multi = set(plan.get("disallow_multiple_types")
                          or _DISALLOW_MULTIPLE_BUILTINS)
@@ -19056,6 +19447,8 @@ def emit_engine(plan, analyses, used_apis):
     want_get_sibling = "transform.GetSiblingIndex" in used_apis
     plan["_want_get_child"] = "transform.GetChild" in used_apis
     plan["_rb_sim"] = bool("Rigidbody2D.simulated" in used_apis
+                           and plan.get("rigidbody2d"))
+    plan["_rb_com"] = bool("Rigidbody2D.worldCenterOfMass" in used_apis
                            and plan.get("rigidbody2d"))
     plan["_rt_clone"] = False
     plan["_ui_gc_maps"] = []
@@ -19216,7 +19609,8 @@ def emit_engine(plan, analyses, used_apis):
             or want_persistent_data_path or want_file_io or want_go_tables
             or want_app_open_url or plan.get("player_prefs")
             or want_str_plus or not plan.get("strict")
-            or plan.get("animators")):
+            or plan.get("animators") or plan.get("classes")):
+        # (classes: _NRE_GUARDS exit(70))
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -19233,8 +19627,9 @@ def emit_engine(plan, analyses, used_apis):
         p("#define ENGINE_MKDIR(p) mkdir((p), 0755)")
         p("#endif")
         p("#endif")
-    if not plan.get("strict"):
-        # a statement left unlowered at runtime (`_trap_tmp_writes`)
+    if not plan.get("strict") or plan.get("tmp_text_set"):
+        # a statement left unlowered at runtime (`_trap_tmp_writes`), a
+        # text nothing baked (`TMP_Text_set_text`)
         p("static void _engine_unlowered_at(const char *api, const char *path,"
           " int line) {")
         p("    fprintf(stderr, \"%s:%d: `%s` is not lowered by crust; \"")
@@ -20125,9 +20520,12 @@ def emit_engine(plan, analyses, used_apis):
         _emit_sprite_color_tables(p, plan, max(
             1, len(plan.get("go_names") or []) + go_spawn_budget))
     plan["_spr_tex_cap"] = 0
-    if "Renderer.sprite" in used_apis and plan.get("go_names"):
+    if ("Renderer.sprite" in used_apis or plan.get("tmp_text_set")) \
+            and plan.get("go_names"):
         _emit_sprite_tex_tables(p, plan, max(
             1, len(plan.get("go_names") or []) + go_spawn_budget))
+        if plan.get("tmp_text_set"):
+            p(_TMP_TEXT_SET_HEAD + ";")
     plan["_spr_off_cap"] = 0
     if "SpriteRenderer.enabled" in used_apis and plan.get("go_names"):
         cap = plan["_spr_off_cap"] = max(
@@ -20157,6 +20555,7 @@ def emit_engine(plan, analyses, used_apis):
             add_types, getcomponentsinchildren_types, p, plan, want_destroy, want_gcic,
             want_go_tables, want_ui)
 
+    _emit_iface_get_component(p, plan, used_apis, analyses)
     # GetComponentInParent<T>: the GO itself, then each ancestor.
     for tname in sorted(a.split("<", 1)[1][:-1] for a in used_apis
                         if a.startswith("GetComponentInParent<")):
@@ -20562,6 +20961,7 @@ def emit_engine(plan, analyses, used_apis):
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
+    _emit_iface_dispatch(p, plan)
     _emit_animator_runtime(p, plan)
     if plan.get("godot_custom"):
         _godot.emit_custom_dispatch(p, plan, _c_ident, want_go_tables)
@@ -20900,6 +21300,8 @@ def emit_engine(plan, analyses, used_apis):
     _lines.emit_collect(p, plan)
     _tm.emit_collect(p, plan, _multi_scene(plan))
     relayout = _emit_runtime_layout(p, plan, want_ui, want_destroy)
+    if plan.get("tmp_text_set") and plan.get("_spr_tex_cap"):
+        _emit_tmp_text_set(p, plan)
     p("int _engine_draw_nosort = 0; /* the GPU sorts (gles3_batch.h GPU_SORT) */")
     p("%s(EngineDraw *out, int max) {" % (
         "static int _engine_collect_draws_all" if plan.get("camera")
@@ -21077,7 +21479,12 @@ def _site_stops(text):
     stops = {n for n, (a, b) in defs.items()
              if n not in ("_engine_nn", "_engine_nre_ix")
              and any("exit(70)" in l for l in lines[a:b])}
-    framed = {n[:-3] for n in defs if n.endswith("__b") and n[:-3] in defs}
+    # a vector-valued call stays bare: cpprust initialises a vector from a
+    # call, not from a comma expression
+    framed = {n[:-3] for n in defs if n.endswith("__b") and n[:-3] in defs
+              and "std::vector<" not in lines[defs[n][0]]} | {
+        n for n, (a, _b) in defs.items()
+        if lines[a + 1].strip() == "/* interface dispatch */"}
 
     def col_for(cs, name):
         for part in reversed(name.split("_")):
@@ -21644,7 +22051,8 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
             text = cs2cpp.code_sub(
                 pat + r"\s*\.\s*childCount\b",
                 lambda m, e=expr: "Transform_childCount(%s)" % e, text)
-            text = _rewrite_get_child(text, pat, expr)
+            text = _rewrite_get_child(text, pat, expr, set(
+                plan.get("classes") or ()) - _RESERVED_PACKED_CLASS_NAMES)
         if ty in ("Image", "RawImage") and plan.get("_spr_color_cap"):
             text = _lower_handle_color(text, pat, expr)
         def up(e, ups):
@@ -21669,9 +22077,10 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
     return text
 
 
-def _rewrite_get_child(text, pat, expr):
-    """`h.GetChild(k)[.gameObject|.transform][.GetComponent<UiType>()]` on a
-    Transform handle: the child's GO index (a uGUI component is its GO)."""
+def _rewrite_get_child(text, pat, expr, classes=()):
+    """`h.GetChild(k)[.gameObject|.transform][.GetComponent<T>()]` on a
+    Transform handle: the child's GO index (a uGUI component is its GO), a
+    packed script class *T*'s its instance."""
     out, i = [], 0
     rx = re.compile(pat + r"\s*\.\s*GetChild\s*\(")
     tail = re.compile(
@@ -21686,10 +22095,14 @@ def _rewrite_get_child(text, pat, expr):
         args, after = parsed
         call = "Transform_GetChild(%s, (int)(%s))" % (expr, args.strip())
         t = tail.match(text, after)
-        while t and (t.group(1) is None or t.group(1) in _UI_GETCOMPONENT_TYPES):
+        # a script instance is not its GO: nothing after it folds away
+        while t and (t.group(1) is None or t.group(1) in _UI_GETCOMPONENT_TYPES
+                     or t.group(1) in classes):
             if t.group(1):
                 call = "GameObject_GetComponent_%s(%s)" % (_c_ident(t.group(1)), call)
             after = t.end()
+            if t.group(1) in classes:
+                break
             t = tail.match(text, after)
         out.append(text[i:m.start()] + call)
         i = after
@@ -21747,6 +22160,12 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
                lambda m: "{ Quaternion _q0; _q0.x = 0.f; _q0.y = 0.f; "
                "_q0.z = 0.f; _q0.w = 1.f; Transform_set_rotation(%s, _q0); }"
                % e(m.group(1)), text)
+    # `= Vector3.forward * deg`: Euler(0, 0, deg)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*=(?!=)\s*Vector3\s*\.\s*forward\s*\*"
+               r"\s*([^;]+);" % alt,
+               lambda m: "{ float _hz = (%s) * 0.00872664626f; Quaternion _qz; _qz.x = 0.f; "
+               "_qz.y = 0.f; _qz.z = sinf(_hz); _qz.w = cosf(_hz); Transform_set_rotation(%s, _qz); }"
+               % (m.group(2).strip(), e(m.group(1))), text)
     text = sub(r"(%s)\s*\.\s*rotation\s*=(?!=)\s*([^;]+);" % alt,
                lambda m: "Transform_set_rotation(%s, %s);" % (
                    e(m.group(1)), m.group(2).strip()), text)
@@ -23073,6 +23492,25 @@ def _vec_helpers_c(ctys):
         "static int _cs_vec_check_insert(int k, int n) {\n"
         "    if (k < 0 || k > n) return _cs_vec_check_index(k, n);\n"
         "    return k;\n}")
+    if "int" in seen:
+        # a packed reference array: an element of another object's row, and
+        # a `params` call's arguments gathered one by one
+        out.append(
+            "static int _cs_vec_at_int(std::vector<int> &v, int k) {\n"
+            "    if (k < 0 || k >= (int)v.size()) {\n"
+            "        fprintf(stderr, \"Unhandled exception: \"\n"
+            "                \"IndexOutOfRangeException: index %d, length %d\\n\","
+            " k, (int)v.size());\n"
+            "        fflush(stderr);\n"
+            "        abort();\n"
+            "    }\n"
+            "    return v[k];\n}\n"
+            "static std::vector<int> _cs_vec_new_int(void) {\n"
+            "    std::vector<int> v;\n"
+            "    return v;\n}\n"
+            "static std::vector<int> _cs_vec_push_int(std::vector<int> v, int x) {\n"
+            "    v.push_back(x);\n"
+            "    return v;\n}")
     return "\n".join(out) + "\n"
 
 
@@ -23461,9 +23899,22 @@ def _emit_string_storage(p, plan, cname, cl, idn):
 def _emit_ref_array_seed(p, plan, cname, cl, idn):
     """`_<Cls>_seed_refs(i)`: row i's ref arrays back to their authored refs."""
     seeds = (plan.get("ref_array_seeds") or {}).get(cname)
-    if not seeds:
+    nums = (plan.get("num_array_seeds") or {}).get(cname) or {}
+    if not seeds and not nums:
         return
-    for fname, rows in sorted(seeds.items()):
+    for fname, (cty, rows) in sorted(nums.items()):
+        flat, off = [], [0]
+        for r in rows:
+            flat += r
+            off.append(len(flat))
+        off += [len(flat)] * (max(1, int(cl.get("n") or 0)) + 1 - len(off))
+        p("static const %s _%s_%s_init[%d] = { %s };" % (
+            cty, idn, fname, max(1, len(flat)), ", ".join(
+                ("%r" % float(v)) if cty == "float" else str(int(v))
+                for v in flat) or "0"))
+        p("static const int _%s_%s_off[%d] = { %s };" % (
+            idn, fname, len(off), ", ".join(str(v) for v in off)))
+    for fname, rows in sorted((seeds or {}).items()):
         flat, off = [], [0]
         for r in rows:
             flat += r
@@ -23476,9 +23927,10 @@ def _emit_ref_array_seed(p, plan, cname, cl, idn):
             idn, fname, len(off), ", ".join(str(v) for v in off)))
     p("static void _%s_seed_refs(unsigned i) {" % idn)
     p("    int k;")
-    for fname in sorted(seeds):
+    for fname in sorted(set(seeds or ()) | set(nums)):
         p("    {")
-        p("        std::vector<int> &v = %s_%s[i];" % (idn, fname))
+        p("        std::vector<%s> &v = %s_%s[i];" % (
+            nums[fname][0] if fname in nums else "int", idn, fname))
         p("        v.clear();")
         p("        for (k = _%s_%s_off[i]; k < _%s_%s_off[i + 1]; k = k + 1)"
           % (idn, fname, idn, fname))
@@ -24765,12 +25217,31 @@ def _handle_method_calls(text, plan, holds):
                  if m.get("name") and not m.get("static")}
         if not names:
             continue
+        o = _c_ident(other)
+        ms = [m for _c, m in by.get(other, [])]
+        emitted = _reachable_emit_methods(ms, _extra_roots(plan, other))
+        # the emitter's own rule for which names carry a type suffix
+        over = _overload_method_names([m for m in ms if m["name"] in emitted
+                                       and m["name"] != "OnEnable"])
+
+        def sym(name, empty, o=o, other=other, over=over):
+            """The C symbol, or None: an overloaded name is its one instance
+            overload taking no arguments / some (Zone2D's `Gen()` beside
+            two static `Gen(..)`); anything else is left for the stub."""
+            if name not in over:
+                return "%s_%s" % (o, name)
+            inst = [m for _c, m in by.get(other, []) if m["name"] == name
+                    and not m.get("static")
+                    and bool((m.get("args") or "").strip()) != empty]
+            return (_method_c_symbol(o, name, inst[0].get("args") or "", True)
+                    if len(inst) == 1 else None)
         pat = r"(?<![\w.])(?:this\s*\.\s*)?(%s)\s*\.\s*(%s)\s*\(\s*(\)?)" % (
             re.escape(recv), "|".join(re.escape(n) for n in sorted(
                 names, key=len, reverse=True)))
         text = cs2cpp.code_sub(
-            pat, lambda m, o=_c_ident(other): "%s_%s(%s%s" % (
-                o, m.group(2), m.group(1), ")" if m.group(3) else ", "),
+            pat, lambda m: m.group(0) if sym(m.group(2), bool(m.group(3))) is None
+            else "%s(%s%s" % (sym(m.group(2), bool(m.group(3))), m.group(1),
+                              ")" if m.group(3) else ", "),
             text)
         # `other.P` an instance property: its get_P / set_P methods
         o = _c_ident(other)
@@ -24856,12 +25327,23 @@ def _getter_transform_positions(text, plan, site):
                     else "Vector2_%s(%s)" % (mm.group(1), expr))
         out += [text[pos:m.start()], expr]
         pos = after + mm.end()
-    if not out:
-        return text
-    if site is not None:
-        site.setdefault("protos", set()).add(
-            _TRANSFORM_HANDLE_PROTOS["Transform_get_position2"])
-    return "".join(out) + text[pos:]
+    if out:
+        text = "".join(out) + text[pos:]
+        if site is not None:
+            site.setdefault("protos", set()).add(
+                _TRANSFORM_HANDLE_PROTOS["Transform_get_position2"])
+    # its rotation (`Other_get_trs(o).eulerAngles = ..`): a Transform handle's
+    if plan.get("_xf_handles") and site is not None:
+        calls = set()
+        for m in re.finditer(r"(?<![\w.])(?:%s)\s*\(" % "|".join(
+                re.escape(g) for g in sorted(getters)), text):
+            got = _match_call_args(text, m.end() - 1)
+            if got and re.match(r"\s*\.\s*(?:eulerAngles|rotation)\b", text[got[1]:]):
+                calls.add(text[m.start():got[1]])
+        if calls:
+            text = _rewrite_transform_handle_trs(
+                text, [(r"(?<![\w.])" + re.escape(c), c) for c in sorted(calls)], site)
+    return text
 
 
 def _lower_own_properties(text, cl, plan, site):
@@ -25082,6 +25564,17 @@ def _handle_positions(text, plan, holds):
                 if w and re.search(r"\bposition$", m.group(1))
                 else "%s_set_pos_x(%s, %s); %s_set_pos_y(%s, %s);" % (
                     o, r, a, o, r, b)))
+        # any other value (`trs.position`): taken once, then as above
+        # ponytail: x and y only, as `new Vector2` -- a handle's position is 2D (z 0)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
+            r"(position|localPosition)\s*=(?!=)\s*([^;]+);" % rq,
+            lambda m, o=_c_ident(other), r=recv, w=world, c=ocid: (
+                "{ Vector2 _hp = (%s); %s }" % (m.group(2).strip(), (
+                    "_engine_set_world(%d, %s, _hp.x, _hp.y, 0.f);" % (c, r)
+                    if w and m.group(1) == "position"
+                    else "%s_set_pos_x(%s, _hp.x); %s_set_pos_y(%s, _hp.y);"
+                    % (o, r, o, r)))), text)
         if world:
             text = cs2cpp.code_sub(
                 r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*transform\s*\.\s*"
@@ -25129,6 +25622,18 @@ def _local_handle_fields(text, cl, plan, site):
     for oname, ocl in classes.items():
         for f, t in _static_new_fields(ocl.get("class_consts"), classes).items():
             holds[f if oname == cl.get("name") else "%s.%s" % (oname, f)] = t
+    # a singleton's `instance` (Slime Jump's `instance.moveInput = amt`),
+    # bare or already `Cls_instance`
+    singles = set(plan.get("singleton_instance_types") or ()) | {
+        n for n, ocl in classes.items() for f in ocl.get("class_consts") or ()
+        if f.get("static") and f["name"] in ("instance", "Instance")
+        and f.get("ty") == n}
+    for oname in singles & set(classes):
+        for f in ("instance", "Instance"):
+            holds["%s_%s" % (_c_ident(oname), f)] = oname
+            if oname == cl.get("name") and f not in holds:
+                holds[f] = oname
+    text = _iface_method_calls(text, plan, site)
     text = _handle_method_calls(text, plan, holds)
     text = _handle_field_access(text, plan, holds)
     text = _handle_positions(text, plan, holds)
@@ -25356,7 +25861,7 @@ def _lower_physics2d_queries(text):
     return text
 
 
-def _lower_collider_param(text, p):
+def _lower_collider_param(text, p, site=None):
     """A collision or trigger handler's parameter -- `Collision2D coll` or
     `Collider2D other`, the other collider's index here -- read for its
     GameObject: `P.gameObject` is `_col2d_go(P)`, and its `name`, `tag`,
@@ -25378,12 +25883,20 @@ def _lower_collider_param(text, p):
     text = cs2cpp.code_sub(go + r"\s*\.\s*tag\b(?!\s*=[^=])",
                            "GameObject_tag(_col2d_go(%s))" % p, text)
     text = cs2cpp.code_sub(
-        go + r"\s*\.\s*GetComponent\s*<\s*(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
-        lambda m: "GameObject_GetComponent_%s(_col2d_go(%s))" % (
-            _c_ident(m.group(1)), p), text)
+        go + r"\s*\.\s*GetComponent(InParent)?\s*<\s*(?:UnityEngine\.)?(\w+)\s*>"
+        r"\s*\(\s*\)",
+        lambda m: "GameObject_GetComponent%s_%s(_col2d_go(%s))" % (
+            m.group(1) or "", _c_ident(m.group(2)), p), text)
+    # isTrigger writes stop (_local_handle_fields): the authored flag holds
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])%s(?:\s*\.\s*collider)?\s*\.\s*isTrigger\b(?!\s*=[^=])" % q,
+        "_Collider2D_is_trigger[%s]" % p, text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])%s\s*\.\s*gameObject\s*\.\s*SetActive\s*\(" % q,
         "GameObject_SetActive(_col2d_go(%s), " % p, text)
+    if site is not None:
+        text = _rewrite_transform_handle_trs(
+            text, [(r"(?<![\w.])%s\s*\.\s*transform" % q, "_col2d_go(%s)" % p)], site)
     text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*gameObject\b" % q,
                            "_col2d_go(%s)" % p, text)
     return text
@@ -26536,6 +27049,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
+    plan["_iface_names_cur"] = set()
     # first: their warnings point into the source by offset
     body = _trap_shallow_calls(
         _drop_shader_params(body, plan, site), plan, site)
@@ -26655,7 +27169,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # (before the null comparisons: `gp == null` is the connected flag)
     text = _lower_gamepad(text)
     if collision2d_param:
-        text = _lower_collider_param(text, collision2d_param)
+        text = _lower_collider_param(text, collision2d_param,
+                                     site if plan.get("_xf_handles") else None)
     # Before `true` becomes 1: a builder's Append(true) and a bool literal
     # in a concatenation print as C# prints them.
     text = _lower_string_builders(text)
@@ -26754,6 +27269,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = _lower_go_active_reads(text, cl, site)
         if text == before:
             break
+    # an inlined helper's body is its C# text (`return (1f - t) * ..`)
+    text = _rewrite_csharp_float_literals(text)
     # Boolean.GetHashCode is 1 / 0 and Int32.GetHashCode the value itself
     # (booleans are 1 / 0 by now unless inlined above).
     for _pass in range(4):
@@ -26897,8 +27414,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     for ui_ty in sorted(_UI_GETCOMPONENT_TYPES, key=len, reverse=True):
         text = cs2cpp.code_sub(
             r"\b%s\b(?=\s+\w)" % re.escape(ui_ty), "int", text)
-    # Packed MonoBehaviour locals are instance indices.
-    for cname in sorted(plan.get("classes") or (), key=len, reverse=True):
+    # Packed MonoBehaviour locals are instance indices; an interface's, a
+    # tagged reference (_IREF_BITS).
+    for cname in sorted(set(plan.get("classes") or ()) | set(
+            plan.get("interfaces") or ()), key=len, reverse=True):
         if cname == cl.get("name"):
             continue
         text = cs2cpp.code_sub(
@@ -26987,7 +27506,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Before the calls are renamed: this class's methods by their C# names.
     for _c, _m in (plan.get("_methods_by") or {}).get(cl.get("name"), []):
         _b = (_m.get("ret") or "void").strip().split(".")[-1]
-        if _ret_c_ty(_b, plan) not in (None, "void"):
+        if _ret_c_ty(_b, plan) not in (None, "void", "Rect"):
             _rk[_m["name"]] = ("s" if _b == "string" else "b" if _b == "bool"
                                else "f" if _b in ("float", "double")
                                else "v" if _b == "Vector2" else "i")
@@ -27105,14 +27624,28 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 idn, vf, idn, vf),
             text)
     # Other classes' Vector2 fields: recv.initLocalPosition → Vector2 / sets.
+    own_pc = _packed_class(cl)
     for ocname, ocl in (plan.get("classes") or {}).items():
         if ocname == cl.get("name"):
             continue
         oidn = _c_ident(ocname)
+        def other(recv, b, o=oidn, oc=ocname):
+            """`recv` visibly not an `ocname`: it keeps its own field
+            (Player's `instance.moveInput = amt`, a float, beside
+            WorldMap's Vector2 `moveInput`)."""
+            # a class-typed local is `int b = ..` by now: a handle, any class
+            return (recv in ("this", "instance", "Instance")
+                    or re.match(r"(?!%s_)\w+_[iI]nstance$" % re.escape(o), recv)
+                    or cs2cpp._receiver_is_not(
+                        re.sub(r"(?<![\w.])int(?=\s+%s\b)" % re.escape(recv),
+                               oc, b), own_pc, recv, oc))
+
         for vf in ocl.get("vec2_fields") or []:
+            b = text
             text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\s*=\s*(.+?)\s*;" % re.escape(vf),
-                lambda m, o=oidn, f=vf: (
+                lambda m, o=oidn, f=vf, b=b: m.group(0) if other(
+                    m.group(1), b) else (
                     "{ Vector2 _v2 = (%s); %s_set_%s_x(%s, _v2.x); "
                     "%s_set_%s_y(%s, _v2.y); }"
                     % (m.group(2), o, f, m.group(1), o, f, m.group(1))),
@@ -27121,26 +27654,71 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\s*\.\s*transform\s*\.\s*localPosition\s*=\s*"
                 r"(?<![_\w])\1\s*\.\s*%s\s*;" % re.escape(vf),
-                lambda m, o=oidn, f=vf: (
+                lambda m, o=oidn, f=vf, b=b: m.group(0) if other(
+                    m.group(1), b) else (
                     "%s_set_pos_x(%s, %s_get_%s_x(%s)); "
                     "%s_set_pos_y(%s, %s_get_%s_y(%s));"
                     % (o, m.group(1), o, f, m.group(1),
                        o, m.group(1), o, f, m.group(1))),
                 text)
-            text = cs2cpp.code_sub(
-                r"(?<![_\w])(\w+)\.%s\.x\b" % re.escape(vf),
-                r"%s_get_%s_x(\1)" % (oidn, vf),
-                text)
-            text = cs2cpp.code_sub(
-                r"(?<![_\w])(\w+)\.%s\.y\b" % re.escape(vf),
-                r"%s_get_%s_y(\1)" % (oidn, vf),
-                text)
+            for ax in "xy":
+                text = cs2cpp.code_sub(
+                    r"(?<![_\w])(\w+)\.%s\.%s\b" % (re.escape(vf), ax),
+                    lambda m, o=oidn, f=vf, b=b, ax=ax: m.group(0) if other(
+                        m.group(1), b) else "%s_get_%s_%s(%s)" % (
+                        o, f, ax, m.group(1)),
+                    text)
             text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\b(?!\s*\.)" % re.escape(vf),
-                lambda m, o=oidn, f=vf: (
+                lambda m, o=oidn, f=vf, b=b: m.group(0) if other(
+                    m.group(1), b) else (
                     "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
                     % (o, f, m.group(1), o, f, m.group(1))),
                 text)
+        # another object's Rect field, read whole (`piece.worldBoundsRect`,
+        # `Cam_Instance().viewRect`); its members are the Rect getter's
+        onames = {n for n, _t, _b, _k in ocl.get("members") or []}
+        for rf in [f["name"] for f in ocl.get("fields") or []
+                   if f.get("ty") == "Rect" and not f.get("static")
+                   and f["name"] + "_x" in onames]:
+            b = text
+            text = cs2cpp.code_sub(
+                r"(?<![_\w.])(\w+)\s*\.\s*%s\b(?!\s*[-+*/]?=(?!=))"
+                % re.escape(rf),
+                lambda m, o=oidn, f=rf, b=b: m.group(0) if other(
+                    m.group(1), b) else "%s_get_%s(%s)" % (o, f, m.group(1)),
+                text)
+            text = cs2cpp.code_sub(
+                r"(?<![_\w.])%s_(?:AT\(((?:[^()]|\([^()]*\))*)\)|(Instance\(\)))"
+                r"\s*\.\s*%s\b(?!\s*[-+*/]?=(?!=))" % (oidn, re.escape(rf)),
+                lambda m, o=oidn, f=rf: "%s_get_%s(%s)" % (
+                    o, f, m.group(1) if m.group(1) is not None
+                    else "%s_Instance()" % o), text)
+        # another object's reference array (`piece.near.Length`,
+        # `piece.near[k]`): its row of the class's vector table
+        for af in [f["name"] for f in ocl.get("ref_array_fields") or []]:
+            b = text
+            row = lambda m, o=oidn, f=af, b=b: None if m.group(1) and other(
+                m.group(1), b) else "%s_%s[%s]" % (o, f, m.group(
+                    1) or m.group(2) or "%s_Instance()" % o)
+            pat = (r"(?<![_\w.])(?:(\w+)|%s_(?:AT\(((?:[^()]|\([^()]*\))*)\)"
+                   r"|Instance\(\)))\s*\.\s*%s" % (oidn, re.escape(af)))
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*Length\b", lambda m: m.group(0) if row(
+                    m) is None else "(int)%s.size()" % row(m), text)
+            text = _index_through(text, pat, row, "_cs_vec_at_int")
+        # another object's List (`clone.fragments`): its row of the class's
+        # table, `.ToArray()` a copy of it, `.Count` its size
+        for lf in [f["name"] for f in ocl.get("list_fields") or []
+                   if _list_elem_name(f.get("ty") or "")]:
+            b = text
+            text = cs2cpp.code_sub(
+                r"(?<![_\w.])(\w+)\s*\.\s*%s\b"
+                r"(\s*\.\s*ToArray\s*\(\s*\)|\s*\.\s*Count\b)?(?!\s*[(\[])"
+                % re.escape(lf),
+                lambda m, o=oidn, f=lf, b=b: m.group(0) if other(
+                    m.group(1), b) else ("(int)%s_%s[%s].size()" if "Count" in (m.group(2) or "")
+                                         else "%s_%s[%s]") % (o, f, m.group(1)), text)
     # new Rect(x, y, w, h) → the engine's value-type constructor.
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Rect\s*\(\s*\)", "Rect_make(0, 0, 0, 0)", text)
@@ -27302,7 +27880,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if m.get("name") and not m.get("static"):
             this_methods.add(m["name"])
             this_method_list.append(m)
-    overloaded = _overload_method_names(this_method_list)
+    # static siblings count (Zone2D's `Gen()` beside two static `Gen(..)`):
+    # the emitter suffixes the name, and `Gen(collider)` is not `Gen()`
+    overloaded = _overload_method_names(this_method_list + [
+        m for _c, m in (plan.get("_methods_by") or {}).get(
+            cl.get("name") or "", []) if m.get("static")])
     for mname in sorted(this_methods, key=len, reverse=True):
         if mname in _UNITY_EMIT_MESSAGES:
             # Awake/Start/Update are called from the tick loop, not inlined.
@@ -27315,23 +27897,21 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                     cands, idn, "i", True, string_idents)
             continue
         sym = "%s_%s" % (idn, mname)
-        params = []
+        params, margs = [], ""
         for tm in this_method_list:
             if tm.get("name") == mname:
-                params = cs2cpp.parse_params(tm.get("args") or "")
+                margs = tm.get("args") or ""
+                params = cs2cpp.parse_params(margs)
                 break
 
-        def _inst_call(m, s=sym, params=params):
-            args = (m.group(1) or "").strip()
-            args = _call_with_defaults(args, params).strip()
+        def _inst_call(args, s=sym, params=params, margs=margs, b=text):
+            args = _call_with_defaults(args.strip(), params).strip()
+            args = _gather_params_args(args, margs, b)
             if not args:
                 return "%s(i)" % s
             return "%s(i, %s)" % (s, args)
 
-        text = cs2cpp.code_sub(
-            r"(?<![\w.])%s\s*\(\s*([^)]*)\s*\)" % re.escape(mname),
-            _inst_call,
-            text)
+        text = _sub_calls(text, mname, _inst_call)
     text = _rewrite_singleton_method_calls(text, plan, cl, site, string_idents)
     # A `_set_(` another rewrite left open at the end of its line.
     fixed = []
@@ -27368,6 +27948,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                               _string_store_names(plan) | string_arrays | _sl,
                               arrays=string_arrays | _sl)
     text = _lower_bounds(text, plan, site)
+    text = _lower_rect_values(text, (site or {}).get("args") or "")
+    text = _lower_ref_array_values(text, plan, (site or {}).get("args") or "")
     # Vector2 operators (a + b, v * s, -v, v += w, ==) as the engine's
     # component-wise helpers: C has no operators on the struct.
     text = _vec.lower_vector2_ops(
@@ -27381,17 +27963,330 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
     text = _drop_empty_instance_lists(text, plan)
     text = _lower_handle_enabled(text, plan)
+    text = _null_handle_setters(text, plan)
     return _late_call_members(text, plan)
 
 
+def _lower_rect_values(text, params=""):
+    """A `Rect` local or parameter's C# properties, on the engine's struct:
+    `r.center|size = v` through its setter (`+=` too), `r.xMin` .. and
+    `r.center|size|min|max` its helpers', `r.Contains(p)` Rect_Contains.
+    `r.x|y|width|height` are struct fields in both languages."""
+    names = set(re.findall(r"(?<![\w.])Rect\s+(\w+)\s*[,)=;]",
+                           params + "\n" + cs2cpp._blank(text)))
+    for n in sorted(names, key=len, reverse=True):
+        r = r"(?<![\w.])%s\s*\.\s*" % re.escape(n)
+        text = cs2cpp.code_sub(
+            r + r"(center|size)\s*([-+*/])=\s*([^;]+);",
+            lambda m, n=n: "Rect_set_%s(&%s, Rect_%s(%s) %s (%s));" % (
+                m.group(1), n, m.group(1), n, m.group(2), m.group(3)), text)
+        text = cs2cpp.code_sub(
+            r + r"(center|size)\s*=(?!=)\s*([^;]+);",
+            lambda m, n=n: "Rect_set_%s(&%s, %s);" % (m.group(1), n, m.group(2)),
+            text)
+        text = cs2cpp.code_sub(
+            r + r"(center|size|min|max|xMin|xMax|yMin|yMax)\b",
+            lambda m, n=n: "Rect_%s(%s)" % (m.group(1), n), text)
+        text = cs2cpp.code_sub(
+            r + r"(Contains|Overlaps)\s*\(",
+            lambda m, n=n: "Rect_%s(%s, " % (m.group(1), n), text)
+    return text
+
+
+def _index_through(text, pat, vec, fn):
+    """`<pat>[k]` as `fn(vec(m), k)`, the brackets matched; a match
+    `vec` gives None for is left as written."""
+    out, pos = [], 0
+    for m in re.finditer(pat + r"\s*\[", cs2cpp._blank(text)):
+        v = vec(re.match(pat, text[m.start():]))
+        if v is None or m.start() < pos:
+            continue
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"[": 1, "]": -1}.get(text[j], 0)
+            j += 1
+        if depth:
+            break
+        out.append(text[pos:m.start()] + "%s(%s, %s)" % (
+            fn, v, _index_through(text[m.end():j - 1], pat, vec, fn)))
+        pos = j
+    return "".join(out) + text[pos:]
+
+
+def _lower_ref_array_values(text, plan, params=""):
+    """`Cls[]` locals and parameters of a packed class, as the vector of
+    indices a reference array field already is: `.Length` its size,
+    `list.ToArray()` and `new List<Cls>(xs)` copies (cpprust copies a
+    vector on initialisation)."""
+    classes = plan.get("classes") or {}
+    scan = "(%s)\n%s" % (params, cs2cpp._blank(text))
+    names = {n for t, n in re.findall(
+        r"(?<![\w.])(?:params\s+)?(\w+)\s*\[\s*\]\s+(\w+)\s*[,)=;]", scan)
+        if t in classes}
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(\w+)\s*\[\s*\]\s+(?=(\w+)\s*[=;])",
+        lambda m: "std::vector<int> " if m.group(1) in classes
+        and m.group(2) in names else m.group(0), text)
+    # any vector's `.Length` is an array's (a List has Count): a number
+    # array field's alias too
+    for n in sorted(names | set(re.findall(
+            r"std::vector<[\w:]+>\s*&?\s*(\w+)\s*[;=]", cs2cpp._blank(text))),
+            key=len, reverse=True):
+        text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*Length\b" % re.escape(n),
+                               "(int)%s.size()" % n, text)
+    vecs = set(re.findall(r"std::vector<int>\s*&?\s*(\w+)\s*[;=]",
+                          cs2cpp._blank(text))) | names
+    if not vecs:
+        return text
+    alt = "|".join(map(re.escape, sorted(vecs, key=len, reverse=True)))
+    text = cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*ToArray\s*\(\s*\)" % alt,
+                           r"\1", text)
+    return cs2cpp.code_sub(
+        r"=\s*new\s+std::vector<int>\s*\(\s*(%s)\s*\)\s*;" % alt,
+        r"= \1;", text)
+
+
+def _null_handle_setters(text, plan):
+    """`Cls_set_f(r, null)` of a handle field (an index), and a handle
+    list's `v.push_back(null)` / `v[k] = null`, as `-1`, the packed model's
+    null; `== null` is `_lower_null_compares`'."""
+    text = _null_handle_args(text, plan)
+    if not re.search(r"\bnull\b", text):
+        return text
+    for v in set(re.findall(r"std::vector<int>\s*&?\s*(\w+)\s*[;=]",
+                            cs2cpp._blank(text))):
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(%s\s*(?:\.\s*push_back\s*\(|\[[^\]]*\]\s*=(?!=)))"
+            r"\s*null\b" % re.escape(v), r"\1-1", text)
+    names = plan.get("_null_set_names")
+    if names is None:
+        names = plan["_null_set_names"] = sorted(
+            {"%s_set_%s" % (_c_ident(cn), n)
+             for cn, c in (plan.get("classes") or {}).items()
+             for n, _t, _b, k in c.get("members") or []
+             if k == "go" or str(k).startswith("idx:")}, key=len, reverse=True)
+    if not names:
+        return text
+    return cs2cpp.code_sub(
+        r"\b(%s)(\((?:[^()]|\([^()]*\))*?,\s*)null(\s*\))"
+        % "|".join(map(re.escape, names)), r"\1\2-1\3", text)
+
+
+def _null_handle_args(text, plan):
+    """`Cls_M(i, a, null)`: a packed method's `null` argument where its
+    parameter is a handle (a class or interface: `int`) is `-1`. An
+    interface parameter takes only an interface-typed name (or null): any
+    other argument is `To<IFace>(..)`, which stubs the method rather than
+    pass a bare instance index as a tagged reference."""
+    slots = plan.get("_null_arg_slots")
+    ifaces = plan.get("interfaces") or {}
+    if slots is None:
+        slots = plan["_null_arg_slots"] = {}
+
+        def add(sym, args_str, skip):
+            got = {skip + k: (p_.type.split(".")[-1]
+                              if p_.type.split(".")[-1] in ifaces else None)
+                   for k, p_ in enumerate(cs2cpp.parse_params(args_str))
+                   if _param_c_ty(p_.type) == "int"
+                   and p_.type.split(".")[-1] not in _PRIMITIVE_PARAM_TYPES}
+            if got:
+                slots[sym] = got
+        for cname, pairs in (plan.get("_methods_by") or {}).items():
+            idn = _c_ident(cname)
+            for _c, m in pairs:
+                for ov in (False, True):
+                    add(_method_c_symbol(idn, m["name"], m.get("args") or "", ov),
+                        m.get("args") or "", 0 if m.get("static") else 1)
+        for iface, decl in ifaces.items():
+            for m in decl.get("methods") or []:
+                add(_iface_dispatch_sym(iface, m["name"]), m.get("args") or "", 1)
+    if not slots:
+        return text
+    names = plan.get("_iface_names_cur") or set()
+
+    def arg(k, a, slot):
+        a = a.strip()
+        if k not in slot:
+            return a
+        if a == "null":
+            return "-1"
+        if slot[k] is None or a == "-1" or a in names:
+            return a
+        return "To%s(%s)" % (slot[k], a)
+    pat = re.compile(r"(?<![\w.])(%s)\s*\(" % "|".join(
+        map(re.escape, sorted(slots, key=len, reverse=True))))
+    pos, scan = 0, cs2cpp._blank(text)
+    while True:
+        m = pat.search(scan, pos)
+        if not m:
+            return text
+        end = cs2cpp._match_paren_or_bracket(scan, m.end() - 1)
+        if end is None:
+            return text
+        args = cs2cpp.split_call_args(text[m.end():end])
+        new = [arg(k, a, slots[m.group(1)]) for k, a in enumerate(args)]
+        if new != [a.strip() for a in args]:
+            inner = ", ".join(new)
+            text = text[:m.end()] + inner + text[end:]
+            scan = cs2cpp._blank(text)
+            end = m.end() + len(inner)
+        pos = m.end()
+
+
 _TMP_TYPES = {"TMP_Text", "TextMeshProUGUI", "TextMeshPro"}
+
+
+_TMP_TEXT_SET = re.compile(
+    r'(?<![\w.])(?:this\s*\.\s*)?(\w+)\s*\.\s*text\s*=(?!=)\s*'
+    r'(\w+|"(?:[^"\\\n]|\\.)*")\s*;')
+
+
+def _tmp_text_sets(text, cl):
+    """The `f.text = v;` statements in *text* the engine runs
+    (TMP_Text_set_text): *f* an own TMP field, *v* an own string field, a
+    literal or null. [(match, string field or None, literal or None)]"""
+    tmps = {f["name"] for f in cl.get("fields") or [] if not f.get("static")
+            and (f.get("ty") or "").split(".")[-1] in _TMP_TYPES}
+    strs = {f["name"] for f in cl.get("string_fields") or []}
+    out = []
+    for m in _TMP_TEXT_SET.finditer(text):
+        v = m.group(2)
+        if m.group(1) not in tmps:
+            continue
+        if v == "null" or v[0] == '"':
+            out.append((m, None, "" if v == "null" else _yaml_scalar_text(v)))
+        elif v in strs:
+            out.append((m, v, None))
+    return out
+
+
+def _tmp_text_variants(plan, analyses):
+    """Bake each text a `f.text = v;` (_tmp_text_sets) can give its TMP:
+    an own string field's authored value per instance, or the literal.
+    ``plan["tmp_texts"]`` = [(GO, text, texture)]; setting any other text
+    stops the player (TMP_Text_set_text). A TMP authored empty gets the
+    draw row _bake_ui_images kept aside for it.
+
+    ponytail: a text whose bake overflows its rect differently from the
+    row's draws at the row's size, so it is left out (stops if set)."""
+    refs = plan.get("go_field_refs") or {}
+    want = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            cl = plan["classes"].get(c["name"])
+            if not cl:
+                continue
+            vals = {f["name"]: f["values"]
+                    for f in cl.get("string_fields") or []}
+            for meth in c.get("methods") or []:
+                for m, name, lit in _tmp_text_sets(meth.get("body") or "", cl):
+                    plan["tmp_text_set"] = True
+                    for k, go in enumerate(refs.get((c["name"], m.group(1)))
+                                           or []):
+                        if go >= 0:
+                            want.setdefault(go, set()).add(
+                                lit if name is None else vals[name][k])
+    by_go = {int(o["go_index"]): o for cl in plan["classes"].values()
+             for o in cl.get("instances") or []
+             if o.get("go_index") is not None
+             and (o.get("ui_tmp") or {}).get("bake")}
+    texs, rows, empty = plan["textures"], [], []
+
+    def add(rgba, w, h, text):
+        texs.append({"guid": "tmptext:%d" % len(texs), "file_id": 0,
+                     "path": "<tmp:%s>" % text, "w": w, "h": h,
+                     "rgba": rgba, "ppu": 100.0})
+        return len(texs) - 1
+    for go in sorted(want):
+        o = by_go.get(go)
+        tmp = (o or {}).get("ui_tmp") or {}
+        if o is not None and not o.get("sprite") and tmp.get("empty_sprite"):
+            o["sprite"] = tmp.pop("empty_sprite")
+            if not empty:
+                empty.append(add(o["sprite"]["tex_rgba"], 1, 1, ""))
+            o["sprite"]["tex_id"] = empty[0]
+        sp = (o or {}).get("sprite")
+        if not sp or sp.get("source") != "ui_tmp" or "tex_id" not in sp:
+            sys.stderr.write(
+                "unity_pack: warning: TMP text on GameObject %d is set by a "
+                "script but cannot be baked (no loadable font asset or "
+                "canvas); setting it stops the player\n" % go)
+            continue
+        b = tmp["bake"]
+        for t in sorted(want[go]):
+            if t == (tmp.get("text") or ""):
+                rows.append((go, t, int(sp["tex_id"])))
+                continue
+            if not t:
+                if not empty:
+                    empty.append(add(bytes(4), 1, 1, ""))
+                rows.append((go, t, empty[0]))
+                continue
+            w, h, rgba, sx, sy = _bake_tmp(tmp, t)
+            bw, bh = abs(b["box_w"]), abs(b["box_h"])
+            if max(abs(w - float(sp.get("draw_sx", 1.0)) * bw),
+                   abs(h - float(sp.get("draw_sy", 1.0)) * bh),
+                   abs(sx - float(sp.get("shift_fx", 0.0)) * bw),
+                   abs(sy - float(sp.get("shift_fy", 0.0)) * bh)) > 1.5:
+                continue
+            rows.append((go, t, add(rgba, w, h, t)))
+    plan["tmp_texts"] = rows
+
+
+_TMP_TEXT_SET_HEAD = ("static void TMP_Text_set_text(int go, const char *s,"
+                      " const char *cls, const char *method,"
+                      " const char *path, int line)")
+
+
+_TMP_TEXT_SET_HEAD = ("static void TMP_Text_set_text(int go, const char *s,"
+                      " const char *cls, const char *method,"
+                      " const char *path, int line)")
+
+
+def _emit_tmp_text_set(p, plan):
+    """`f.text = v;` (_tmp_text_sets): the GO draws the texture baked for
+    *s* (_tmp_text_variants); a text not baked for it stops the player."""
+    rows = plan.get("tmp_texts") or []
+    p(_TMP_TEXT_SET_HEAD + " {")
+    if rows:
+        p("    static const int _go[%d] = { %s };" % (
+            len(rows), ", ".join(str(g) for g, _t, _x in rows)))
+        p("    static const char *const _s[%d] = { %s };" % (
+            len(rows), ", ".join(_c_string(t) for _g, t, _x in rows)))
+        p("    static const int _tex[%d] = { %s };" % (
+            len(rows), ", ".join(str(x) for _g, _t, x in rows)))
+        p("    int k;")
+    p("    (void)_engine_nn(go, cls, method, path, line, 0);")
+    if rows:
+        p("    for (k = 0; k < %d; k = k + 1)" % len(rows))
+        p("        if (_go[k] == go && strcmp(_s[k], s ? s : \"\") == 0) {")
+        p("            Renderer_set_sprite(go, _tex[k]);")
+        p("            return;")
+        p("        }")
+    p("    _engine_unlowered_at(\"TMP_Text.text\", path, line);")
+    p("}")
 
 
 def _trap_tmp_writes(body, plan, site):
     """`f.text = ..;` / `f.color = ..;` on a TMP field: TMP text is baked at
     pack time, so the statement stops the player with its C# line when it
     runs, instead of emptying the whole method around it. A CS8000 warning
-    names it at pack time; under strict it is left for the stub to refuse."""
+    names it at pack time; under strict it is left for the stub to refuse.
+    A `.text =` _tmp_text_sets finds swaps to a text baked for it."""
+    cl = (plan.get("classes") or {}).get((site or {}).get("class"))
+    if plan.get("tmp_text_set") and cl and site:
+        ft = site.get("file_text") or ""
+        at = int(site.get("body_abs") or 0)
+        for m, _n, _l in reversed(_tmp_text_sets(body, cl)):
+            line = ft.count("\n", 0, _body_src_off(
+                ft, at, body, m.start())) + 1 if ft else 0
+            body = body[:m.start()] + (
+                "TMP_Text_set_text(%s, %s, %s, %s, %s, %d);" % (
+                    m.group(1), '""' if m.group(2) == "null" else m.group(2),
+                    _c_string(site["class"]),
+                    _c_string(site.get("method") or "?"),
+                    _c_string(site.get("path") or "<cs>"), line)
+            ) + body[m.end():]
     if plan.get("strict") or not site:
         return body
     names = {f["name"] for c in (plan.get("classes") or {}).values()
@@ -27486,6 +28381,49 @@ def _trap_shallow_calls(body, plan, site):
                            _c_string(api), _c_string(path), ln,
                            "\n" * body.count("\n", m.start(), m.end())))
             last = m.end()
+        body = "".join(out) + body[last:]
+        # a plain statement reading a field it does not store (`fw.waypoints[k].trs`)
+        # (a List of a struct is a vector of ints: its elements' fields are not kept)
+        ocl = (plan.get("classes") or {}).get(cname)
+        if not ocl:
+            continue
+        try:
+            with open(ocl.get("script_path") or "", encoding="utf-8", errors="replace") as f:
+                osrc = cs2cpp._blank(f.read())
+        except OSError:
+            osrc = ""
+        unstored = _unstored_field_names(ocl, plan) | {
+            f["name"] for f in ocl.get("list_fields") or []
+            if re.search(r"\bstruct\s+%s\b" % re.escape(
+                (_list_elem_name(f.get("ty") or "") or "?").split(".")[-1]), osrc)}
+        if not unstored:
+            continue
+        fpat = re.compile(r"(?<![\w.])(?:this\s*\.\s*)?(?P<r>%s)\s*\.\s*(?P<m>%s)\b" % (
+            "|".join(recvs), "|".join(re.escape(f) for f in sorted(unstored))))
+        scan = cs2cpp._blank(body)
+        out, last = [], 0
+        for m in fpat.finditer(scan):
+            s = max(scan.rfind(c, 0, m.start()) for c in ";{}") + 1
+            e = scan.find(";", m.end())
+            stmt = scan[s:e]
+            if (s < last or e < 0 or stmt.count("(") != stmt.count(")")
+                    or re.match(r"\s*(?:for|foreach|while|if|else|return)\b", stmt)):
+                continue
+            off = _body_src_off(ft, at, body, m.start("r"))
+            ln = ft.count("\n", 0, off) + 1
+            col = off - (ft.rfind("\n", 0, off) + 1) + 1
+            api = "%s.%s" % (cname, m.group("m"))
+            sys.stderr.write(_cs_diag(
+                path, ft, off, "CS8000",
+                "`%s` is not lowered (crust packs no %s methods, nor that field); "
+                "the statement stops the player if it runs" % (api, cname),
+                kind="warning") + "\n")
+            lead = len(stmt) - len(stmt.lstrip())
+            out.append(body[last:s + lead])
+            out.append("{ if (%s == null) __nre(%d, %d); _engine_unlowered_at(%s, %s, %d); }%s" % (
+                body[m.start("r"):m.end("r")], ln, col, _c_string(api), _c_string(path), ln,
+                "\n" * body.count("\n", s + lead, e + 1)))
+            last = e + 1
         body = "".join(out) + body[last:]
     return body
 
@@ -27591,6 +28529,11 @@ def _late_call_members(text, plan):
         def parts(call):
             k = call.index("(")
             return call[:k], call[k + 1:call.rindex(")")]
+        # an inlined helper's bound argument: `(Cls_get_r(o)).xMin`
+        text = cs2cpp.code_sub(
+            r"\(\s*((?:%s)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))\s*\)"
+            r"(?=\s*\.)" % "|".join(map(re.escape, sorted(rects))),
+            r"\1", text)
         text = _call_suffix_sub(
             text, rects, r"\s*\.\s*(center|size)\s*=(?!=)",
             lambda call, mm: "{ Rect _rf = %s; Rect_set_%s(&_rf, \x01%s(%s, _rf); }\x02" % (
@@ -27609,8 +28552,12 @@ def _late_call_members(text, plan):
             lambda call, mm: "%s_%s(%s)" % (parts(call)[0], mm.group(1),
                                             parts(call)[1]))
         text = _call_suffix_sub(
-            text, rects, r"\s*\.\s*(center|size|min|max)\b(?!\s*=(?!=))",
+            text, rects, r"\s*\.\s*(center|size|min|max|xMin|xMax|yMin|yMax)"
+            r"\b(?!\s*=(?!=))",
             lambda call, mm: "Rect_%s(%s)" % (mm.group(1), call))
+        text = _call_suffix_sub(
+            text, rects, r"\s*\.\s*(Contains|Overlaps)\s*\(",
+            lambda call, mm: "Rect_%s(%s, " % (mm.group(1), call))
         text = _rewrite_vector2_value_axis(text)
     if plan.get("_spr_tex_cap") and ".sprite" in text:
         # `r.sprite = s;` / `r.sprite` of an Image / SpriteRenderer field
@@ -28604,11 +29551,11 @@ def emit_data(plan, used_apis=None):
                 os.path.basename(tex["path"]), tex["w"], tex["h"]))
             p("const unsigned char _engine_tex%d_rgba[%d] = {" % (
                 ti, len(rgba)))
-            for i in range(0, len(rgba), 16):
-                chunk = rgba[i:i + 16]
-                p("    %s%s" % (
-                    ", ".join(str(b) for b in chunk),
-                    "," if i + 16 < len(rgba) else ""))
+            # one string per texture: a line object per 16 bytes held
+            # ~1 GB for Slime Jump's 120 textures
+            if rgba:
+                p(",\n".join("    " + ", ".join(map(str, rgba[i:i + 16]))
+                             for i in range(0, len(rgba), 16)))
             p("};")
     p("")
     for cname, cl in sorted(plan["classes"].items()):
@@ -28741,7 +29688,12 @@ def emit_data(plan, used_apis=None):
             p("    { %s }, /* addcomponent spare */" % (", ".join(parts)))
         p("};")
         p("")
-    return "\n".join(lines) + "\n"
+    p("")
+    out = "\n".join(lines)
+    # (a serialized `damage: Infinity`, through _init_num)
+    if re.search(r"\b(?:INFINITY|NAN)\b", out):
+        out = out.replace("#include <stdint.h>\n", "#include <stdint.h>\n#include <math.h>\n", 1)
+    return out
 
 
 def _rb_field_init_index(plan, o, fname, kind):
@@ -28773,7 +29725,12 @@ def _init_num(v, kind):
     if kind == "f16":
         return "%du" % _f16_bits(float(v))
     if kind == "f32":
-        return "%sf" % (repr(float(v)))
+        f = float(v)
+        if f != f:
+            return "NAN"
+        if f in (float("inf"), float("-inf")):
+            return "INFINITY" if f > 0 else "(-INFINITY)"
+        return "%sf" % (repr(f))
     return str(int(v))
 
 
@@ -28973,10 +29930,11 @@ def _embedded_values(block):
         sub = re.sub(r"(?m)^  ", "", fm.group(2))
         v = {"fields": {}, "str_fields": {}, "object_refs": {},
              "vec2_fields": {}}
-        for m in re.finditer(r"(?m)^  (\w+):[ \t]*(.*?)[ \t]*$", sub):
-            key, raw = m.group(1), m.group(2)
-            if re.fullmatch(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", raw):
-                v["fields"][key] = (float(raw) if re.search(r"[.eE]", raw)
+        for m in re.finditer(r"(?m)^  (\w+):[ \t]*(.*?)[ \t]*$"
+                             + _YAML_FLOW_MORE, sub):
+            key, raw = m.group(1), _yaml_flow_join(m.group(2), m.group(3))
+            if re.fullmatch(_YAML_NUM, raw):
+                v["fields"][key] = (float(raw) if re.search(r"[.eEIN]", raw)
                                     else int(raw))
             ref = re.fullmatch(r"\{fileID:\s*(-?\d+)\}", raw)
             if ref and ref.group(1) != "0":
@@ -29237,11 +30195,13 @@ def _load_scenes_lights_cameras(root, assets):
     _mark_hierarchy_live(objects, hierarchy)
     _apply_camera_script_view_to_cameras(cameras, objects)
     sw, sh = _ui_layout_screen(root, objects)
+    _ui_mark_canvas_units(root, objects)
     _apply_layout_groups(objects, sw, sh)
     _apply_slider_visuals(objects)
     _apply_scrollbar_visuals(objects)
     _bake_ui_images(
-        objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy)
+        objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy,
+        pixel_scale=_ui_bake_pixel_scale(root, objects))
     # Snapshot rect onto hierarchy before dropping layout-only scaffolds so
     # live RT / GO parent chains still see Canvas / plain Rect parents.
     _snapshot_ui_rects_onto_hierarchy(objects, hierarchy)
@@ -29951,7 +30911,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 13
+_SCENE_CACHE_VERSION = 20
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -30268,10 +31228,11 @@ def _write_if_different(path, text):
 
 def _cpp_twin(c_text):
     """C emit → C++-subset twin header for cpprust (same as pack())."""
-    body = (c_text.split("\n", 1)[1] if c_text.startswith("/*") else c_text)
-    return (
-        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
-        + body)
+    head = "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+    if not c_text.startswith("/*"):
+        return head + c_text
+    # one copy: data.c is ~600 MB, and a split then a concat made two
+    return c_text.replace(c_text[:c_text.index("\n") + 1], head, 1)
 
 
 def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
@@ -30536,6 +31497,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         plan["godot"] = _godot.physics_settings(root)
     else:
         plan["unity_physics"] = unity_physics_settings(root)
+        plan["physics2d_queries_hit_triggers"] = plan["unity_physics"][
+            "queries_hit_triggers"]
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
     else:
@@ -30588,6 +31551,11 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
                     _tc["max_instances"] = int(_tc["n"]) + _PREFAB_SPAWN_POOL
             # ponytail: at most _GO_CLONE_POOL live clones of a child; the
             # next Instantiate stops the program -- raise it, or [MaxInstances]
+            # (a child with no packed script stops it too: GameObject_Instantiate)
+            if re.search(r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*\(\s*"
+                         r"(?:this\s*\.\s*)?\w+\s*\.\s*GetChild\s*\(", cs2cpp._blank(
+                             "\n".join(m.get("body") or "" for m in c.get("methods") or []))):
+                plan.setdefault("go_clone_classes", set())
             for _t in _child_clone_classes(c, plan):
                 plan.setdefault("go_clone_classes", set()).add(_t)
                 _tc = plan["classes"][_t]
@@ -30797,6 +31765,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     plan["audiosource_by_file_id"] = as_by_fid
     plan["audioclip_guids"] = clip_guids
     _resolve_go_field_refs(plan)
+    _tmp_text_variants(plan, analyses)
     _attach_transform_parents(plan)
     if plan.get("godot_spawn"):
         # a clone is added under a node at runtime (AddChild)
@@ -30867,7 +31836,13 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
             and "#include <math.h>" not in engine:
         k = engine.index("#include <stdint.h>\n") + len("#include <stdint.h>\n")
         engine = engine[:k] + "#include <math.h>\n" + engine[k:]
-    vec_types = plan.pop("_vec_helper_types", None)
+    # only the types a call survived for: a body that recorded one and was
+    # then stubbed (Slime Jump's `List<Vector3Int>`) may leave the type
+    # itself undeclared
+    vec_types = [t for t in (plan.pop("_vec_helper_types", None) or set())
+                 | {"int"}
+                 if re.search(r"\b_cs_vec_(?:index|remove|at|new)_%s\(" % re.escape(
+                     _vec_helper_suffix(t)), engine)]
     if vec_types:
         helpers_c += _vec_helpers_c(vec_types)
     json_protos, json_defs = [], []

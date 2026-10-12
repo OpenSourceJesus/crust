@@ -7258,6 +7258,18 @@ def _copy_source(expr, ctype, scopes, type_info):
     """
     found = _named_object(expr, scopes, type_info)
     if found is None:
+        # `T b = r;` from a `T &r` local, which is a pointer by now: a `T *`
+        # cannot initialise a `T` (unless a constructor takes one), so the
+        # name is the referenced object
+        nm = (expr or "").strip()
+        one = ((type_info.get(ctype) or {}).get("ctors") or {}).get(1)
+        if one and "*" in str(one.get("params") or ""):
+            return None
+        for fr in reversed(scopes):
+            if nm in fr.vals:
+                return None
+            if fr.ptrvals.get(nm) == ctype:
+                return "(*%s)" % nm
         return None
     out, cls = found
     return out if cls == ctype else None
@@ -8849,6 +8861,14 @@ def _construct_byval_args(text, byval, cinfo, path):
     if not byval:
         return text
     n = [0]
+    rets = _free_class_returns(_strip_comments(text), cinfo)
+
+    def temporary(arg, cls):
+        # `sink(mk())`: a call returning the class by value is already a
+        # constructed temporary, handed over as `std::move` would be
+        m = re.match(r"(\w+)\s*\(", arg)
+        return (m is not None and rets.get(m.group(1)) == (cls, False)
+                and _match_paren(arg, m.end() - 1) == len(arg) - 1)
 
     def one(mtext, fname):
         close = _match_paren(text, mtext.end() - 1)
@@ -8875,7 +8895,7 @@ def _construct_byval_args(text, byval, cinfo, path):
                 continue
             cls = slots[idx][0]
             info = cinfo.get(cls)
-            if info is None:
+            if info is None or temporary(arg, cls):
                 outp.append(part)
                 continue
             if not info["copy"]:
@@ -10086,6 +10106,10 @@ def _defers_to_nested(raw, scopes, lookup):
     loop would run out its iterations with no `&` inserted at all.
     """
     for mm in _NESTED_CHAIN.finditer(raw):
+        if lookup(scopes, mm.group(1)) is not None:
+            return True
+    # and a class's `operator[]` (`take(&a, v[0])`), the same way
+    for mm in re.finditer(r"(?<![\w.>])(\w+)\s*\[", raw):
         if lookup(scopes, mm.group(1)) is not None:
             return True
     return False
@@ -13611,7 +13635,9 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     text = _lower_lambdas(text, path)
     # `return Cls(a, b);` becomes a named local before anything reads
     # declarations, so the ordinary initialiser lowering handles it.
-    text = _materialise_ctor_returns(text, _strip_comments(text))
+    # strings blanked: `"World (Small).unity"` is no construction
+    text = _materialise_ctor_returns(
+        text, _blank_strings(_strip_comments(text)))
     text = _lower_functional_casts(text, _strip_comments(text))
     # `auto` becomes a written type before anything reads types, because
     # everything downstream -- the class emitter, the scope tracker, the call
@@ -13695,7 +13721,8 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # pass above could not see it. Idempotent -- an already-lowered
     # `((int)(x))` has its type followed by `)`, not `(`.
     text = _lower_functional_casts(text, _strip_comments(text))
-    text = _materialise_ctor_temporaries(text, _strip_comments(text), path)
+    text = _materialise_ctor_temporaries(
+        text, _blank_strings(_strip_comments(text)), path)
     scan = _blank_literal_braces(_strip_comments(text))
     text, _exc_used = _lower_except(text, path)
     if _exc_used:

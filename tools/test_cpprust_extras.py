@@ -74,6 +74,47 @@ class Base(unittest.TestCase):
         return out
 
 
+class TestCtorInString(Base):
+    def test_class_name_call_in_a_literal(self):
+        """unity_pack's `"Assets/Scenes/World (Small).unity"` beside a
+        `struct World`: text, not a `World(Small)` temporary."""
+        out = self.assertLowers(
+            'struct World { int a; };\n'
+            'static const char *const p[1] = { "World (Small).unity" };\n',
+            '"World (Small).unity"')
+        self.assertNotIn("__cpp_tmp", out)
+
+
+class TestVectorValues(Base):
+    """unity_pack's `List<T> prev = new List<T>(field)` and a `params T[]`
+    call: a copy from a reference local, and a temporary passed by value."""
+
+    def test_copy_from_reference_local(self):
+        out = self.assertLowers(
+            "#include <vector>\nstatic std::vector<int> T[2];\n"
+            "int f() { std::vector<int> &r = T[1];\n"
+            "    std::vector<int> b = r; return (int)b.size(); }\n",
+            "vector_int_copy(&b, &(*r))")
+        self.assertNotIn("vector_int_new_1(&b, r)", out)
+
+    def test_call_result_passed_by_value(self):
+        out = self.assertLowers(
+            "#include <vector>\n"
+            "static std::vector<int> mk(int a) { std::vector<int> o;"
+            " o.push_back(a); return o; }\n"
+            "static int sum(std::vector<int> v) { return (int)v.size(); }\n"
+            "int f() { return sum(mk(3)); }\n", "sum(mk(3))")
+        self.assertNotIn("&(mk(3))", out)
+
+    def test_subscript_beside_a_reference_argument(self):
+        self.assertLowers(
+            "#include <vector>\n"
+            "static int rm(std::vector<int> &v, int x) { return x; }\n"
+            "int f(std::vector<int> a) { std::vector<int> o;"
+            " return rm(o, a[0]); }\n",
+            "rm(&o, (*vector_int__index(&a, 0)))")
+
+
 # ---------------------------------------------------------------- casts
 
 class TestCastDeduction(Base):
