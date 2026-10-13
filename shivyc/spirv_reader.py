@@ -746,11 +746,43 @@ def _check_interface_layout(m, errors):
                               % where)
             else:
                 key = (s[0], b[0])
-                if key in bound:
-                    errors.append("%s: (set %d, binding %d) is already used "
-                                  "by %%%d" % (where, key[0], key[1],
-                                               bound[key]))
-                bound[key] = ins.result_id
+                bound.setdefault(key, []).append(ins.result_id)
+    for key in bound:
+        ids = bound[key]
+        if len(ids) < 2:
+            continue
+        # Two variables may share a (set, binding) as long as no single entry
+        # point can reach both (separate kernels in one module).
+        for ep in m.entry_points:
+            used = _entry_point_uses(m, ep[1])
+            both = [v for v in ids if v in used]
+            if len(both) > 1:
+                errors.append("variable %%%d: (set %d, binding %d) is already "
+                              "used by %%%d in entry point %s"
+                              % (both[1], key[0], key[1], both[0], ep[2]))
+
+
+def _entry_point_uses(m, fid):
+    """Ids referenced by an entry point or anything it can call."""
+    funcs = {}
+    for f in m.functions:
+        funcs[f.id] = f
+    seen = {}
+    used = {}
+    todo = [fid]
+    while todo:
+        cur = todo.pop()
+        if cur in seen or cur not in funcs:
+            continue
+        seen[cur] = True
+        for b in funcs[cur].blocks:
+            for ins in b.insts:
+                for op in ins.operands:
+                    if op[0] == "I":
+                        used[op[1]] = True
+                if ins.name == "OpFunctionCall":
+                    todo.append(ins.operands[0][1])
+    return used
 
 
 def _label_operand_slots(ins):
@@ -974,27 +1006,62 @@ def _check_structured(m, f, where, succs, order, reach, idom, doms, errors):
     # Constructs and exits.
     constructs = {}
     for h in header:
-        if h not in reach:
+        if h not in reach or header[h][0] != "loop":
             continue
         mg = header[h][1]
         members = {}
+        # A loop is everything it dominates up to its merge block.
         for b in order:
             if h in doms[b] and not (mg in reach and mg in doms[b]):
                 members[b] = True
+        constructs[h] = members
+    for h in header:
+        if h not in reach or header[h][0] == "loop":
+            continue
+        mg = header[h][1]
+        # A selection is what is reached from the header before leaving
+        # through its merge block or through a break / continue of a loop
+        # around it: those end the construct, so the loop's merge block (and
+        # whatever follows it) is not part of it even when only a break
+        # inside the selection reaches it.
+        stop = {}
+        for oh in constructs:
+            if header[oh][0] == "loop" and h in constructs[oh]:
+                stop[header[oh][1]] = True
+                stop[header[oh][2]] = True
+        members = {}
+        todo = [h]
+        while todo:
+            b = todo.pop()
+            if b in members:
+                continue
+            members[b] = True
+            for s in succs[b]:
+                if s == mg or s in stop or s in members:
+                    continue
+                if s not in reach or h not in doms[s]:
+                    continue
+                todo.append(s)
         constructs[h] = members
     for h in constructs:
         mg = header[h][1]
         allowed = {}
         allowed[mg] = True
-        # An enclosing loop's merge and continue are legal exits (break,
-        # continue); so is the back edge itself.
+        # The innermost enclosing loop's merge and continue are the legal
+        # exits (break, continue); so is the back edge itself.
+        inner = None
         for oh in header:
             if oh == h or oh not in constructs:
                 continue
             if header[oh][0] == "loop" and h in constructs[oh]:
-                allowed[header[oh][1]] = True
-                allowed[header[oh][2]] = True
-                allowed[oh] = True
+                if inner is None or len(constructs[oh]) < len(constructs[inner]):
+                    inner = oh
+        # Only a selection can break or continue an enclosing loop; a loop
+        # inside a loop leaves through its own merge block.
+        if inner is not None and header[h][0] != "loop":
+            allowed[header[inner][1]] = True
+            allowed[header[inner][2]] = True
+            allowed[inner] = True
         if header[h][0] == "loop":
             allowed[h] = True
         for b in constructs[h]:
