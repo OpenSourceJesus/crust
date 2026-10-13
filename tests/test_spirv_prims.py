@@ -269,20 +269,35 @@ class TestValidatorRejects(unittest.TestCase):
         blk.insts[1][-1] = 999        # an OpLoad's pointer operand
         self.assertRejected(m.words(), "undefined id")
 
-    def test_duplicate_binding(self):
+    def _two_buffers_same_binding(self, shared_entry):
         m = sp.Module()
         m.capability("Shader")
         m.memory_model()
         f32 = m.t_float(32)
-        ex._buffer(m, f32, 0, name="a")
-        ex._buffer(m, f32, 0, name="b")
+        u32 = m.t_int(32, False)
+        a = ex._buffer(m, f32, 0, name="a")
+        b = ex._buffer(m, f32, 0, name="b")
+        pty = m.t_pointer("StorageBuffer", f32)
+        c0 = m.const_int(u32, 0)
         void = m.t_void()
-        fn = m.function(void)
-        b = fn.block()
-        b.ret()
-        m.entry_point(fn, "main")
-        m.local_size(fn, 1)
-        self.assertRejected(m.words(), "already used")
+        kernels = [[a, b]] if shared_entry else [[a], [b]]
+        for k, uses in enumerate(kernels):
+            fn = m.function(void)
+            blk = fn.block()
+            for v in uses:
+                blk.op("OpAccessChain", pty, v, c0, c0)
+            blk.ret()
+            m.entry_point(fn, "main%d" % k)
+            m.local_size(fn, 1)
+        return m.words()
+
+    def test_duplicate_binding(self):
+        self.assertRejected(self._two_buffers_same_binding(True),
+                            "already used")
+
+    def test_same_binding_in_separate_kernels_is_fine(self):
+        self.assertEqual(
+            rd.validate(self._two_buffers_same_binding(False)), [])
 
     def test_missing_array_stride(self):
         m = sp.Module()
@@ -371,6 +386,82 @@ class TestValidatorRejects(unittest.TestCase):
         loop_b.insts[-1] = sp.inst_words("OpBranch", 0, 0, [done.label])
         errs = "\n".join(rd.validate(m.words()))
         self.assertIn("neither its merge block", errs)
+
+    def _nested_loops(self, target):
+        """loop h0 { loop h1 { if (c) goto <target>; } } -- target picks
+        which merge block the inner selection jumps to."""
+        m = sp.Module()
+        m.capability("Shader")
+        m.memory_model()
+        fn = m.function(m.t_void())
+        yes = m.const_bool(m.t_bool(), True)
+        entry = fn.block()
+        h0 = fn.block()
+        b0 = fn.block()
+        h1 = fn.block()
+        b1 = fn.block()
+        t1 = fn.block()
+        s1 = fn.block()
+        c1 = fn.block()
+        m1 = fn.block()
+        c0 = fn.block()
+        m0 = fn.block()
+        entry.branch(h0.label)
+        h0.loop_merge(m0.label, c0.label)
+        h0.branch(b0.label)
+        b0.branch(h1.label)
+        h1.loop_merge(m1.label, c1.label)
+        h1.branch(b1.label)
+        b1.selection_merge(s1.label)
+        b1.cond_branch(yes, t1.label, s1.label)
+        t1.branch({"m1": m1, "m0": m0, "c0": c0}[target].label)
+        s1.branch(c1.label)
+        c1.branch(h1.label)
+        m1.branch(c0.label)
+        c0.branch(h0.label)
+        m0.ret()
+        m.entry_point(fn, "main")
+        m.local_size(fn, 1)
+        return m.words()
+
+    def test_break_from_a_selection_to_its_loop_merge_is_fine(self):
+        self.assertEqual(rd.validate(self._nested_loops("m1")), [])
+
+    def test_break_out_of_two_loops_is_rejected(self):
+        self.assertRejected(self._nested_loops("m0"), "neither its merge")
+
+    def test_continue_the_outer_loop_from_the_inner_is_rejected(self):
+        self.assertRejected(self._nested_loops("c0"), "neither its merge")
+
+    def test_loop_merge_after_a_break_does_not_belong_to_the_selection(self):
+        # for (;;) { if (c) break; ... } -- the merge block is only reachable
+        # through the selection, yet it branches onward legally.
+        m = sp.Module()
+        m.capability("Shader")
+        m.memory_model()
+        fn = m.function(m.t_void())
+        yes = m.const_bool(m.t_bool(), True)
+        entry = fn.block()
+        h = fn.block()
+        b = fn.block()
+        t = fn.block()
+        s = fn.block()
+        c = fn.block()
+        mg = fn.block()
+        after = fn.block()
+        entry.branch(h.label)
+        h.loop_merge(mg.label, c.label)
+        h.branch(b.label)
+        b.selection_merge(s.label)
+        b.cond_branch(yes, t.label, s.label)
+        t.branch(mg.label)
+        s.branch(c.label)
+        c.branch(h.label)
+        mg.branch(after.label)
+        after.ret()
+        m.entry_point(fn, "main")
+        m.local_size(fn, 1)
+        self.assertEqual(rd.validate(m.words()), [])
 
     def test_block_without_terminator_is_refused_by_the_writer(self):
         m = sp.Module()
