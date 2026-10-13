@@ -653,6 +653,8 @@ class Machine:
                     pass
                 elif n == "OpControlBarrier":
                     yield "barrier"
+                elif n == "OpAtomicStore":
+                    self._store(get(o[0][1]), get(o[3][1]))
                 elif n == "OpStore":
                     self._store(get(o[0][1]), get(o[1][1]))
                 elif n == "OpFunctionCall":
@@ -745,7 +747,51 @@ class Machine:
             return a if c else b
         if n == "OpExtInst":
             return self._ext(ins, get)
+        if n == "OpBitCount":
+            w = self.scalar(rt).width
+            return bin(get(o[0][1]) & _mask(w)).count("1")
+        if n.startswith("OpAtomic"):
+            return self._atomic(ins, get)
         return self._arith(ins, get)
+
+    def _atomic(self, ins, get):
+        """One atomic read-modify-write. Invocations only interleave at
+        barriers here, so each is trivially indivisible; what matters is the
+        value it returns and leaves behind."""
+        n = ins.name
+        o = ins.operands
+        ptr = get(o[0][1])
+        old = self._walk(ptr)
+        if n == "OpAtomicLoad":
+            return old
+        t = self.scalar(ins.type_id)
+        mask = _mask(t.width)
+
+        def sgn(x):
+            return _sgn(x, t.width)
+        if n == "OpAtomicCompareExchange":
+            val = get(o[4][1])
+            cmp = get(o[5][1])
+            if old == cmp:
+                self._store(ptr, val)
+            return old
+        val = get(o[3][1])
+        new = {
+            "OpAtomicExchange": lambda: val,
+            "OpAtomicIAdd": lambda: (old + val) & mask,
+            "OpAtomicISub": lambda: (old - val) & mask,
+            "OpAtomicSMin": lambda: min(sgn(old), sgn(val)) & mask,
+            "OpAtomicUMin": lambda: min(old, val),
+            "OpAtomicSMax": lambda: max(sgn(old), sgn(val)) & mask,
+            "OpAtomicUMax": lambda: max(old, val),
+            "OpAtomicAnd": lambda: old & val,
+            "OpAtomicOr": lambda: old | val,
+            "OpAtomicXor": lambda: old ^ val,
+        }.get(n)
+        if new is None:
+            raise InterpError("unsupported atomic %s" % n)
+        self._store(ptr, new())
+        return old
 
     def _arith(self, ins, get, ):
         n = ins.name
