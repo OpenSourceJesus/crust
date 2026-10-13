@@ -14,6 +14,10 @@ static unsigned gpu_local_id(int d)   { return gpu__lid[d]; }
 static unsigned gpu_group_id(int d)   { return gpu__grp[d]; }
 static unsigned gpu_num_groups(int d) { return gpu__ngrp[d]; }
 
+/* NOTE: GPU_LAUNCH runs the invocations one after another, so it cannot
+ * run a kernel that calls gpu_barrier() or uses workgroup memory; check those
+ * with tools/spirv_interp.py, which runs a workgroup in lockstep. */
+
 /* Run body() for every invocation of a (gx,gy,gz) grid of (lx,ly,lz) groups. */
 #define GPU_LAUNCH(gx, gy, gz, lx, ly, lz, CALL) do {                      \
     unsigned a_, b_, c_, i_, j_, k_;                                        \
