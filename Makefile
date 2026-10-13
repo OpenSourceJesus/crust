@@ -130,6 +130,15 @@ mem-safe:
 test_wasm:
 	python3 tools/wasm_difftest.py
 
+# SPIR-V back end, Phase 1 primitives (SPIRV.md): the module writer, the
+# decoder/validator and the reference interpreter, tested against each other
+# on hand-built compute modules. No compiler, GPU or external SPIR-V tool.
+test_spirv:
+	python3 -m unittest tests.test_spirv_prims tests.test_spirv_struct tests.test_spirv_gen
+
+fuzz_spirv:
+	python3 tools/spirv_fuzz.py --kernels $${N:-200}
+
 # macOS on Apple Silicon (MACOS.md). Assembly checks everywhere; real Mach-O
 # assemble + link with LLVM when installed; build-and-run on a Mac.
 test_macos:

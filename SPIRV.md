@@ -1,6 +1,6 @@
 # SPIR-V back end — plan
 
-Status: **Phase 1 (primitives) is implemented; the compiler back end is not started.**
+Status: **Phases 1 (primitives), 2 (skeleton back end) and 3 (structurizer) are implemented.** `--target spirv` compiles scalar kernels with typed buffers, push constants, builtins, helper calls and dispatcher control flow; output is self-validated and diff-tested against gcc (`tests/test_spirv_gen.py`). Control flow is emitted as native SPIR-V `if`/loop/`break`/`continue` (`shivyc/spirv_struct.py`); the dispatcher remains as the fallback and was needed for ~0.25% of 1200 fuzzed kernels (a join block too big to copy that is reached from two nesting levels). Not yet done: structs/arrays/int8-16 (phase 4), shared memory/barriers (phase 6).
 `make test_spirv` runs the writer, validator and interpreter tests. This file is the working plan for
 `--target spirv`: translating the GPU-safe subsets of C, Rust, C++ and C# into
 SPIR-V so the same source can run on a GPU.
@@ -287,8 +287,8 @@ Each phase has an exit criterion that is a test, not a feeling.
 |---|---|---|
 | **0. Lock** | This plan agreed; §10 decisions made; a corpus of ~10 kernels written (saxpy, prefix-sum step, histogram, bitonic-sort step lifted from `gles3_batch.h`, a culling test, matmul tile) | Corpus builds natively and passes its own CPU-fallback self-check |
 | **1. Primitives** ✅ | `shivyc/spirv.py` writer, `shivyc/spirv_reader.py` decode/disasm/validate, `tools/spirv_interp.py`, hand-built `tools/spirv_examples.py` (`vecadd`, `saxpy_loop`, `reduce`) | **Done:** the three examples round-trip, validate and run; `tests/test_spirv_prims.py` (48 tests, incl. validator mutation tests) via `make test_spirv` |
-| **2. Skeleton back end** | `SpirvTarget`, `spirv_gen.py` for scalars + typed buffers + builtins, **dispatcher** control flow, contract parsing | `saxpy` and the elementwise corpus pass difftest |
-| **3. Control flow + calls** | Structurizer, reducibility check, strong inliner, recursion refusal | Loops / `break` / `continue` / early return kernels pass; 1000 fuzz kernels agree with native |
+| **2. Skeleton back end** ✅ (first cut) | `SpirvTarget`, `spirv_gen.py` for scalars + typed buffers + builtins, **dispatcher** control flow, contract parsing | `saxpy` and the elementwise corpus pass difftest |
+| **3. Control flow + calls** ✅ (structurizer; inliner not needed yet) | Structurizer, reducibility check, strong inliner, recursion refusal | Loops / `break` / `continue` / early return kernels pass; 1000 fuzz kernels agree with native |
 | **4. Data** | Structs and local arrays with explicit offsets, int8/16/64, `double`, provenance analysis, optional bounds checks, `linear` fallback | Layout test green; refusal tests pinned; the SoA tables from `unity_pack` read correctly |
 | **5. Front ends** | Rust `#[kernel]` + slices, C++ attribute, C# `[Kernel]` + arena→SSBO | The same algorithm written in all four languages produces identical `.spv` behaviour in difftest |
 | **6. GPU features** | Workgroup shared memory, barriers, atomics, subgroup ops, specialization constants | Reduction, histogram, scan kernels pass; divergent-barrier refusal pinned |
