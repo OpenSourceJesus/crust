@@ -785,6 +785,74 @@ def _entry_point_uses(m, fid):
     return used
 
 
+def describe(words):
+    """The host-facing interface of every GLCompute entry point in a module,
+    for a program that has to create the pipeline and bind the buffers:
+
+        [{"name": "vadd", "local_size": [64, 1, 1],
+          "buffers": [{"set": 0, "binding": 0, "name": "a",
+                       "access": "read" | "write" | "read_write"}, ...],
+          "push": [{"name": "n", "offset": 0, "type": "u32"}, ...],
+          "push_size": 4}, ...]
+
+    Only the variables an entry point can actually reach are listed, so two
+    kernels in one module may reuse a binding number."""
+    m = parse(words)
+    out = []
+    for ep in m.entry_points:
+        if ep[0] != sp.EXEC_MODEL["GLCompute"]:
+            continue
+        fid = ep[1]
+        used = _entry_point_uses(m, fid)
+        size = m.exec_modes.get(fid, {}).get(sp.EXEC_MODE["LocalSize"],
+                                             [1, 1, 1])
+        rec = {"name": ep[2], "local_size": list(size), "buffers": [],
+               "push": [], "push_size": 0}
+        for vid in sorted(m.defs):
+            ins = m.defs[vid]
+            if ins.name != "OpVariable" or vid not in used:
+                continue
+            sc = ins.operands[0][1]
+            pointee = m.defs[m.defs[ins.type_id].operands[1][1]]
+            sid = pointee.result_id
+            if sc == sp.STORAGE["StorageBuffer"]:
+                access = "read_write"
+                for d in m.member_decorations.get((sid, 0), []):
+                    if d[0] == sp.DECORATION["NonWritable"]:
+                        access = "read"
+                    elif d[0] == sp.DECORATION["NonReadable"]:
+                        access = "write"
+                rec["buffers"].append({
+                    "set": _decor(m, vid, "DescriptorSet")[0],
+                    "binding": _decor(m, vid, "Binding")[0],
+                    "name": m.names.get(vid, "v%d" % vid),
+                    "access": access})
+            elif sc == sp.STORAGE["PushConstant"]:
+                k = 0
+                end = 0
+                while k < len(pointee.operands):
+                    off = 0
+                    for d in m.member_decorations.get((sid, k), []):
+                        if d[0] == sp.DECORATION["Offset"]:
+                            off = d[1][0]
+                    mt = m.defs[pointee.operands[k][1]]
+                    if mt.name == "OpTypeFloat":
+                        tname = "f%d" % mt.operands[0][1]
+                    else:
+                        tname = ("i%d" if mt.operands[1][1] else "u%d") \
+                            % mt.operands[0][1]
+                    width = mt.operands[0][1] // 8
+                    rec["push"].append({
+                        "name": m.member_names.get((sid, k), "m%d" % k),
+                        "offset": off, "type": tname})
+                    end = max(end, off + width)
+                    k += 1
+                rec["push_size"] = end
+        rec["buffers"].sort(key=lambda b: (b["set"], b["binding"]))
+        out.append(rec)
+    return out
+
+
 def _label_operand_slots(ins):
     """Indices into ins.operands that are block labels or forward-allowed
     references, i.e. exempt from the definition-dominates-use check."""

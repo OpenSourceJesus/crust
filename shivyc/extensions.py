@@ -259,6 +259,9 @@ class ExtensionInfo:
         # -> fn -> {param -> {'binding': int, 'set': int,
         #                     'readonly': bool, 'writeonly': bool}}
         self.gpu_buffers = {}
+        # `assert NAME in gpu.shared` in a kernel's header: the file-scope
+        # static NAME lives in workgroup memory (one copy per workgroup)
+        self.gpu_shared = set()
 
     def attrs_of(self, name):
         return self.attrs.get(name, set())
@@ -272,7 +275,7 @@ class ExtensionInfo:
     def __bool__(self):
         return (bool(self.attrs) or bool(self.contracts)
                 or bool(self.threads) or bool(self.gpu_compute)
-                or bool(self.gpu_buffers))
+                or bool(self.gpu_buffers) or bool(self.gpu_shared))
 
 
 def preprocess_extensions(code):
@@ -309,10 +312,11 @@ def preprocess_extensions(code):
         if not _looks_like_extension(region):
             continue
 
-        gpu = {"compute": {}, "buffers": {}}
+        gpu = {"compute": {}, "buffers": {}, "shared": set()}
         attrs, contracts, threads = _parse_region(region, name, gpu)
         for kname, rec in gpu["compute"].items():
             info.gpu_compute[kname] = rec
+        info.gpu_shared.update(gpu["shared"])
         if gpu["buffers"]:
             info.gpu_buffers.setdefault(name, {}).update(gpu["buffers"])
         if attrs:
@@ -344,7 +348,15 @@ def _parse_region(region, func_name, gpu=None):
     # Pull out specifier tokens first; whatever remains should be asserts.
     remaining = _extract_specifiers(region, attrs)
 
-    for line in remaining.splitlines():
+    lines = []
+    for chunk in remaining.splitlines():
+        # The Rust front end writes a kernel's declarations on one line,
+        # `assert a in gpu.buffer(..), assert b in gpu.buffer(..)`, so that
+        # the line numbers of the source survive. A comma outside every
+        # parenthesis, followed by `assert`, starts the next one.
+        for part in _split_top_level(chunk):
+            lines.append(part)
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -360,6 +372,8 @@ def _parse_region(region, func_name, gpu=None):
                     f"'{func_name}': {line!r}")
             if decl[0] == "compute":
                 gpu["compute"][decl[1]] = decl[2]
+            elif decl[0] == "shared":
+                gpu["shared"].add(decl[1])
             else:
                 gpu["buffers"][decl[1]] = decl[2]
             continue
@@ -416,6 +430,7 @@ def _parse_gpu_assert(line, func_name):
         assert FN in gpu.compute(local_size=64)
         assert FN in gpu.compute(local_size=(8, 8))
         assert PARAM in gpu.buffer(binding=0, readonly)
+        assert STATIC in gpu.shared
 
     Returns ('compute', FN, {'local_size': (x, y, z)}),
     ('buffer', PARAM, {...}) or None when the line is not a gpu declaration.
@@ -439,6 +454,8 @@ def _parse_gpu_assert(line, func_name):
             f"gpu declaration needs a name on the left of 'in' in "
             f"'{func_name}': {line!r}")
     rest = right[len("gpu."):]
+    if rest.strip() == "shared":
+        return ("shared", left, {})
     lp = rest.find("(")
     if lp < 0 or not rest.endswith(")"):
         raise ExtensionError(

@@ -3600,6 +3600,37 @@ class Parser:
                 self.err("struct `%s` has no field `%s`", ty.base, field)
         return Expr(code, ftype)
 
+    def float_method(self, recv, name, args):
+        """`x.sqrt()`, `x.min(y)`, `x.clamp(lo, hi)`, `x.mul_add(a, b)` on an
+        f32 / f64: a libm call, or for `clamp`/`fract` a short expression."""
+        single = recv.type.base == "float"
+        ty = RustCType(recv.type.base)
+        if name == "clamp":
+            if len(args) != 2:
+                self.err("`clamp` takes a low and a high bound")
+            lo, hi = self._fmath("fmax", single), self._fmath("fmin", single)
+            return Expr("%s(%s(%s, %s), %s)" % (hi, lo, recv.code, args[0],
+                                                args[1]), ty)
+        if name == "fract":
+            if args:
+                self.err("`fract` takes no arguments")
+            fl = self._fmath("floor", single)
+            x = self.once(recv)
+            return Expr("(%s - %s(%s))" % (x, fl, x), ty)
+        if name not in _FLOAT_METHODS:
+            return None
+        cname, arity = _FLOAT_METHODS[name]
+        if len(args) != arity:
+            self.err("`%s` takes %d argument%s", name, arity,
+                     "" if arity == 1 else "s")
+        fn = self._fmath(cname, single)
+        return Expr("%s(%s)" % (fn, ", ".join([recv.code] + args)), ty)
+
+    def _fmath(self, cname, single):
+        full = cname + "f" if single else cname
+        self.unit.needs.add("fmath:" + full)
+        return full
+
     def parse_method_call(self, recv, name):
         """Lower `recv.method(args)` to the free function `Type_method`."""
         self.expect("(")
@@ -3657,6 +3688,20 @@ class Parser:
         self.expect(")")
         if info is not None:
             self._move_by_value_args(params, args, aexprs)
+        if recv.type is not None and not recv.type.ptr \
+                and not recv.type.array \
+                and recv.type.base in ("float", "double") and info is None:
+            got = self.float_method(recv, name, args)
+            if got is not None:
+                return got
+        if name == "count_ones" and info is None and not args \
+                and recv.type is not None and not recv.type.ptr \
+                and not recv.type.array and _SINGLE_FLOAT_LITERALS \
+                and recv.type.base in ("unsigned int", "int"):
+            # a GPU kernel's popcount (OpBitCount)
+            self.unit.needs.add("gpu:gpu_popcount")
+            return Expr("gpu_popcount(%s)" % recv.code,
+                        RustCType("unsigned int"))
 
         # `PyList<T>` is py2c's own list, so its mutating methods are py2c's
         # own helpers. They are `static`, which is fine: an `#include "x.py"`
@@ -6896,6 +6941,39 @@ class Parser:
                             break
                     self.next()
 
+    def _kernel_attr_sizes(self):
+        """`#[kernel(local_size = 64)]` / `local_size = (8, 8)`: the numbers
+        after `local_size`, read by lookahead (the caller keeps consuming the
+        attribute's tokens). A GPU kernel (SPIRV.md section 5)."""
+        d = self.i + 1
+        nums = []
+        seen = False
+        depth = 1
+        while d < len(self.toks) and depth > 0:
+            tk = self.toks[d]
+            if tk.val == "(":
+                depth += 1
+            elif tk.val == ")":
+                depth -= 1
+            elif tk.kind == "ident" and tk.val == "local_size":
+                seen = True
+            elif seen and tk.kind == "num":
+                digits = ""
+                for ch in str(tk.val):
+                    if ch.isdigit():
+                        digits += ch
+                    elif ch != "_":
+                        break
+                if digits == "":
+                    raise CrustError("line %d: local_size must be a "
+                                     "number" % tk.line)
+                nums.append(int(digits))
+            d += 1
+        if not seen or not 1 <= len(nums) <= 3:
+            raise CrustError("line %d: #[kernel(local_size = N)] needs one to "
+                             "three sizes" % self.cur.line)
+        return tuple(nums)
+
     def skip_attributes(self):
         """Skip `#[...]` outer attributes, recording any `derive` list.
 
@@ -6906,6 +6984,7 @@ class Parser:
         """
         self.derives = []
         self.contracts = []
+        self.kernel_attr = None
         while self.at("#", "punc"):
             self.next()
             if not self.at("[", "punc"):
@@ -6926,6 +7005,9 @@ class Parser:
                     depth -= 1
                     if depth == 0:
                         break
+                elif t.kind == "ident" and t.val == "kernel" \
+                        and self.at("(", "punc"):
+                    self.kernel_attr = self._kernel_attr_sizes()
                 elif t.kind == "ident" and t.val == "derive" \
                         and self.at("(", "punc"):
                     d = self.i + 1
@@ -7212,6 +7294,10 @@ class Parser:
         """Parse an `impl` method header into a MethodInfo."""
         self.skip_attributes()
         self.fn_contracts = self.contracts
+        self.fn_kernel = None
+        self.fn_kbuffers = []
+        if self.kernel_attr is not None:
+            self.err("#[kernel] belongs on a free function, not a method")
         self.skip_visibility()
         while self.cur.val == "unsafe":
             self.next()
@@ -7297,6 +7383,8 @@ class Parser:
         """Parse `[pub] [unsafe] [extern "C"] fn name(params) [-> T]`."""
         self.skip_attributes()
         self.fn_contracts = self.contracts
+        self.fn_kernel = self.kernel_attr
+        self.fn_kbuffers = []
         self.skip_visibility()
         while self.cur.val == "unsafe":
             self.next()
@@ -7309,11 +7397,50 @@ class Parser:
         self.expect("(")
         self.impl_n = 0
         params = []
+        next_binding = 0
         while not self.at(")", "punc"):
+            # `#[binding(N)] buf: &[f32]` pins a kernel buffer to the binding
+            # number the host expects; without it buffers take 0, 1, 2 ..
+            want_binding = None
+            while self.at("#", "punc"):
+                self.next()
+                self.expect("[")
+                aname = self.expect_ident()
+                if aname == "binding" and self.fn_kernel is not None:
+                    self.expect("(")
+                    num = self.cur
+                    if num.kind != "num":
+                        self.err("#[binding(N)] needs a number")
+                    want_binding = int(str(self.next().val).rstrip("uUiIzZsS"))
+                    self.expect(")")
+                else:
+                    self.err("unsupported parameter attribute `#[%s]`", aname)
+                self.expect("]")
             self.accept("mut")
             pname = self.expect_ident()
             self.expect(":")
-            ptype = self.parse_type()
+            ptype = None
+            if self.fn_kernel is not None and self.at("&", "punc"):
+                # A kernel's `&[T]` / `&mut [T]` is a storage buffer, so it
+                # lowers to a bare `T *` (a slice struct has no SPIR-V
+                # form) and gets the next binding number.
+                j = self.i + 1
+                is_mut = self.toks[j].val == "mut"
+                if is_mut:
+                    j += 1
+                if self.toks[j].val == "[":
+                    self.next()
+                    self.accept("mut")
+                    self.expect("[")
+                    elem = self.parse_type()
+                    self.expect("]")
+                    ptype = RustCType(elem.base, elem.ptr + 1)
+                    slot = next_binding if want_binding is None \
+                        else want_binding
+                    next_binding = slot + 1
+                    self.fn_kbuffers.append((pname, not is_mut, slot))
+            if ptype is None:
+                ptype = self.parse_type()
             params.append((pname, ptype))
             if not self.accept(","):
                 break
@@ -7350,6 +7477,11 @@ class Parser:
         start, name, params, ret = self.parse_fn_signature()
         if name_override is not None:
             name = name_override
+        self.kernel_ctx = None
+        if self.fn_kernel is not None:
+            if not ret.is_void():
+                self.err("a #[kernel] function returns nothing")
+            self.kernel_ctx = (self.fn_kernel, list(self.fn_kbuffers))
         synth_main_ret = False
         if name == "main" and ret.is_void():
             ret = INT
@@ -7380,8 +7512,24 @@ class Parser:
                 and name == "%s_drop" % self.impl_type \
                 and self.unit.drop_glue.get(self.impl_type):
             self.drop_owner = self.impl_type
-        out.line_at(start.line, "%s(%s)" % (ret.decl(name),
-                                            render_params(params)), 0)
+        header = "%s(%s)" % (ret.decl(name), render_params(params))
+        kctx = getattr(self, "kernel_ctx", None)
+        self.kernel_ctx = None
+        if kctx is not None:
+            # The kernel's declarations, in the C contract syntax that
+            # shivyc/extensions.py already parses (SPIRV.md section 5), all
+            # on this one line so the source's line numbers survive.
+            sizes, bufs = kctx
+            size = (str(sizes[0]) if len(sizes) == 1
+                    else "(%s)" % ", ".join(str(n) for n in sizes))
+            decls = ["assert %s in gpu.compute(local_size=%s)" % (name, size)]
+            for pname_, readonly_, slot_ in bufs:
+                decls.append("assert %s in gpu.buffer(binding=%d%s)" % (
+                    pname_, slot_, ", readonly" if readonly_ else ""))
+            for sname in _WORKGROUP_STATICS:
+                decls.append("assert %s in gpu.shared" % sname)
+            header += " " + ", ".join(decls)
+        out.line_at(start.line, header, 0)
         self.scope_push("func")
         for pname, ptype in params:
             self.declare(pname, ptype)
@@ -7674,7 +7822,73 @@ def _ci_from_raw_parts(p, args, atys, targs):
     return Expr("(%s){.ptr = %s, .len = %s}" % (sl.base, args[0], args[1]), sl)
 
 
+def _gpu_intrinsic(cname):
+    """`gpu_global_id(0)` and friends (shivyc/include/crust_gpu.h): under
+    `--target spirv` these are compiler builtins, on the CPU the header
+    supplies them. Typed here so `let i = gpu_global_id(0)` infers a u32."""
+    def lower(p, args, atys, targs):
+        if len(args) != 1:
+            p.err("`%s` takes one argument, the dimension", cname)
+        p.unit.needs.add("gpu:" + cname)
+        return Expr("%s(%s)" % (cname, args[0]), RustCType("unsigned int"))
+    return lower
+
+
+# f32 / f64 methods a GPU kernel needs (SPIRV.md section 5): the libm call each
+# lowers to, `f` suffixed for f32. The SPIR-V back end maps these onto
+# GLSL.std.450. name -> (C name, arity)
+_FLOAT_METHODS = {
+    "abs": ("fabs", 0), "sqrt": ("sqrt", 0), "floor": ("floor", 0),
+    "ceil": ("ceil", 0), "trunc": ("trunc", 0), "sin": ("sin", 0),
+    "cos": ("cos", 0), "exp": ("exp", 0), "ln": ("log", 0),
+    "powf": ("pow", 1), "min": ("fmin", 1), "max": ("fmax", 1),
+    "mul_add": ("fma", 2),
+}
+
+
+def _gpu_atomic(cname, nvals):
+    """`gpu_atomic_add(&mut counts[i], 1)` and friends: an atomic on a
+    32-bit integer in a storage buffer or a `#[workgroup]` array. Returns the
+    value the location held before (nothing for `store`)."""
+    def lower(p, args, atys, targs):
+        if len(args) != 1 + nvals:
+            p.err("`%s` takes a reference and %d value(s)", cname, nvals)
+        pt = atys[0]
+        if pt is None or not pt.ptr or pt.base not in ("unsigned int", "int"):
+            p.err("`%s` needs `&mut` of a u32 or i32 element", cname)
+        elem = RustCType(pt.base, pt.ptr - 1)
+        p.unit.needs.add("gpua:%s:%s" % (cname, pt.base))
+        ret = RustCType("void") if cname == "gpu_atomic_store" else elem
+        return Expr("%s(%s)" % (cname, ", ".join(args)), ret)
+    return lower
+
+
+def _gpu_barrier(p, args, atys, targs):
+    """`gpu_barrier()`: every invocation of the workgroup waits here, and
+    workgroup-memory writes before it are visible after it."""
+    if args:
+        p.err("`gpu_barrier` takes no arguments")
+    p.unit.needs.add("gpu:gpu_barrier")
+    return Expr("gpu_barrier()", RustCType("void"))
+
+
 _CORE_FNS = {
+    "gpu_barrier": _gpu_barrier,
+    "gpu_atomic_add": _gpu_atomic("gpu_atomic_add", 1),
+    "gpu_atomic_sub": _gpu_atomic("gpu_atomic_sub", 1),
+    "gpu_atomic_min": _gpu_atomic("gpu_atomic_min", 1),
+    "gpu_atomic_max": _gpu_atomic("gpu_atomic_max", 1),
+    "gpu_atomic_and": _gpu_atomic("gpu_atomic_and", 1),
+    "gpu_atomic_or": _gpu_atomic("gpu_atomic_or", 1),
+    "gpu_atomic_xor": _gpu_atomic("gpu_atomic_xor", 1),
+    "gpu_atomic_exchange": _gpu_atomic("gpu_atomic_exchange", 1),
+    "gpu_atomic_cas": _gpu_atomic("gpu_atomic_cas", 2),
+    "gpu_atomic_load": _gpu_atomic("gpu_atomic_load", 0),
+    "gpu_atomic_store": _gpu_atomic("gpu_atomic_store", 1),
+    "gpu_global_id": _gpu_intrinsic("gpu_global_id"),
+    "gpu_local_id": _gpu_intrinsic("gpu_local_id"),
+    "gpu_group_id": _gpu_intrinsic("gpu_group_id"),
+    "gpu_num_groups": _gpu_intrinsic("gpu_num_groups"),
     "ptr_null": _ci_null,
     "ptr_null_mut": _ci_null,
     "null": _ci_null,
@@ -8222,7 +8436,8 @@ def normalize_number_code(tok):
     body = _num_body(tok.val)
     suffix = _num_suffix(tok.val.replace("_", ""))
     if _num_is_float(body, suffix):
-        return body + "f" if suffix == "f32" else body
+        return body + "f" if (suffix == "f32" or (
+            not suffix and _SINGLE_FLOAT_LITERALS)) else body
     if not suffix:
         return body
     base = PRIMITIVES[suffix]
@@ -8239,7 +8454,8 @@ def normalize_number_type(tok):
     body = _num_body(tok.val)
     suffix = _num_suffix(tok.val.replace("_", ""))
     if _num_is_float(body, suffix):
-        return RustCType("float" if suffix == "f32" else "double")
+        return RustCType("float" if (suffix == "f32" or (
+            not suffix and _SINGLE_FLOAT_LITERALS)) else "double")
     if suffix:
         return RustCType(PRIMITIVES[suffix])
     return RustCType("int")
@@ -8659,7 +8875,19 @@ def find_rust_items(code, rust_file=False):
             rest = scan[_iend:].lstrip()
             if not rest.startswith(":") or rest.startswith("::"):
                 continue
-            close = scan.find(";", _iend)
+            # The terminating `;` is the one outside every bracket: the
+            # array type `[u32; 64]` and the repeat `[0; 64]` carry their own.
+            close = -1
+            depth = 0
+            for q in range(_iend, len(scan)):
+                ch = scan[q]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                elif ch == ";" and depth <= 0:
+                    close = q
+                    break
             if close < 0:
                 raise CrustError("unterminated Rust %s near offset %d"
                                  % (kw, start))
@@ -11135,6 +11363,14 @@ def erase_module_items(code):
     return "".join(out)
 
 
+# In a file with #[kernel] functions an unsuffixed float literal is `float`
+# (GPUs have no free double); elsewhere it stays C's `double`.
+_SINGLE_FLOAT_LITERALS = False
+# `#[workgroup] static mut NAME: [T; N]` -- names in workgroup memory; every
+# kernel header in the file declares them `gpu.shared`.
+_WORKGROUP_STATICS = []
+
+
 def translate(code, path=None):
     """Lower every top-level Rust item in `code` to C.
 
@@ -11144,6 +11380,11 @@ def translate(code, path=None):
     """
     # Capture bare `mod name;` before erase blanks them — those names are
     # how we find sibling files for cross-file type knowledge.
+    global _SINGLE_FLOAT_LITERALS, _WORKGROUP_STATICS
+    _SINGLE_FLOAT_LITERALS = "#[kernel" in code
+    _WORKGROUP_STATICS = re.findall(
+        r"#\[\s*workgroup\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?static\s+"
+        r"(?:mut\s+)?(\w+)", code)
     mod_names = find_mod_decls(code) + find_use_paths(code)
     # Captured before erasure: `erase_module_items` blanks every `use`, so
     # reading them afterwards finds nothing.
@@ -11289,6 +11530,26 @@ def translate(code, path=None):
     if "snprintf" in unit.needs:
         prelude.append("int snprintf(char *, unsigned long, "
                        "const char *, ...);")
+    for need in sorted(unit.needs):
+        if need == "gpu:gpu_barrier":
+            prelude.append("void gpu_barrier(void);")
+        elif need == "gpu:gpu_popcount":
+            prelude.append("unsigned int gpu_popcount(unsigned int);")
+        elif need.startswith("gpua:"):
+            _, an, ab = need.split(":", 2)
+            nv = {"gpu_atomic_cas": 2, "gpu_atomic_load": 0}.get(an, 1)
+            rt = "void" if an == "gpu_atomic_store" else ab
+            prelude.append("%s %s(%s);" % (rt, an, ", ".join(
+                [ab + " *"] + [ab] * nv)))
+        elif need.startswith("gpu:"):
+            prelude.append("unsigned int %s(int);" % need[4:])
+        elif need.startswith("fmath:"):
+            fn = need[6:]
+            ty = "float" if fn.endswith("f") and fn != "floor" else "double"
+            arity = 3 if fn in ("fma", "fmaf") else \
+                2 if fn in ("pow", "powf", "fmin", "fminf", "fmax",
+                            "fmaxf") else 1
+            prelude.append("%s %s(%s);" % (ty, fn, ", ".join([ty] * arity)))
     if "int128" in unit.needs:
         prelude.append("typedef struct crust_u128 { unsigned long lo; "
                        "unsigned long hi; } crust_u128;")
