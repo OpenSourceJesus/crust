@@ -452,8 +452,15 @@ class Machine:
             if not isinstance(k, tuple):
                 k = (0, k)
             bufmap[k] = buffers[key]
+        used = rd._entry_point_uses(self.m, ep[1])
         for vid in self.gvars:
             sc, pointee = self.gvars[vid]
+            if vid not in used and sc in (
+                    sp.STORAGE["StorageBuffer"], sp.STORAGE["Uniform"],
+                    sp.STORAGE["PushConstant"]):
+                # Another kernel's interface: another entry point may reuse
+                # its (set, binding), so it must not be bound or written back.
+                continue
             if sc in (sp.STORAGE["StorageBuffer"], sp.STORAGE["Uniform"]):
                 s = self._decor(vid, "DescriptorSet")
                 b = self._decor(vid, "Binding")
