@@ -152,6 +152,24 @@ class TestDisassembler(unittest.TestCase):
         self.assertIn("OpFAdd", text)
 
 
+class TestDescribe(unittest.TestCase):
+    def test_vecadd_interface(self):
+        iface = rd.describe(ex.build_vecadd().words())
+        self.assertEqual(len(iface), 1)
+        k = iface[0]
+        self.assertEqual(k["name"], "main")
+        self.assertEqual(len(k["local_size"]), 3)
+        self.assertEqual([b["binding"] for b in k["buffers"]], [0, 1, 2])
+        self.assertEqual(k["buffers"][2]["access"], "read_write")
+        self.assertEqual(k["push"], [])
+
+    def test_two_kernels_reuse_a_binding(self):
+        m = TestValidatorRejects()._two_buffers_same_binding(False)
+        iface = rd.describe(m)
+        self.assertEqual([[b["name"] for b in k["buffers"]] for k in iface],
+                         [["a"], ["b"]])
+
+
 class TestValidatorAccepts(unittest.TestCase):
     def test_examples_validate(self):
         for name in ex.EXAMPLES:
