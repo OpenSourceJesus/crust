@@ -324,6 +324,17 @@ class Function:
         self.blocks.append(b)
         return b
 
+    def new_block(self):
+        """A block with an id but no place in the function yet. Merge and
+        continue blocks are created early (their ids are needed by the
+        header) and placed with place() once the construct's body is out,
+        so the layout is header, body, continue, merge."""
+        return Block(self.module, self.module.new_id())
+
+    def place(self, b):
+        self.blocks.append(b)
+        return b
+
     def local_var(self, ptr_type, init=None):
         """A Function-storage variable. The spec wants these first in the
         entry block, so they are collected and emitted there."""

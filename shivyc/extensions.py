@@ -252,6 +252,13 @@ class ExtensionInfo:
         # thread function name -> {'side': 'left'|'right', 'core': int}
         # Declared via `assert FN in threads.left(core=N)` in a function header.
         self.threads = {}
+        # GPU kernels (SPIRV.md): `assert FN in gpu.compute(local_size=64)`
+        # -> fn -> {'local_size': (x, y, z)}
+        self.gpu_compute = {}
+        # `assert PARAM in gpu.buffer(binding=0, readonly)` in FN's header
+        # -> fn -> {param -> {'binding': int, 'set': int,
+        #                     'readonly': bool, 'writeonly': bool}}
+        self.gpu_buffers = {}
 
     def attrs_of(self, name):
         return self.attrs.get(name, set())
@@ -263,7 +270,9 @@ class ExtensionInfo:
         return self.contracts.get(name, {})
 
     def __bool__(self):
-        return bool(self.attrs) or bool(self.contracts) or bool(self.threads)
+        return (bool(self.attrs) or bool(self.contracts)
+                or bool(self.threads) or bool(self.gpu_compute)
+                or bool(self.gpu_buffers))
 
 
 def preprocess_extensions(code):
@@ -300,7 +309,12 @@ def preprocess_extensions(code):
         if not _looks_like_extension(region):
             continue
 
-        attrs, contracts, threads = _parse_region(region, name)
+        gpu = {"compute": {}, "buffers": {}}
+        attrs, contracts, threads = _parse_region(region, name, gpu)
+        for kname, rec in gpu["compute"].items():
+            info.gpu_compute[kname] = rec
+        if gpu["buffers"]:
+            info.gpu_buffers.setdefault(name, {}).update(gpu["buffers"])
         if attrs:
             info.attrs.setdefault(name, set()).update(attrs)
         if contracts:
@@ -317,9 +331,12 @@ def preprocess_extensions(code):
     return "".join(chars), info
 
 
-def _parse_region(region, func_name):
+def _parse_region(region, func_name, gpu=None):
     """Extract specifiers, contracts, and thread declarations from a header
-    region. Returns (attrs, contracts, threads)."""
+    region. Returns (attrs, contracts, threads). GPU kernel declarations
+    (`gpu.compute`, `gpu.buffer`) are recorded into the `gpu` dict when one
+    is passed ({'compute': {}, 'buffers': {}}); without it they are refused,
+    so no caller can silently drop one."""
     attrs = set()
     contracts = {}
     threads = {}
@@ -335,6 +352,17 @@ def _parse_region(region, func_name):
             raise ExtensionError(
                 f"unexpected text in extension region of '{func_name}': "
                 f"{line!r}")
+        decl = _parse_gpu_assert(line, func_name)
+        if decl is not None:
+            if gpu is None:
+                raise ExtensionError(
+                    f"gpu declaration is not accepted here in "
+                    f"'{func_name}': {line!r}")
+            if decl[0] == "compute":
+                gpu["compute"][decl[1]] = decl[2]
+            else:
+                gpu["buffers"][decl[1]] = decl[2]
+            continue
         thread = _parse_thread_assert(line, func_name)
         if thread is not None:
             tname, rec = thread
@@ -360,6 +388,134 @@ def _is_identifier(s):
 def _is_int(s):
     """True if `s` is a non-negative integer literal."""
     return s != "" and s.isdigit()
+
+
+def _split_top_level(s):
+    """Split on commas that are not inside parentheses."""
+    parts = []
+    depth = 0
+    cur = ""
+    for c in s:
+        if c == "(":
+            depth = depth + 1
+        elif c == ")":
+            depth = depth - 1
+        if c == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur = cur + c
+    if cur.strip() != "":
+        parts.append(cur.strip())
+    return parts
+
+
+def _parse_gpu_assert(line, func_name):
+    """Recognize the GPU kernel declarations (SPIRV.md section 5):
+
+        assert FN in gpu.compute(local_size=64)
+        assert FN in gpu.compute(local_size=(8, 8))
+        assert PARAM in gpu.buffer(binding=0, readonly)
+
+    Returns ('compute', FN, {'local_size': (x, y, z)}),
+    ('buffer', PARAM, {...}) or None when the line is not a gpu declaration.
+    Anything that *is* one but malformed is refused with the reason, in the
+    same spirit as the thread declarations: a kernel the compiler cannot
+    understand must not quietly become an ordinary function.
+    """
+    s = line.strip()
+    if not s.startswith("assert"):
+        return None
+    body = s[len("assert"):].strip()
+    in_pos = body.find(" in ")
+    if in_pos < 0:
+        return None
+    left = body[:in_pos].strip()
+    right = body[in_pos + 4:].strip()
+    if not right.startswith("gpu."):
+        return None
+    if not _is_identifier(left):
+        raise ExtensionError(
+            f"gpu declaration needs a name on the left of 'in' in "
+            f"'{func_name}': {line!r}")
+    rest = right[len("gpu."):]
+    lp = rest.find("(")
+    if lp < 0 or not rest.endswith(")"):
+        raise ExtensionError(
+            f"gpu declaration must look like gpu.compute(...) or "
+            f"gpu.buffer(...) in '{func_name}': {line!r}")
+    kind = rest[:lp].strip()
+    items = _split_top_level(rest[lp + 1:len(rest) - 1])
+
+    if kind == "compute":
+        size = None
+        for it in items:
+            eq = it.find("=")
+            key = it[:eq].strip() if eq >= 0 else it
+            val = it[eq + 1:].strip() if eq >= 0 else ""
+            if key != "local_size" or eq < 0:
+                raise ExtensionError(
+                    f"gpu.compute takes only local_size=N or "
+                    f"local_size=(X, Y[, Z]) in '{func_name}': {line!r}")
+            dims = []
+            if val.startswith("(") and val.endswith(")"):
+                for d in _split_top_level(val[1:len(val) - 1]):
+                    dims.append(d)
+            else:
+                dims.append(val)
+            if len(dims) < 1 or len(dims) > 3:
+                raise ExtensionError(
+                    f"local_size takes one to three sizes in "
+                    f"'{func_name}': {line!r}")
+            nums = []
+            for d in dims:
+                if not _is_int(d) or int(d) < 1:
+                    raise ExtensionError(
+                        f"local_size must be positive integer constants in "
+                        f"'{func_name}': {line!r}")
+                nums.append(int(d))
+            while len(nums) < 3:
+                nums.append(1)
+            size = (nums[0], nums[1], nums[2])
+        if size is None:
+            raise ExtensionError(
+                f"gpu.compute needs local_size=... in '{func_name}': "
+                f"{line!r}")
+        return ("compute", left, {"local_size": size})
+
+    if kind == "buffer":
+        rec = {"binding": None, "set": 0, "readonly": False,
+               "writeonly": False}
+        for it in items:
+            eq = it.find("=")
+            if eq >= 0:
+                key = it[:eq].strip()
+                val = it[eq + 1:].strip()
+                if key == "binding" or key == "set":
+                    if not _is_int(val):
+                        raise ExtensionError(
+                            f"{key} must be an integer constant in "
+                            f"'{func_name}': {line!r}")
+                    rec[key] = int(val)
+                    continue
+            elif it == "readonly" or it == "writeonly":
+                rec[it] = True
+                continue
+            raise ExtensionError(
+                f"gpu.buffer takes binding=N, set=N, readonly, writeonly in "
+                f"'{func_name}': {line!r}")
+        if rec["binding"] is None:
+            raise ExtensionError(
+                f"gpu.buffer needs binding=N in '{func_name}': {line!r}")
+        if rec["readonly"] and rec["writeonly"]:
+            raise ExtensionError(
+                f"a buffer cannot be both readonly and writeonly in "
+                f"'{func_name}': {line!r}")
+        return ("buffer", left, rec)
+
+    raise ExtensionError(
+        f"unknown gpu declaration 'gpu.{kind}' in '{func_name}' (known: "
+        f"compute, buffer): {line!r}")
 
 
 def _parse_thread_assert(line, func_name):

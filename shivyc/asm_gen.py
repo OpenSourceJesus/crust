@@ -531,6 +531,8 @@ class ASMGen:
             return self._make_asm_m68k()
         if self.asm_code.target.name == "wasm":
             return self._make_asm_wasm()
+        if self.asm_code.target.name == "spirv":
+            return self._make_asm_spirv()
 
         global_spotmap = self._get_global_spotmap()
 
@@ -6086,6 +6088,16 @@ class ASMGen:
             self._wasm_data.append((addr, self._wasm_init_bytes(init, size)))
         # An uninitialized static is zero, and linear memory starts zeroed, so
         # no data segment is needed for it at all.
+
+    def _make_asm_spirv(self):
+        """SPIR-V (Vulkan compute) lowering. Runs only under `--target spirv`.
+
+        Like wasm this is binary: the module bytes go on `asm_code.wasm_bytes`
+        and the driver skips `as` and `ld`. See shivyc/spirv_gen.py.
+        """
+        from shivyc.spirv_gen import SpirvGen
+        gen = SpirvGen(self.il_code, self.symbol_table, self.arguments)
+        self.asm_code.wasm_bytes = gen.make()
 
     def _make_asm_wasm(self):
         """WebAssembly lowering. Runs only under `--target wasm`.

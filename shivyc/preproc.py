@@ -463,6 +463,10 @@ def set_defines(defines: "list[str]"):
         # between the builtins and a portable scalar fallback.
         lines.append("#define __wasm__ 1")
         lines.append("#define __wasm32__ 1")
+    if _target_name == "spirv":
+        # shivyc/include/crust_gpu.h picks the GPU intrinsics under this and
+        # its sequential CPU fallback everywhere else.
+        lines.append("#define __spirv__ 1")
     if _target_os == "macos":
         # What clang predefines for arm64-apple-macos11 that portable code
         # and the SDK headers test for: the platform, the architecture, the

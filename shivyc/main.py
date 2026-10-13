@@ -1629,7 +1629,7 @@ def _validate_target(args):
     if name and not is_known_target(name):
         error_collector.add(CompilerError(
             "unrecognized target '%s'; known targets are x86_64, arm64, "
-            "riscv64, m68k, wasm" % name))
+            "riscv64, m68k, wasm, spirv" % name))
 
     # --os: validate the spelling, then the pairing, then resolve the default
     # once so every later stage reads a single canonical answer.
