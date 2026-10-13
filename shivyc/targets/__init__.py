@@ -200,6 +200,27 @@ class WasmTarget(Target):
         self.output_ext = ".wasm"
 
 
+class SpirvTarget(Target):
+    """SPIR-V (Vulkan compute, `Shader` capability, Logical addressing).
+
+    The second binary back end after wasm, and the first whose output runs on
+    a GPU. It shares wasm's structural facts -- no registers, no assembler
+    text, `is_binary` set -- and adds one of its own: the front end keeps its
+    LP64 data model (pointers are 8 bytes, `long` is 8), and it is the *back
+    end* that decides how those map onto a device that has neither. See
+    SPIRV.md for the plan and shivyc/spirv_gen.py for the lowering.
+    """
+
+    def __init__(self):
+        Target.__init__(self)
+        self.name = "spirv"
+        self.triple = "spirv-unknown-vulkan1.1"
+        self.asm_syntax_prologue = []
+        self.asm_syntax_epilogue = []
+        self.is_binary = True
+        self.output_ext = ".spv"
+
+
 def _make_target(n):
     """Construct the architecture target for canonical-or-alias name `n`."""
     if n == "x86_64" or n == "amd64":
@@ -212,6 +233,8 @@ def _make_target(n):
         return M68kTarget()
     if n == "wasm" or n == "wasm32" or n == "webassembly":
         return WasmTarget()
+    if n == "spirv" or n == "spv" or n == "vulkan":
+        return SpirvTarget()
     return X86_64Target()
 
 
@@ -285,7 +308,8 @@ def is_supported_os(target_name, os_name):
 def is_known_target(name):
     """True if `name` is a recognized target or alias."""
     return name in ("x86_64", "amd64", "arm64", "aarch64", "riscv64", "rv64",
-                    "m68k", "neogeo", "68k", "wasm", "wasm32", "webassembly")
+                    "m68k", "neogeo", "68k", "wasm", "wasm32", "webassembly",
+                    "spirv", "spv", "vulkan")
 
 
 DEFAULT_TARGET = "x86_64"
