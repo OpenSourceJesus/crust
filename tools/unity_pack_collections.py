@@ -757,3 +757,149 @@ def _hoist_byte_producers(text):
             rep = "{ %s%s }" % (pre, stmt)
         text = text[:s0] + rep + text[s1 + 1:]
     return text
+
+
+def desugar_string_switch(text):
+    """`switch (s) { case "a": .. case "b": .. default: .. }` on a string -> a switch on the index of
+    the string among the case labels, `switch (_cs_switch_str(s, 2, "a" "\\0" "b")) { case 0: ..
+    case 1: .. }`: C switches only on integers, and this keeps fallthrough and `default` as they
+    were. Only the labels of the switch's own block change (a nested switch is its own)."""
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        hit = None
+        for m in re.finditer(r"(?<![\w.])switch\s*\(", scan):
+            op = m.end() - 1
+            cp = _match(scan, op, "(", ")")
+            if cp is None:
+                continue
+            if text[op + 1:cp].lstrip().startswith("_cs_switch_str("):
+                continue                              # done
+            k = cp + 1
+            while k < len(scan) and scan[k] in " \t\r\n":
+                k += 1
+            if k >= len(scan) or scan[k] != "{":
+                continue
+            e = _match(scan, k, "{", "}")
+            if e is None:
+                continue
+            labels, depth, j = [], 0, k
+            while j < e:
+                c = scan[j]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                elif depth == 1:
+                    cm = re.compile(r"(?<![\w.])case\s*(?=\")").match(scan, j)
+                    if cm:
+                        q0 = cm.end()
+                        q1 = scan.index('"', q0 + 1)
+                        labels.append((q0, q1 + 1))
+                        j = q1
+                j += 1
+            if labels:
+                hit = (op, cp, labels)
+                break
+        if hit is None:
+            return text
+        op, cp, labels = hit
+        lits = []
+        for a, b in labels:
+            lit = text[a:b]
+            if lit not in lits:
+                lits.append(lit)
+        out, pos = [], 0
+        for a, b in labels:
+            out.append(text[pos:a])
+            out.append(str(lits.index(text[a:b])))
+            pos = b
+        body_tail = "".join(out) + text[pos:]
+        # `body_tail` starts at 0 and has the labels replaced: the head's span shifts nothing
+        # (the head precedes every label), so op / cp still index it
+        expr = text[op + 1:cp]
+        table = ' "\\0" '.join(lits)
+        text = (body_tail[:op + 1] + "_cs_switch_str(%s, %d, %s)" % (expr.strip(), len(lits), table)
+                + body_tail[cp:])
+    return text
+
+
+def _split_top(text):
+    """`a, f(b, c), new V{1, 2}` -> its top-level pieces."""
+    out, depth, cur = [], 0, []
+    scan = cs2cpp._blank(text)
+    for ch, sc in zip(text, scan):
+        if sc in "([{<" and sc != "<":
+            depth += 1
+        elif sc in ")]}":
+            depth -= 1
+        if sc == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    last = "".join(cur).strip()
+    if last:
+        out.append(last)
+    return out
+
+
+def desugar_list_initializers(text):
+    """`List<T> xs = new List<T> { a, b };` (and `var`) -> `List<T> xs = new List<T>(); xs.Add(a);
+    xs.Add(b);`: the lowering to a vector takes a call, not a brace list, and a brace list on a
+    field was dropped without a word (the list came up empty).
+
+    In a method the adds follow the declaration. On an instance field they open `Awake` (made
+    when the class has none), where C# ran the initializer before any message. A static field's
+    initializer has no such place: it is refused, with the way out."""
+    pat = re.compile(
+        r"(?<![\w.])(?:var|List\s*<[^<>;={}]*>)\s+(\w+)\s*=\s*new\s+List\s*<[^<>;={}]*>\s*"
+        r"(?:\(\s*\)\s*)?\{")
+    pos = 0
+    field_adds = {}                       # class `{` offset (in the final text) -> adds
+    for _pass in range(512):
+        scan = cs2cpp._blank(text)
+        m = pat.search(scan, pos)
+        if not m:
+            break
+        ob = m.end() - 1
+        cb = _match(scan, ob, "{", "}")
+        if cb is None:
+            break
+        k = cb + 1
+        while k < len(scan) and scan[k] in " \t\r\n":
+            k += 1
+        if k >= len(scan) or scan[k] != ";":
+            pos = m.end()
+            continue
+        name = m.group(1)
+        items = _split_top(text[ob + 1:cb])
+        head = text[m.start():ob].rstrip()
+        if not head.endswith(")"):
+            head += "()"
+        adds = "".join(" %s.Add(%s);" % (name, it) for it in items)
+        cls = _class_body_open(scan, m.start())
+        if cls is None:
+            text = text[:m.start()] + head + ";" + adds + text[k + 1:]
+            pos = m.start() + len(head)
+            continue
+        decl = scan[max(scan.rfind(";", 0, m.start()), scan.rfind("}", 0, m.start()),
+                        scan.rfind("{", 0, m.start())) + 1:m.start()]
+        if re.search(r"(?<![\w])static\b", decl):
+            from tools.unity_pack_common import PackError
+            raise PackError(
+                "`static List<..> %s = new List<..> { .. }`: a collection initializer on a static "
+                "field is not lowered; add the elements in Awake" % name)
+        text = text[:m.start()] + head + ";" + text[k + 1:]
+        # the class `{` keeps its offset: the edit is after it
+        field_adds.setdefault(cls, []).append(adds)
+        pos = m.start() + len(head)
+    for cls in sorted(field_adds, reverse=True):
+        scan = cs2cpp._blank(text)
+        close = _match(scan, cls, "{", "}")
+        body_adds = "".join(field_adds[cls])
+        aw = re.compile(r"(?<![\w.])void\s+Awake\s*\(\s*\)\s*\{").search(scan, cls, close)
+        if aw and _class_body_open(scan, aw.start()) == cls:
+            text = text[:aw.end()] + body_adds + text[aw.end():]
+        else:
+            text = text[:close] + "    void Awake() {" + body_adds + " }\n" + text[close:]
+    return text

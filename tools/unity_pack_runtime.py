@@ -688,6 +688,18 @@ _h("_cs_euler_z", "float",
    "    while (d >= 360.f) d = d - 360.f;\n"
    "    return d;\n}", math=True)
 
+# -- switch on a string (unity_pack_collections.desugar_string_switch) ---------
+
+_h("_cs_switch_str", "int",
+   "static int _cs_switch_str(const char *s, int n, const char *tab) {\n"
+   "    int k;\n"
+   "    if (!s) return -1;\n"
+   "    for (k = 0; k < n; k = k + 1) {\n"
+   "        if (strcmp(s, tab) == 0) return k;\n"
+   "        tab = tab + strlen(tab) + 1;\n"
+   "    }\n"
+   "    return -1;\n}")
+
 # -- LinkedList ends -----------------------------------------------------------
 
 _h("_cs_ll_first", "int",

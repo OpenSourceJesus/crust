@@ -7386,7 +7386,8 @@ def analyze_script(path, text=None, shallow=False):
     # List search is a helper per element type: both are emitted with the
     # string helpers.
     if "_cs_require_nonempty(" in scan or "_cs_idx" in scan or \
-            "_cs_ll_" in scan or "_cs_bytes_" in scan or "_cs_file_" in scan or (
+            "_cs_ll_" in scan or "_cs_bytes_" in scan or "_cs_file_" in scan or \
+            "_cs_switch_str(" in scan or (
             re.search(r"\bList\s*<", scan) and re.search(
                 r"\.\s*(?:RemoveAt|Insert|Contains|IndexOf|Remove)\s*\(",
                 scan)):
@@ -7410,6 +7411,11 @@ def analyze_script(path, text=None, shallow=False):
     # lives with the scratch slots.
     if re.search(r"(?<![\w.])string\b", scan) and re.search(
             r"[=!]=\s*null\b|\bnull\s*[=!]=", scan):
+        apis.add("string.+")
+    # `s == "lit"` / `"lit" != s` is lowered to `_cs_str_Equals`, which is
+    # emitted with them as well (it was undeclared when nothing else in the
+    # project used a string helper).
+    if re.search(r'[=!]=\s*"|"\s*[=!]=', scan):
         apis.add("string.+")
     # Formatting ($"..", string.Format, ToString) builds strings there too.
     if re.search(r'(?<![\w@])\$"|\bFormat\s*\(|\.\s*ToString\s*\(', scan):
@@ -8067,6 +8073,7 @@ def _method_ret_kinds(plan):
             if _ret_c_ty(base, plan) in (None, "void", "Rect"):
                 continue
             kind = ("s" if base == "string" else "b" if base == "bool"
+                    else "c" if base == "char"
                     else "f" if base in ("float", "double")
                     else "v" if base == "Vector2" else "i")
             for ov in (False, True):
@@ -10319,10 +10326,13 @@ def _emit_engine_debug_log(p, plan, want_log):
         p("    return _engine_log_fp;")
         p("}")
         p("")
+        _emit_float_fmt(p)
         p("static void Debug_Log_f(float v) {")
         p("    FILE *f = _engine_log();")
+        p("    char t[64];")
         p("    if (!f) return;")
-        p("    fprintf(f, \"%g\\n\", (double)v);")
+        p("    _engine_fmt_f(t, sizeof t, (double)v);")
+        p("    fprintf(f, \"%s\\n\", t);")
         p("    fflush(f);")
         p("}")
         p("static void Debug_Log_i(int v) {")
@@ -10338,7 +10348,14 @@ def _emit_engine_debug_log(p, plan, want_log):
         p("    fputc('\\n', f);")
         p("    fflush(f);")
         p("}")
-        p("/* Call sites pick Debug_Log_{i,f,s} at rewrite (no C11 generics). */")
+        p("static void Debug_Log_c(char c) {")
+        p("    FILE *f = _engine_log();")
+        p("    if (!f) return;")
+        p("    fputc(c, f);")
+        p("    fputc('\\n', f);")
+        p("    fflush(f);")
+        p("}")
+        p("/* Call sites pick Debug_Log_{i,f,c,s} at rewrite (no C11 generics). */")
         p("")
     else:
         p("void engine_set_log_file(const char *path) { (void)path; }")
@@ -20207,13 +20224,17 @@ def emit_engine(plan, analyses, used_apis):
         p("    }")
         p("    return _engine_str_buf[k];")
         p("}")
+        _emit_float_fmt(p)
         for kind, cty, fmt, arg in (("i", "int", "%d", "b"),
-                                     ("f", "float", "%g", "(double)b"),
+                                     ("f", "float", "%s", "_t"),
                                      ("c", "char", "%c", "b"),
                                      ("s", "const char *", "%s",
                                       'b ? b : ""')):
             p("static const char *_str_plus_%s(const char *a, %s%sb) {"
               % (kind, cty, "" if cty.endswith("*") else " "))
+            if kind == "f":
+                p("    char _t[64];")
+                p("    _engine_fmt_f(_t, sizeof _t, (double)b);")
             p("    int n = snprintf((char *)0, 0, \"%%s%s\", a ? a : \"\", %s);"
               % (fmt, arg))
             p("    char *out = _engine_str_slot((size_t)n + 1);")
@@ -20426,8 +20447,11 @@ def emit_engine(plan, analyses, used_apis):
             p, want_file_create_text, want_file_open_text, want_file_text_stream)
     if want_console:
         p("/* System.Console.WriteLine → stdout (terminal), not Player.log */")
+        _emit_float_fmt(p)
         p("static void Console_WriteLine_f(float v) {")
-        p("    printf(\"%g\\n\", (double)v);")
+        p("    char t[64];")
+        p("    _engine_fmt_f(t, sizeof t, (double)v);")
+        p("    printf(\"%s\\n\", t);")
         p("}")
         p("static void Console_WriteLine_i(int v) { printf(\"%d\\n\", v); }")
         p("static void Console_WriteLine_s(const char *s) {")
@@ -21446,6 +21470,31 @@ def emit_engine(plan, analyses, used_apis):
     return _site_stops(_fill_accessor_prototypes("\n".join(lines) + "\n"))
 
 
+#: Mono's `float.ToString()` (Unity): seven significant digits, `G7`. That is C's `%.7g` with the
+#: exponent as `E+10` and the specials spelled `NaN` / `Infinity`; `%g` alone keeps six digits
+#: (`0.333333` for 1/3f, where Unity prints 0.3333333).
+_FLOAT_FMT_C = (
+    "#ifndef ENGINE_FMT_F_DEFINED\n"
+    "#define ENGINE_FMT_F_DEFINED\n"
+    "static int _engine_fmt_f(char *out, size_t cap, double dv) {\n"
+    "    float v = (float)dv;\n"
+    "    char t[48];\n"
+    "    int k;\n"
+    "    if (v != v) return snprintf(out, cap, \"NaN\");\n"
+    "    if (v > 3.4028235e38f) return snprintf(out, cap, \"Infinity\");\n"
+    "    if (v < -3.4028235e38f) return snprintf(out, cap, \"-Infinity\");\n"
+    "    snprintf(t, sizeof t, \"%.7g\", (double)v);\n"
+    "    for (k = 0; t[k]; k = k + 1) if (t[k] == 'e') t[k] = 'E';\n"
+    "    return snprintf(out, cap, \"%s\", t);\n"
+    "}\n"
+    "#endif\n")
+
+
+def _emit_float_fmt(p):
+    for line in _FLOAT_FMT_C.rstrip("\n").split("\n"):
+        p(line)
+
+
 _SITE_MARK = re.compile(r" /\*@site (.*?) @cs (.*?)\*/$", re.M)
 
 
@@ -21476,8 +21525,11 @@ def _site_stops(text):
             defs[m.group(1)] = (k, e)
             k = e
         k += 1
+    # (a vector-valued stopping helper stays bare too: `vector_int ws = (site, call)` is not
+    # a call returning a vector to cpprust, so a local initialised from it was refused)
     stops = {n for n, (a, b) in defs.items()
              if n not in ("_engine_nn", "_engine_nre_ix")
+             and "std::vector<" not in lines[a]
              and any("exit(70)" in l for l in lines[a:b])}
     # a vector-valued call stays bare: cpprust initialises a vector from a
     # call, not from a comma expression
@@ -24214,6 +24266,32 @@ def _packed_model(plan):
         elem_type=lambda t: _collection_elem_c_ty(t, plan))
 
 
+def _rewrite_nary_min_max(text):
+    """`Mathf.Max(a, b, c)` / `Mathf.Min(..)` with more than two arguments (Unity's `params`
+    overloads) -> nested two-argument calls, which are what the engine defines."""
+    for _pass in range(64):
+        scan = cs2cpp._blank(text)
+        hit = None
+        for m in re.finditer(r"(?<![\w.])Mathf\.(Max|Min)\s*\(", scan):
+            op = m.end() - 1
+            cp = _match_close(scan, op, "(", ")")
+            if cp is None:
+                continue
+            args = [a.strip() for a in cs2cpp.split_call_args(text[op + 1:cp])]
+            if len(args) > 2:
+                hit = (m, cp, args)
+                break
+        if hit is None:
+            break
+        m, cp, args = hit
+        name = "Mathf." + m.group(1)
+        acc = "%s(%s, %s)" % (name, args[0], args[1])
+        for a in args[2:]:
+            acc = "%s(%s, %s)" % (name, acc, a)
+        text = text[:m.start()] + acc + text[cp + 1:]
+    return text
+
+
 def _rewrite_csharp_float_literals(text):
     """C# `0f` → C `0.f`. C rejects a float suffix on an integer constant.
 
@@ -24225,7 +24303,8 @@ def _rewrite_csharp_float_literals(text):
     scan = cs2cpp._blank(text)
     out = []
     pos = 0
-    for m in re.finditer(r"(?<![\w.])(\d+)([fF])\b", scan):
+    # (not the exponent of `1.0e-5f`, whose `5f` is already a float literal)
+    for m in re.finditer(r"(?<![\w.])(?<![\d.][eE][-+])(\d+)([fF])\b", scan):
         out.append(text[pos:m.start(1)])
         out.append(m.group(1) + "." + m.group(2))
         pos = m.end()
@@ -24258,6 +24337,11 @@ def _int_idents(cl, plan, body, site):
     for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
         if prm.type in _CS_INT_TYPES:
             out.add(prm.name)
+        elif prm.type == "char":
+            out.add("char:" + prm.name)
+    # characters print as characters (`"" + c`), not as their code
+    out |= {"char:" + n for n in re.findall(
+        r"(?<![\w.])char\s+(\w+)\s*[;=,)]", cs2cpp._blank(body or ""))}
     for ocname, ocl in (plan.get("classes") or {}).items():
         oidn = _c_ident(ocname)
         for name, _ty, _bits, kind in ocl.get("members") or ():
@@ -24635,6 +24719,51 @@ def _format_bool_comparisons(text):
     return "".join(out)
 
 
+def _format_bool_log_args(text):
+    """`Debug.Log(a && b)` / `Debug.Log(n > 3)` / `Debug.Log(!ok)`: a comparison or logical
+    expression that is the whole argument of a log call is a bool, and prints True / False (the
+    engine printed 1 and 0). A conditional (`?:`) or a concatenation is not one."""
+    scan = cs2cpp._blank(text)
+    out, last = [], 0
+    opener = re.compile(r"(?<![\w.])(?:Debug_Log|Debug\s*\.\s*Log|print|Console_WriteLine|"
+                        r"Console\s*\.\s*WriteLine)\s*\(")
+    for m in opener.finditer(scan):
+        if m.start() < last:
+            continue
+        op = m.end() - 1
+        cb = _match_close(scan, op, "(", ")")
+        if cb is None:
+            continue
+        inner = scan[op + 1:cb]
+        a = 0
+        while True:                       # through parentheses that only wrap the expression
+            st = inner.strip()
+            if st.startswith("(") and _match_close(st, 0, "(", ")") == len(st) - 1:
+                inner = st[1:-1]
+            else:
+                break
+        depth, top = 0, []
+        for ch in inner:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            top.append(ch if depth == 0 else " ")
+        top = "".join(top)
+        if "," in top or "?" in top or "+" in top.replace("++", ""):
+            continue
+        bm = re.fullmatch(r"\s*(\w+)\s*[\^&|]\s*(\w+)\s*", top)
+        bool_op = bool(bm) and all(
+            re.search(r"\bbool\s+(?:\w+\s*(?:=[^,;]*)?,\s*)*%s\b" % re.escape(n), scan)
+            for n in bm.groups())
+        if bool_op or re.search(r"==|!=|<=|>=|&&|\|\||(?<![<>=-])[<>](?![<>=])", top) or re.match(r"\s*!(?!=)", top):
+            out.append(text[last:op + 1])
+            out.append('(%s) ? "True" : "False"' % text[op + 1:cb].strip())
+            last = cb
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _format_bools(text, names, calls):
     """A bool as C# formats it: `"alive " + alive` is "alive True", and
     `Debug.Log(ok)` prints "False" -- the engine printed 1 and 0.
@@ -24645,7 +24774,7 @@ def _format_bools(text, names, calls):
     the typed concatenation reads as a string. `names` are bool variables
     and accessors, `calls` helpers returning one.
     """
-    text = _format_bool_comparisons(text)
+    text = _format_bool_log_args(_format_bool_comparisons(text))
     alts = []
     if names:
         alts.append(r"(?<![\w.>])(?:%s)(?![\w(\[])" % "|".join(
@@ -26719,6 +26848,10 @@ def _own_string_locals(text, string_idents, int_idents, stores=(),
             j -= 1
         if j < 0 or scan[j] in ";{}":
             return True
+        # the statement after a `case X:` / `default:` label (not a ternary's `:`)
+        if scan[j] == ":" and re.search(
+                r"(?:^|[;{}])\s*(?:case\b[^;{}:?]*|default)\s*$", scan[:j]):
+            return True
         # The body of a brace-less `for (..)`, `if (..)`, `while (..)`,
         # `foreach (..)`, or of `else` / `do`.
         if re.search(r"(?<![\w])(?:else|do)$", scan[:j + 1]):
@@ -27178,7 +27311,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = runtime.lower_clock(text, plan.setdefault("_cs_str_used", set()),
                                cs2cpp._blank, _match_close)
     text = _format_bool_literals(text)
-    text = _rewrite_csharp_float_literals(text)
+    text = _rewrite_nary_min_max(_rewrite_csharp_float_literals(text))
     text = re.sub(r"(?<![\w.])true\b", "1", text)
     text = re.sub(r"(?<![\w.])false\b", "0", text)
     text = re.sub(r"\bthis\.", "", text)
@@ -27195,7 +27328,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # table (tools/unity_pack_runtime.py), while the text is still C#.
     if "_cs_require_nonempty(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_require_nonempty")
-    for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last",
+    for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last", "_cs_switch_str",
                "_cs_bytes_utf8", "_cs_bytes_to_string", "_cs_bytes_base64",
                "_cs_bytes_unbase64", "_cs_bytes_md5", "_cs_bytes_sha256",
                "_cs_bytes_hex_dash", "_cs_file_read_bytes",
@@ -27271,7 +27404,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if text == before:
             break
     # an inlined helper's body is its C# text (`return (1f - t) * ..`)
-    text = _rewrite_csharp_float_literals(text)
+    text = _rewrite_nary_min_max(_rewrite_csharp_float_literals(text))
     # Boolean.GetHashCode is 1 / 0 and Int32.GetHashCode the value itself
     # (booleans are 1 / 0 by now unless inlined above).
     for _pass in range(4):
@@ -27509,6 +27642,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         _b = (_m.get("ret") or "void").strip().split(".")[-1]
         if _ret_c_ty(_b, plan) not in (None, "void", "Rect"):
             _rk[_m["name"]] = ("s" if _b == "string" else "b" if _b == "bool"
+                               else "c" if _b == "char"
                                else "f" if _b in ("float", "double")
                                else "v" if _b == "Vector2" else "i")
     plan["_method_ret_kinds_local"] = _rk
@@ -27521,6 +27655,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     int_idents |= _string_helper_names("int") | _string_helper_names("bool")
     int_idents |= {k for k, v in (plan.get("_method_ret_kinds_local")
                                   or {}).items() if v in ("i", "b")}
+    int_idents |= {"char:" + k for k, v in (plan.get("_method_ret_kinds_local")
+                                            or {}).items() if v == "c"}
     string_idents |= {
         prm.name for prm in cs2cpp.parse_params((site or {}).get("args") or "")
         if prm.type in ("string", "String", "System.String")}
@@ -31321,7 +31457,8 @@ def pack(root, outdir, *args, **kwargs):
     _items = _item_gain_types(files.values())
     _n = [0]
     for fp in sorted(files):
-        t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
+        t = _coll.desugar_list_initializers(overlay.get(fp, files[fp]))
+        t = _coll.desugar_collections(t, _n)
         t = _phys.desugar_layers(t, _layer_names,
                                  _common.SOURCE_LAYER_MATRIX, _has_remove)
         t = _inp.desugar_input_actions(t, _common.SOURCE_INPUT_ACTIONS,
@@ -31333,6 +31470,7 @@ def pack(root, outdir, *args, **kwargs):
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
+        t = _coll.desugar_string_switch(t)
         # Coroutines, as state machines (tools/unity_pack_coroutines.py).
         import tools.unity_pack_coroutines as _co
         t = _co.desugar_coroutines(t)
@@ -31851,6 +31989,11 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
                  | {"int"}
                  if re.search(r"\b_cs_vec_(?:index|remove|at|new)_%s\(" % re.escape(
                      _vec_helper_suffix(t)), engine)]
+    if not vec_types and re.search(r"\b_cs_vec_check_(?:index|insert)\(", engine):
+        # List.RemoveAt / Insert (a LinkedList's AddFirst / RemoveFirst too) call the
+        # bounds checks, which the search helpers define; with no search in the program
+        # nothing asked for them and the call was left undeclared
+        vec_types = ["int"]
     if vec_types:
         helpers_c += _vec_helpers_c(vec_types)
     json_protos, json_defs = [], []

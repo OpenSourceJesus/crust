@@ -780,8 +780,7 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
     string_idents = frozenset(string_idents or ())
     int_idents = frozenset(int_idents or ())
     e = expr.strip()
-    while (e.startswith("(") and e.endswith(")")
-           and e.count("(") == e.count(")")):
+    while e.startswith("(") and e.endswith(")") and _is_one_paren_group(e):
         inner = e[1:-1].strip()
         if not inner:
             break
@@ -826,12 +825,30 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
         return "c"
     if re.match(r"^-?\d+$", e):
         return "i"
+    if re.match(r"^\w+$", e) and ("char:" + e) in int_idents:
+        return "c"               # a `char` local / parameter / field
     if re.match(r"^\w+$", e) and e in int_idents:
         return "i"
     cm = re.match(r"^(\w+)\s*\(", e)
+    if cm and ("char:" + cm.group(1)) in int_idents and _is_one_call(e):
+        return "c"               # a method returning char
     if cm and cm.group(1) in int_idents and _is_one_call(e):
         return "i"               # an accessor the engine types as integer
     return "f"
+
+
+def _is_one_paren_group(e):
+    """`(..)` whose first parenthesis closes at the very end: not `(char)(c + 1)`, whose
+    parentheses balance but are two groups."""
+    depth = 0
+    for k, ch in enumerate(e):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return k == len(e) - 1
+    return False
 
 
 def _is_string_table_entry(e, string_idents):
