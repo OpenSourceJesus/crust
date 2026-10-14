@@ -179,6 +179,33 @@ class TestSpirvGen(unittest.TestCase):
         self.assertEqual(spirv_reader.validate(w), [])
         return w
 
+    def test_params_in_a_storage_buffer_match_push_constants(self):
+        """CRUST_SPIRV_PUSH=buffer moves the scalar parameters into a storage
+        buffer (binding 30); the kernel must compute the same thing."""
+        xs = [-1.5, -0.5, 0.25, 0.75, 2.0, 3.5, -4.0, 0.0, 1.0]
+        results = []
+        with tempfile.TemporaryDirectory() as t:
+            for env in ({}, {"CRUST_SPIRV_PUSH": "buffer"}):
+                p, out = compile_spirv(os.path.join(GPU, "rkernel.rs"), t, env)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                w = bytes_to_words(open(out, "rb").read())
+                self.assertEqual(spirv_reader.validate(w), [])
+                iface = spirv_reader.describe(w)[0]
+                buf = bytearray(4 * len(xs))
+                bufs = {2: bytearray(struct.pack("<%df" % len(xs), *xs)),
+                        5: buf}
+                params = struct.pack("<fI", 0.5, len(xs))
+                if env:
+                    self.assertEqual(iface["push_binding"]["binding"], 30)
+                    self.assertEqual(iface["push_size"], 8)
+                    bufs[30] = bytearray(params)
+                    spirv_interp.run(w, "shape", (2, 1, 1), bufs)
+                else:
+                    self.assertNotIn("push_binding", iface)
+                    spirv_interp.run(w, "shape", (2, 1, 1), bufs, params)
+                results.append(bytes(buf))
+        self.assertEqual(results[0], results[1])
+
     def test_kernel_float_literals_are_single(self):
         src = ("#[kernel(local_size = 8)]\n"
                "fn k(a: &mut [f32]) { let i: u32 = gpu_global_id(0);\n"
