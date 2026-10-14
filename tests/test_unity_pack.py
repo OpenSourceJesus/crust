@@ -2743,6 +2743,17 @@ class TestRuntimeApis(unittest.TestCase):
         self.assertEqual(out[0], "3,2,3,12,True,0.25")
 
     @needs_coost
+    def test_bool_expressions_log_as_true_false(self):
+        out = self._run(
+            "        int r = 5; bool a = true, b = false; string s = \"ab\";\n"
+            "        Debug.Log(r >= 0 && r < 10);\n"
+            "        Debug.Log(!(r > 3));\n"
+            "        Debug.Log(a ^ b);\n"
+            "        Debug.Log(a & b);\n"
+            "        Debug.Log(s == \"ab\");\n")
+        self.assertEqual(out[:5], ["True", "False", "True", "False", "True"])
+
+    @needs_coost
     def test_string_builder(self):
         out = self._run(
             "        var sb = new System.Text.StringBuilder();\n"
@@ -2918,6 +2929,66 @@ class TestRuntimeApis(unittest.TestCase):
             "        Debug.Log(m[1, 2] + \",\" + m.GetLength(1) + \",\" + m.Length"
             " + \",\" + sum);\n")
         self.assertEqual(out[0], "12,3,6,36")
+
+    @needs_coost
+    def test_floats_print_with_seven_digits_like_mono(self):
+        # `%g` kept six: 1/3f printed 0.333333 where Unity prints 0.3333333, and 1e-5f as 1e-05
+        out = self._run(
+            "        float a = 1f / 3f;\n"
+            "        Debug.Log(a); Debug.Log(0.00001234f); Debug.Log(1e10f); Debug.Log(-2.5f);\n"
+            "        Debug.Log(\"\" + 1234567f + \",\" + 0.1f + \",\" + 123456789f);\n")
+        self.assertEqual(out[:4], ["0.3333333", "1.234E-05", "1E+10", "-2.5"])
+        self.assertEqual(out[4], "1234567,0.1,1.234568E+08")
+
+    @needs_coost
+    def test_chars_print_as_characters(self):
+        # `"" + c` printed the code (97), `(char)(c + 1)` was read as one parenthesised group
+        out = self._run(
+            "        char c = 'a';\n"
+            "        Debug.Log((c + 1) + \",\" + (char)(c + 1) + \",\" + (\"\" + c + 1) + \",\" + c);\n"
+            "        Debug.Log(c);\n        Debug.Log(Up('q') + \"\" + 5);\n",
+            fields="    char Up(char x) { return (char)(x - 32); }\n")
+        self.assertEqual(out[:3], ["98,b,a1,a", "a", "Q5"])
+
+    @needs_coost
+    def test_list_collection_initializers(self):
+        # locals get Adds after them; an instance field's open Awake (they were dropped, the list empty)
+        out = self._run(
+            "        var l = new List<int>{3,1,2}; List<float> f = new List<float>() { 1.5f, 2.5f };\n"
+            "        float t = 0; foreach (float x in f) t += x;\n"
+            "        Debug.Log(l.Count + \",\" + t + \",\" + xs.Count + \",\" + xs[1] + \",\" + hp);\n",
+            fields="    List<int> xs = new List<int>{5,6,7};\n    void Awake() { hp = 8; }\n")
+        self.assertEqual(out[0], "3,4,3,6,8")
+
+    @needs_coost
+    def test_switch_on_a_string(self):
+        # C switches only on integers: the cases become the string's index among the labels
+        out = self._run(
+            "        string s = \"b\"; int r = 0; string o = \"\";\n"
+            "        switch (s) { case \"a\": r = 1; break; case \"b\": r = 2; o = \"two\"; break;"
+            " default: r = 3; break; }\n"
+            "        switch (s) { case \"q\": r = 9; break; }\n"
+            "        Debug.Log(r + \",\" + o + \",\" + Pick(\"x\") + Pick(\"zz\") + Pick(\"a\\\"b\") + Pick(\"?\"));\n",
+            fields="    int Pick(string k) {\n        switch (k) {\n            case \"x\": return 1;\n"
+                   "            case \"yy\":\n            case \"zz\": return 2;\n"
+                   "            case \"a\\\"b\": return 3;\n        }\n        return 0;\n    }\n")
+        self.assertEqual(out[0], "2,two,1230")
+
+    @needs_coost
+    def test_string_assigned_in_a_case_body(self):
+        # `o = ..` right after `case 2:` was not a statement start, so the store was left unlowered
+        out = self._run(
+            "        string o = \"\"; int n = 2;\n"
+            "        switch (n) { case 1: o = \"one\"; break; case 2: o = \"two\"; break; }\n"
+            "        Debug.Log(o);\n")
+        self.assertEqual(out[0], "two")
+
+    @needs_coost
+    def test_float_exponent_literal_and_nary_min_max(self):
+        out = self._run(
+            "        Debug.Log((1.0e-5f < 0.001f) + \",\" + Mathf.Max(1, 5, 3) + \",\""
+            " + Mathf.Min(4f, 2f, 9f, 0.5f));\n")
+        self.assertEqual(out[0], "True,5,0.5")
 
     @needs_coost
     def test_linked_list(self):
@@ -3378,7 +3449,8 @@ class TestPackedFields(unittest.TestCase):
             eng = f.read()
         # through the other class's accessor, which decodes the field as it
         # is packed (a bitfield here; a half float, a null handle ..)
-        self.assertIn("Enemy_get_hp(Coin_get_target(i))", eng)
+        # (a null handle stops the player: the read is wrapped in _engine_nn)
+        self.assertIn("Enemy_get_hp(_engine_nn(Coin_get_target(i)", eng)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
         run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
@@ -4145,8 +4217,8 @@ class TestSystems(unittest.TestCase):
             eng = f.read()
         self.assertIn("typedef struct Vector2", eng)
         self.assertIn("Vector2_make(1.f, 2.f)", eng)
-        self.assertIn("Player_set_last_x(i, (0.f))", eng)
-        self.assertIn("Player_set_last_y(i, (0.f))", eng)
+        self.assertIn("Vector2 _v2 = (Vector2_make(0.f, 0.f)); Player_set_last_x(i, _v2.x);", eng)
+        self.assertIn("Player_set_last_y(i, _v2.y)", eng)
         self.assertNotIn("new Vector2", eng)
         self.assertNotIn("error CS0246", eng)
         self.assertIn("Cosmetic_set_initLocalPosition_x", eng)
@@ -5139,7 +5211,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("static int CosmeticsMenu_Instance(void)", eng)
         self.assertIn(
             "CosmeticsMenu_AddPoints(CosmeticsMenu_get_pointsPerGem("
-            "CosmeticsMenu_Instance()))", eng)
+            "_engine_nn(CosmeticsMenu_Instance(),", eng)
         self.assertNotIn(
             "CosmeticsMenu_get_pointsPerGem(0)", eng)
         self.assertNotIn("CosmeticsMenu.AddPoints", eng)
@@ -5398,7 +5470,8 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "engine.cpp")) as f:
             eng = f.read()
         self.assertIn(
-            "Lasso_set_changeLengthInput(Lasso_Instance(), ((int) amt));",
+            "Lasso_set_changeLengthInput(_engine_nn(Lasso_Instance(), \"Player\", "
+            "\"SetChangeLengthInput\", \"Assets/Scripts/Player.cs\", 4, 9), ((int) amt));",
             eng)
         self.assertNotRegex(
             eng, r"Lasso_get_changeLengthInput\([^)]*\)\s*=")
@@ -17188,7 +17261,7 @@ class TestProjectPhysicsSettings(unittest.TestCase):
         self.assertEqual(
             unity_pack.unity_physics_settings(tempfile.mkdtemp()),
             {"gravity2d": (0.0, -9.81), "gravity3d": (0.0, -9.81, 0.0),
-             "fixed_dt": 0.02})
+             "fixed_dt": 0.02, "queries_hit_triggers": 1})
 
     @needs_box2d
     def test_packed_gravity_is_authored(self):
