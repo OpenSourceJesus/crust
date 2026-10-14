@@ -834,7 +834,68 @@ def scalar_kind(expr, model, string_idents=None, int_idents=None):
         return "c"               # a method returning char
     if cm and cm.group(1) in int_idents and _is_one_call(e):
         return "i"               # an accessor the engine types as integer
+    im = re.match(r"^(\w+)\s*\[", e)
+    if im and ("[]" + im.group(1)) in int_idents:
+        depth = 0
+        for k in range(e.index("["), len(e)):
+            depth += e[k] == "["
+            depth -= e[k] == "]"
+            if depth == 0:
+                if k == len(e) - 1:
+                    return "i"        # an integer list's element
+                break
+    if _int_arithmetic(e, model, string_idents, int_idents):
+        return "i"
     return "f"
+
+
+_INT_CAST = re.compile(r"^\(\s*(?:int|uint|long|ulong|short|ushort|byte|sbyte|"
+                       r"unsigned\s+(?:char|short|int|long)|signed\s+char|long\s+long)\s*\)")
+
+
+def _int_arithmetic(e, model, string_idents, int_idents):
+    """`a - b`, `n * 2 + k`, `(int)x`: integer operands under arithmetic or bit operators
+    are an integer, and print as one (they printed through the float path: 20000001 as 2E+07)."""
+    if _INT_CAST.match(e):
+        return True
+    ops, depth, last, k, n = [], 0, 0, 0, len(e)
+    while k < n:
+        c = e[k]
+        if c == '"':
+            k = skip_string_literal(e, k)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and c in "+-*/%&|^<>" and k > 0:
+            two = e[k:k + 2]
+            if two in ("<<", ">>"):
+                ops.append((last, k))
+                last = k = k + 2
+                continue
+            if c in "<>" or two in ("==", "&&", "||") or e[k - 1] in "+-*/%&|^<>=!(":
+                if c in "<>" or two in ("==", "&&", "||"):
+                    return False        # a comparison or logical expression
+                k += 1                  # a unary sign after an operator
+                continue
+            if c in "+-" and two in ("++", "--"):
+                return False
+            ops.append((last, k))
+            last = k + 1
+        k += 1
+    if not ops:
+        return False
+    ops.append((last, n))
+    for lo, hi in ops:
+        part = e[lo:hi].strip().lstrip("-~+ ").strip()
+        if not part or "?" in part:
+            return False
+        if part.startswith("(") and _is_one_paren_group(part):
+            part = part[1:-1]
+        if scalar_kind(part, model, string_idents, int_idents) != "i":
+            return False
+    return True
 
 
 def _is_one_paren_group(e):

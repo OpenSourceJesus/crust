@@ -7834,6 +7834,12 @@ _UNITY_EMIT_MESSAGES = frozenset({
 })
 
 
+#: Integer types a method's parameter or result keeps at their C# width (an `int` cut a uint
+#: above 2^31 and a long to 32 bits).
+_WIDE_C_TYPES = {"uint": "unsigned int", "long": "long long", "ulong": "unsigned long long"}
+_WIDE_ELEM_TYPES = {"uint": "uint32_t", "long": "int64_t", "ulong": "uint64_t"}
+
+
 def _param_c_ty(ty):
     """C type for a C# method parameter. ``T[]`` is a pointer to T's C type."""
     ty = (ty or "").split(".")[-1].strip()
@@ -7846,8 +7852,9 @@ def _param_c_ty(ty):
         return "float"
     if ty == "string":
         return "const char *"
-    if ty in ("byte", "sbyte", "short", "ushort", "int", "uint", "long",
-              "ulong", "bool", "char"):
+    if ty in _WIDE_C_TYPES:
+        return _WIDE_C_TYPES[ty]
+    if ty in ("byte", "sbyte", "short", "ushort", "int", "bool", "char"):
         return "int"
     if ty in ("Vector2", "Rect"):
         # The engine's value struct -- it fell to `int` below, a handle.
@@ -8046,8 +8053,9 @@ def _ret_c_ty(ret, plan):
         return "float"
     if base == "string":
         return "const char *"
-    if base in ("byte", "sbyte", "short", "ushort", "int", "uint", "bool",
-                "char"):
+    if base in _WIDE_C_TYPES:
+        return _WIDE_C_TYPES[base]
+    if base in ("byte", "sbyte", "short", "ushort", "int", "bool", "char"):
         return "int"
     if base in (plan.get("classes") or {}) or base in (
             "GameObject", "Transform"):
@@ -10335,10 +10343,10 @@ def _emit_engine_debug_log(p, plan, want_log):
         p("    fprintf(f, \"%s\\n\", t);")
         p("    fflush(f);")
         p("}")
-        p("static void Debug_Log_i(int v) {")
+        p("static void Debug_Log_i(long long v) {")
         p("    FILE *f = _engine_log();")
         p("    if (!f) return;")
-        p("    fprintf(f, \"%d\\n\", v);")
+        p("    fprintf(f, \"%lld\\n\", v);")
         p("    fflush(f);")
         p("}")
         p("static void Debug_Log_s(const char *s) {")
@@ -15347,8 +15355,15 @@ def _emit_engine_class_groups(
                   " %s_AT(i).%s = v < 0 ? %su : (unsigned)v; }"
                   % (idn, name, idn, name, sent))
             else:
-                p("static unsigned %s_get_%s(unsigned i) { return (unsigned)%s_AT(i).%s; }"
-                  % (idn, name, idn, name))
+                # a signed C# integer reads back signed: `hp - 10` is -5, not 4294967291
+                _cs_ty = next((f.get("ty") for f in cl.get("fields") or []
+                               if f.get("name") == name), None)
+                if _cs_ty in ("int", "short", "sbyte", "byte", "ushort", "bool", "char"):
+                    p("static int %s_get_%s(unsigned i) { return (int)%s_AT(i).%s; }"
+                      % (idn, name, idn, name))
+                else:
+                    p("static unsigned %s_get_%s(unsigned i) { return (unsigned)%s_AT(i).%s; }"
+                      % (idn, name, idn, name))
                 p("static void %s_set_%s(unsigned i, unsigned v) { %s_AT(i).%s = v; }"
                   % (idn, name, idn, name))
         names = {m[0] for m in cl["members"]}
@@ -20225,7 +20240,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    return _engine_str_buf[k];")
         p("}")
         _emit_float_fmt(p)
-        for kind, cty, fmt, arg in (("i", "int", "%d", "b"),
+        for kind, cty, fmt, arg in (("i", "long long", "%lld", "b"),
                                      ("f", "float", "%s", "_t"),
                                      ("c", "char", "%c", "b"),
                                      ("s", "const char *", "%s",
@@ -20453,7 +20468,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    _engine_fmt_f(t, sizeof t, (double)v);")
         p("    printf(\"%s\\n\", t);")
         p("}")
-        p("static void Console_WriteLine_i(int v) { printf(\"%d\\n\", v); }")
+        p("static void Console_WriteLine_i(long long v) { printf(\"%lld\\n\", v); }")
         p("static void Console_WriteLine_s(const char *s) {")
         p("    puts(s ? s : \"\");")
         p("}")
@@ -23696,8 +23711,9 @@ def _collection_elem_c_ty(elem, plan=None):
     elem = (elem or "").split(".")[-1]
     if elem in ("float", "double"):
         return "float"
-    if elem in ("int", "byte", "short", "uint", "long", "sbyte",
-                "ushort", "ulong", "bool"):
+    if elem in _WIDE_ELEM_TYPES:
+        return _WIDE_ELEM_TYPES[elem]
+    if elem in ("int", "byte", "short", "sbyte", "ushort", "bool"):
         return "int"
     if elem == "string":
         return "std::string"
@@ -24313,10 +24329,9 @@ def _rewrite_csharp_float_literals(text):
 
 
 
-#: C# integer types that fit the engine's `int` formatters (`_str_plus_i`,
-#: `Debug_Log_i`). `long`, `uint` and `ulong` do not, and keep the float
-#: path rather than be truncated.
-_CS_INT_TYPES = ("int", "short", "ushort", "byte", "sbyte")
+#: C# integer types the engine's integer formatters (`_str_plus_i`,
+#: `Debug_Log_i`, 64-bit) print. A `ulong` above 2^63 prints negative.
+_CS_INT_TYPES = ("int", "short", "ushort", "byte", "sbyte", "uint", "long", "ulong")
 
 #: Packed member kinds whose accessor returns an integer.
 _INT_MEMBER_KINDS = ("bits", "u8", "u16", "i32")
@@ -24339,6 +24354,33 @@ def _int_idents(cl, plan, body, site):
             out.add(prm.name)
         elif prm.type == "char":
             out.add("char:" + prm.name)
+    # an integer list's elements (`l[i]`) print as integers: `[]name`
+    scan0 = cs2cpp._blank(body or "")
+    for lm in re.finditer(r"(?<![\w.])List\s*<\s*(\w+)\s*>\s+(\w+)\s*[;=,)]|"
+                          r"(?<![\w.])var\s+(\w+)\s*=\s*new\s+List\s*<\s*(\w+)\s*>", scan0):
+        et, nm = (lm.group(1), lm.group(2)) if lm.group(1) else (lm.group(4), lm.group(3))
+        if et in _CS_INT_TYPES:
+            out.add("[]" + nm)
+    for lf in cl.get("list_fields") or []:
+        if _list_elem_name(lf.get("ty") or "") in _CS_INT_TYPES:
+            out.add("[]" + lf["name"])
+    # `int a = 3, b = 5;`: every declarator, not only the first
+    scan = cs2cpp._blank(body or "")
+    for dm in re.finditer(r"(?<![\w.])(?:%s)\s+([^;(){}]*,[^;(){}]*);" % ints, scan):
+        depth, cur, parts = 0, "", []
+        for ch in dm.group(1):
+            depth += ch in "[<"
+            depth -= ch in "]>"
+            if ch == "," and depth == 0:
+                parts.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        parts.append(cur)
+        for part in parts:
+            nm = re.match(r"\s*([A-Za-z_]\w*)\s*(?:=(?!=)|$)", part)
+            if nm:
+                out.add(nm.group(1))
     # characters print as characters (`"" + c`), not as their code
     out |= {"char:" + n for n in re.findall(
         r"(?<![\w.])char\s+(\w+)\s*[;=,)]", cs2cpp._blank(body or ""))}
@@ -24764,7 +24806,7 @@ def _format_bool_log_args(text):
     return "".join(out)
 
 
-def _format_bools(text, names, calls):
+def _format_bools(text, names, calls, bool_lists=()):
     """A bool as C# formats it: `"alive " + alive` is "alive True", and
     `Debug.Log(ok)` prints "False" -- the engine printed 1 and 0.
 
@@ -24786,6 +24828,13 @@ def _format_bools(text, names, calls):
     # still in its C# spelling here.
     alts.append(r"(?<![\w.>])[A-Za-z_]\w*(?:\s*\[[^\[\]]*\])?\s*\.\s*"
                 r"(?:Contains|ContainsKey|Remove)\s*\(")
+    # a `List<bool>`'s element (`flags[i]`), by the lists the body or the class declares
+    lists = set(bool_lists) | {a or b for a, b in re.findall(
+        r"(?<![\w.])List\s*<\s*bool\s*>\s+(\w+)|(?<![\w.])var\s+(\w+)\s*=\s*new\s+"
+        r"List\s*<\s*bool\s*>", cs2cpp._blank(text))}
+    if lists:
+        alts.append(r"(?<![\w.>])(?:%s)\s*\[[^\[\]]*\](?![\w(\[=]|\s*=(?!=))" % "|".join(
+            re.escape(n) for n in sorted(lists, key=len, reverse=True)))
     pat = re.compile("|".join(alts))
     log = re.compile(r"(?:Debug_Log|Debug\s*\.\s*Log|print|"
                      r"Console_WriteLine|Console\s*\.\s*WriteLine)\s*\(\s*$")
@@ -27664,6 +27713,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                               | _string_store_names(plan)
                               | plan.get("_string_lists_local", set()))
     text = _lower_is_touching_layers(text, cl, plan, site)
+    _bool_list_fields = {lf["name"] for lf in cl.get("list_fields") or []
+                         if _list_elem_name(lf.get("ty") or "") == "bool"} | {
+        x or y for x, y in re.findall(
+            r"(?<![\w.])List\s*<\s*bool\s*>\s+(\w+)|(?<![\w.])var\s+(\w+)\s*=\s*new\s+"
+            r"List\s*<\s*bool\s*>", cs2cpp._blank(body or ""))}
     text = _format_bools(text, _bool_names(cl, body, site)
                          | {"Cursor_visible", "true", "false",
                             "engine_box2d_queries_start_in_colliders"},
@@ -27684,7 +27738,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                          | (_godot.BOOL_CALLS if plan.get("godot") else set())
                          | {
                              k for k, v in (plan.get("_method_ret_kinds_local")
-                                            or {}).items() if v == "b"})
+                                            or {}).items() if v == "b"},
+                         _bool_list_fields)
     text = _lower_string_concat(text, string_idents=string_idents,
                                 int_idents=int_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
@@ -28098,6 +28153,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             if v == "s"))
     if "_cs_str_Equals(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
+    # C# byte / sbyte / ushort / uint / ulong locals and casts: C has no such names
+    text = cs2cpp._map_types(text)
     text = _drop_empty_instance_lists(text, plan)
     text = _lower_handle_enabled(text, plan)
     text = _null_handle_setters(text, plan)
@@ -31457,7 +31514,9 @@ def pack(root, outdir, *args, **kwargs):
     _items = _item_gain_types(files.values())
     _n = [0]
     for fp in sorted(files):
-        t = _coll.desugar_list_initializers(overlay.get(fp, files[fp]))
+        t = _coll.desugar_null_conditional(overlay.get(fp, files[fp]))
+        t = _coll.desugar_local_arrays(t, _n)
+        t = _coll.desugar_list_initializers(t)
         t = _coll.desugar_collections(t, _n)
         t = _phys.desugar_layers(t, _layer_names,
                                  _common.SOURCE_LAYER_MATRIX, _has_remove)

@@ -687,6 +687,16 @@ def desugar_bytes(text):
                     "%s.Add(0);" % (text[m.start(2):m.end(2)], name))
         text = (text[:m.start()] + "List<byte> %s = new List<byte>(); %s"
                 % (name, fill) + text[m.end():])
+    # a byte element wraps at 256 (the list holds ints): `a[i] += 255`, `a[i]++`
+    if names:
+        nalt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])((?:%s)\s*\[[^\[\]]*\])\s*(\+|-|\*|/|%%|<<|>>|\||&|\^)=(?!=)\s*([^;{}]*);" % nalt,
+            lambda m: "%s = (%s %s (%s)) & 255;" % (m.group(1), m.group(1), m.group(2),
+                                                      m.group(3).strip()), text)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])((?:%s)\s*\[[^\[\]]*\])\s*(\+\+|--)\s*;" % nalt,
+            lambda m: "%s = (%s %s 1) & 255;" % (m.group(1), m.group(1), m.group(2)[0]), text)
     text = cs2cpp.code_sub(r"(?<![\w.])byte\s*\[\s*\](?=\s+\w)", "List<byte>",
                            text)
     if names:
@@ -696,8 +706,7 @@ def desugar_bytes(text):
                                lambda m: "%s.Count" % m.group(1), text)
     # A `byte` local (a list's element, `foreach (byte x in h)`) is an int,
     # as the list holds it.
-    text = cs2cpp.code_sub(r"(?<![\w.<])byte(?=\s+[A-Za-z_]\w*\s*(?:[=;,)]|in\b))",
-                           "int", text)
+    text = cs2cpp.code_sub(r"(?<![\w.<])byte(?=\s+[A-Za-z_]\w*\s+in\b)", "int", text)
     return text
 
 
@@ -903,3 +912,205 @@ def desugar_list_initializers(text):
         else:
             text = text[:close] + "    void Awake() {" + body_adds + " }\n" + text[close:]
     return text
+
+
+_LA_ELEM = {"int": "0", "float": "0f", "bool": "false", "string": '""', "uint": "0u",
+            "long": "0L", "ulong": "0UL", "short": "0", "ushort": "0", "sbyte": "0"}
+
+
+def desugar_local_arrays(text, counter=None):
+    """A local `T[]` of a primitive or `string` as a `List<T>`:
+
+        int[] a = new int[n];            List<int> a, filled with n zeros
+        int[] a = new int[] { 1, 2 };    List<int> a = new List<int> { 1, 2 };
+        int[] a = { 1, 2 };              (the same)
+        a.Length                         a.Count
+
+    These were reported stubs (`C# array local or field left after rewrite`). `byte[]` has its
+    own (desugar_bytes), a field or parameter array is left as it was, and so is a name that is
+    also declared as one in the file (its `.Length` would be ambiguous)."""
+    scan = cs2cpp._blank(text)
+    elem = "|".join(sorted(_LA_ELEM, key=len, reverse=True))
+    head = re.compile(r"(?<![\w.])(%s)\s*\[\s*\]\s+(\w+)" % elem)
+    local, other = {}, set()
+    for m in head.finditer(scan):
+        nxt = scan[m.end():].lstrip()
+        if _class_body_open(scan, m.start()) is None and nxt.startswith("="):
+            local.setdefault(m.group(2), set()).add(m.group(1))
+        else:
+            other.add(m.group(2))
+    names = {n for n, ts in local.items() if n not in other and len(ts) == 1}
+    if not names:
+        return text
+    n_ = counter if counter is not None else [0]
+    pat = re.compile(
+        r"(?<![\w.])(%s)\s*\[\s*\]\s+(%s)\s*=\s*(?:new\s+\1\s*\[\s*([^\]\[]*?)\s*\]\s*(\{[^{}]*\})?|"
+        r"new\s*\[\s*\]\s*(\{[^{}]*\})|(\{[^{}]*\}))\s*;" % (elem, "|".join(map(re.escape, names))))
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        m = pat.search(scan)
+        if not m:
+            break
+        ty, name = m.group(1), m.group(2)
+        lit = m.group(4) or m.group(5) or m.group(6)
+        if lit:
+            body = text[m.start(4 if m.group(4) else 5 if m.group(5) else 6):
+                        m.end(4 if m.group(4) else 5 if m.group(5) else 6)]
+            new = "List<%s> %s = new List<%s> %s;" % (ty, name, ty, body)
+        else:
+            n_[0] += 1
+            k = "_cs_ak%d" % n_[0]
+            new = ("List<%s> %s = new List<%s>(); for (int %s = 0; %s < %s; %s = %s + 1) "
+                   "%s.Add(%s);" % (ty, name, ty, k, k, text[m.start(3):m.end(3)], k, k, name,
+                                    _LA_ELEM[ty]))
+        text = text[:m.start()] + new + text[m.end():]
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    return cs2cpp.code_sub(r"(?<![\w.])(%s)\s*\.\s*Length\b" % alt,
+                           lambda m: "%s.Count" % m.group(1), text)
+
+
+def _nc_operand_start(scan, k):
+    """Start of the primary expression that ends just before index k (the `?` of `?.`):
+    a name chain with `.` / `[..]` / one `(..)` group, or a parenthesised group. None if it has
+    a call (evaluating it twice is not safe)."""
+    j = k
+    while j > 0:
+        c = scan[j - 1]
+        if c.isalnum() or c in "_.":
+            j -= 1
+        elif c == "]":
+            depth = 0
+            while j > 0:
+                j -= 1
+                depth += scan[j] == "]"
+                depth -= scan[j] == "["
+                if depth == 0:
+                    break
+        elif c == ")":
+            depth = 0
+            p = j
+            while p > 0:
+                p -= 1
+                depth += scan[p] == ")"
+                depth -= scan[p] == "("
+                if depth == 0:
+                    break
+            inner = scan[p + 1:j - 1]
+            if re.search(r"\w\s*\(", inner) and "!=" not in inner:
+                return None            # a call inside: not evaluated twice
+            j = p
+            if p > 0 and (scan[p - 1].isalnum() or scan[p - 1] == "_"):
+                return None            # `f(..)?.x`: a call
+            break
+        else:
+            break
+    return j if j < k else None
+
+
+def _nc_tail_end(scan, k):
+    """End of the member chain that starts at k (after `?.`): `name`, `.name`, `[..]`, `(..)`;
+    it stops at another `?.`."""
+    n = len(scan)
+    m = re.match(r"[A-Za-z_]\w*", scan[k:])
+    if not m:
+        return None
+    j = k + m.end()
+    while j < n:
+        if scan[j] == "(" or scan[j] == "[":
+            close = ")" if scan[j] == "(" else "]"
+            depth = 0
+            q = j
+            while q < n:
+                depth += scan[q] == scan[j]
+                depth -= scan[q] == close
+                if depth == 0:
+                    break
+                q += 1
+            j = q + 1
+        elif scan[j] == "." and re.match(r"\.[A-Za-z_]", scan[j:j + 2]):
+            j += 1 + re.match(r"[A-Za-z_]\w*", scan[j + 1:]).end()
+        else:
+            break
+    return j
+
+
+def desugar_null_conditional(text):
+    """`a?.b` (C# 6) as a null test: `a` is read twice, so it must be a plain name chain.
+
+        a?.hp > 3          (a != null && a.hp > 3)
+        a?.hp == 3         (a != null && a.hp == 3);  `!= 3` is true for a null `a`
+        a?.name ?? "x"     (a != null ? a.name : "x")
+        a?.Hit();          if (a != null) a.Hit();    (a statement)
+        a?.name            (a != null ? a.name : null)
+        a?.b?.c            the inner one first: (a != null ? a.b : null) is `a?.b`'s operand
+
+    `a?.b` where `a` is a call (`Get()?.b`) or a value that is not a plain chain is left alone."""
+    for _pass in range(256):
+        scan = cs2cpp._blank(text)
+        hit = None
+        for m in re.finditer(r"\?\.(?=[A-Za-z_])", scan):
+            hit = m
+            break
+        if hit is None:
+            break
+        q = hit.start()
+        start = _nc_operand_start(scan, q)
+        end = _nc_tail_end(scan, q + 2)
+        if start is None or end is None:
+            # leave this one: blank it from later passes by marking
+            text = text[:q] + "?\x00." + text[q + 2:]
+            continue
+        x = text[start:q]
+        tail = text[q + 2:end]
+        guards = [x]
+        while scan[end:end + 2] == "?." and re.match(r"[A-Za-z_]", scan[end + 2:end + 3] or " "):
+            nend = _nc_tail_end(scan, end + 2)
+            if nend is None:
+                break
+            guards.append("%s.%s" % (x, tail))
+            tail = tail + "." + text[end + 2:nend]
+            end = nend
+        cond = " && ".join("%s != null" % g for g in guards)
+        nulls = " || ".join("%s == null" % g for g in guards)
+        full = "%s.%s" % (x, tail)
+        rest = scan[end:]
+        before = scan[:start].rstrip()
+        stmt = (before == "" or before[-1] in ";{}") and re.match(r"\s*;", rest) \
+            and tail.rstrip().endswith(")")
+        if stmt:
+            new, stop = "if (%s) %s" % (cond, full), end
+        else:
+            cmp_ = re.match(r"\s*(>=|<=|>(?!>)|<(?!<)|==|!=)\s*(null\b|[-\w.\"']+)", rest)
+            coal = re.match(r"\s*\?\?\s*", rest)
+            if cmp_ and cmp_.group(1) in ("==", "!=") and cmp_.group(2) == "null":
+                op = cmp_.group(1)
+                new = ("(%s || %s == null)" % (nulls, full)) if op == "==" else \
+                    "(%s && %s != null)" % (cond, full)
+                stop = end + cmp_.end()
+            elif cmp_:
+                op = cmp_.group(1)
+                rhs = text[end + cmp_.start(2):end + cmp_.end()]
+                new = ("(%s || %s != %s)" % (nulls, full, rhs)) if op == "!=" else \
+                    "(%s && %s %s %s)" % (cond, full, op, rhs)
+                stop = end + cmp_.end()
+            elif coal:
+                j = end + coal.end()
+                depth = 0
+                while j < len(scan):
+                    c = scan[j]
+                    if c in "([{":
+                        depth += 1
+                    elif c in ")]}":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif depth == 0 and c in ";,":
+                        break
+                    j += 1
+                new = "(%s ? %s : %s)" % (cond, full, text[end + coal.end():j].strip())
+                stop = j
+            else:
+                dflt = "0" if tail.split(".")[-1] in ("Length", "Count") else "null"
+                new, stop = "(%s ? %s : %s)" % (cond, full, dflt), end
+        text = text[:start] + new + text[stop:]
+    return text.replace("?\x00.", "?.")
