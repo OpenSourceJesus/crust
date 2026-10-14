@@ -49,6 +49,20 @@ needs_coost = unittest.skipUnless(
     "C# string locals are coost fastrings: set COOST_ROOT or clone "
     "https://github.com/crustos/coost beside this repository")
 
+def _gpu_physics_root():
+    try:
+        import tools.unity_pack_gpu_physics as g
+        return g.find_root()
+    except Exception:
+        return None
+
+
+_GPU_ROOT = _gpu_physics_root()
+needs_gpu_physics = unittest.skipUnless(
+    _GPU_ROOT is not None and _CC is not None,
+    "--gpu-physics: set GPU_PHYSICS_ROOT or clone "
+    "https://github.com/crustos/gpu-physics-engine beside this repository")
+
 
 class TestSceneImport(unittest.TestCase):
 
@@ -2600,6 +2614,51 @@ class TestBox2DIntegration(unittest.TestCase):
         ok, report = F.run_project("box2d-inject", F.box2d_project, tmp, False,
                                    inject=True)
         self.assertTrue(ok, "\n".join(report))
+
+
+@needs_gpu_physics
+class TestGpuPhysics(unittest.TestCase):
+    """unity_pack --gpu-physics: Rigidbody2D / Collider2D on the gpu-physics-engine circle solver
+    (a ball and a crate land on a static floor; OnCollisionEnter2D, OnTriggerEnter2D and
+    Physics2D.Raycast work), and a scene it cannot simulate is refused with the reason."""
+
+    @needs_coost
+    def test_scene_runs_on_the_gpu_solver(self):
+        import tools.unity_pack_features as F
+        tmp = tempfile.mkdtemp(prefix="upack-gpu-")
+        ok, report = F.run_project("gpu", F.gpu_physics_project, tmp, False, gpu_physics=_GPU_ROOT)
+        self.assertTrue(ok, "\n".join(report))
+        self.assertTrue(os.path.isfile(os.path.join(tmp, "gpu-out", "physics_gpu.c")))
+        self.assertFalse(os.path.exists(os.path.join(tmp, "gpu-out", "physics_box2d.c")))
+
+    @needs_coost
+    def test_joints_and_kinematic_platform(self):
+        # a hinge pendulum holds its length, a rope goes taut, a kinematic platform lifts a ball
+        import tools.unity_pack_features as F
+        tmp = tempfile.mkdtemp(prefix="upack-gpu-j-")
+        ok, report = F.run_project("gpu", F.gpu_joints_project, tmp, False, gpu_physics=_GPU_ROOT)
+        self.assertTrue(ok, "\n".join(report))
+
+    @needs_coost
+    def test_unmapped_joints_are_refused(self):
+        import tools.unity_pack_features as F
+        tmp = tempfile.mkdtemp(prefix="upack-gpu-no-")
+        F.box2d_project(os.path.join(tmp, "p"))
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(os.path.join(tmp, "p"), os.path.join(tmp, "o"), force=True, gpu_physics=_GPU_ROOT)
+        self.assertIn("GPU physics", cm.exception.message)
+
+
+class TestPositionAssignInUnbracedIf(unittest.TestCase):
+    """`if (c) transform.position = new Vector3(..);` expanded to several C statements, and only the
+    first stayed under the `if`: every instance of the class had its y (and z) set."""
+
+    def test_assignment_stays_under_the_if(self):
+        import tools.unity_pack as up
+        out = up._rewrite_new_vector_assigns(
+            "if (mode == 2) transform.position = new Vector3(-3f, 7f, 0f);\nelse x = 1;", "M", two_d=False)
+        self.assertIn("if (mode == 2) { M_set_pos_x(i, (-3f)); M_set_pos_y(i, (7f)); M_set_pos_z(i, (0f)); }", out)
+        self.assertIn("\nelse x = 1;", out)
 
 
 class TestAuthoredZeroValues(unittest.TestCase):
