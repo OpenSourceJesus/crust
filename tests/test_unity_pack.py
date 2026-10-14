@@ -2754,6 +2754,63 @@ class TestRuntimeApis(unittest.TestCase):
         self.assertEqual(out[:5], ["True", "False", "True", "False", "True"])
 
     @needs_coost
+    def test_byte_and_uint_arithmetic_wraps_and_prints(self):
+        out = self._run(
+            "        byte b = 250; b += 10;\n"
+            "        uint u = 3; u -= 5;\n"
+            "        uint big = 4000000000u;\n"
+            "        byte[] raw = new byte[2]; raw[0] = 255; raw[0] += 2;\n"
+            "        Debug.Log(b + \",\" + u + \",\" + big + \",\" + raw[0]);\n"
+            "        Debug.Log((byte)300);\n"
+            "        Debug.Log(Mix(4000000000u));\n",
+            "    uint Mix(uint x) { return x * 2u; }\n")
+        self.assertEqual(out[:3], ["4,4294967294,4000000000,1", "44", "3705032704"])
+
+    @needs_coost
+    def test_integer_expressions_and_list_elements_print_as_integers(self):
+        out = self._run(
+            "        int a = 20000000, c = 1;\n"
+            "        var l = new List<int>(); l.Add(20000001);\n"
+            "        var w = new List<long>(); w.Add(5000000000L);\n"
+            "        Debug.Log(a + c);\n"
+            "        Debug.Log(l[0]);\n"
+            "        Debug.Log(w[0]);\n")
+        self.assertEqual(out[:3], ["20000001", "20000001", "5000000000"])
+
+    @needs_coost
+    def test_local_primitive_arrays(self):
+        out = self._run(
+            "        int[] a = { 3, 1, 2 };\n"
+            "        int s = 0;\n"
+            "        for (int i = 0; i < a.Length; i++) s += a[i];\n"
+            "        bool[] f = new bool[2]; f[1] = true;\n"
+            "        Debug.Log(s + \",\" + f[0] + \",\" + f[1]);\n")
+        self.assertEqual(out[0], "6,False,True")
+
+    @needs_coost
+    def test_null_conditional_member_access(self):
+        out = self._run(
+            "        Debug.Log(other?.hp > 3);\n"
+            "        Debug.Log((other?.hp ?? 9) + 1);\n"
+            "        other?.Hit();\n"
+            "        Debug.Log(hp);\n"
+            "        Debug.Log(none?.hp ?? -1);\n"
+            "        Debug.Log(hp - 10);\n",
+            "    public Player other;\n    public Player none;\n"
+            "    void Awake() { hp = 5; other = this; }\n"
+            "    public void Hit() { hp++; }\n")
+        self.assertEqual(out[:5], ["True", "6", "6", "-1", "-4"])
+
+    def test_null_conditional_desugar_text(self):
+        import tools.unity_pack_collections as C
+        self.assertEqual(C.desugar_null_conditional("x = a?.b?.c ?? 7;"),
+                         "x = (a != null && a.b != null ? a.b.c : 7);")
+        self.assertEqual(C.desugar_null_conditional("a?.b?.Go();"),
+                         "if (a != null && a.b != null) a.b.Go();")
+        self.assertEqual(C.desugar_null_conditional("y = c ? .5f : 1f;"), "y = c ? .5f : 1f;")
+        self.assertEqual(C.desugar_null_conditional("Get()?.x;"), "Get()?.x;")
+
+    @needs_coost
     def test_string_builder(self):
         out = self._run(
             "        var sb = new System.Text.StringBuilder();\n"
