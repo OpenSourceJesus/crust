@@ -842,6 +842,45 @@ project method that returns one -- and lowers every operator with a
 `Vector2` operand is left as it was, character for character. They came out
 as C that does not compile.
 
+## GPU physics: `--gpu-physics`
+
+By default 2D physics is Box2D-Packed. `--gpu-physics [PATH]` swaps it for the circle solver of
+[gpu-physics-engine](https://github.com/crustos/gpu-physics-engine) -- the same Crust-translated kernels
+that run on the GPU, run here on the CPU (`runtime/gpuphys.c`; the radix sort and prefix sum, which need
+workgroup memory on a GPU, are plain C). The checkout is `PATH`, `$GPU_PHYSICS_ROOT`, or
+`../gpu-physics-engine`; `pack(..., gpu_physics=True | PATH)` is the API.
+
+```
+python3 tools/unity_pack.py MyGame --gpu-physics ../gpu-physics-engine -o out
+```
+
+`unity_glue.py` in the engine generates `physics_gpu.c` for the same `engine_box2d_*` contract
+`physics_box2d.c` meets, so scripts and the engine see no difference: `OnCollisionEnter/Stay/Exit2D`,
+`OnTrigger*2D`, `Physics2D.Raycast / RaycastAll / OverlapCircle / OverlapPoint` (layer masks and
+`queriesStartInColliders` included), `Rigidbody2D.velocity`, `position`, `gravityScale`, `drag`, and
+teleports. No Box2D is built or linked; the Makefile links `physics_gpu.o` and `gpuphys/*.o`.
+
+| Unity | On the solver |
+|---|---|
+| dynamic `CircleCollider2D` | a ball |
+| dynamic `BoxCollider2D` | a crate: a grid of at least 2x2 circles held by rigid joints |
+| static Box / Circle colliders | rasterised into the solid-tile grid (a tile is 2x the biggest circle) |
+| trigger colliders | exact overlap tests against the dynamic circles |
+| kinematic `Rigidbody2D` | held where the script puts it (re-pinned after every solver pass), so it pushes and is never pushed |
+| `HingeJoint2D` (to the world / a static body), `DistanceJoint2D`, `SpringJoint2D`, `FixedJoint2D` | distance constraints between the circles nearest the anchors; `maxDistanceOnly` is a rope; a spring's frequency sets the stiffness |
+
+Refused with a `PackError` that says why: capsule / polygon / terrain colliders, slider / wheel / friction /
+relative / target joints, joint motors, limits and breaking, a hinge between two moving bodies,
+`Collision2D` contact points (`GetContact`, `contactCount`), `AddComponent` of a `Rigidbody2D` or a joint,
+more than one solid collider on a body, Godot projects.
+
+Differences from Box2D worth knowing: a ball does not spin; static shapes are as sharp as the tile (a
+floor thinner than a tile still blocks, but its edge moves by up to half a tile); `Rigidbody2D.mass` is not
+mapped, and friction / bounciness are one pair for the whole world (the mean of the solid colliders'); bodies stay inside a
+world box (the static colliders plus 25 units). The CPU runtime matches the engine's reference
+interpreter to 2e-6 over 20 steps; the SPIR-V path of the same kernels has not been run on real GPU
+hardware from here.
+
 ## Box2D-Packed: triggers and the Rigidbody2D API
 
 `Destroy(gameObject)` takes the object's Rigidbody2D and Collider2D out of
