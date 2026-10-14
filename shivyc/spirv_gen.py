@@ -88,6 +88,12 @@ GPU_MATH = {
     "fmaf": ("Fma", 3),
 }
 
+# CRUST_SPIRV_PUSH=buffer[:N] puts a kernel's scalar parameters in a read-only
+# storage buffer at binding N (default 30) instead of push constants.
+_push_env = os.environ.get("CRUST_SPIRV_PUSH", "")
+PUSH_AS_BUFFER = _push_env.startswith("buffer")
+PARAMS_BINDING = int(_push_env.split(":")[1]) if ":" in _push_env else 30
+
 SHARED_LIMIT = 16384      # bytes; Vulkan's guaranteed maxComputeSharedMemorySize
 
 I32 = ("i", 32, True)
@@ -912,10 +918,24 @@ class SpirvGen:
                 m.member_decorate(stt, i, "Offset", 4 * i)
                 m.member_name(stt, i, scalars[i][2])
                 index[scalars[i][0]] = i
-            var = m.global_var(m.t_pointer("PushConstant", stt),
-                               "PushConstant")
+            if PUSH_AS_BUFFER:
+                # Parameters in a read-only storage buffer instead of push
+                # constants: no device feature needed (WebGPU has none), at
+                # the price of the host writing a buffer before a dispatch.
+                for i in range(len(scalars)):
+                    m.member_decorate(stt, i, "NonWritable")
+                var = m.global_var(m.t_pointer("StorageBuffer", stt),
+                                   "StorageBuffer")
+                m.decorate(var, "DescriptorSet", 0)
+                m.decorate(var, "Binding", PARAMS_BINDING)
+                push = {"var": var, "index": index, "scalars": scalars,
+                        "storage": "StorageBuffer"}
+            else:
+                var = m.global_var(m.t_pointer("PushConstant", stt),
+                                   "PushConstant")
+                push = {"var": var, "index": index, "scalars": scalars,
+                        "storage": "PushConstant"}
             m.name(var, fn + "_args")
-            push = {"var": var, "index": index, "scalars": scalars}
         rec = {"buffers": buffers, "push": push}
         self.kernel_if[fn] = rec
         return rec
@@ -1469,7 +1489,8 @@ class SpirvGen:
         i = self.push["index"][k]
         sk = self.push["scalars"][i][1]
         u32 = m.t_int(32, False)
-        p = b.op("OpAccessChain", m.t_pointer("PushConstant", self.tid(sk)),
+        p = b.op("OpAccessChain",
+                 m.t_pointer(self.push["storage"], self.tid(sk)),
                  self.push["var"], m.const_int(u32, i))
         val = b.load(self.tid(sk), p)
         self.st_(c.output, self._conv(val, sk, self.vkind[c.output]))

@@ -815,7 +815,11 @@ def describe(words):
             sc = ins.operands[0][1]
             pointee = m.defs[m.defs[ins.type_id].operands[1][1]]
             sid = pointee.result_id
-            if sc == sp.STORAGE["StorageBuffer"]:
+            first = m.defs.get(pointee.operands[0][1]) \
+                if pointee.operands else None
+            as_params = sc == sp.STORAGE["StorageBuffer"] and first is not None \
+                and first.name != "OpTypeRuntimeArray"
+            if sc == sp.STORAGE["StorageBuffer"] and not as_params:
                 access = "read_write"
                 for d in m.member_decorations.get((sid, 0), []):
                     if d[0] == sp.DECORATION["NonWritable"]:
@@ -827,7 +831,13 @@ def describe(words):
                     "binding": _decor(m, vid, "Binding")[0],
                     "name": m.names.get(vid, "v%d" % vid),
                     "access": access})
-            elif sc == sp.STORAGE["PushConstant"]:
+            elif sc == sp.STORAGE["PushConstant"] or as_params:
+                if as_params:
+                    # scalar parameters kept in a storage buffer
+                    # (CRUST_SPIRV_PUSH=buffer): the host binds it
+                    rec["push_binding"] = {
+                        "set": _decor(m, vid, "DescriptorSet")[0],
+                        "binding": _decor(m, vid, "Binding")[0]}
                 k = 0
                 end = 0
                 while k < len(pointee.operands):
