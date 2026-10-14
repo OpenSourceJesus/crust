@@ -1486,7 +1486,166 @@ def _asan_player(out):
     return exe
 
 
-def run_project(kind, make, tmp, verbose, asan=False, inject=False):
+GPU_PHYSICS_REST = (
+    "using UnityEngine;\n"
+    "public class Rest : MonoBehaviour {\n"
+    "    int ticks; public int enters; public string label;\n"
+    "    void OnCollisionEnter2D(Collision2D c) { enters = enters + 1; }\n"
+    "    void FixedUpdate() {\n"
+    "        ticks = ticks + 1;\n"
+    "        if (ticks == 45) Debug.Log(\"gpu_rest:\" + label + \" \" + Mathf.RoundToInt(transform.position.y * 10f)"
+    " + \" \" + (enters > 0 ? \"hit\" : \"nohit\"));\n"
+    "    }\n"
+    "}\n")
+GPU_PHYSICS_PROBE = (
+    "using UnityEngine;\n"
+    "public class Probe : MonoBehaviour {\n"
+    "    public LayerMask groundMask;\n"
+    "    void Start() {\n"
+    "        RaycastHit2D hit = Physics2D.Raycast(transform.position, Vector2.down, 20f);\n"
+    "        if (hit) Debug.Log(\"gpu_q:\" + hit.collider.gameObject.name + \",\" + Mathf.RoundToInt(hit.distance)"
+    " + \",\" + Mathf.RoundToInt(hit.normal.y) + \",\" + Mathf.RoundToInt(hit.point.y));\n"
+    "        Collider2D far = Physics2D.OverlapCircle(new Vector2(100f, 100f), 1f);\n"
+    "        RaycastHit2D ng = Physics2D.Raycast(transform.position, Vector2.down, 20f, ~groundMask.value);\n"
+    "        Debug.Log(\"gpu_q:\" + (ng ? ng.collider.name : \"none\") + \",\" + (far == null ? \"none\" : far.name));\n"
+    "    }\n"
+    "}\n")
+GPU_PHYSICS_EXPECT = ["gpu_rest:ball -15 hit", "gpu_rest:crate -15 hit", "gpu_trig:enter Ball Player",
+                      "gpu_q:Ground,7,1,-2", "gpu_q:none,none"]
+
+
+def gpu_physics_project(root):
+    """Ground, a ball, a crate, a trigger zone and a ray cast: the scene `--gpu-physics` runs."""
+    scripts = os.path.join(root, "Assets", "Scripts")
+    for name, src, guid in (("Rest", GPU_PHYSICS_REST, "fea00000000000000000000000000031"),
+                            ("Zone", BOX2D_ZONE.replace("b2d_trig", "gpu_trig"),
+                             "fea00000000000000000000000000012"),
+                            ("Probe", GPU_PHYSICS_PROBE, "fea00000000000000000000000000014")):
+        _write(os.path.join(scripts, name + ".cs"), src)
+        _write(os.path.join(scripts, name + ".cs.meta"), "guid: %s\n" % guid)
+    body = lambda fid, name, pos, col: (
+        "--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_TagString: Player\n  m_Component:\n"
+        "  - component: {fileID: %d}\n  - component: {fileID: %d}\n  - component: {fileID: %d}\n"
+        "  - component: {fileID: %d}\n"
+        "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+        "  m_LocalPosition: {x: %s, y: %s, z: 0}\n"
+        "--- !u!50 &%d\nRigidbody2D:\n  m_GameObject: {fileID: %d}\n"
+        "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n  m_LinearDamping: 0\n%s"
+        % (fid, name, fid + 1, fid + 2, fid + 3, fid + 4, fid + 1, fid, pos[0], pos[1], fid + 2, fid, col)
+    )
+    scene = (
+        "%YAML 1.1\n"
+        "--- !u!1 &1\nGameObject:\n  m_Name: Ground\n  m_Layer: 8\n"
+        "  m_Component:\n  - component: {fileID: 2}\n  - component: {fileID: 3}\n"
+        "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+        "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n"
+        "--- !u!61 &3\nBoxCollider2D:\n  m_GameObject: {fileID: 1}\n"
+        "  m_Enabled: 1\n  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 20, y: 1}\n")
+    scene += body(10, "Ball", (0, 0),
+                  "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n  m_Enabled: 1\n"
+                  "  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
+                  + _mb(14, 10, "fea00000000000000000000000000031", "  label: ball\n"))
+    scene += body(20, "Crate", (4, 0),
+                  "--- !u!61 &23\nBoxCollider2D:\n  m_GameObject: {fileID: 20}\n  m_Enabled: 1\n"
+                  "  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 1, y: 1}\n"
+                  + _mb(24, 20, "fea00000000000000000000000000031", "  label: crate\n"))
+    scene += (
+        "--- !u!1 &30\nGameObject:\n  m_Name: Zone\n  m_TagString: Finish\n  m_Component:\n"
+        "  - component: {fileID: 31}\n  - component: {fileID: 32}\n  - component: {fileID: 33}\n"
+        "--- !u!4 &31\nTransform:\n  m_GameObject: {fileID: 30}\n"
+        "  m_LocalPosition: {x: 0, y: -1.5, z: 0}\n"
+        "--- !u!61 &32\nBoxCollider2D:\n  m_GameObject: {fileID: 30}\n  m_Enabled: 1\n  m_IsTrigger: 1\n"
+        "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 4, y: 0.5}\n"
+        + _mb(33, 30, "fea00000000000000000000000000012")
+        + "--- !u!1 &40\nGameObject:\n  m_Name: Probe\n  m_Component:\n  - component: {fileID: 41}\n"
+        "  - component: {fileID: 42}\n"
+        "--- !u!4 &41\nTransform:\n  m_GameObject: {fileID: 40}\n"
+        "  m_LocalPosition: {x: 5, y: 5, z: 0}\n"
+        + _mb(42, 40, "fea00000000000000000000000000014").rstrip("\n") + "\n  groundMask: {serializedVersion: 2, m_Bits: 256}\n")
+    _write(os.path.join(root, "ProjectSettings", "TagManager.asset"),
+           "%YAML 1.1\n--- !u!78 &1\nTagManager:\n  tags: []\n  layers:\n"
+           + "".join("  - %s\n" % n for n in (
+               ["Default", "TransparentFX", "Ignore Raycast", "", "Water", "UI",
+                "", "", "Ground"] + [""] * 23)))
+    _write(os.path.join(root, "Assets", "Scenes", "S.unity"), scene)
+    return list(GPU_PHYSICS_EXPECT)
+
+
+GPU_JOINT_PROBE = (
+    "using UnityEngine;\n"
+    "public class JProbe : MonoBehaviour {\n"
+    "    public int mode; int ticks;\n"
+    "    void FixedUpdate() {\n"
+    "        ticks = ticks + 1;\n"
+    "        if (ticks != 45) return;\n"
+    "        float px = transform.position.x; float py = transform.position.y;\n"
+    "        if (mode == 0) Debug.Log(\"gpu_joint:hinge \" + Mathf.RoundToInt(Mathf.Sqrt((px + 5f) * (px + 5f) + (py - 6f) * (py - 6f)) * 10f));\n"
+    "        if (mode == 1) Debug.Log(\"gpu_joint:rope \" + (Mathf.Sqrt((px - 8f) * (px - 8f) + (py - 7f) * (py - 7f)) < 2.1f ? \"taut\" : \"loose\"));\n"
+        "        if (mode == 3) Debug.Log(\"gpu_joint:rider \" + (py > 0f ? \"lifted\" : \"low\"));\n"
+    "    }\n"
+    "}\n")
+GPU_JOINT_LIFT = (
+    "using UnityEngine;\n"
+    "public class Lift : MonoBehaviour {\n"
+    "    int ticks;\n"
+    "    void FixedUpdate() {\n"
+    "        ticks = ticks + 1;\n"
+    "        transform.position = new Vector3(-3f, -1.5f + 0.02f * 2f * ticks, 0f);\n"
+    "        if (ticks == 45) Debug.Log(\"gpu_joint:platform \" + Mathf.RoundToInt(transform.position.y * 10f));\n"
+    "    }\n"
+    "}\n")
+GPU_JOINT_EXPECT = ["gpu_joint:hinge 14", "gpu_joint:rope taut", "gpu_joint:rider lifted", "gpu_joint:platform 3"]
+
+
+def gpu_joints_project(root):
+    """A hinge pendulum, a rope, and a kinematic platform lifting a ball: joints and kinematic bodies."""
+    scripts = os.path.join(root, "Assets", "Scripts")
+    _write(os.path.join(scripts, "JProbe.cs"), GPU_JOINT_PROBE)
+    _write(os.path.join(scripts, "JProbe.cs.meta"), "guid: fea00000000000000000000000000041\n")
+    _write(os.path.join(scripts, "Lift.cs"), GPU_JOINT_LIFT)
+    _write(os.path.join(scripts, "Lift.cs.meta"), "guid: fea00000000000000000000000000042\n")
+    g = "fea00000000000000000000000000041"
+    common = "  m_Enabled: 1\n  m_EnableCollision: 0\n  m_BreakForce: Infinity\n  m_BreakTorque: Infinity\n"
+    scene = (
+        "%YAML 1.1\n"
+        "--- !u!1 &1\nGameObject:\n  m_Name: Ground\n  m_Component:\n"
+        "  - component: {fileID: 2}\n  - component: {fileID: 3}\n"
+        "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+        "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n"
+        "--- !u!61 &3\nBoxCollider2D:\n  m_GameObject: {fileID: 1}\n"
+        "  m_Enabled: 1\n  m_IsTrigger: 0\n  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 40, y: 1}\n")
+    scene += _joint_body(
+        100, "Bob", (-6, 5), g,
+        "--- !u!233 &{jid}\nHingeJoint2D:\n  m_GameObject: {{fileID: {go}}}\n" + common +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 1\n"
+        "  m_Anchor: {{x: 1, y: 1}}\n  m_ConnectedAnchor: {{x: 0, y: 0}}\n  m_UseMotor: 0\n  m_UseLimits: 0\n",
+        extra="  mode: 0\n")
+    scene += _joint_body(
+        110, "Weight", (8, 5), g,
+        "--- !u!231 &{jid}\nDistanceJoint2D:\n  m_GameObject: {{fileID: {go}}}\n" + common +
+        "  m_ConnectedRigidBody: {{fileID: 0}}\n  m_AutoConfigureConnectedAnchor: 0\n"
+        "  m_Anchor: {{x: 0, y: 0}}\n  m_ConnectedAnchor: {{x: 8, y: 7}}\n"
+        "  m_AutoConfigureDistance: 0\n  m_Distance: 2\n  m_MaxDistanceOnly: 1\n",
+        extra="  mode: 1\n")
+    # a kinematic platform that a script raises, and a ball dropped onto it
+    scene += (
+        "--- !u!1 &120\nGameObject:\n  m_Name: Platform\n  m_Component:\n"
+        "  - component: {fileID: 121}\n  - component: {fileID: 122}\n  - component: {fileID: 123}\n"
+        "  - component: {fileID: 124}\n"
+        "--- !u!4 &121\nTransform:\n  m_GameObject: {fileID: 120}\n"
+        "  m_LocalPosition: {x: -3, y: -1.5, z: 0}\n"
+        "--- !u!50 &122\nRigidbody2D:\n  m_GameObject: {fileID: 120}\n"
+        "  m_BodyType: 1\n  m_Mass: 1\n  m_GravityScale: 0\n"
+        "--- !u!61 &123\nBoxCollider2D:\n  m_GameObject: {fileID: 120}\n  m_Enabled: 1\n  m_IsTrigger: 0\n"
+        "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 3, y: 0.5}\n"
+        + _mb(124, 120, "fea00000000000000000000000000042")
+        + _joint_body(130, "Rider", (-3, -0.5), g, "", extra="  mode: 3\n", rb=True)
+        )
+    _write(os.path.join(root, "Assets", "Scenes", "S.unity"), scene)
+    return list(GPU_JOINT_EXPECT)
+
+
+def run_project(kind, make, tmp, verbose, asan=False, inject=False, gpu_physics=None):
     """Pack, build and run one project; returns (ok, report lines).
     `inject`: Box2D-Packed's --physics-inject build."""
     root = os.path.join(tmp, "feat_" + kind)
@@ -1497,7 +1656,8 @@ def run_project(kind, make, tmp, verbose, asan=False, inject=False):
     try:
         with contextlib.redirect_stderr(err):
             plan = unity_pack.pack(root, out, force=True,
-                                   **({"physics_inject": True} if inject else {}))
+                                   **({"physics_inject": True} if inject else {}),
+                                   **({"gpu_physics": gpu_physics} if gpu_physics else {}))
             exe = unity_pack.build_player_executable(
                 out, plan.get("product_name") or "Player")
             if asan:

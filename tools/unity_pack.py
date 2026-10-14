@@ -21737,7 +21737,8 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
         zset = ""
         if (not two_d) and len(args) >= 3:
             zset = " %s_set_pos_z(i, (%s));" % (idn, args[2])
-        return ("%s_set_pos_x(i, (%s)); %s_set_pos_y(i, (%s));%s" % (
+        # braced: the replacement is several statements and may be an unbraced if / else body
+        return ("{ %s_set_pos_x(i, (%s)); %s_set_pos_y(i, (%s));%s }" % (
             idn, args[0], idn, args[1], zset))
 
     def repl_add(m):
@@ -21750,16 +21751,16 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
                 " %s_set_pos_z(i, %s_get_pos_z(i) + (%s));"
                 % (idn, idn, args[2]))
         return (
-            "%s_set_pos_x(i, %s_get_pos_x(i) + (%s)); "
-            "%s_set_pos_y(i, %s_get_pos_y(i) + (%s));%s" % (
+            "{ %s_set_pos_x(i, %s_get_pos_x(i) + (%s)); "
+            "%s_set_pos_y(i, %s_get_pos_y(i) + (%s));%s }" % (
                 idn, idn, args[0], idn, idn, args[1], zadd)
         )
 
     def repl_zero(m):
         if two_d:
-            return "%s_set_pos_x(i, 0.f); %s_set_pos_y(i, 0.f);" % (idn, idn)
-        return ("%s_set_pos_x(i, 0.f); %s_set_pos_y(i, 0.f); "
-                "%s_set_pos_z(i, 0.f);" % (idn, idn, idn))
+            return "{ %s_set_pos_x(i, 0.f); %s_set_pos_y(i, 0.f); }" % (idn, idn)
+        return ("{ %s_set_pos_x(i, 0.f); %s_set_pos_y(i, 0.f); "
+                "%s_set_pos_z(i, 0.f); }" % (idn, idn, idn))
 
     flags = re.DOTALL
     for prop in ("position", "localPosition"):
@@ -21783,12 +21784,12 @@ def _rewrite_local_position_vec2_fields(text, cl):
     idn = _c_ident(cl["name"])
     for vf in cl.get("vec2_fields") or []:
         load = (
-            "%s_set_%s_x(i, %s_get_pos_x(i)); "
-            "%s_set_%s_y(i, %s_get_pos_y(i));"
+            "{ %s_set_%s_x(i, %s_get_pos_x(i)); "
+            "%s_set_%s_y(i, %s_get_pos_y(i)); }"
             % (idn, vf, idn, idn, vf, idn))
         store = (
-            "%s_set_pos_x(i, %s_get_%s_x(i)); "
-            "%s_set_pos_y(i, %s_get_%s_y(i));"
+            "{ %s_set_pos_x(i, %s_get_%s_x(i)); "
+            "%s_set_pos_y(i, %s_get_%s_y(i)); }"
             % (idn, idn, vf, idn, idn, vf))
         text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=\s*(?:this\s*\.\s*)?transform\s*\.\s*"
@@ -31381,8 +31382,12 @@ def pack(root, outdir, *args, **kwargs):
 
 def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
          gpu_handles=False, physics_inject=False, box2d_root=None,
-         coost_root=None, hybrid=False, managed=None):
+         coost_root=None, hybrid=False, managed=None, gpu_physics=None):
     """Pack the Unity-subset project at *root* into *outdir*.
+
+    gpu_physics: run the 2D physics on the gpu-physics-engine circle solver
+    instead of Box2D-Packed (True, or the checkout's path; also
+    $GPU_PHYSICS_ROOT or ../gpu-physics-engine). See tools/unity_pack_gpu_physics.py.
 
     managed: run whole script classes as managed C# on DotNetAnywhere instead
     of lowering them (implies hybrid): "*" for every script class, or a
@@ -31399,6 +31404,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     Box2D's event arrays.
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
+    if gpu_physics:
+        import tools.unity_pack_gpu_physics as _gpuphys
+        physics_key = "gpu:" + _gpuphys.fingerprint(gpu_physics)
     if managed:
         hybrid = True
     if hybrid:
@@ -31924,8 +31932,15 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     _write_if_different(
         os.path.join(outdir, "Makefile"),
         emit_makefile(outdir, box2d=bool(plan.get("box2d_physics")),
-                      box2d_inject=bool(physics_inject)))
-    if plan.get("box2d_physics"):
+                      box2d_inject=bool(physics_inject),
+                      gpu_physics=bool(gpu_physics and plan.get("box2d_physics"))))
+    if plan.get("box2d_physics") and gpu_physics:
+        import tools.unity_pack_gpu_physics as _gpuphys
+        _gpuphys.emit(outdir, plan, gpu_physics)
+        for stale in ("physics_box2d.c", "box2d_inject.json"):
+            if os.path.exists(os.path.join(outdir, stale)):
+                os.remove(os.path.join(outdir, stale))
+    elif plan.get("box2d_physics"):
         b2u = _load_box2d_unity(box2d_root)
         if plan.get("physics2d_contacts") and not hasattr(
                 b2u, "_with_contact_manifolds"):
@@ -31953,6 +31968,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         for stale in ("physics_box2d.c", "box2d_inject.json"):
             if os.path.exists(os.path.join(outdir, stale)):
                 os.remove(os.path.join(outdir, stale))
+    if not (gpu_physics and plan.get("box2d_physics")) and os.path.exists(
+            os.path.join(outdir, "physics_gpu.c")):
+        os.remove(os.path.join(outdir, "physics_gpu.c"))
     shdir = os.path.join(outdir, "shaders")
     os.makedirs(shdir, exist_ok=True)
     for plat in ("linux", "apple", "windows", "wasm"):
@@ -32069,6 +32087,16 @@ def main():
             return 2
         coost_root = args[i + 1]
         del args[i:i + 2]
+    gpu_physics = None
+    if "--gpu-physics" in args:
+        i = args.index("--gpu-physics")
+        gpu_physics = True
+        if i + 1 < len(args) and os.path.isfile(
+                os.path.join(args[i + 1], "runtime", "gpuphys.c")):
+            gpu_physics = args[i + 1]
+            del args[i:i + 2]
+        else:
+            del args[i]
     box2d_root = None
     if "--box2d" in args:
         i = args.index("--box2d")
@@ -32088,12 +32116,13 @@ def main():
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
             "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
-            "       [--physics-inject] [--box2d PATH] [--box2d-lto]"
+            "       [--physics-inject] [--box2d PATH] [--box2d-lto] [--gpu-physics [PATH]]"
             " [--coost PATH] [--hybrid] [--managed[=Class,..]]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  default layout:  SoA position tables (use --aos for AoS)\n"
             "  --force:         ignore stamp; always re-emit and transpile\n"
+            "  --gpu-physics:   2D physics on the gpu-physics-engine circle solver, not Box2D\n"
             "  --hybrid:        a method that cannot be lowered to C runs as managed\n"
             "                   code on DotNetAnywhere (needs ../DotNetAnywhere, and\n"
             "                   ../CCSharp built (Roslyn) or mcs)\n"
@@ -32107,7 +32136,8 @@ def main():
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
                     strict=strict, gpu_handles=gpu_handles, gpu_batch=gpu_batch,
                     physics_inject=physics_inject, box2d_root=box2d_root,
-                    coost_root=coost_root, hybrid=hybrid, managed=managed)
+                    coost_root=coost_root, hybrid=hybrid, managed=managed,
+                    gpu_physics=gpu_physics)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player",
             box2d_root=box2d_root, box2d_lto=box2d_lto)
