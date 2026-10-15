@@ -576,9 +576,12 @@ def _lower_except(text, path="<cpp>"):
         return text, False
 
     # -- fallible signatures: collect, then strip the keyword ------------
-    fallible = {}
+    fallible, fret = {}, {}
     for m in _FALLIBLE_SIG.finditer(look):
         fallible[m.group(2)] = _except_zero(m.group(1))
+        rt = " ".join(w for w in m.group(1).split()
+                      if w not in ("static", "virtual", "inline", "public:", "private:", "protected:"))
+        fret.setdefault(m.group(2), set()).add(rt)
     # A constructor that can fail has no return channel to poison and
     # leaves a partially-built object behind -- the exact situation the
     # standards that ban throwing constructors are naming. The checked
@@ -650,6 +653,94 @@ def _lower_except(text, path="<cpp>"):
                        cm.group(1)))
             return True
         return False
+
+    ew = [0]
+
+    def operand_start(sl, end):
+        """Start of the receiver chain ending at `end`: `a.b[i]->f`."""
+        k = end
+        while True:
+            j = k
+            while j > 0 and sl[j - 1] in " \t\n":
+                j -= 1
+            if j > 0 and sl[j - 1] == ".":
+                j -= 1
+            elif j > 1 and sl[j - 2:j] == "->":
+                j -= 2
+            else:
+                return k
+            while j > 0 and sl[j - 1] in " \t\n":
+                j -= 1
+            if j > 0 and sl[j - 1] in ")]":
+                close, opener, depth = sl[j - 1], "(" if sl[j - 1] == ")" else "[", 0
+                while j > 0:
+                    j -= 1
+                    depth += (sl[j] == close) - (sl[j] == opener)
+                    if depth == 0:
+                        break
+            while j > 0 and (sl[j - 1].isalnum() or sl[j - 1] == "_"):
+                j -= 1
+            k = j
+
+    def wrap_nested(seg, handlers, at, force=False):
+        """A fallible call inside a larger expression -- an argument, a
+        condition, an operand -- checked where it is made, in a statement
+        expression, so nothing uses its value or runs after it first:
+        `({ T t = f(..); if (_cpp_exc.flag) <dispatch>; t; })`. Returns the
+        segment and whether a whole-statement call (`f(..);`, `x = f(..);`,
+        `return f(..);`) is left for the check after the statement."""
+        if call_re is None:
+            return seg, False
+        top = False
+        while True:
+            sl = _code_view(seg)
+            cands, top = [], False
+            for cm in call_re.finditer(sl):
+                before = sl[:cm.start()].rstrip()
+                if before.endswith(("int", "long", "void", "double", "float",
+                                    "char", "*")):
+                    continue
+                rs = operand_start(sl, cm.start())
+                if re.search(r"__cpp_ew\d+\s*=\s*$", sl[:rs]) or \
+                        re.search(r"\(\{\s*$", sl[:rs]):
+                    continue                    # already wrapped
+                ce = _match_paren(sl, cm.end() - 1)
+                if ce is None:
+                    continue
+                if not force and re.fullmatch(r"\s*\}?\s*(?:return\s+|[\w\s\*&<>:,.\[\]]*?(?:->[\w\s\[\].]*)*=\s*)?",
+                                              sl[:rs]) and re.fullmatch(r"\s*;\s*", sl[ce + 1:]):
+                    top = True
+                    continue
+                cands.append((rs, ce, cm.group(1)))
+            if not cands:
+                return seg, top
+            if handlers[-1][0] == "none":
+                raise CppError(
+                    "%s:%d: this statement calls a function declared `except`, and there is "
+                    "nothing to handle a failure: no `try` around it, and the enclosing function "
+                    "is not `except` itself." % (os.path.basename(path), at))
+            rs, ce, name = max(cands)
+            types = fret.get(name, {"void"})
+            if len(types) > 1:
+                # a value used in an expression is not a `void` overload's
+                types = types - {"void"}
+            rt = next(iter(types))
+            if len(types) > 1 or (not rt.endswith("*") and re.match(r"\w+", rt)
+                                  and re.match(r"\w+", rt).group(0) in classes):
+                raise CppError(
+                    "%s:%d: a call to `%s` (declared `except`) is part of a larger expression, "
+                    "and it returns %s -- bind it to a local first: `T v = %s(..);` then use `v`."
+                    % (os.path.basename(path), at, name,
+                       "different types by overload" if len(types) > 1 else "an object", name))
+            check = _exc_check(handlers).strip()
+            call = seg[rs:ce + 1]
+            ew[0] += 1
+            if rt == "void":
+                wrapped = "({ %s; %s })" % (call, check)
+            else:
+                v = "__cpp_ew%d" % ew[0]
+                wrapped = "({ %s %s = %s; %s %s; })" % (rt, v, call, check, v)
+            seg = seg[:rs] + wrapped + seg[ce + 1:]
 
     def walk(body, handlers, off=0, depth=0):
         """Rewrite one block body. `handlers` is the context stack,
@@ -792,6 +883,16 @@ def _lower_except(text, path="<cpp>"):
                 seg_start = i
                 continue
             c = lm[i]
+            if c in ";{" and call_re is not None:
+                seg = body[seg_start:i + 1]
+                new_seg, top = wrap_nested(seg, handlers, line(i), force=(c == "{"))
+                if new_seg != seg:
+                    out.append(new_seg)
+                    if top:
+                        out.append(_exc_check(handlers))
+                    seg_start = i + 1
+                    i += 1
+                    continue
             if c == ";":
                 seg = body[seg_start:i + 1]
                 if stmt_needs_check(seg, line(i)):
@@ -1933,11 +2034,23 @@ def _split_members(body, cname, line0, path="<cpp>"):
                         statics.append((" ".join(cparts[:-1]),
                                         cparts[-1], cinit, mutable))
                         continue
-                definit = None
+                # Each declarator its own initializer: `float x = 0, y = 0;`
+                # cut at the first `=` read as one field `x` initialised to
+                # `0, y = 0` -- and `y` was gone.
+                # A braced initializer (`= {1, 2}`) has top-level commas
+                # of its own, so it keeps the one cut at the first `=`.
                 eq = _top_level_eq(decl)
-                if eq >= 0:
-                    definit = decl[eq + 1:].strip()
-                    decl = decl[:eq].strip()
+                if "{" in decl:
+                    inits = None
+                    definit = decl[eq + 1:].strip() if eq >= 0 else None
+                    decl = decl[:eq].strip() if eq >= 0 else decl
+                else:
+                    inits = []
+                    for d in _split_declarators(decl):
+                        eq = _top_level_eq(d)
+                        inits.append(d[eq + 1:].strip() if eq >= 0 else None)
+                    decl = ", ".join(d[:_top_level_eq(d)] if _top_level_eq(d) >= 0 else d
+                                     for d in _split_declarators(decl))
                 # `int x, y;` -- one declaration, several declarators, which
                 # is ordinary C++ and was read as a single field named `y`
                 # of type `int x,`. The type is whatever precedes the first
@@ -1982,9 +2095,10 @@ def _split_members(body, cname, line0, path="<cpp>"):
                     fname = parts[-1]
                     fm = Member("field", " ".join(parts[:-1]), fname,
                                 None, None, line0, dim)
-                    # An initialiser belongs to the declarator it was
-                    # written on, which is the last one here.
-                    fm.definit = definit if idx == len(decls) - 1 else None
+                    if inits is None:
+                        fm.definit = definit if idx == len(decls) - 1 else None
+                    else:
+                        fm.definit = inits[idx]
                     members.append(fm)
                 continue
             head, inner = decl, None
@@ -4307,14 +4421,17 @@ def _parse_param(text, names):
 
 
 class _RefSet(set):
-    """The by-reference parameter positions of one function, remembering which of them are references to a pointer (`T *&`)."""
+    """The by-reference parameter positions of one function, remembering which of them are references to a pointer (`T *&`),
+    and the class of each `const T &` -- which a temporary may bind to."""
     ptr = frozenset()
+    consts = {}
 
 
 def _ref_positions(params, names):
     """Indices of the parameters in `params` that are taken by reference."""
     out = _RefSet()
     ptr = set()
+    consts = {}
     for idx, p in enumerate(_split_top(params or "")):
         if "&" in p:
             got = _parse_param(p, names)
@@ -4322,7 +4439,10 @@ def _ref_positions(params, names):
                 out.add(idx)
                 if got[1] == 2:
                     ptr.add(idx)
+                elif re.match(r"\s*const\s", p) and "*" not in p:
+                    consts[idx] = got[0]
     out.ptr = frozenset(ptr)
+    out.consts = consts
     return out
 
 
@@ -5444,7 +5564,7 @@ def _typeinfo_ref(cname, info):
     return "(const struct _CppTypeInfo *)&%s__vtable" % cname
 
 
-def _vtable_slots(cls, cname, base_info, known):
+def _vtable_slots(cls, cname, base_info, known, tsub=lambda t: t):
     """Ordered vtable layout: inherited slots first, then newly declared.
 
     A slot keeps the signature of the class that first declared it, so a
@@ -5469,8 +5589,9 @@ def _vtable_slots(cls, cname, base_info, known):
                 slot["impl"] = None if m.pure else cname
                 slot["pure"] = m.pure
             else:
-                slot = {"name": m.name, "decl": cname, "ret": m.ret,
-                        "params": m.params or "", "pure": m.pure,
+                # a template's own parameters (`IComparer<T>`) as this instance's
+                slot = {"name": m.name, "decl": cname, "ret": tsub(m.ret or ""),
+                        "params": tsub(m.params or ""), "pure": m.pure,
                         "impl": None if m.pure else cname}
                 slots.append(slot)
                 by_name[m.name] = slot
@@ -5570,7 +5691,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             all_extras.append((bn, bi, "%s.%s" % (_BASE_MEMBER, bpath)
                                if bpath else "%s." % _BASE_MEMBER))
 
-    slots = _vtable_slots(cls, cname, base_info, known)
+    slots = _vtable_slots(cls, cname, base_info, known, lambda t: tsub(sub(t)))
     # Is this hierarchy rooted in a class the other language emitted? If so
     # its descriptor type, its layout and its slot names are already fixed,
     # and this class joins them rather than defining its own.
@@ -6519,21 +6640,22 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                                for x in _split_top(cparams)) if n]
             alloc = ent["alloc"] if ent else "%s__alloc" % cname
             if arena_n is not None:
-                body = ["%s *p;" % cname,
+                body = ["%s *__p;" % cname,
                         "if (%s__arena_n >= %d) { abort(); }" % (cname, arena_n),
-                        "p = &%s__arena[%s__arena_n]; %s__arena_n = %s__arena_n + 1;"
+                        "__p = &%s__arena[%s__arena_n]; %s__arena_n = %s__arena_n + 1;"
                         % (cname, cname, cname, cname),
-                        "memset(p, 0, sizeof(%s));" % cname]
+                        "memset(__p, 0, sizeof(%s));" % cname]
             else:
-                body = ["%s *p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
+                # `__p`: a constructor parameter may be named `p`
+                body = ["%s *__p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
             if ent:
                 # A failed allocation must not be constructed through. C++
                 # would throw here; the subset has no exceptions, so `new`
                 # yields null and the caller checks, which is the C
                 # convention anyway.
-                body.append("if (p) { %s(p%s); }"
+                body.append("if (__p) { %s(__p%s); }"
                             % (ent["fn"], "".join(", " + f for f in fwd)))
-            body.append("return p;")
+            body.append("return __p;")
             # declared with the methods: one of them may `new` its own
             # class (a pool's Create), and the definition comes after them --
             # undeclared, C took it for an `int` function and they conflicted
@@ -7145,7 +7267,7 @@ def _named_object(expr, scopes, type_info):
         # object, and `&(*p)` is `p` -- written out so the address the
         # caller takes is the one it wants rather than the pointer's own.
         out = "(*%s)" % parts[0]
-    for fld in parts[1:]:
+    for _k, fld in enumerate(parts[1:], 2):
         info = type_info.get(cls)
         # `_base` is the synthesized hop to the base class, not a declared
         # field, so it is not in `fields` -- an inherited field is flattened
@@ -7191,10 +7313,11 @@ def _named_object(expr, scopes, type_info):
         if info is None or fld not in info["fields"]:
             return None
         fcls, is_ptr = info["fields"][fld]
-        if is_ptr:
+        if is_ptr and _k == len(parts):
             return None              # a pointer member is not the object
         out = "%s%s%s" % (out, sep, info["paths"].get(fld, fld))
-        sep = "."
+        # through one, the walk goes on to its pointee (`op.Prev.Pt`)
+        sep = "->" if is_ptr else "."
         cls = fcls
     return (out, cls)
 
@@ -7715,7 +7838,8 @@ def _rewrite_scopes_inner(text, type_info, _pos):
     # pass knows the type of a local, and an expression it would have to
     # infer one for is left alone.
     cmp_re = re.compile(
-        r"(?<![\w.>])(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+)(?![\w(<])")
+        r"(?<![\w.>])(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+(?:\s*(?:\.|->)\s*\w+)*)"
+        r"(?![\w(<]|\s*(?:\.|->|\[|\())")
     aug_re = re.compile(
         r"(?<![\w.>])(\w+)\s*([+\-*/%|&^])=(?!=)\s*([^;]+);")
 
@@ -7848,6 +7972,19 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                         pm = re.match(r"^(?:const\s+)?(\w+)\s*\*\s*(\w+)$",
                                       part.strip())
                         if pm is not None and pm.group(2) == "this":
+                            continue
+                        if pm is not None and pm.group(1) in type_info and \
+                                re.match(r"^(?:const\s+)?\w+\*\s", part.strip()):
+                            # `T* p`: a pointer as written, kept with the
+                            # pointer locals -- `p = q` repoints it. Read as a
+                            # lowered reference it was `T__assign(p, q)`, an
+                            # object copy C# (`[MaxInstances]` classes) never makes.
+                            # ponytail: told apart by spelling -- `_lower_refs`
+                            # writes `T *r`; a hand-written `T *p` is still
+                            # read as a reference. A marker from `_lower_refs`
+                            # would make it exact.
+                            fr.ptrvals[pm.group(2)] = pm.group(1)
+                            fr.ptrs.add(pm.group(2))
                             continue
                         if pm is not None and pm.group(1) in type_info:
                             fr.vals[pm.group(2)] = pm.group(1)
@@ -8374,8 +8511,9 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             if found is not None:
                 ix = (type_info.get(found[1]) or {}).get("index")
                 if ix is not None:
-                    ec = _ret_class(ix["ret"], type_info)[0]
-                    if ec is not None and ec in type_info:
+                    ec, eptr = _ret_class(ix["ret"], type_info)
+                    # a container of pointers (`vector<S*>`) holds no objects
+                    if ec is not None and ec in type_info and not eptr:
                         actype = ec
         if actype is not None:
             close = _match_bracket(look, m.end() - 1)
@@ -9498,6 +9636,13 @@ def _assign_target(look, at, scopes, cinfo):
             if m.group(1) in s:
                 cls, is_ptr = s[m.group(1)]
                 return cls if is_ptr else None
+    # `this->f = new D()`: the declared class of the pointer field `f`
+    m = re.search(r"(?<![\w.>])this\s*->\s*(\w+)\s*=\s*$", look[max(0, lo - 80):at])
+    if m is not None:
+        this = next((s["this"] for s in reversed(scopes) if "this" in s), None)
+        fld = this and cinfo.get(this[0], {}).get("fields", {}).get(m.group(1))
+        if fld and fld[1] and fld[0] in cinfo:
+            return fld[0]
     return None
 
 
@@ -10403,6 +10548,7 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     cont_re = re.compile(r"\s*(?:\.|->)\s*(\w+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
     static_re = re.compile(r"(?<![\w.>:])(\w+)\s*::\s*(\w+)\s*\(")
+    name_re = re.compile(r"(?<![\w.>])([A-Za-z_]\w*)(?=\s*;)")
 
     def static_pending(raw):
         """Does this argument list still hold a `Cls::f(..)` the static-call branch below will lower?
@@ -10646,6 +10792,11 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             a = parts[idx].strip()
             if not a or a.startswith("&") or a.startswith("*"):
                 continue
+            # Not C++ (a reference never binds null), but a C# borrow of a
+            # reference type -- a `List` -- may be null, and the pointer the
+            # reference becomes says so.
+            if a in ("NULL", "nullptr", "((void *)0)"):
+                continue
             # `void take(Inner *r, int k);` is a declaration, not a call: its
             # "arguments" parse as parameters. Leave the prototype alone.
             #
@@ -10667,6 +10818,14 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 if not (idx in getattr(refs, "ptr", ()) and sym[1] != 2):
                     continue
             why = _unaddressable_arg(a)
+            tcls = getattr(refs, "consts", {}).get(idx)
+            if why is not None and tcls in cinfo and not cinfo[tcls]["dtor"] \
+                    and not cinfo[tcls].get("slots"):
+                # A `const T &` binds a temporary. For a class that owns
+                # nothing, a compound literal is one: its address lives to
+                # the end of the enclosing block, past the full expression.
+                parts[idx] = " (%s[1]){ %s }" % (tcls, a)
+                continue
             if why is not None:
                 raise CppError(
                     "`%s` is passed to a reference parameter, and %s. This "
@@ -11437,6 +11596,20 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 out.append("%s(%s)" % (_ent["fn"], args))
                 i = close + 1
                 continue
+            # `Base::name(..)` from a derived member function -- the base's
+            # own implementation, called directly rather than through the
+            # vtable. The base object is the derived struct's first member,
+            # so `this` converts by a cast.
+            _this = lookup(scopes, "this")
+            _anc = _this and _this[0]
+            while _anc and _anc != m.group(1):
+                _anc = ((cinfo.get(_anc) or {}).get("base") or "").split(",")[0].strip() or None
+            if _ent is not None and not _ent.get("static") and _anc and _this[0] != m.group(1) \
+                    and not _args_hold_new(look[op + 1:close]):
+                args = fix_args(text[op + 1:close], _ent["refs"], scopes)
+                out.append("%s((%s *)this%s)" % (_ent["fn"], m.group(1), ", " + args if args.strip() else ""))
+                i = close + 1
+                continue
 
         m = plain_re.match(look, i)
         if m and (m.group(1) in free_refs or m.group(1) in free_rets):
@@ -11460,6 +11633,17 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 expr, end = follow(expr, rcls, rptr, close + 1, fn)
                 out.append(expr)
                 i = end
+                continue
+
+        # `Base *p = d;` / `p = d;` with `d` a `Derived *`: the same
+        # address-preserving upcast `new Derived(..)` gets above.
+        m = name_re.match(look, i)
+        if m:
+            sym = lookup(scopes, m.group(1))
+            target = sym and sym[1] and _assign_target(look, i, scopes, cinfo)
+            if target and target != sym[0] and _is_ancestor(target, sym[0], cinfo):
+                out.append("((%s *)%s)" % (target, m.group(1)))
+                i = m.end()
                 continue
 
         out.append(text[i])
@@ -13786,7 +13970,8 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # receiver twice and a call receiver must not run twice. The pattern is
     # exactly the chained-call syntax, so this neither misses a case the
     # rewriter will take nor is it worth narrowing further.
-    chained = set(re.findall(r"\)\s*(?:\.|->)\s*(\w+)\s*\(", heap))
+    # `]` too: a subscript on a container is an `operator[]` call by then
+    chained = set(re.findall(r"[)\]]\s*(?:\.|->)\s*(\w+)\s*\(", heap))
     uses_heap = bool(new_used) or bool(
         re.search(r"(?<![\w.>])delete\b", heap))
     declared = set(cls.name for _s, _e, cls in classes)

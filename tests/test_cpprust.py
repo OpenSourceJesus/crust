@@ -2111,13 +2111,13 @@ void f(void) { Node *p = new Node(5); }
         out = cpprust.translate(_NODE + "void f(void) { Node *p = new Node(5); }")
         self.assertIn("static Node *Node__alloc(int x) {", out)
         self.assertIn("malloc(sizeof(Node))", out)
-        self.assertIn("Node_new(p, x);", out)
+        self.assertIn("Node_new(__p, x);", out)
 
     def test_alloc_does_not_construct_through_a_failed_malloc(self):
         # No exceptions in the subset, so `new` yields null and the caller
         # checks -- constructing through null would fault instead.
         out = cpprust.translate(_NODE + "void f(void) { Node *p = new Node(5); }")
-        self.assertIn("if (p) { Node_new(p, x); }", out)
+        self.assertIn("if (__p) { Node_new(__p, x); }", out)
 
     def test_new_without_parentheses(self):
         out = cpprust.translate("""
