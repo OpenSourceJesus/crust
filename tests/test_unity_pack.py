@@ -8854,13 +8854,16 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Assets", assets[font])
 
     def test_gles_host_draw_tex_limits_cover_large_ui(self):
-        """Host MAX_DRAWS/MAX_TEX must fit menus with 100+ UI sprites/textures."""
-        for name in ("gles2_window.c", "gles2_view.c"):
+        """Hosts fit menus with 100+ UI sprites and upload every texture: a
+        pack's runtime TMP variants come last (Slime Jump's tips are 675 of
+        771), so a fixed texture cap drops exactly those."""
+        for name in ("gles2_window.c", "gles2_view.c", "gles3_render.h"):
             path = os.path.join(ROOT, "examples", "unity_pack", name)
             with open(path) as f:
                 src = f.read()
             self.assertRegex(src, r"#define MAX_DRAWS\s+4096")
-            self.assertRegex(src, r"#define MAX_TEX\s+512")
+            self.assertNotIn("MAX_TEX", src)
+            self.assertRegex(src, r"calloc\(\(size_t\)\w*tex_n")
 
     def test_sprite_mode_multiple_crops_by_file_id(self):
         """Multiple spriteMode: Image fileID selects spriteSheet rect, not full PNG."""

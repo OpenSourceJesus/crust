@@ -345,9 +345,8 @@ legacy `UI.Text` / `GridLayoutGroup` are not imported.
 `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
 remain refused invent / no-op (no invent); `using UnityEngine.UI` and Image fields are fine.
 
-The GLES hosts (`gles2_window.c` / `gles2_view.c`) accept up to 512 draws and
-512 textures by default (`MAX_DRAWS` / `MAX_TEX`) so large UI menus are not
-silently truncated.
+The GLES hosts (`gles2_window.c` / `gles2_view.c` / `gles3_render.h`) accept
+up to 4096 draws by default (`MAX_DRAWS`) and upload every packed texture.
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
@@ -691,8 +690,8 @@ Button prefabs). Canvas sorting walks hierarchy past those stripped roots so
 labels share the Canvas `sorting_layer_id` (otherwise the Main Menu Image can
 paint over them).
 
-The GLES host uploads up to 256 packed textures / draw sprites per frame
-(`MAX_TEX` / `MAX_DRAWS` in `gles2_window.c`).
+The GLES host uploads every packed texture and draws up to `MAX_DRAWS`
+sprites per frame (`gles2_window.c`).
 
 ## Incremental pack
 
