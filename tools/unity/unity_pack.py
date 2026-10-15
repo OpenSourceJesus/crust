@@ -21421,6 +21421,8 @@ def emit_engine(plan, analyses, used_apis):
         p("        }")
         p("        n = w;")
         p("    }")
+        if plan.get("tmp_live") and plan.get("tmp_text_set"):
+            p("    n = _tl_draws(out, n, max);")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
@@ -28376,6 +28378,32 @@ def _tmp_text_sets(text, cl):
     return out
 
 
+_TMP_TEXT_LIVE = re.compile(
+    r'(?<![\w.])((?:(\w+)\s*\.\s*[iI]nstance\s*\.\s*|this\s*\.\s*)?(\w+))'
+    r'\s*\.\s*text\s*=(?!=)\s*((?:[^;{}"\n]|"(?:[^"\\\n]|\\.)*")+);')
+
+
+def _tmp_text_live(text, cname, plan):
+    """The `f.text = expr;` / `Cls.instance.f.text = expr;` statements in
+    *text* (a method of *cname*) that _tmp_text_sets does not bake: drawn
+    at run time from per-glyph textures (_emit_tmp_text_set).
+    [(match, class, field)]"""
+    classes = plan.get("classes") or {}
+    baked = {m.start() for m, _n, _l in
+             _tmp_text_sets(text, classes.get(cname) or {})}
+    out = []
+    for m in _TMP_TEXT_LIVE.finditer(text):
+        if m.start() in baked:
+            continue
+        owner = m.group(2) or cname
+        oc = classes.get(owner)
+        if oc and any(f["name"] == m.group(3) and not f.get("static")
+                      and (f.get("ty") or "").split(".")[-1] in _TMP_TYPES
+                      for f in oc.get("fields") or []):
+            out.append((m, owner, m.group(3)))
+    return out
+
+
 def _tmp_text_variants(plan, analyses):
     """Bake each text a `f.text = v;` (_tmp_text_sets) can give its TMP:
     an own string field's authored value per instance, or the literal.
@@ -28386,7 +28414,7 @@ def _tmp_text_variants(plan, analyses):
     ponytail: a text whose bake overflows its rect differently from the
     row's draws at the row's size, so it is left out (stops if set)."""
     refs = plan.get("go_field_refs") or {}
-    want = {}
+    want, live = {}, set()
     for a in analyses:
         for c in a.get("classes") or []:
             cl = plan["classes"].get(c["name"])
@@ -28395,6 +28423,13 @@ def _tmp_text_variants(plan, analyses):
             vals = {f["name"]: f["values"]
                     for f in cl.get("string_fields") or []}
             for meth in c.get("methods") or []:
+                for _m, owner, f in _tmp_text_live(
+                        meth.get("body") or "", c["name"], plan):
+                    plan["tmp_text_set"] = True
+                    for go in refs.get((owner, f)) or []:
+                        if go >= 0:
+                            live.add(go)
+                            want.setdefault(go, set())
                 for m, name, lit in _tmp_text_sets(meth.get("body") or "", cl):
                     plan["tmp_text_set"] = True
                     for k, go in enumerate(refs.get((c["name"], m.group(1)))
@@ -28429,6 +28464,11 @@ def _tmp_text_variants(plan, analyses):
                 "canvas); setting it stops the player\n" % go)
             continue
         b = tmp["bake"]
+        if go in live:
+            if not empty:
+                empty.append(add(bytes(4), 1, 1, ""))
+            plan.setdefault("tmp_live", []).append(
+                _tmp_live_glyphs(go, tmp, sp, add, empty[0]))
         for t in sorted(want[go]):
             if t == (tmp.get("text") or ""):
                 rows.append((go, t, int(sp["tex_id"])))
@@ -28449,6 +28489,55 @@ def _tmp_text_variants(plan, analyses):
     plan["tmp_texts"] = rows
 
 
+def _tmp_live_glyphs(go, tmp, sp, add, empty):
+    """The run-time layout of the TMP on *go* (_emit_tmp_text_set): its
+    rect and font metrics, and a white texture per printable ASCII glyph
+    the font has, baked at the largest size the TMP draws at.
+
+    ponytail: ASCII only and one line; a string with a newline or another
+    character stops the player when set."""
+    b = tmp["bake"]
+    font = _load_tmp_font_asset(b["font"])
+    ps = float(font["point_size"]) or 1.0
+    asc, desc = float(font["ascent"]), float(font["descent"])
+    bh0 = max(1, int(round(abs(float(b["box_h"])))))
+    size = float(b["size"])
+    if b.get("auto_size"):
+        size = min(float(b["auto_size"][1]),
+                   bh0 * ps / max(asc - desc, 1e-6))
+    scale = size / ps
+    glyphs = []
+    for c in range(32, 127):
+        gi = font["chars"].get(c)
+        g = font["glyphs"].get(gi) if gi is not None else None
+        if not g:
+            continue
+        w = max(1, int(math.ceil(float(g["w"]) * scale)))
+        h = max(1, int(math.ceil(float(g["h"]) * scale)))
+        tex = -1
+        if float(g["w"]) > 0 and float(g["h"]) > 0:
+            out = bytearray(w * h * 4)
+            _blit_tmp_glyph(out, w, h, font, g, 0.0, 0.0, float(w),
+                            float(h), (1.0, 1.0, 1.0, 1.0))
+            tex = add(bytes(out), w, h, chr(c))
+        glyphs.append((c, tex, float(g["adv"]), float(g["bx"]),
+                       float(g["by"]), float(g["w"]), float(g["h"])))
+    return {
+        "go": go, "empty": empty, "glyphs": glyphs,
+        "bw": max(1, int(round(abs(float(b["box_w"]))))), "bh": bh0,
+        "sx": float(sp.get("draw_sx", 1.0)),
+        "sy": float(sp.get("draw_sy", 1.0)),
+        "fx": float(sp.get("shift_fx", 0.0)),
+        "fy": float(sp.get("shift_fy", 0.0)),
+        "size": float(b["size"]),
+        "auto": tuple(b["auto_size"]) if b.get("auto_size") else None,
+        "h_align": int(tmp.get("h_align") or 1),
+        "v_align": int(tmp.get("v_align") or 256),
+        "wrap": bool(tmp.get("wrap")),
+        "clip": int(tmp.get("overflow_mode") or 0) != 0,
+        "ps": ps, "asc": asc, "desc": desc}
+
+
 _TMP_TEXT_SET_HEAD = ("static void TMP_Text_set_text(int go, const char *s,"
                       " const char *cls, const char *method,"
                       " const char *path, int line)")
@@ -28463,6 +28552,9 @@ def _emit_tmp_text_set(p, plan):
     """`f.text = v;` (_tmp_text_sets): the GO draws the texture baked for
     *s* (_tmp_text_variants); a text not baked for it stops the player."""
     rows = plan.get("tmp_texts") or []
+    live = plan.get("tmp_live") or []
+    if live:
+        _emit_tmp_live(p, live)
     p(_TMP_TEXT_SET_HEAD + " {")
     if rows:
         p("    static const int _go[%d] = { %s };" % (
@@ -28476,10 +28568,147 @@ def _emit_tmp_text_set(p, plan):
     if rows:
         p("    for (k = 0; k < %d; k = k + 1)" % len(rows))
         p("        if (_go[k] == go && strcmp(_s[k], s ? s : \"\") == 0) {")
+        if live:
+            p("            _tl_set(go, 0);")
         p("            Renderer_set_sprite(go, _tex[k]);")
         p("            return;")
         p("        }")
+    if live:
+        p("    if (_tl_set(go, s ? s : \"\")) return;")
     p("    _engine_unlowered_at(\"TMP_Text.text\", path, line);")
+    p("}")
+
+
+def _emit_tmp_live(p, live):
+    """TMP texts set at run time (_tmp_live_glyphs): `_tl_set` keeps the
+    text and swaps the TMP's draw to a transparent one, `_tl_draws` (at the
+    end of engine_collect_draws) adds a quad per glyph over it, laid out as
+    _rasterize_tmp_text lays out one line."""
+    n = len(live)
+    gs = [g for t in live for g in t["glyphs"]]
+    p("static const int _tl_go[%d] = { %s };" % (
+        n, ", ".join(str(t["go"]) for t in live)))
+    p("static const int _tl_empty[%d] = { %s };" % (
+        n, ", ".join(str(t["empty"]) for t in live)))
+    # bw bh sx sy fx fy size lo hi ps asc desc
+    p("static const float _tl_f[%d][12] = { %s };" % (n, ", ".join(
+        "{ %s }" % ", ".join("%sf" % repr(float(v)) for v in (
+            t["bw"], t["bh"], t["sx"], t["sy"], t["fx"], t["fy"], t["size"],
+            (t["auto"] or (0, 0))[0], (t["auto"] or (0, 0))[1], t["ps"],
+            t["asc"], t["desc"])) for t in live)))
+    # h_align v_align auto wrap clip first-glyph glyph-count
+    off = 0
+    ints = []
+    for t in live:
+        ints.append("{ %d, %d, %d, %d, %d, %d, %d }" % (
+            t["h_align"], t["v_align"], 1 if t["auto"] else 0,
+            1 if t["wrap"] else 0, 1 if t["clip"] else 0,
+            off, len(t["glyphs"])))
+        off += len(t["glyphs"])
+    p("static const int _tl_i[%d][7] = { %s };" % (n, ", ".join(ints)))
+    p("static const int _tl_gc[%d] = { %s };" % (
+        len(gs), ", ".join(str(g[0]) for g in gs)))
+    p("static const int _tl_gt[%d] = { %s };" % (
+        len(gs), ", ".join(str(g[1]) for g in gs)))
+    # adv bx by w h (font units)
+    p("static const float _tl_gm[%d][5] = { %s };" % (len(gs), ", ".join(
+        "{ %s }" % ", ".join("%sf" % repr(v) for v in g[2:]) for g in gs)))
+    p("static char _tl_text[%d][128];" % n)
+    p("static int _tl_on[%d];" % n)
+    p("static int _tl_glyph(int k, int c) {")
+    p("    int j;")
+    p("    for (j = _tl_i[k][5]; j < _tl_i[k][5] + _tl_i[k][6]; j = j + 1)")
+    p("        if (_tl_gc[j] == c) return j;")
+    p("    return -1;")
+    p("}")
+    p("/* The size *s* draws at in TMP *k* and its width (rect pixels);")
+    p("   0 when it cannot be drawn: not printable ASCII, or past a rect")
+    p("   that wraps or clips. */")
+    p("static int _tl_layout(int k, const char *s, float *size, float *w) {")
+    p("    const float *f = _tl_f[k];")
+    p("    float adv = 0.f, end = 0.f;")
+    p("    int j, words = 0, gap = 1;")
+    p("    for (j = 0; s[j]; j = j + 1) {")
+    p("        int g;")
+    p("        if (s[j] < 32 || s[j] > 126 || j >= 127) return 0;")
+    p("        if (s[j] != ' ' && gap) words = words + 1;")
+    p("        gap = s[j] == ' ';")
+    p("        g = _tl_glyph(k, s[j]);")
+    p("        if (g < 0) continue;")
+    p("        adv = adv + _tl_gm[g][0];")
+    p("        if (s[j] != ' ') end = adv;")
+    p("    }")
+    p("    *size = f[6];")
+    # ponytail: auto size shrinks one word to the rect's width, as TMP does
+    # before it breaks a word; words that would wrap stop instead
+    p("    if (_tl_i[k][2]) {")
+    p("        float hi = f[1] * f[9] / (f[10] - f[11] > 1e-6f ? f[10] - f[11] : 1e-6f);")
+    p("        if (f[8] < hi) hi = f[8];")
+    p("        *size = hi;")
+    p("        if ((!_tl_i[k][3] || words < 2) && end > 0.f && f[0] * f[9] / end < hi)")
+    p("            *size = f[0] * f[9] / end;")
+    p("        if (*size < f[7]) *size = f[7];")
+    p("    }")
+    p("    *w = end * *size / f[9];")
+    p("    return !((_tl_i[k][3] || _tl_i[k][4]) && *w > f[0] + 1e-3f);")
+    p("}")
+    p("/* *s* drawn live on TMP *go* (0: back to its baked texts); 0 when")
+    p("   *go* has no live text or *s* cannot be drawn. */")
+    p("static int _tl_set(int go, const char *s) {")
+    p("    float size, w;")
+    p("    int k;")
+    p("    for (k = 0; k < %d; k = k + 1) {" % n)
+    p("        if (_tl_go[k] != go) continue;")
+    p("        if (!s) { _tl_on[k] = 0; return 1; }")
+    p("        if (!_tl_layout(k, s, &size, &w)) return 0;")
+    p("        strcpy(_tl_text[k], s);")
+    p("        _tl_on[k] = 1;")
+    p("        Renderer_set_sprite(go, _tl_empty[k]);")
+    p("        return 1;")
+    p("    }")
+    p("    return 0;")
+    p("}")
+    p("static int _tl_draws(EngineDraw *out, int n, int max) {")
+    p("    int n0 = n, d, k, j;")
+    p("    for (d = 0; d < n0; d = d + 1)")
+    p("        for (k = 0; k < %d; k = k + 1) {" % n)
+    p("            const float *f = _tl_f[k];")
+    p("            float size, tw, sc, W, H, ux, uy, ox, oy, vh, top, pen;")
+    p("            if (!_tl_on[k] || _tl_go[k] != out[d].go"
+      " || out[d].tex != _tl_empty[k]) continue;")
+    p("            if (!_tl_layout(k, _tl_text[k], &size, &tw)) continue;")
+    p("            sc = size / f[9];")
+    p("            W = 2.f * out[d].half_w / f[2];")
+    p("            H = 2.f * out[d].half_h / f[3];")
+    p("            ux = W / f[0];")
+    p("            uy = H / f[1];")
+    p("            ox = -f[4] * W - 0.5f * W;")
+    p("            oy = -f[5] * H - 0.5f * H;")
+    p("            vh = (f[10] - f[11]) * sc;")
+    p("            top = _tl_i[k][1] & 1024 ? vh"
+      " : _tl_i[k][1] & 512 ? (f[1] + vh) * 0.5f : f[1];")
+    p("            pen = _tl_i[k][0] & 4 ? f[0] - tw"
+      " : _tl_i[k][0] & 2 ? (f[0] - tw) * 0.5f : 0.f;")
+    p("            for (j = 0; _tl_text[k][j]; j = j + 1) {")
+    p("                int g = _tl_glyph(k, _tl_text[k][j]);")
+    p("                if (g < 0) continue;")
+    p("                if (_tl_gt[g] >= 0 && n < max) {")
+    p("                    const float *m = _tl_gm[g];")
+    p("                    float lx = ox + (pen + (m[1] + 0.5f * m[3]) * sc) * ux;")
+    p("                    float ly = oy + (top - f[10] * sc"
+      " + (m[2] - 0.5f * m[4]) * sc) * uy;")
+    p("                    out[n] = out[d];")
+    p("                    out[n].x = out[d].x + out[d].m00 * lx + out[d].m01 * ly;")
+    p("                    out[n].y = out[d].y + out[d].m10 * lx + out[d].m11 * ly;")
+    p("                    out[n].half_w = 0.5f * m[3] * sc * ux;")
+    p("                    out[n].half_h = 0.5f * m[4] * sc * uy;")
+    p("                    out[n].tex = _tl_gt[g];")
+    p("                    n = n + 1;")
+    p("                }")
+    p("                pen = pen + _tl_gm[g][0] * sc;")
+    p("            }")
+    p("        }")
+    p("    return n;")
     p("}")
 
 
@@ -28500,6 +28729,19 @@ def _trap_tmp_writes(body, plan, site):
                 "TMP_Text_set_text(%s, %s, %s, %s, %s, %d);" % (
                     m.group(1), '""' if m.group(2) == "null" else m.group(2),
                     _c_string(site["class"]),
+                    _c_string(site.get("method") or "?"),
+                    _c_string(site.get("path") or "<cs>"), line)
+            ) + body[m.end():]
+        lgo = {t["go"] for t in plan.get("tmp_live") or []}
+        refs = plan.get("go_field_refs") or {}
+        for m, owner, f in reversed(_tmp_text_live(body, site["class"], plan)):
+            if not lgo & set(refs.get((owner, f)) or []):
+                continue
+            line = ft.count("\n", 0, _body_src_off(
+                ft, at, body, m.start())) + 1 if ft else 0
+            body = body[:m.start()] + (
+                "TMP_Text_set_text(%s, %s, %s, %s, %s, %d);" % (
+                    m.group(1), m.group(4), _c_string(site["class"]),
                     _c_string(site.get("method") or "?"),
                     _c_string(site.get("path") or "<cs>"), line)
             ) + body[m.end():]

@@ -4531,5 +4531,74 @@ public class Sign : MonoBehaviour {
                       str(cm.exception))
 
 
+class TestTmpTextLive(TestTmpTextSet):
+    """Player.Death's `GameManager.instance.deathCounterText.text = "" +
+    DeathCount;`: a text no pack can bake draws a quad per glyph over the
+    TMP's rect; one it cannot lay out (a newline) stops."""
+    SIGN = """using UnityEngine;
+using TMPro;
+public class Sign : MonoBehaviour {
+    public static Sign instance;
+    public TMP_Text label;
+    static int n;
+    int f;
+    void Awake () { instance = this; }
+    void Update () {
+        f++;
+        n += 1234567;
+        if (f == 2) Sign.instance.label.text = "" + n;
+        if (f == 4) label.text = "a\\n" + n;
+    }
+}
+"""
+
+    def test_rasterize_lines(self):
+        pass
+
+    def test_empty_text_keeps_canvas_layer(self):
+        pass
+
+    @needs_cc
+    def test_sign(self):
+        root = tempfile.mkdtemp(prefix="upf-")
+        self.addCleanup(shutil.rmtree, root, True)
+        for d in ("Scripts", "Fonts", "Scenes"):
+            os.makedirs(os.path.join(root, "Assets", d))
+        sign_guid, font_guid = "%032x" % 1, "%032x" % 2
+        shutil.copy(self.FONT, os.path.join(root, "Assets", "Fonts", "Font.asset"))
+        ttf = self.FONT.replace(" SDF.asset", ".ttf")
+        for ext in ("", ".meta"):
+            shutil.copy(ttf + ext, os.path.join(root, "Assets", "Fonts",
+                                                "Font.ttf" + ext))
+        for path, guid, src in (("Scripts/Sign.cs", sign_guid, self.SIGN),
+                                ("Fonts/Font.asset", font_guid, None)):
+            if src:
+                with open(os.path.join(root, "Assets", path), "w") as f:
+                    f.write(src)
+            with open(os.path.join(root, "Assets", path + ".meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(self._scene(sign_guid, font_guid))
+        out = pack(self, root)
+        draws = ("EngineDraw b[16]; int n = engine_collect_draws(b, 16), k;"
+                 " for (k = 0; k < n; k++) printf(\"d %d %.3f %.3f\\n\","
+                 " b[k].tex, b[k].x, b[k].half_w);")
+        d = [[l.split()[1:] for l in run_frames(self, out, f, draws)
+              if l[:2] == "d "] for f in (0, 2)]
+        self.assertEqual(len(d[0]), 1)
+        base, *gs = d[1]                        # "2469134": a quad per digit
+        self.assertEqual(base[0], d[0][0][0])   # the rect, drawn empty
+        self.assertEqual([g[0] for g in gs].count(gs[0][0]), 1)  # "2" once
+        self.assertEqual(len(gs), 7)
+        xs = [float(g[1]) for g in gs]
+        self.assertEqual(xs, sorted(xs))
+        self.assertLess(abs((xs[0] + xs[-1]) / 2 - float(base[1])),
+                        float(gs[0][2]))        # centered
+        with self.assertRaises(AssertionError) as cm:
+            run_frames(self, out, 4)
+        self.assertIn("Sign.cs:13: `TMP_Text.text` is not lowered",
+                      str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

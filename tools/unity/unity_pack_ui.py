@@ -49,6 +49,7 @@ __all__ = [
     '_apply_slider_visuals',
     '_apply_ui_button_onclick_mods',
     '_apply_ui_image_sprite_mod',
+    '_blit_tmp_glyph',
     '_build_go_ui_component_maps',
     '_build_rect_transforms',
     '_build_ui_buttons',
@@ -1579,54 +1580,57 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     shift_x = (pad_r - pad_l) * 0.5
     shift_y = (pad_t - pad_b) * 0.5
     out = bytearray(bw * bh * 4)
-    aw = int(font["atlas_w"])
-    ah = int(font["atlas_h"])
-    atlas = font["atlas"]
-    cr = float(color[0])
-    cg = float(color[1])
-    cb = float(color[2])
-    ca = float(color[3])
     for g, pen, base in placed:
         gw = max(float(g["w"]) * scale, 0.0)
         gh = max(float(g["h"]) * scale, 0.0)
         if gw <= 0.0 or gh <= 0.0:
             continue  # a space: no ink
-        gx0 = pen + pad_l + float(g["bx"]) * scale
         gy1 = base + pad_b + float(g["by"]) * scale  # top
-        gy0 = gy1 - gh  # bottom
-        rx, ry, rw, rh = int(g["rx"]), int(g["ry"]), int(g["rw"]), int(g["rh"])
-        # GlyphRect Y is from the top of the (top-first) atlas. Empirically
-        # TMP SDF glyphs sample with v increasing toward the bottom of the
-        # rect (matches LiberationSans SDF packing).
-        for py in range(int(math.floor(gy0)), int(math.ceil(gy1))):
-            if py < 0 or py >= bh:
-                continue
-            v = (py + 0.5 - gy0) / gh if gh > 1e-6 else 0.0
-            if v < 0.0 or v > 1.0:
-                continue
-            sy = v * max(rh - 1, 0)
-            for px in range(int(math.floor(gx0)), int(math.ceil(gx0 + gw))):
-                if px < 0 or px >= bw:
-                    continue
-                u = (px + 0.5 - gx0) / gw if gw > 1e-6 else 0.0
-                if u < 0.0 or u > 1.0:
-                    continue
-                sx = u * max(rw - 1, 0)
-                ix = rx + int(round(sx))
-                iy = ry + int(round(sy))
-                if ix < 0 or iy < 0 or ix >= aw or iy >= ah:
-                    continue
-                cov = (atlas[iy * aw + ix] / 255.0 if font.get("coverage")
-                       else _sdf_coverage(atlas[iy * aw + ix]))
-                if cov <= 0.0:
-                    continue
-                o = (py * bw + px) * 4
-                a = cov * ca
-                out[o] = int(min(255, round(cr * 255.0 * cov)))
-                out[o + 1] = int(min(255, round(cg * 255.0 * cov)))
-                out[o + 2] = int(min(255, round(cb * 255.0 * cov)))
-                out[o + 3] = int(min(255, round(a * 255.0)))
+        _blit_tmp_glyph(out, bw, bh, font, g, pen + pad_l
+                        + float(g["bx"]) * scale, gy1 - gh, gw, gh, color)
     return bw, bh, bytes(out), shift_x, shift_y
+
+
+def _blit_tmp_glyph(out, bw, bh, font, g, gx0, gy0, gw, gh, color):
+    """Draw the font's glyph *g* into the *bw* x *bh* RGBA *out* (y=0
+    bottom) over the rect at (*gx0*, *gy0*) of size *gw* x *gh* pixels."""
+    aw = int(font["atlas_w"])
+    ah = int(font["atlas_h"])
+    atlas = font["atlas"]
+    cr, cg, cb, ca = (float(c) for c in color)
+    gy1 = gy0 + gh
+    rx, ry, rw, rh = int(g["rx"]), int(g["ry"]), int(g["rw"]), int(g["rh"])
+    # GlyphRect Y is from the top of the (top-first) atlas. Empirically
+    # TMP SDF glyphs sample with v increasing toward the bottom of the
+    # rect (matches LiberationSans SDF packing).
+    for py in range(int(math.floor(gy0)), int(math.ceil(gy1))):
+        if py < 0 or py >= bh:
+            continue
+        v = (py + 0.5 - gy0) / gh if gh > 1e-6 else 0.0
+        if v < 0.0 or v > 1.0:
+            continue
+        sy = v * max(rh - 1, 0)
+        for px in range(int(math.floor(gx0)), int(math.ceil(gx0 + gw))):
+            if px < 0 or px >= bw:
+                continue
+            u = (px + 0.5 - gx0) / gw if gw > 1e-6 else 0.0
+            if u < 0.0 or u > 1.0:
+                continue
+            sx = u * max(rw - 1, 0)
+            ix = rx + int(round(sx))
+            iy = ry + int(round(sy))
+            if ix < 0 or iy < 0 or ix >= aw or iy >= ah:
+                continue
+            cov = (atlas[iy * aw + ix] / 255.0 if font.get("coverage")
+                   else _sdf_coverage(atlas[iy * aw + ix]))
+            if cov <= 0.0:
+                continue
+            o = (py * bw + px) * 4
+            a = cov * ca
+            out[o] = int(min(255, round(cr * 255.0 * cov)))
+            out[o + 1] = int(min(255, round(cg * 255.0 * cov)))
+            out[o + 2] = int(min(255, round(cb * 255.0 * cov)))
+            out[o + 3] = int(min(255, round(a * 255.0)))
 
 
 # Unity builtin UISprite (UI/Skin/UISprite.psd): ~32×32 white rounded rect.
