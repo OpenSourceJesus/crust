@@ -10,9 +10,9 @@ contiguous float buffer (the CPU side of a GPU upload).
 
 C legs run under gcc and clang when both are installed (label cc=...).
 
-    python3 tools/unity_pack_bench_csharp.py
-    python3 tools/unity_pack_bench_csharp.py --n 50000 --iters 5000
-    python3 tools/unity_pack_bench_csharp.py --cc clang
+    python3 tools/unity/unity_pack_bench_csharp.py
+    python3 tools/unity/unity_pack_bench_csharp.py --n 50000 --iters 5000
+    python3 tools/unity/unity_pack_bench_csharp.py --cc clang
 
 Needs: gcc and/or clang (or cc), and `dotnet` (SDK) for the C# leg. Skips
 C# with a clear reason if dotnet is missing.

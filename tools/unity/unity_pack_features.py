@@ -7,12 +7,12 @@ Unity project, one Godot project and, with a Box2D-Packed checkout, one
 physics scene -- each holding every feature under test, builds them, runs
 them, and compares what they print with what C# prints. About a minute.
 
-    python3 tools/unity_pack_features.py            # everything
-    python3 tools/unity_pack_features.py unity      # one project: unity,
+    python3 tools/unity/unity_pack_features.py            # everything
+    python3 tools/unity/unity_pack_features.py unity      # one project: unity,
                                                     # godot or box2d
-    python3 tools/unity_pack_features.py -v         # show every line
-    python3 tools/unity_pack_features.py --keep     # keep the temp dirs
-    python3 tools/unity_pack_features.py --asan     # players under ASan +
+    python3 tools/unity/unity_pack_features.py -v         # show every line
+    python3 tools/unity/unity_pack_features.py --keep     # keep the temp dirs
+    python3 tools/unity/unity_pack_features.py --asan     # players under ASan +
                                                     # UBSan (not box2d)
 
 Each check is a C# method of its own, called from `Start`, printing lines
@@ -36,10 +36,10 @@ import sys
 import tempfile
 import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 
-import tools.unity_pack as unity_pack  # noqa: E402
+import tools.unity.unity_pack as unity_pack  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -491,7 +491,7 @@ UNITY_SAVE_EXPECT = [
     'json:{"hp":42,"speed":1.5,"alive":true,"title":"n\u00e9w","v":{"x":1.5,"y":-2.0}}9',
 ]
 
-#: Static helper classes and extension methods (tools/unity_pack_extensions.py):
+#: Static helper classes and extension methods (tools/unity/unity_pack_extensions.py):
 #: a block-bodied helper calling a sibling and a const, a one-line one the
 #: packer inlines, a classic `this` extension, and the C# 14 block form --
 #: an extension property and a generic method.
@@ -547,7 +547,7 @@ UNITY_BADGE_SCRIPT = (
     "    public int n = 5;\n"
     "}\n")
 
-#: Coroutines (tools/unity_pack_coroutines.py): one that yields null each
+#: Coroutines (tools/unity/unity_pack_coroutines.py): one that yields null each
 #: frame -- resumed after Update, the frame after it yielded -- and one that
 #: waits WaitForSeconds and ends with `yield break` before a line that must
 #: not run. Started from Start, both run to their first yield at once.
@@ -664,7 +664,7 @@ UNITY_LIFE_CYCLE_EXPECT = [
     "cycle:A enable", "cycle:B awake", "cycle:B enable", "cycle:B start",
     "cycle:A disable", "cycle:A destroy"]
 
-#: Code-defined InputActions (tools/unity_pack_input.py): a button bound to
+#: Code-defined InputActions (tools/unity/unity_pack_input.py): a button bound to
 #: a key and a gamepad button, a WASD 2DVector composite; nothing pressed.
 UNITY_ACT_SCRIPT = (
     "using UnityEngine;\n"
@@ -717,7 +717,7 @@ UNITY_ACT2_SCRIPT = (
     "    }\n"
     "}\n")
 
-#: A ParticleSystem (tools/unity_pack_particles.py): a looping emitter,
+#: A ParticleSystem (tools/unity/unity_pack_particles.py): a looping emitter,
 #: 50 a second living a second; half a second in it plays with many; then
 #: Stop / Clear / Emit(7) leave seven, not emitting.
 UNITY_SPARKS_SCRIPT = (

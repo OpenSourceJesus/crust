@@ -23,7 +23,7 @@ def find_root(root=None):
         if c and os.path.isfile(os.path.join(c, "runtime", "gpuphys.c")) and \
                 os.path.isfile(os.path.join(c, "unity_glue.py")):
             return os.path.abspath(c)
-    from tools.unity_pack import PackError
+    from tools.unity.unity_pack import PackError
     raise PackError("--gpu-physics needs a gpu-physics-engine checkout with unity_glue.py "
                     "(--gpu-physics PATH, $%s, or ../gpu-physics-engine)" % GPU_PHYSICS_ENV)
 
@@ -57,7 +57,7 @@ def _load_glue(base):
 
 def emit(outdir, plan, root=None):
     """Write physics_gpu.c and gpuphys/ into *outdir* for *plan*."""
-    from tools.unity_pack import PackError
+    from tools.unity.unity_pack import PackError
     base = find_root(root)
     glue = _load_glue(base)
     crust = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

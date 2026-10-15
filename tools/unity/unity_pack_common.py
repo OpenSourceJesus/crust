@@ -2,7 +2,7 @@
 """unity_pack: Shared helpers for the unity_pack modules: errors, progress output, and small
 leaf utilities that several modules use.
 
-Moved out of tools/unity_pack.py unchanged; unity_pack re-exports every name
+Moved out of tools/unity/unity_pack.py unchanged; unity_pack re-exports every name
 here, so `unity_pack.<name>` keeps working."""
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ _COOST_URL = "https://github.com/crustos/coost"
 def find_coost_root(coost_root=None):
     """coost checkout: *coost_root*, $COOST_ROOT, or a ``coost`` directory
     beside this repository. None when there is none."""
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     candidates = [coost_root, os.environ.get("COOST_ROOT"),
                   os.path.join(os.path.dirname(here), "coost")]
     for c in candidates:
@@ -233,7 +233,7 @@ def player_display(root):
 
 
 #: path -> text a pack reads instead of the file: C# rewritten at the
-#: source level (tools/unity_pack_extensions.py). Set and cleared by pack().
+#: source level (tools/unity/unity_pack_extensions.py). Set and cleared by pack().
 SOURCE_OVERLAY = {}
 # the project's C# files as they were read, before the source rewrites (desugaring) that make an overlay: path -> text.  The managed (--hybrid)
 # side compiles a method's own source where it can.
@@ -256,10 +256,10 @@ SOURCE_ENABLED_WRITTEN = set()
 # packed at all): {class: its method names}.
 SHALLOW_METHODS = {}
 
-#: The code-defined InputActions pack() found (tools/unity_pack_input.py).
+#: The code-defined InputActions pack() found (tools/unity/unity_pack_input.py).
 SOURCE_INPUT_ACTIONS = []
 
-#: pack(.., gpu_batch=True): the 2D GPU path (tools/unity_pack_gpu2d.py).
+#: pack(.., gpu_batch=True): the 2D GPU path (tools/unity/unity_pack_gpu2d.py).
 GPU_BATCH = [False]
 #: a script calls SpriteEffects2D (the effect byte's setter)
 FX_USED = [False]

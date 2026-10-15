@@ -6,8 +6,8 @@ calls engine_upload_positions many times, and prints ns/call.
 
 Runs under gcc and clang when both are installed (label cc=...).
 
-    python3 tools/unity_pack_bench_upload.py
-    python3 tools/unity_pack_bench_upload.py --cc clang
+    python3 tools/unity/unity_pack_bench_upload.py
+    python3 tools/unity/unity_pack_bench_upload.py --cc clang
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROJECT = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
 
 HOST = r"""
@@ -70,7 +70,7 @@ def _host_ccs(restrict: str | None = None):
 
 def build_and_run(soa: bool, cc_name: str, cc_path: str) -> str:
     d = tempfile.mkdtemp(prefix="upack-bench-")
-    cmd = [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
+    cmd = [sys.executable, os.path.join(ROOT, "tools", "unity", "unity_pack.py"),
            PROJECT, "-o", d]
     if not soa:
         cmd.append("--aos")

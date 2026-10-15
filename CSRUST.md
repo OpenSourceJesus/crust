@@ -331,7 +331,7 @@ accept it — see PREPROCESSOR.md.)
 
 ## Object models and `lower_body` (§6)
 
-cs2cpp's C# families are not only for whole files. `tools/unity_pack.py`
+cs2cpp's C# families are not only for whole files. `tools/unity/unity_pack.py`
 lowers Unity script bodies with them too, under a different object model:
 there a class is an index into a per-class instance array, and a missing
 object is `-1`. `cs2cpp.ObjectModel` holds everything the two differ on;
@@ -366,7 +366,7 @@ spaces.
 well — the subset used to pass it to C, which rejects it). Everything
 matches outside strings and comments. `TestLowerBody` pins each family
 under both models; unity_pack's packed output is checked end to end by
-`tools/unity_pack_golden.py`.
+`tools/unity/unity_pack_golden.py`.
 
 ## Fields, statics, properties and integers (§7)
 

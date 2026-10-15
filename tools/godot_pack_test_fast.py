@@ -6,7 +6,7 @@
     python3 tools/godot_pack_test_fast.py -k vector      # by name
 
 Each test writes a small Godot project and packs it with
-tools/unity_pack.py, but skips what makes a pack slow and is not about
+tools/unity/unity_pack.py, but skips what makes a pack slow and is not about
 Godot: the emitted C is not re-validated through cpprust + crust (about 2 s
 a pack), and it is compiled with gcc -O0 rather than built as an -O3 player.
 The emitted C is the same text either way (the `.cpp` twin is a copy), so a
@@ -47,7 +47,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 import tools.godot_pack as godot  # noqa: E402
-import tools.unity_pack as unity_pack  # noqa: E402
+import tools.unity.unity_pack as unity_pack  # noqa: E402
 
 _CC = shutil.which("gcc") or shutil.which("cc")
 needs_cc = unittest.skipIf(_CC is None, "no C compiler")
@@ -1880,7 +1880,7 @@ class TestGpuBatch(unittest.TestCase):
 # Strings: coost fastrings, as a Unity pack's
 # ---------------------------------------------------------------------------
 
-from tools.unity_pack_common import find_coost_root as _find_coost  # noqa: E402
+from tools.unity.unity_pack_common import find_coost_root as _find_coost  # noqa: E402
 
 needs_coost = unittest.skipUnless(
     _CC is not None and _find_coost() is not None,
@@ -2693,8 +2693,8 @@ class TestLinesAndCurves(unittest.TestCase):
     @needs_cc
     def test_line2d_draws_as_godot_samples_it(self):
         import math
-        import tools.unity_pack_curves as uc
-        import tools.unity_pack_lines as ul
+        import tools.unity.unity_pack_curves as uc
+        import tools.unity.unity_pack_lines as ul
         for mode, rot in ((0, 0.0), (1, 0.0), (0, 0.6)):
             def edit(text, mode=mode, rot=rot):
                 k = text.index("[node ")
@@ -2730,7 +2730,7 @@ class TestLinesAndCurves(unittest.TestCase):
 
     @needs_cc
     def test_exported_curve_samples(self):
-        import tools.unity_pack_curves as uc
+        import tools.unity.unity_pack_curves as uc
         ts = [-0.5, 0.0, 0.25, 0.5, 0.8, 1.0, 1.4]
 
         def scene(text):

@@ -2,7 +2,7 @@
 """unity_pack: uGUI: RectTransform, Canvas / CanvasScaler, Image, Button, Toggle, Slider,
 Scrollbar, ScrollRect, EventTrigger, layout groups and TextMeshPro text.
 
-Moved out of tools/unity_pack.py unchanged; unity_pack re-exports every name
+Moved out of tools/unity/unity_pack.py unchanged; unity_pack re-exports every name
 here, so `unity_pack.<name>` keeps working."""
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ import copy
 import tools.cs2cpp as cs2cpp  # noqa: E402
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-from tools.unity_pack_common import *  # noqa: E402,F401,F403
-from tools.unity_pack_physics import *  # noqa: E402,F401,F403
-from tools.unity_pack_sprites import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
 
 __all__ = [
     '_BUTTON_SCRIPT_GUID',

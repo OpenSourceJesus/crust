@@ -26,8 +26,8 @@ takes a spare row (null when the GameObject already has one).
 """
 import re
 
-import tools.unity_pack_common as _cmn
-import tools.unity_pack_curves as _curves
+import tools.unity.unity_pack_common as _cmn
+import tools.unity.unity_pack_curves as _curves
 
 #: At most this many points a line (Unity has no limit; this is the table).
 PER_LINE_CAP = 256
@@ -216,7 +216,7 @@ def emit_api(p, plan):
     def arr(cty, name, vals, const=True):
         p("static %s%s _lr_%s[%d] = { %s };" % ("const " if const else "", cty, name,
                                                 len(vals), ", ".join(vals)))
-    p("/* LineRenderers (tools/unity_pack_lines.py) */")
+    p("/* LineRenderers (tools/unity/unity_pack_lines.py) */")
     arr("int", "go", [str(int(l["go_index"])) if l.get("go_index") is not None else "-1"
                       for l in lines], const=False)
     arr("int", "world", [str(int(l["world"])) for l in lines], const=False)

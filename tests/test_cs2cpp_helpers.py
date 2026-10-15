@@ -1,6 +1,6 @@
 """C# structure and literal helpers in tools/cs2cpp.py.
 
-These moved from tools/unity_pack.py (unity_pack keeps the old underscore
+These moved from tools/unity/unity_pack.py (unity_pack keeps the old underscore
 names as aliases). Nothing here is Unity-specific.
 """
 
@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-import tools.unity_pack as unity_pack  # noqa: E402
+import tools.unity.unity_pack as unity_pack  # noqa: E402
 
 
 class TestLiterals(unittest.TestCase):

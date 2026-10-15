@@ -1,6 +1,6 @@
 /* Display a packed Unity scene (engine.c + data.c) via surfaceless GLES2.
  *
- *     python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
+ *     python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
  *     # copy or -I this file's sibling engine_draw.h from the pack output
  *     gcc -O3 -c /tmp/upack/engine.c -o /tmp/upack/engine.o
  *     gcc -O0 -c /tmp/upack/data.c   -o /tmp/upack/data.o

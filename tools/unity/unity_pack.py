@@ -14,9 +14,9 @@ builtins and authored MonoBehaviours. Types with
 the attribute) refuse a second add and print Unity's error; others
 GetOrAdd into a pre-sized pool.
 
-    python3 tools/unity_pack.py <project>
-    python3 tools/unity_pack.py <project> -o <outdir>
-    python3 tools/unity_pack.py <project> -o <outdir> --force
+    python3 tools/unity/unity_pack.py <project>
+    python3 tools/unity/unity_pack.py <project> -o <outdir>
+    python3 tools/unity/unity_pack.py <project> -o <outdir> --force
 
 Default output is $TMPDIR/<project-folder>/<productName>[.exe], a linked
 player (GLFW window when glfw3 is present, otherwise the headless host).
@@ -37,21 +37,21 @@ import sys
 import math
 import copy
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import tools.cs2cpp as cs2cpp
-import tools.unity_pack_runtime as runtime  # noqa: E402
+import tools.unity.unity_pack_runtime as runtime  # noqa: E402
 
 # unity_pack is split by subsystem; each module's names are re-exported here.
-from tools.unity_pack_common import *  # noqa: E402,F401,F403
-from tools.unity_pack_physics import *  # noqa: E402,F401,F403
-from tools.unity_pack_sprites import *  # noqa: E402,F401,F403
-from tools.unity_pack_ui import *  # noqa: E402,F401,F403
-from tools.unity_pack_anim import *  # noqa: E402,F401,F403
-from tools.unity_pack_audio import *  # noqa: E402,F401,F403
-from tools.unity_pack_build import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_ui import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_anim import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_audio import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_build import *  # noqa: E402,F401,F403
 import tools.godot_pack as _godot  # noqa: E402
-import tools.unity_pack_vectors as _vec  # noqa: E402
+import tools.unity.unity_pack_vectors as _vec  # noqa: E402
 
 # C# helpers that moved to cs2cpp; the old names stay for callers and tests.
 _c_string = cs2cpp.c_string
@@ -210,7 +210,7 @@ def _empty_instance_lists(plan):
     exists in the packed game, so nothing that runs can fill the list
     (`_drop_empty_instance_lists`; an instance one through a handle,
     `_handle_field_access`). ponytail: `Add(null)` would fill one."""
-    import tools.unity_pack_common as _cm
+    import tools.unity.unity_pack_common as _cm
     # every project script, not only the analyzed ones: a class no scene
     # places is not analyzed
     bases = {k: list(v) for k, v in (plan.get("mb_bases") or {}).items()}
@@ -380,7 +380,7 @@ _PS_NAMED_VARIABLE = re.compile(
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
     "Exists", "Delete", "CreateText", "OpenText", "Copy",
-    # tools/unity_pack_runtime.py
+    # tools/unity/unity_pack_runtime.py
     "ReadAllText", "ReadAllLines",
 })
 
@@ -701,7 +701,7 @@ _ADDABLE_BUILTINS = frozenset((
     "Animation",
     "Animator",
     "AudioSource",
-    "LineRenderer",     # spare rows (tools/unity_pack_lines.py)
+    "LineRenderer",     # spare rows (tools/unity/unity_pack_lines.py)
 ))
 
 # Unity marks these with [DisallowMultipleComponent] — a second AddComponent
@@ -727,13 +727,13 @@ _GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
 _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
 
-# ParticleSystem: read, simulated and drawn (tools/unity_pack_particles.py).
+# ParticleSystem: read, simulated and drawn (tools/unity/unity_pack_particles.py).
 _PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
-import tools.unity_pack_particles as _parts
-import tools.unity_pack_curves as _curves
-import tools.unity_pack_lines as _lines
-import tools.unity_pack_tilemap as _tm
-import tools.unity_pack_mesh as _mesh
+import tools.unity.unity_pack_particles as _parts
+import tools.unity.unity_pack_curves as _curves
+import tools.unity.unity_pack_lines as _lines
+import tools.unity.unity_pack_tilemap as _tm
+import tools.unity.unity_pack_mesh as _mesh
 
 
 
@@ -2966,7 +2966,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if kind in _JOINT2D_KINDS:
             rec["joint2d"] = _parse_joint2d(kind, block)
         if kind == "MonoBehaviour" and "m_LightType:" in block:
-            import tools.unity_pack_gpu2d as _gpu
+            import tools.unity.unity_pack_gpu2d as _gpu
             _l2d = _gpu.parse_light2d(block)
             if _l2d:
                 rec["light2d"] = _l2d
@@ -3356,7 +3356,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 vec3_fields.update(k.get("vec3_fields") or {})
                 struct_values.update(k.get("struct_values") or {})
                 # AnimationCurve fields: keys and wrap modes, serialized
-                # inline (tools/unity_pack_curves.py).
+                # inline (tools/unity/unity_pack_curves.py).
                 try:
                     anim_curves.update(
                         _curves.parse_curve_fields(k.get("raw") or ""))
@@ -9219,7 +9219,7 @@ def _rename_shadowed_params(cl, m):
 def _extra_roots(plan, cname):
     """Methods the scene / the engine calls by name: Animation Events, and
     InputAction callbacks."""
-    import tools.unity_pack_input as _inp
+    import tools.unity.unity_pack_input as _inp
     return (set((plan.get("anim_event_methods") or {}).get(cname, ()))
             | set(_inp.ROOTS.get(cname, ())))
 
@@ -10966,7 +10966,7 @@ def _emit_engine_gameobject_tables(
         p("    }")
         p("    return _engine_go_layer[go];")
         p("}")
-    import tools.unity_pack_common as _cmm
+    import tools.unity.unity_pack_common as _cmm
     if _cmm.SOURCE_LAYER_MATRIX:
         p("static const unsigned _engine_layer_matrix[32] = { %s };"
           % ", ".join("%du" % v for v in _cmm.SOURCE_LAYER_MATRIX))
@@ -15537,7 +15537,7 @@ def _emit_engine_class_groups(
                        % _FORCE_MANAGED[(site.get("path") or "", cs_line)], m["name"])
             hy_ok = False
             if plan.get("hybrid") and not coll_param:
-                import tools.unity_pack_hybrid as _hy
+                import tools.unity.unity_pack_hybrid as _hy
                 hy_ok = _hy.signature_ok(
                     cs2cpp.parse_params(m.get("args") or ""), m.get("ret"))
                 hy_info = {"name": m["name"], "sym": sym, "params": hy_params,
@@ -19461,8 +19461,8 @@ def emit_engine(plan, analyses, used_apis):
     keyboard_keys = set()
     for a in analyses:
         keyboard_keys |= set(a.get("keyboard_keys") or [])
-    import tools.unity_pack_common as _cm
-    import tools.unity_pack_input as _inp
+    import tools.unity.unity_pack_common as _cm
+    import tools.unity.unity_pack_input as _inp
     _ia_code, _ia_keys, _ia_hints = _inp.engine_tables(_cm.SOURCE_INPUT_ACTIONS)
     if _cm.SOURCE_INPUT_ACTIONS:
         keyboard_keys |= set(_ia_keys)
@@ -19553,7 +19553,7 @@ def emit_engine(plan, analyses, used_apis):
         # a mesh draws while its GameObject is active (unity_pack_mesh)
         or bool(plan.get("mesh_draws"))
         # SpriteEffects2D: effects are per GameObject
-        or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0])
+        or bool(__import__("tools.unity.unity_pack_common", fromlist=["x"]).FX_USED[0])
         # a script's sprite / tint applies to its GameObject's draws
         or "Renderer.sprite" in used_apis or "SpriteRenderer.color" in used_apis)
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
@@ -19571,7 +19571,7 @@ def emit_engine(plan, analyses, used_apis):
     light_n = int(plan.get("light_count") or 0)
     light_cap = light_n + int(add_budget.get("Light") or 0)
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    p("/* generated by tools/unity_pack.py — do not edit */")
+    p("/* generated by tools/unity/unity_pack.py — do not edit */")
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
@@ -19917,9 +19917,9 @@ def emit_engine(plan, analyses, used_apis):
     _parts.emit_api(p, plan)
     _curves.emit_c(p, plan)
     _lines.emit_api(p, plan)
-    import tools.unity_pack_common as _cmx
+    import tools.unity.unity_pack_common as _cmx
     if _cmx.GPU_BATCH[0]:
-        import tools.unity_pack_gpu2d as _gfx
+        import tools.unity.unity_pack_gpu2d as _gfx
         _fx_cap = len(plan.get("go_names") or []) + 256
         _gfx.emit_effects(p, _fx_cap, subtree=_godot_free_tree(plan, _fx_cap)
                           if plan.get("godot") else None)
@@ -21428,7 +21428,7 @@ def emit_engine(plan, analyses, used_apis):
         _emit_camera_pass(p, plan)
     _emit_bounds(p, plan)
     if _want_gpu_sprites:
-        import tools.unity_pack_gpu2d as _gpu
+        import tools.unity.unity_pack_gpu2d as _gpu
         p(_gpu.HEADER.split("int engine_atlas_side")[0])   # the typedef
         _gpu.emit_engine(p, plan)
         p(_gpu.LIGHT_HEADER.split("int engine_collect_lights2d")[0])
@@ -21718,10 +21718,10 @@ def _emit_runtime_layout(p, plan, want_ui, want_destroy):
 
 def emit_engine_draw_h():
     """Public draw-list API written next to engine.c so hosts stay in sync."""
-    import tools.unity_pack_common as _cmn
+    import tools.unity.unity_pack_common as _cmn
     text = _emit_engine_draw_h_base()
     if _cmn.GPU_BATCH[0]:
-        import tools.unity_pack_gpu2d as _gpu
+        import tools.unity.unity_pack_gpu2d as _gpu
         k = text.rfind("#endif")
         text = text[:k] + _gpu.HEADER + "\n" + text[k:]
     return text
@@ -21729,7 +21729,7 @@ def emit_engine_draw_h():
 
 def _emit_engine_draw_h_base():
     return (
-        "/* generated by tools/unity_pack.py — do not edit */\n"
+        "/* generated by tools/unity/unity_pack.py — do not edit */\n"
         "#ifndef UNITY_PACK_ENGINE_DRAW_H\n"
         "#define UNITY_PACK_ENGINE_DRAW_H\n"
         "\n"
@@ -25996,7 +25996,7 @@ def _lower_physics2d_queries(text):
         r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
         r"defaultContactOffset\b", "0.01f", text)
     scan = cs2cpp._blank(text)
-    # the *All results' lists (tools/unity_pack_physics.desugar_layers)
+    # the *All results' lists (tools/unity/unity_pack_physics.desugar_layers)
     for n in set(re.findall(r"(?<![\w.])List\s*<\s*(?:RaycastHit2D|Collider2D)\s*>"
                             r"\s+(\w+)\s*=\s*Physics2D_", scan)):
         text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*Count\b" % re.escape(n),
@@ -27246,7 +27246,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # `enabled` is the authored m_Enabled: crust runs every packed script
     # enabled, so it is 1 where every row was authored enabled and no
     # script writes it (a write is not lowered, its method stubs)
-    import tools.unity_pack_common as _cme
+    import tools.unity.unity_pack_common as _cme
     insts = cl.get("instances") or []
     bases = plan.get("mb_bases") or {}
     written = _cme.SOURCE_ENABLED_WRITTEN
@@ -27374,7 +27374,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text, string_arrays = _lower_string_arrays(
         text, plan.setdefault("_cs_str_used", set()))
     # Mathf / Random / Parse / Path / Directory / File reads: the runtime
-    # table (tools/unity_pack_runtime.py), while the text is still C#.
+    # table (tools/unity/unity_pack_runtime.py), while the text is still C#.
     if "_cs_require_nonempty(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_require_nonempty")
     for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last", "_cs_switch_str",
@@ -28532,7 +28532,7 @@ def _trap_shallow_calls(body, plan, site):
 
     ponytail: a receiver is typed by name across the file (one type per
     name), and the arguments are not evaluated before the stop."""
-    import tools.unity_pack_common as _cm
+    import tools.unity.unity_pack_common as _cm
     if plan.get("strict") or not site or not _cm.SHALLOW_METHODS:
         return body
     ft = site.get("file_text") or ""
@@ -29115,7 +29115,7 @@ def emit_data(plan, used_apis=None):
     lights = plan.get("lights") or []
     light_cap = len(lights) + light_budget
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    p("/* generated by tools/unity_pack.py — scene tables, compile -O0 */")
+    p("/* generated by tools/unity/unity_pack.py — scene tables, compile -O0 */")
     if plan.get("soa"):
         p("/* SoA: positions live in _Class_pos[N][dims], not in the struct */")
     p("#include <stdint.h>")
@@ -29731,7 +29731,7 @@ def emit_data(plan, used_apis=None):
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
         if plan.get("gpu_atlas"):
-            import tools.unity_pack_gpu2d as _gpu
+            import tools.unity.unity_pack_gpu2d as _gpu
             _gpu.emit_data(p, plan)
         p("const int _engine_tex_w[%d] = { %s };" % (
             len(textures),
@@ -29932,7 +29932,7 @@ def _init_num(v, kind):
 def emit_main():
     """Headless host so `make` links: tick a second, print draw count."""
     return (
-        "/* generated by tools/unity_pack.py — replace for a real host */\n"
+        "/* generated by tools/unity/unity_pack.py — replace for a real host */\n"
         "#include <stdio.h>\n"
         "#include \"engine_draw.h\"\n"
         "\n"
@@ -30452,7 +30452,7 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     *objects* is extended in place with prefab instances. Returns analyses.
     """
-    import tools.unity_pack_common as _common
+    import tools.unity.unity_pack_common as _common
     _common.SHALLOW_METHODS.clear()
     if _godot.is_godot_project(root):
         return _godot.analyze_scripts(root, objects, analyze_script)
@@ -30650,7 +30650,7 @@ def emit_handles_h(plan):
     """engine_handles.h: the stream layout, for the host that uploads it."""
     streams, total = _handle_streams(plan)
     lines = [
-        "/* generated by tools/unity_pack.py -- packed handles for the GPU */",
+        "/* generated by tools/unity/unity_pack.py -- packed handles for the GPU */",
         "/* Upload engine_upload_handles() into a GLES 3.1 SSBO at binding 1;",
         "   shaders/handles.glsl reads it. OFF and WORDS count 32-bit words. */",
         "#ifndef ENGINE_HANDLES_H",
@@ -30719,7 +30719,7 @@ def emit_handles_glsl(plan):
     3.1 is what has SSBOs and `bitfieldExtract`."""
     streams, total = _handle_streams(plan)
     lines = [
-        "/* generated by tools/unity_pack.py -- packed handles (GLES 3.1+) */",
+        "/* generated by tools/unity/unity_pack.py -- packed handles (GLES 3.1+) */",
         "/* Include after `#version 310 es`. The host uploads",
         "   engine_upload_handles() (%d words) into binding 1. Each accessor"
         % max(1, total),
@@ -30755,7 +30755,7 @@ def emit_soa_positions_glsl(plan):
     """
     lines = []
     p = lines.append
-    p("/* generated by tools/unity_pack.py — SoA position buffer layout */")
+    p("/* generated by tools/unity/unity_pack.py — SoA position buffer layout */")
     p("/* OpenGL / GLSL target. Requires SSBO (std430) or upload as vec4[]. */")
     p("#version 310 es")
     p("precision highp float;")
@@ -31046,7 +31046,7 @@ def _crust_compile_c(text, path, defines=None, analyses=None, source_text=None):
         for d in defines:
             cmd.extend(["-D", d])
         cmd.extend(["-o", obj, src])
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
         if r.returncode != 0:
             err = (r.stderr or r.stdout or "").strip()
@@ -31148,8 +31148,9 @@ def _fingerprint_entries(root, box2d_root=None, coost_root=None):
     """
     root = os.path.abspath(root)
     entries = []
-    tools_dir = os.path.dirname(os.path.abspath(__file__))
-    names = sorted(n for n in os.listdir(tools_dir)
+    unity_dir = os.path.dirname(os.path.abspath(__file__))
+    tools_dir = os.path.dirname(unity_dir)
+    names = sorted("unity/" + n for n in os.listdir(unity_dir)
                    if n.startswith("unity_pack") and n.endswith(".py"))
     for name in names + ["cs2cpp.py", "cpprust.py"]:
         e = _file_fingerprint_entry(os.path.join(tools_dir, name), tools_dir)
@@ -31422,7 +31423,7 @@ def _write_if_different(path, text):
 
 def _cpp_twin(c_text):
     """C emit → C++-subset twin header for cpprust (same as pack())."""
-    head = "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+    head = "/* generated by tools/unity/unity_pack.py — C++ subset for cpprust */\n"
     if not c_text.startswith("/*"):
         return head + c_text
     # one copy: data.c is ~600 MB, and a split then a concat made two
@@ -31449,15 +31450,15 @@ def pack(root, outdir, *args, **kwargs):
     """Pack a Unity (or Godot) project. See `_pack_impl`.
 
     Static helper classes and extension methods are rewritten at the source
-    level first (tools/unity_pack_extensions.py): the analysis and the
+    level first (tools/unity/unity_pack_extensions.py): the analysis and the
     lowering read the rewritten text through `SOURCE_OVERLAY`, and every
     original line stays on its line, so diagnostics point at the author's.
     """
-    import tools.unity_pack_common as _common
-    import tools.unity_pack_extensions as _ext
+    import tools.unity.unity_pack_common as _common
+    import tools.unity.unity_pack_extensions as _ext
     _common.GPU_BATCH[0] = bool(kwargs.pop("gpu_batch", False))
     files = {}
-    import tools.unity_pack_gpu2d as _gpu2d
+    import tools.unity.unity_pack_gpu2d as _gpu2d
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in (
             "Library", "Temp", "Logs", "obj", "Packages", ".godot", ".git")]
@@ -31482,11 +31483,11 @@ def pack(root, outdir, *args, **kwargs):
     _common.FX_USED[0] = bool(_fx_changed)
     overlay = _ext.desugar_project(files) if files else {}
     # Stack / Queue / HashSet, as the List the packer lowers
-    # (tools/unity_pack_collections.py).
-    import tools.unity_pack_collections as _coll
-    import tools.unity_pack_physics as _phys
+    # (tools/unity/unity_pack_collections.py).
+    import tools.unity.unity_pack_collections as _coll
+    import tools.unity.unity_pack_physics as _phys
     _layer_names = _phys.read_layer_names(root)
-    import tools.unity_pack_input as _inp
+    import tools.unity.unity_pack_input as _inp
     _common.SOURCE_INPUT_ACTIONS[:] = []
     _inp.HANDLERS[:] = []
     _inp.ROOTS.clear()
@@ -31530,8 +31531,8 @@ def pack(root, outdir, *args, **kwargs):
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
         t = _coll.desugar_string_switch(t)
-        # Coroutines, as state machines (tools/unity_pack_coroutines.py).
-        import tools.unity_pack_coroutines as _co
+        # Coroutines, as state machines (tools/unity/unity_pack_coroutines.py).
+        import tools.unity.unity_pack_coroutines as _co
         t = _co.desugar_coroutines(t)
         if t != files[fp] or fp in _fx_changed:
             overlay[fp] = t
@@ -31584,12 +31585,12 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
 
     gpu_physics: run the 2D physics on the gpu-physics-engine circle solver
     instead of Box2D-Packed (True, or the checkout's path; also
-    $GPU_PHYSICS_ROOT or ../gpu-physics-engine). See tools/unity_pack_gpu_physics.py.
+    $GPU_PHYSICS_ROOT or ../gpu-physics-engine). See tools/unity/unity_pack_gpu_physics.py.
 
     managed: run whole script classes as managed C# on DotNetAnywhere instead
     of lowering them (implies hybrid): "*" for every script class, or a
     collection of class names. A class whose managed code cannot be built
-    keeps its lowered C (tools/unity_pack_hybrid.py).
+    keeps its lowered C (tools/unity/unity_pack_hybrid.py).
 
     2D physics (Rigidbody2D, Collider2D) is Box2D-Packed: box2d_unity.py from
     the Box2D-Packed checkout at *box2d_root*, $BOX2D_PACKED_ROOT, or a
@@ -31602,7 +31603,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
     if gpu_physics:
-        import tools.unity_pack_gpu_physics as _gpuphys
+        import tools.unity.unity_pack_gpu_physics as _gpuphys
         physics_key = "gpu:" + _gpuphys.fingerprint(gpu_physics)
     if managed:
         hybrid = True
@@ -31834,9 +31835,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     plan["tiles"] = [{k: v for k, v in o["sprite"].items() if k != "tex_rgba"}
                      for o in tiles
                      if o.get("sprite") and "tex_id" in o["sprite"]]
-    import tools.unity_pack_common as _cmn
+    import tools.unity.unity_pack_common as _cmn
     if _cmn.GPU_BATCH[0]:
-        # the 2D GPU path's atlas (tools/unity_pack_gpu2d.py) -- built once
+        # the 2D GPU path's atlas (tools/unity/unity_pack_gpu2d.py) -- built once
         # every texture is in the table (see below)
         plan["_gpu_batch"] = True
     _ensure_texture_guids(
@@ -31847,7 +31848,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         for cl in plan["classes"].values() for f in cl.get("fields") or []
         if f.get("ty") == "Sprite" for o in cl.get("instances") or []}
         - {None}), asset_guids)
-    # a MeshRenderer's material's _MainTex (tools/unity_pack_mesh.py)
+    # a MeshRenderer's material's _MainTex (tools/unity/unity_pack_mesh.py)
     for _o in objects:
         _md = _o.get("mesh_draw")
         if not _md or not _md.get("mat_guid"):
@@ -32016,17 +32017,17 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     if isinstance(managed, str) and managed != "*":
         managed = [m for m in managed.split(",") if m]       # ("A,B", as on the command line)
     plan["managed"] = "*" if managed == "*" else (set(managed) if managed else set())
-    import tools.unity_pack_common as _common
+    import tools.unity.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
     if plan.get("_gpu_batch"):
-        import tools.unity_pack_gpu2d as _gpu
+        import tools.unity.unity_pack_gpu2d as _gpu
         os.makedirs(outdir, exist_ok=True)
         plan["gpu_atlas"] = _gpu.build_atlas(plan.get("textures") or [], outdir, root)
         _gpu.build_lights(plan, _load_sorting_layers(root))
     engine = emit_engine(plan, analyses, used_apis)
-    import tools.unity_pack_hybrid as _hybrid
+    import tools.unity.unity_pack_hybrid as _hybrid
     if plan.get("hybrid"):
-        # a method the lowering left a stub: managed code on DotNetAnywhere where that compiles (tools/unity_pack_hybrid.py)
+        # a method the lowering left a stub: managed code on DotNetAnywhere where that compiles (tools/unity/unity_pack_hybrid.py)
         plan["_root"] = root
         engine = _hybrid.apply(plan, engine, outdir, _report_stub, _progress)
     else:
@@ -32137,7 +32138,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
                       box2d_inject=bool(physics_inject),
                       gpu_physics=bool(gpu_physics and plan.get("box2d_physics"))))
     if plan.get("box2d_physics") and gpu_physics:
-        import tools.unity_pack_gpu_physics as _gpuphys
+        import tools.unity.unity_pack_gpu_physics as _gpuphys
         _gpuphys.emit(outdir, plan, gpu_physics)
         for stale in ("physics_box2d.c", "box2d_inject.json"):
             if os.path.exists(os.path.join(outdir, stale)):

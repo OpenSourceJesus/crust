@@ -1,7 +1,7 @@
 /* Display a packed Unity scene (engine.c + data.c) via surfaceless
  * OpenGL ES 3.1 -- the headless twin of gles3_window.c.
  *
- *     python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
+ *     python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
  *     gcc -O3 -c /tmp/upack/engine.c -o /tmp/upack/engine.o
  *     gcc -O0 -c /tmp/upack/data.c   -o /tmp/upack/data.o
  *     python3 crust examples/unity_pack/gles3_view.c \

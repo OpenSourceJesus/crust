@@ -25,7 +25,7 @@ can autovec). `make vectorize-report` compiles `engine.c` with those flags
 plus `clang -Rpass-missed=loop-vectorize,slp-vectorize` so missed
 auto-vectorization remarks print on stderr. `make crust-check` recompiles
 the lowered `.c` files with crust. Microbenches
-`tools/unity_pack_bench_upload.py` and `tools/unity_pack_bench_csharp.py`
+`tools/unity/unity_pack_bench_upload.py` and `tools/unity/unity_pack_bench_csharp.py`
 time C under both gcc and clang when both are on PATH (`--cc` to restrict).
 ## Input (host-fed)
 
@@ -411,8 +411,8 @@ refused with a message that says so. 3D physics (Rigidbody, BoxCollider,
 SphereCollider) stays unity_pack's own, below.
 
 ```sh
-python3 tools/unity_pack.py <project> -o /tmp/out
-python3 tools/unity_pack.py <project> -o /tmp/out --physics-inject --box2d ~/box2d
+python3 tools/unity/unity_pack.py <project> -o /tmp/out
+python3 tools/unity/unity_pack.py <project> -o /tmp/out --physics-inject --box2d ~/box2d
 ```
 
 | Option | Effect |
@@ -712,16 +712,16 @@ same project into the same outdir:
   `.cpp` is byte-identical (and the lowered `.c` exists). Other outputs use
   write-if-different so mtimes stay put for `gcc`.
 
-Fingerprint covers `tools/unity_pack*.py`, `tools/cs2cpp.py`,
+Fingerprint covers `tools/unity/unity_pack*.py`, `tools/cs2cpp.py`,
 `tools/cpprust.py`, Box2D-Packed's `box2d_unity.py`,
 `ProjectSettings/`, and authored `Assets/` extensions (`.cs`, scenes,
 prefabs, metas, common textures/audio, etc.). It does **not** walk
 `Library/PackageCache` — after a UPM-only change, pass `--force`.
 
 ```
-python3 tools/unity_pack.py <project> -o /tmp/out
-python3 tools/unity_pack.py <project> -o /tmp/out          # stamp hit
-python3 tools/unity_pack.py <project> -o /tmp/out --force  # always re-emit
+python3 tools/unity/unity_pack.py <project> -o /tmp/out
+python3 tools/unity/unity_pack.py <project> -o /tmp/out          # stamp hit
+python3 tools/unity/unity_pack.py <project> -o /tmp/out --force  # always re-emit
 ```
 
 `build_player_executable` also skips compiling/linking when `.o` / the exe

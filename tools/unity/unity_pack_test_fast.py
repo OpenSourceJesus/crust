@@ -11,8 +11,8 @@ that holds a C# string (a coost fastring) is still lowered for real.
 
 New fixes add their tests here. Run:
 
-    python3 tools/unity_pack_test_fast.py            # everything
-    python3 tools/unity_pack_test_fast.py TestLineRenderer
+    python3 tools/unity/unity_pack_test_fast.py            # everything
+    python3 tools/unity/unity_pack_test_fast.py TestLineRenderer
 """
 import contextlib
 import io
@@ -25,10 +25,10 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
 
-import tools.unity_pack as unity_pack  # noqa: E402
+import tools.unity.unity_pack as unity_pack  # noqa: E402
 
 _CC = shutil.which("gcc") or shutil.which("cc")
 needs_cc = unittest.skipIf(_CC is None, "no C compiler")
@@ -309,7 +309,7 @@ class TestAnimationCurves(unittest.TestCase):
         return root
 
     def test_reference_matches_unity_known_values(self):
-        import tools.unity_pack_curves as uc
+        import tools.unity.unity_pack_curves as uc
         ease = {"keys": [(0, 0, 0, 0), (1, 1, 0, 0)], "pre": 8, "post": 8}
         lin = {"keys": [(0, 0, 1, 1), (1, 1, 1, 1)], "pre": 8, "post": 8}
         # AnimationCurve.EaseInOut is smoothstep; .Linear is the line
@@ -320,7 +320,7 @@ class TestAnimationCurves(unittest.TestCase):
 
     @needs_cc
     def test_engine_evaluates_as_the_reference(self):
-        import tools.unity_pack_curves as uc
+        import tools.unity.unity_pack_curves as uc
         out = tempfile.mkdtemp(prefix="upack-curve-out-")
         self.addCleanup(shutil.rmtree, out, True)
         unity_pack.pack(self._project(self.CURVES), out, force=True, strict=True)
@@ -443,8 +443,8 @@ public class Drawer : MonoBehaviour {
     @needs_cc
     def test_scripted_line_draws_as_unity_evaluates_it(self):
         import math
-        import tools.unity_pack_curves as uc
-        import tools.unity_pack_lines as ul
+        import tools.unity.unity_pack_curves as uc
+        import tools.unity.unity_pack_lines as ul
         lines = self._run_lines(self._project(self.SCRIPT))
         self.assertIn("n=4 y3=2 w0=0.5", lines)
         quads = [list(map(float, l.split()[1:])) for l in lines if l.startswith("Q ")]
@@ -503,7 +503,7 @@ public class Drawer : MonoBehaviour {
         self.assertIn("was=True now=False", out)
 
     def test_gradient_reference(self):
-        import tools.unity_pack_lines as ul
+        import tools.unity.unity_pack_lines as ul
         g = {"mode": 0, "colors": [(0.0, 1.0, 1.0, 1.0), (1.0, 1.0, 0.0, 0.0)],
              "alphas": [(0.0, 1.0), (1.0, 0.0)]}
         self.assertEqual(ul.gradient_eval(g, 0.25), (1.0, 0.75, 0.75, 0.75))
@@ -1740,7 +1740,7 @@ class TestUnity2DDestruction(unittest.TestCase):
                 pass                    # a refusal, with a line and a reason
 
 
-import tools.unity_pack_hybrid as unity_pack_hybrid  # noqa: E402
+import tools.unity.unity_pack_hybrid as unity_pack_hybrid  # noqa: E402
 
 _hybrid_ok, _hybrid_why = unity_pack_hybrid.available()
 needs_hybrid = unittest.skipUnless(_hybrid_ok, "--hybrid needs: " + _hybrid_why)
@@ -1748,7 +1748,7 @@ needs_hybrid = unittest.skipUnless(_hybrid_ok, "--hybrid needs: " + _hybrid_why)
 
 @needs_hybrid
 class TestManagedShim(unittest.TestCase):
-    """The managed UnityEngine (tools/unity_pack_managed/UnityShim.cs) gives Unity's answers when it runs on DotNetAnywhere.  The packer is not in
+    """The managed UnityEngine (tools/unity/unity_pack_managed/UnityShim.cs) gives Unity's answers when it runs on DotNetAnywhere.  The packer is not in
     this: a console program is built against the shim and run.  The expected values are Unity's, worked by hand."""
 
     PROGRAM = """
@@ -1825,8 +1825,8 @@ public class Check {
     @needs_cc
     def test_the_maths_matches_the_packers_own_c(self):
         """a method gives the same answer managed as lowered: the shim's Mathf against the C unity_pack lowers the same calls to
-        (tools/unity_pack_runtime.py), over a sweep of inputs, as results scaled by 1000 and rounded"""
-        import tools.unity_pack_runtime as rt
+        (tools/unity/unity_pack_runtime.py), over a sweep of inputs, as results scaled by 1000 and rounded"""
+        import tools.unity.unity_pack_runtime as rt
         funcs = [("Repeat", 2), ("PingPong", 2), ("DeltaAngle", 2), ("SmoothStep", 3), ("MoveTowards", 3), ("InverseLerp", 3),
                  ("LerpUnclamped", 3), ("Clamp01", 1), ("Round", 1), ("Approximately", 2)]
         two = [-725.5, -360.0, -10.0, -0.5, 0.0, 2.5, 180.0, 359.9, 725.5]
@@ -2585,7 +2585,7 @@ class TestHybrid(_PackHarness):
         self.assertEqual(self._play(managed, 3, probe), want)
 
     def test_a_methods_own_source_is_found_before_the_packers_rewrites(self):
-        import tools.unity_pack_common as common
+        import tools.unity.unity_pack_common as common
         path = os.path.join(tempfile.gettempdir(), "Orig.cs")
         text = ("using UnityEngine;\npublic class Orig : MonoBehaviour {\n  int Add(int a, int b) { return a + b; }\n"
                 "  int Add(int a) { return a; }\n  void Go() { if (true) { transform.Rotate(Vector3.up); } }\n}\n"
@@ -3159,7 +3159,7 @@ class TestChildColliderBody(unittest.TestCase):
     static, the player fell through the floor."""
 
     def test_nearest_ancestor_rb(self):
-        import tools.unity_pack_physics as phys
+        import tools.unity.unity_pack_physics as phys
         box = {"kind": "box", "enabled": 1}
         plan = {"rigidbody2d": [{"owner_class": "P", "owner_inst": 0,
                                  "body_type": 0}],
@@ -4369,7 +4369,7 @@ class TestTmpTextSet(unittest.TestCase):
 
     def test_empty_text_keeps_canvas_layer(self):
         # Tips Text under Tips Panel: drawn on the canvas's sorting layer
-        from tools.unity_pack_sprites import _apply_sprite_sorting
+        from tools.unity.unity_pack_sprites import _apply_sprite_sorting
         es = {"sorting_layer_id": 77, "sorting_order": 1}
         _apply_sprite_sorting([{"ui_tmp": {"empty_sprite": es}}],
                               [{"unique_id": 0}, {"unique_id": 77}])

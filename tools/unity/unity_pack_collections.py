@@ -610,7 +610,7 @@ _HASHNS = r"(?:System\s*\.\s*Security\s*\.\s*Cryptography\s*\.\s*)?"
 
 def desugar_bytes(text):
     """`byte[]` locals and fields as a `List<byte>`, with .NET's byte APIs
-    as runtime helpers over it (tools/unity_pack_runtime.py):
+    as runtime helpers over it (tools/unity/unity_pack_runtime.py):
 
         byte[] b = new byte[n];          filled with 0; `{ .. }` added
         b.Length                         b.Count
@@ -894,7 +894,7 @@ def desugar_list_initializers(text):
         decl = scan[max(scan.rfind(";", 0, m.start()), scan.rfind("}", 0, m.start()),
                         scan.rfind("{", 0, m.start())) + 1:m.start()]
         if re.search(r"(?<![\w])static\b", decl):
-            from tools.unity_pack_common import PackError
+            from tools.unity.unity_pack_common import PackError
             raise PackError(
                 "`static List<..> %s = new List<..> { .. }`: a collection initializer on a static "
                 "field is not lowered; add the elements in Awake" % name)

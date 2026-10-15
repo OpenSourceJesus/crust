@@ -1,6 +1,6 @@
 /* The 2D GPU path: every sprite in one draw call (GLES 3.1).
  *
- * For a pack made with --gpu-batch (tools/unity_pack_gpu2d.py):
+ * For a pack made with --gpu-batch (tools/unity/unity_pack_gpu2d.py):
  *
  *   atlas     the pages are the layers of one GL_TEXTURE_2D_ARRAY; URP normal
  *             maps a second array of the same layout

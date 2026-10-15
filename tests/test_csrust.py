@@ -1670,7 +1670,7 @@ class TestLowerBody(unittest.TestCase):
     unity_pack lowers each script method body with it before its Unity API
     rewrites, under `packed_model` (a reference is an instance index);
     `translate` runs it under `OWNED`. The golden corpus
-    (`tools/unity_pack_golden.py`) checks the packed output end to end, but
+    (`tools/unity/unity_pack_golden.py`) checks the packed output end to end, but
     only for what its projects happen to use -- the packed `this` appears in
     one case -- so the families are pinned here directly.
     """

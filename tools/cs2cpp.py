@@ -1996,7 +1996,7 @@ def lower_float_literals(text):
     (`1.5f`, `1e2f`), is valid in both and left alone. Matched on a blanked
     scan, so a `"0f"` inside a string stays put.
 
-    Shared: `tools/unity_pack.py` lowers script bodies with it too. It was
+    Shared: `tools/unity/unity_pack.py` lowers script bodies with it too. It was
     written there first; the C# subset did not lower the suffix at all, so
     `float x = 2f;` reached C as `2f` and did not compile.
     """
@@ -5667,7 +5667,7 @@ def real_literal_error(path, text, scan=None, display_path=None):
 
 
 # ---------------------------------------------------------------------------
-# C# structure and literal helpers shared with tools/unity_pack.py. Moved from
+# C# structure and literal helpers shared with tools/unity/unity_pack.py. Moved from
 # unity_pack unchanged, apart from public names; nothing here is Unity-specific.
 # ---------------------------------------------------------------------------
 

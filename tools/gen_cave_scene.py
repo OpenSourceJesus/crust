@@ -386,7 +386,7 @@ GPU_NOTE = ("The tree under this object may have its animation and transforms\n"
 
 def destruction_fork():
     """Unity-2D-Destruction's 2D_Destruction folder: UNITY_2D_DESTRUCTION, or
-    the fork cloned beside crust (as tools/unity_pack_test_fast.py finds it)."""
+    the fork cloned beside crust (as tools/unity/unity_pack_test_fast.py finds it)."""
     root = os.environ.get("UNITY_2D_DESTRUCTION") or os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "Unity-2D-Destruction")
@@ -566,7 +566,7 @@ def _mesh_yaml(name, verts, uv, tris):
     """A Mesh body as Unity serialises it (crust's unity_pack_mesh writes the
     same format it reads)."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    import tools.unity_pack_mesh as um
+    import tools.unity.unity_pack_mesh as um
     return um.write_mesh(name, verts, uv, tris)
 
 
