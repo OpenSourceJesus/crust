@@ -66,7 +66,7 @@ def run_c(csrc, main):
         with open(path, "w") as f:
             f.write(csrc + "\n" + main + "\n")
         exe = os.path.join(tmp, "t")
-        proc = subprocess.run([_CC, "-w", "-o", exe, path],
+        proc = subprocess.run([_CC, "-w", "-o", exe, path, "-lm"],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise AssertionError(
@@ -1172,10 +1172,14 @@ class TestEnums(unittest.TestCase):
                           "        return (int)b.Color;"))
         self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 1)
 
-    def test_a_field_sharing_the_enum_name_is_refused(self):
-        self.assert_refuses("public enum Color { Red }\n"
-                            "public class Box { public Color Color; }\n",
-                            "`Color`", "{ get; set; }")
+    @needs_cc
+    def test_a_field_may_share_the_enum_name(self):
+        src = ("public enum Color { Red, Green }\n"
+               "public class Box { public Color Color; }\n"
+               + _program("        Box b = new Box();\n"
+                          "        b.Color = Color.Green;\n"
+                          "        return (int)b.Color;"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 1)
 
     def test_two_enums_of_one_name_are_refused(self):
         self.assert_refuses("namespace A { public enum Kind { X } }\n"
@@ -1533,8 +1537,8 @@ class TestLists(unittest.TestCase):
 
     def test_other_members_are_refused(self):
         self.assert_refuses(_LIST_HEAD + _program(
-            "        var xs = new List<int>();\n        xs.Sort();\n"
-            "        return 0;"), "`List.Sort`", "`Add`, `Insert`")
+            "        var xs = new List<int>();\n        xs.TrimExcess();\n"
+            "        return 0;"), "`List.TrimExcess`", "`Add`, `Insert`")
 
     def test_contains_on_a_class_is_refused(self):
         self.assert_refuses(
@@ -2170,6 +2174,83 @@ public class Program {
 """), 0)
 
 
+class TestFractureLibrarySurface(unittest.TestCase):
+    """What Voronoi/Clipper (Slime Jump's 2D_Destruction) needed lowered."""
+
+    def run_prog(self, types, body):
+        return run_c(lower("using System.Collections.Generic;\n" + types
+                           + "public class Program {\n    public int Run() {\n"
+                           + body + "\n    }\n}\n"), _RUN_PROGRAM)
+
+    @needs_cc
+    def test_struct_temporary_to_a_const_reference(self):
+        self.assertEqual(self.run_prog(
+            "public struct V { public float x; public V(float x) { this.x = x; } }\n"
+            "[MaxInstances(4)] public class S { V c; public S(float a) { c = new V(a); }"
+            " public V Coord { get { return c; } } }\n"
+            "public static class H { public static float D(V a, V b) { return a.x - b.x; } }\n",
+            "        S s = new S(5f); V o = new V(2f);\n"
+            "        return (int)H.D(s.Coord, o);"), 3)
+
+    @needs_cc
+    def test_returned_list_passed_on_is_hoisted(self):
+        self.assertEqual(self.run_prog(
+            "public static class H {\n"
+            "  public static List<int> Evens(int n) { List<int> r = new List<int>();"
+            " for (int i = 0; i < n; i += 2) r.Add(i); return r; }\n"
+            "  public static int Sum(List<int> xs) { int t = 0;"
+            " for (int i = 0; i < xs.Count; i++) t += xs[i]; return t; } }\n",
+            "        return H.Sum(H.Evens(10));"), 20)
+
+    @needs_cc
+    def test_field_named_like_another_types_property(self):
+        self.assertEqual(self.run_prog(
+            "public struct V { public float x; public float y; }\n"
+            "[MaxInstances(2)] public class S { public float x { get { return 7f; } } }\n",
+            "        V v = new V(); v.x = 4f; v.x += 1f; v.y = 3f; S s = new S();\n"
+            "        return (int)(v.x * 10 + v.y + s.x * 100);"), 753 % 256)
+
+    @needs_cc
+    def test_initialised_declarators_each_kept(self):
+        self.assertEqual(run_c(cpprust.translate(
+            "struct V { float x = 1, y = 2; int *p, q = 3; };\n"
+            "int f(void) { V v; return (int)(v.x + v.y) + v.q; }\n"),
+            "int main(void) { return f(); }"), 6)
+
+    @needs_cc
+    def test_null_list_argument_and_static_property(self):
+        self.assertEqual(self.run_prog(
+            "public class V { int n; public V(List<int> c) { n = c != null ? c.Count : 7; }"
+            " public int N() { return n; } }\n"
+            "public static class R { static int s = 1; public static int value"
+            " { get { s = s * 3; return s; } } }\n",
+            "        V a = new V(null); V b = new V(new List<int>());\n"
+            "        return a.N() * 10 + b.N() + R.value + R.value;"), 82)
+
+    @needs_cc
+    def test_nested_namespace_used_three_ways(self):
+        c = csrust.translate_unit([
+            ("a.cs", "namespace D { namespace U { public interface IDisp { int Dispose(); } } }\n"),
+            ("c.cs", "namespace D { public class E : U.IDisp"
+                     " { public int Dispose() { return 4; } } }\n"),
+            ("b.cs", "using D.U;\nnamespace D { public class T : IDisp"
+                     " { public int Dispose() { return 3; } } }\n")])
+        self.assertEqual(run_c(c, "int main(void) { D_T t; D_E e; return D_T_Dispose(&t)"
+                                  " * 10 + D_E_Dispose(&e); }"), 34)
+
+    @needs_cc
+    def test_system_math_and_numeric_constants(self):
+        self.assertEqual(self.run_prog("",
+            "        long a = -5; int r = 0; float n = float.NaN; Int64 big = Int64.MaxValue;\n"
+            "        if (Math.Abs(a) == 5 && Math.Abs(-3) == 3 && Math.Abs(-2.5f) == 2.5f) r += 1;\n"
+            "        if (System.Math.Sqrt(16.0) == 4.0 && float.IsNaN(n)) r += 2;\n"
+            "        if (Math.Max(a, 3) == 3 && double.IsNaN(Math.Max(1.0, double.NaN))) r += 4;\n"
+            "        if (Math.Round(2.5) == 2.0 && Math.Round(3.5) == 4.0) r += 8;\n"
+            "        if (big == 9223372036854775807L && 1f < 9.99999944E-11f == false) r += 16;\n"
+            "        if (Math.Abs(Math.Atan2(1.0, 1.0) * 4 - Math.PI) < 1e-12) r += 32;\n"
+            "        return r;"), 63)
+
+
 class TestRefusedInCSharpTerms(unittest.TestCase):
     """Each reached the C compiler as invalid C; each is now refused, in C#
     terms, at its C# line."""
@@ -2183,10 +2264,12 @@ class TestRefusedInCSharpTerms(unittest.TestCase):
         self.check("public class P {\n  public int F() { string s = \"a\"; return 0; }\n}\n",
                    "`string` is not in the C# subset", 2)
 
-    def test_base_call(self):
-        self.check("public class A { public virtual int F() { return 1; } }\n"
-                   "public class B : A { public override int F() { return base.F(); } }\n",
-                   "`base.F`", 2)
+    @needs_cc
+    def test_base_call_is_lowered(self):
+        src = ("public class A { public virtual int F() { return 1; } }\n"
+               "public class B : A { public override int F() { return base.F() + 2; } }\n"
+               + _program("        B b = new B();\n        return b.F();"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 3)
 
     def test_is(self):
         self.check("public class A { }\npublic class P {\n"

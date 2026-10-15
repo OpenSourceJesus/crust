@@ -279,8 +279,9 @@ def _qualify_bases(text):
     exactly what `_parse_base` wants -- so the order is left alone.
     """
     scan = _blank(text)
-    edits = []
-    for _kind, name, start, brace, _close in _find_types(text):
+    types = _find_types(text)
+    ours = {t[1] for t in types}
+    for _kind, name, start, brace, _close in sorted(types, key=lambda t: -t[2]):
         head = scan[start:brace]
         colon = head.find(":")
         if colon < 0:
@@ -290,15 +291,14 @@ def _qualify_bases(text):
         # belong to the type parameter, not the type.
         if re.search(r"(?<![\w])where(?![\w])", head[:colon]):
             continue
-        pos = start + colon + 1
-        for part in cpprust._split_top(clause):
-            raw = part.strip()
-            if not raw:
-                continue
-            off = clause.find(raw)
-            edits.append((pos + off, "public "))
-    for at, ins in sorted(edits, reverse=True):
-        text = text[:at] + ins + text[at:]
+        # A System interface (`IComparable`) has no members to inherit; the
+        # sort lowering read it already, and `CompareTo` is an ordinary method.
+        parts = [p.strip() for p in cpprust._split_top(clause) if p.strip()]
+        kept = [p for p in parts if re.sub(r"\s*<.*", "", p) in ours
+                or not re.fullmatch(r"(IComparable|IEquatable)(\s*<.*>)?", p, re.S)]
+        new = (": " + ", ".join("public " + p for p in kept)) if kept else ""
+        text = (text[:start + colon] + new + "\n" * clause.count("\n") + " "
+                + text[brace:])
     return text
 
 
@@ -325,6 +325,16 @@ def _lower_interfaces(text, path):
                 "its own to put it in, and here an interface *is* the "
                 "vtable. Move it to a class."
                 % (_at(path, text, start), name))
+
+        def prop(m):
+            # `T P { get; set; }` -> the accessors a class property lowers to
+            t, p, acc = m.group(1).strip(), m.group(2), m.group(3)
+            out = ["virtual %s get_%s() = 0;" % (t, p)] if re.search(r"\bget\b", acc) else []
+            if re.search(r"\bset\b", acc):
+                out.append("virtual void set_%s(%s value) = 0;" % (p, t))
+            return " ".join(out) + "\n" * m.group(0).count("\n")
+        body = re.sub(r"([\w<>\[\],. ]+?)\s+(\w+)\s*\{((?:\s*(?:get|set)\s*;)+)\s*\}", prop, body)
+        bscan = _blank(body)
         out, pos = [], 0
         for m in _MEMBER_DECL.finditer(bscan):
             out.append(body[pos:m.start()])
@@ -1523,6 +1533,11 @@ def lower_map_string_index(text, target_pattern, model, value=None):
     if model.map_at_string is None:
         return text
     helper = map_at_string_helper(model, value)
+    # ContainsKey (lower_map_members_named): `count` takes a reference
+    text = _sub_orig(
+        r"(%s)\.count\((.*?)\) != 0" % target_pattern,
+        lambda g: "%s(%s, %s)" % (helper.replace("_at_", "_has_", 1),
+                                  g(1), g(2)), text)
     return _sub_orig(
         r"(%s)\s*\[(.*?)\]" % target_pattern,
         lambda g: "(*%s(%s, %s))" % (helper, g(1), g(2)), text)
@@ -2003,7 +2018,7 @@ def lower_float_literals(text):
     scan = _blank(text)
     out = []
     pos = 0
-    for m in re.finditer(r"(?<![\w.])(\d+)([fF])\b", scan):
+    for m in re.finditer(r"(?<![\w.])(?<![eE][-+])(\d+)([fF])\b", scan):
         out.append(text[pos:m.start(1)])
         out.append(m.group(1) + "." + m.group(2))
         pos = m.end()
@@ -2106,31 +2121,124 @@ def _lower_new(text, shared_names):
 
 def _lower_throw_catch(text):
     """`throw`/`catch` -> the checked `raise`/`except` model."""
+    # ponytail: an exception object is not carried -- the payload is one
+    # word, so `throw new E(..)` raises 1 (its arguments, the message, are
+    # not evaluated) and a typed `catch (E e)` is refused by the C++ half
+    # rather than matched.
+    scan = _blank(text)
+    for m in reversed(list(re.finditer(r"(?<![\w.])throw\s+(new\s+[\w.]+\s*\()", scan))):
+        close = cpprust._match_paren(scan, m.end() - 1)
+        text = text[:m.start(1)] + "1" + "\n" * text[m.start(1):close].count("\n") + text[close + 1:]
     text = cpprust._sub_code(r"(?<![\w.])throw(?![\w])",
                              lambda m: "raise", text)
     # `catch` is 5 letters, `except` is 6 -- one column shifts on that line.
-    text = cpprust._sub_code(r"(?<![\w.])catch(?=\s*\()",
+    text = cpprust._sub_code(r"(?<![\w.])catch(?=\s*[({])",
                              lambda m: "except", text)
     return text
 
 
-def _mark_except_functions(text):
-    """A function body that `raise`s must be declared `except`."""
+_FN_HEAD = re.compile(r"(?<![\w:])([A-Za-z_][\w:<>,\s\*&]*?[\w>\*&])\s+([A-Za-z_]\w*)\s*"
+                      r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*(?:const\s*)?(?=\{)")
+_NOT_FN = frozenset(("if", "for", "while", "switch", "except", "catch", "return",
+                     "else", "do", "sizeof", "new", "delete"))
+
+
+def _function_bodies(text):
+    """[(name, return_type, brace, close)] of every function definition."""
     scan = _blank(text)
+    out = []
+    for m in _FN_HEAD.finditer(scan):
+        words = [w for w in m.group(1).split() if not w.endswith(":")]
+        if m.group(2) in _NOT_FN or not words or words[-1] in _NOT_FN:
+            continue
+        close = _match_brace_at(scan, m.end())
+        if close is not None:
+            ret = " ".join(w for w in words if w not in ("static", "virtual", "inline"))
+            out.append((m.group(2), ret, m.end(), close))
+    return out
 
-    def maybe(m):
-        head, body = m.group(1), m.group(2)
-        if re.search(r"(?<![\w.])raise(?![\w])", body) and "except" not in head:
-            return head + " except {" + body + "}"
-        return m.group(0)
 
-    # One nesting level of braces in the body is enough for the forms the
-    # tests write; deeper nests still carry `raise` into a later cpprust
-    # diagnostic, which is the escape hatch for a cs2cpp bug.
-    return re.sub(
-        r"((?:[\w:<>,\*\&]+\s+)+\w+\s*\([^)]*\)\s*)"
-        r"\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
-        maybe, text)
+def _match_brace_at(scan, i):
+    depth = 0
+    for j in range(i, len(scan)):
+        depth += {"{": 1, "}": -1}.get(scan[j], 0)
+        if depth == 0:
+            return j
+    return None
+
+
+def _lower_finally(text, path):
+    """`try { A } finally { F }` -> F on every way out of A.
+
+    A `return x;` in A keeps x, runs F, then returns it; a failure runs F
+    and re-raises; falling off the end runs F. A `break`/`continue` that
+    would leave the `try` is refused -- it would have to run F too.
+    """
+    try_re = re.compile(r"(?<![\w.])try\s*\{")
+    while True:
+        scan = _blank(text)
+        m = try_re.search(scan)
+        while m is not None:
+            a_close = _match_brace_at(scan, m.end() - 1)
+            fm = re.match(r"\s*finally\s*\{", scan[a_close + 1:])
+            if fm:
+                break
+            m = try_re.search(scan, m.end())
+        if m is None:
+            return text
+        f_open = a_close + 1 + fm.end() - 1
+        f_close = _match_brace_at(scan, f_open)
+        a, f = text[m.end():a_close], text[f_open + 1:f_close]
+        if "finally" in _blank(a):
+            raise CsError("%snested `finally` is not in the C# subset yet."
+                          % _at(path, text, m.start()))
+        ascan = _blank(a)
+        loops = []
+        for lm in re.finditer(r"(?<![\w.])(?:(?:for|while|switch)\s*\(|do\s*\{)", ascan):
+            ob = ascan.find("{", lm.end() - 1 if lm.group(0).endswith("{") else
+                            cpprust._match_paren(ascan, lm.end() - 1))
+            loops.append((ob, _match_brace_at(ascan, ob)))
+        for bm in re.finditer(r"(?<![\w.])(?:break|continue)\s*;", ascan):
+            if not any(lo < bm.start() < hi for lo, hi in loops):
+                raise CsError("%s`%s` out of a `try` with a `finally` is not in the C# subset yet."
+                              % (_at(path, text, m.end() + bm.start()), bm.group(0).rstrip("; ")))
+        fn = [b for b in _function_bodies(text) if b[2] < m.start() < b[3]]
+        ret = fn[-1][1] if fn else "void"
+        k = len(re.findall(r"__fin_done\d+", text))
+        done, val, end = "__fin_done%d" % k, "__fin_val%d" % k, "__fin_end%d" % k
+
+        def ret_sub(rm):
+            e = rm.group(1).strip()
+            return ("{ %s%s = true; goto %s; }" % ("%s = %s; " % (val, e) if e else "", done, end))
+        a2 = cpprust._sub_code(r"(?<![\w.])return\b([^;]*);", ret_sub, a)
+        decl = "bool %s = false; " % done + ("%s %s; " % (ret, val) if ret != "void" else "")
+        back = "return %s;" % val if ret != "void" else "return;"
+        f = cpprust._strip_comments(f).replace("\n", " ")
+        repl = ("{ %stry { %s %s: ; } catch { %s throw; } %s if (%s) { %s } }"
+                % (decl, a2, end, f, f, done, back))
+        text = (text[:m.start()] + repl + "\n" * text[a_close:f_close].count("\n")
+                + text[f_close + 1:])
+
+
+def _mark_except_functions(text):
+    """A function that can fail is declared `except` -- one that `raise`s,
+    or calls one that can (C# exceptions pass through every caller)."""
+    # ponytail: by name -- an overload or a same-named method elsewhere is
+    # marked too, which costs a check, never a missed failure.
+    bodies = _function_bodies(text)
+    scan = _blank(text)
+    marked = {n for n, _r, b, c in bodies
+              if re.search(r"(?<![\w.])raise(?![\w])", scan[b:c])}
+    while True:
+        more = {n for n, _r, b, c in bodies if n not in marked and marked and re.search(
+            r"(?<![\w])(?:%s)\s*\(" % "|".join(map(re.escape, marked)), scan[b:c])}
+        if not more:
+            break
+        marked |= more
+    for n, _r, b, c in sorted(bodies, key=lambda x: -x[2]):
+        if n in marked and not re.search(r"except\s*$", scan[:b]):
+            text = text[:b] + " except " + text[b:]
+    return text
 
 
 _DECL_NOISE = frozenset(("public", "private", "protected", "internal",
@@ -2138,6 +2246,22 @@ _DECL_NOISE = frozenset(("public", "private", "protected", "internal",
 _NOT_A_FIELD = frozenset(("static", "const", "event", "delegate", "using",
                           "abstract", "override", "virtual", "class",
                           "struct", "enum", "interface", "operator"))
+
+
+def _lower_base_calls(text, table):
+    """`base.M(..)` -> `Base::M(..)`: the base's own implementation, which
+    the C++ half calls directly instead of through the vtable."""
+    scan = _blank(text)
+    types = _find_types(text)
+    edits = []
+    for m in re.finditer(r"(?<![\w.])base\s*\.\s*(\w+)\s*(?=\()", scan):
+        here = _enclosing(types, m.start(), ("class",))
+        base = here and (table.get(here[0]) or {}).get("base", "").split(",")[0].strip()
+        if base and re.fullmatch(r"\w+", base):
+            edits.append((m.start(), m.end(), "%s::%s" % (base, m.group(1))))
+    for start, end, repl in reversed(edits):
+        text = text[:start] + repl + text[end:]
+    return text
 
 
 def _check_unsupported_forms(text, table, path):
@@ -2212,9 +2336,11 @@ def _borrow_interface_params(text, table, path):
     """
     ifaces = sorted((n for n, i in table.items() if i["kind"] == "interface"),
                     key=len, reverse=True)
-    if not ifaces:
-        return text
-    alt = "|".join(re.escape(n) for n in ifaces)
+    # A collection is a reference type as well: by value, the callee would
+    # mutate a copy.
+    targs = r"\s*<(?:[^<>()]|<(?:[^<>()]|<[^<>()]*>)*>)*>"
+    alt = "|".join([re.escape(n) + "(?:%s)?" % targs for n in ifaces] + [
+        r"(?:List|Dictionary|HashSet|Stack|Queue)" + targs])
     scan = _blank(text)
     edits = []
     # a method head: `Name(params) {` or `Name(params) =>`
@@ -2223,7 +2349,10 @@ def _borrow_interface_params(text, table, path):
         if close is None or not re.match(r"\s*(\{|=>|;)", scan[close + 1:]):
             continue
         prev = scan[:m.start()].rstrip()
-        if not prev or not (prev[-1].isalnum() or prev[-1] in "_>]"):
+        # `*`: an arena class's return type is `T*` by now
+        # a constructor's head follows the previous member: modifiers are gone
+        if not prev or not (prev[-1].isalnum() or prev[-1] in "_>]*"
+                            or (prev[-1] in ";{}" and m.group(1) in table)):
             continue                       # a call, not a declaration
         if re.search(r"(?<![\w.])(?:new|return|else|await)$", prev):
             continue
@@ -2233,6 +2362,9 @@ def _borrow_interface_params(text, table, path):
             edits.append((pos, pos, "&"))
     for a, b, rep in sorted(edits, reverse=True):
         text = text[:a] + rep + text[b:]
+    if not ifaces:
+        return text
+    alt = "|".join(re.escape(n) + "(?:%s)?" % targs for n in ifaces)
     # storage of an interface type
     scan = _blank(text)
     m = re.search(r"(?<![\w.&])(%s)\s+([A-Za-z_]\w*)\s*(=(?!=)|;|\(|\{)" % alt, scan)
@@ -2248,8 +2380,8 @@ def _borrow_interface_params(text, table, path):
             "%s`%s %s`: an interface-typed %s is not in the C# subset. Owned "
             "values have one concrete type here, so an `%s` can only be "
             "borrowed: take it as a parameter, or use the concrete class."
-            % (_at(path, text, m.start()), m.group(1), m.group(2), what,
-               m.group(1)))
+            % (_at(path, text, m.start()), m.group(1).replace("*", ""), m.group(2), what,
+               m.group(1).replace("*", "")))
     return text
 
 
@@ -2533,6 +2665,314 @@ def _check_static_fields(text, table, path):
                     % (where, name, fname, init.strip()))
 
 
+def _lower_typed_overloads(text, table, path):
+    """`F(Site a, Site b)` and `F(Site a, Vector2 b)` -> `F__Site_Site`, `F__Site_Vector2`.
+
+    The C++ half tells overloads apart by argument count only. Same-count
+    overloads are renamed by their parameter types, and each call picks the
+    one its argument types fit -- or is refused when they are not known.
+    """
+    # ponytail: argument types come from `_expr_type` (names and member
+    # chains), literals and `new T(..)`; anything else matches every
+    # overload, so an ambiguous call is refused rather than guessed.
+    scan = _blank(text)
+    types = _find_types(text)
+    groups, decls = {}, {}
+
+    sysname = {"Int64": "long", "Int32": "int", "Int16": "short", "UInt64": "ulong", "UInt32": "uint",
+               "UInt16": "ushort", "Byte": "byte", "SByte": "sbyte", "Double": "double",
+               "Single": "float", "Boolean": "bool", "Char": "char", "String": "string"}
+
+    def norm(t):
+        # `ClipperLib.IntPoint` is `IntPoint`: types are matched by bare name
+        t = re.sub(r"\b\w+\.", "", re.sub(r"\s+|\*", "", t))
+        return sysname.get(t, t)
+    for _kind, cname, _start, brace, close in types:
+        body = scan[brace + 1:close]
+        for m in re.finditer(r"(?<![\w.])[A-Za-z_][\w<>\[\],.*]*\s+(\w+)\s*\(([^()]*)\)\s*\{", body):
+            if body[:m.start()].count("{") != body[:m.start()].count("}") or m.group(1) == cname:
+                continue
+            ps = [p.strip() for p in cpprust._split_top(m.group(2)) if p.strip()]
+            pts = tuple(norm(re.sub(r"^(?:ref|out|params|this)\s+", "",
+                        re.sub(r"\s*=.*$", "", p, flags=re.S)).rsplit(None, 1)[0]) for p in ps)
+            groups.setdefault((cname, m.group(1), len(pts)), []).append(pts)
+            decls[brace + 1 + m.start(1)] = (m.group(1), pts)
+    over = {k: v for k, v in groups.items() if len(set(v)) > 1}
+
+    # Constructors keep their name, so all but the first of a same-count
+    # group take padding parameters up to a count no other has, and a
+    # `new T(..)` that means one of them passes zeros for the padding.
+    cover = {}      # class -> {arity: [(ctor parameter types, pad)]}
+    edits = []
+    for _kind, cname, _start, brace, close in types:
+        body, ctors = scan[brace + 1:close], []
+        for m in re.finditer(r"(?<![\w.~])%s\s*\(" % re.escape(cname), body):
+            if body[:m.start()].count("{") != body[:m.start()].count("}") \
+                    or re.search(r"\bnew\s*$", body[:m.start()]):
+                continue
+            pc = cpprust._match_paren(scan, brace + 1 + m.end() - 1)
+            if pc is None or not re.match(r"\s*(?::[^{;]*)?\{", scan[pc + 1:]):
+                continue
+            ps = [p for p in cpprust._split_top(scan[brace + 1 + m.end():pc]) if p.strip()]
+            pts = tuple(norm(re.sub(r"^(?:ref|out|params)\s+", "", re.sub(
+                r"\s*=.*$", "", p.strip(), flags=re.S)).rsplit(None, 1)[0]) for p in ps)
+            ctors.append([pc, len([p for p in ps if "=" not in p]), pts, 0])
+        top = max([len(c[2]) for c in ctors] or [0])
+        for a in range(top + 1):
+            app = [c for c in ctors if c[1] <= a <= len(c[2])]
+            if len({c[2][:a] for c in app}) < 2:
+                continue
+            for c in app[1:]:
+                if c[3] == 0:
+                    if c[1] != len(c[2]):
+                        raise CsError("%sa `%s` constructor with default arguments is overloaded by "
+                                      "parameter type; that is not in the C# subset yet. Drop the "
+                                      "defaults." % (_at(path, text, c[0]), cname))
+                    top += 1
+                    c[3] = top - len(c[2])
+                    edits.append((c[0], c[0], ", " * bool(c[2]) + ", ".join(
+                        "int __pad%d" % i for i in range(c[3]))))
+            cover.setdefault(cname, {})[a] = [(c[2][:a], c[3]) for c in app]
+
+    if not over and not cover:
+        return text
+
+    def mangle(name, pts):
+        return "%s__%s" % (name, re.sub(r"\W+", "_", "_".join(pts)).strip("_"))
+
+    def ancestors(t):
+        seen = []
+        while t in table and t not in seen:
+            seen.append(t)
+            t = re.sub(r"<.*", "", (table[t]["base"].split(",") or [""])[0]).strip()
+        return seen + [b.strip() for s in seen for b in table[s]["base"].split(",")[1:]]
+
+    rank = ["sbyte", "byte", "short", "ushort", "char", "int", "uint", "long", "ulong", "float", "double"]
+
+    def arg_type(a, pos):
+        a = a.strip()
+        while a.startswith("(") and cpprust._match_paren(a, 0) == len(a) - 1:
+            a = a[1:-1].strip()
+        if a == "null":
+            return None
+        # `a * b - c`: the operands' promotion, int at least
+        ops, depth, last = [], 0, 0
+        for i, ch in enumerate(a):
+            depth += {"(": 1, "[": 1, ")": -1, "]": -1}.get(ch, 0)
+            if depth == 0 and ch in "+-*/%" and a[last:i].strip() \
+                    and a[:i].rstrip()[-1] not in "+-*/%" and not re.search(r"\d[eE]$", a[:i]):
+                ops.append(a[last:i])
+                last = i + 1
+        if ops:
+            ts = [arg_type(o, pos) for o in ops + [a[last:]]]
+            if None in ts or not all(t in rank for t in ts):
+                return None
+            return max(ts + ["int"], key=rank.index)
+        cm = re.match(r"\(([\w.]+)\)\s*\S", a)
+        if cm and norm(cm.group(1)) in rank:
+            return norm(cm.group(1))
+        if a.startswith("-"):
+            return arg_type(a[1:], pos)
+        if re.fullmatch(r"-?\d+", a):
+            return "int"
+        if re.fullmatch(r"-?[\d.]+[fF]", a):
+            return "float"
+        if re.fullmatch(r"-?\d*\.\d+(?:[eE][-+]?\d+)?", a):
+            return "double"
+        nm = re.match(r"new\s+([\w.]+)\s*\(", a)
+        if nm:
+            return norm(nm.group(1))
+        em = re.fullmatch(r"([\w.]*?)(\w+)\s*\.\s*\w+", a)
+        if em and (table.get(em.group(2)) or {}).get("kind") == "enum":
+            return em.group(2)
+        cm = re.match(r"(?:([\w.]+?)\s*\.\s*)?(\w+)\s*\(", a)
+        if cm and cpprust._match_paren(a, cm.end() - 1) == len(a) - 1:
+            # a call: its method's declared return type, if every same-named one agrees
+            here = _enclosing(types, pos)
+            if cm.group(1) is None:
+                owners = ancestors(here[0]) if here else []
+            elif norm(cm.group(1)) in table:
+                owners = ancestors(norm(cm.group(1)))
+            else:
+                t = _expr_type(cm.group(1), pos, scan, table, types)
+                owners = ancestors(norm(t)) if t else []
+            rets = {norm(r) for o in owners for r in member_types(o, cm.group(2), r"\(")}
+            return rets.pop() if len(rets) == 1 else None
+        if re.fullmatch(r"[A-Za-z_]\w*", a):
+            here = _enclosing(types, pos)
+            span = here and _method_span(scan, here[1], here[2], pos)
+            lo = span[0] if span else (here[1] if here else 0)
+            # `int j = 0, k = 0;`: a later declarator of a multi-declaration
+            md = list(re.finditer(r"(?<![\w.])([A-Za-z_][\w.<>\[\]]*)\s+\w+\s*(?:=[^;,(){}]*)?"
+                                  r"(?:,\s*\w+\s*(?:=[^;,(){}]*)?)*,\s*%s\s*[=;,]" % re.escape(a),
+                                  scan[lo:pos]))
+            if md and md[-1].group(1) not in _NOT_A_TYPE and \
+                    _declared_in(scan, lo, pos, a) is None:
+                return norm(md[-1].group(1))
+        if re.fullmatch(r"[A-Za-z_]\w*(?:\s*\.\s*\w+|\s*\[[^\[\]]*\])*", a):
+            t = chain_type(a, pos)
+            return t and norm(t)
+        return None
+
+    def chain_type(a, pos):
+        t = _expr_type(a, pos, scan, table, types)
+        if t is not None:
+            return t
+        # through a computed property, which the table does not hold
+        pm = re.fullmatch(r"(.+?)\s*\.\s*(\w+)", a, re.S)
+        im = re.fullmatch(r"(.+?)\s*\[[^\[\]]*\]", a, re.S)
+        owner = chain_type((pm or im).group(1), pos) if pm or im else None
+        if owner is None:
+            return None
+        if pm and pm.group(2) in ("Count", "Length") and \
+                (_element_type(owner) is not None or _dict_types(owner) is not None
+                 or norm(owner) == "string"):
+            return "int"
+        if im:
+            kv = _dict_types(owner)
+            return kv[1] if kv is not None else _element_type(owner)
+        return _field_type(table, norm(owner), pm.group(2)) or prop_type(norm(owner), pm.group(2))
+
+    widen = {"sbyte": "short int long float double", "byte": "short ushort int uint long ulong float double",
+             "short": "int long float double", "ushort": "int uint long ulong float double",
+             "int": "long float double", "uint": "long ulong float double",
+             "long": "float double", "ulong": "float double", "char": "ushort int uint long ulong float double",
+             "float": "double"}
+
+    def fit(a, p):
+        # C#'s implicit conversions: a base, or a wider number
+        return a is None or a == p or p in ancestors(a) or p in widen.get(a, "").split()
+
+    def best(fits, ats, key=lambda f: f):
+        """C#'s better function member: at every known argument a parameter
+        at least as close (`long` over `double` for a `long`). An unknown
+        argument decides nothing, so its parameters must agree."""
+        def better(p, q):
+            return q in widen.get(p, "").split() or q in ancestors(p)
+
+        def beats(f, g):
+            return all((p == q) if a is None else (p == q or better(p, q))
+                       for a, p, q in zip(ats, key(f), key(g)))
+        return [f for f in fits if all(f is g or beats(f, g) for g in fits)]
+
+    def member_types(cls, name, after):
+        """Declared types of `cls`'s members `name` followed by `after`."""
+        out = []
+        for kind, n, _s, brace, close in types:
+            if n == cls:
+                body = scan[brace + 1:close]
+                for m in re.finditer(r"([\w.<>\[\],*]+)\s+%s\s*(?:%s)" % (re.escape(name), after), body):
+                    if body[:m.start()].count("{") == body[:m.start()].count("}"):
+                        out.append(m.group(1))
+        return out
+
+    def prop_type(cls, name):
+        return (member_types(cls, name, r"\{|=>") or [None])[0]
+
+    for m in re.finditer(r"(?:\bnew\s+([\w.]+)|:\s*(this))\s*\(", scan):
+        here = _enclosing(types, m.start())
+        cname = norm(m.group(1)) if m.group(1) else (here[0] if here else None)
+        close = cpprust._match_paren(scan, m.end() - 1)
+        args = [a for a in cpprust._split_top(scan[m.end():close]) if a.strip()]
+        cands = cover.get(cname, {}).get(len(args))
+        if not cands:
+            continue
+        ats = [arg_type(a, m.start()) for a in args]
+        fits = [c for c in cands
+                if all(fit(a, p) for a, p in zip(ats, c[0]))]
+        fits = best(fits, ats, key=lambda c: c[0])
+        if len(fits) != 1:
+            raise CsError("%scannot tell which `%s` constructor this calls: they differ by "
+                          "parameter type, and the argument types here are %s. Put the arguments "
+                          "in typed locals first." % (_at(path, text, m.start()), cname,
+                                                      ", ".join(a or "unknown" for a in ats)))
+        if fits[0][1]:
+            edits.append((close, close, ", " * bool(args) + ", ".join(["0"] * fits[0][1])))
+
+    names = {k[1] for k in over}
+    for m in re.finditer(r"(?<![\w])(%s)\s*\(" % "|".join(map(re.escape, names)), scan) if names else ():
+        if m.start() in decls:
+            pts = decls[m.start()][1]
+            edits.append((m.start(), m.end(1), mangle(m.group(1), pts)))
+            continue
+        open_ = m.end() - 1
+        close = cpprust._match_paren(scan, open_)
+        args = [a for a in cpprust._split_top(scan[open_ + 1:close]) if a.strip()]
+        rm = re.search(r"([A-Za-z_][\w.]*)\s*\.\s*$", scan[:m.start()])
+        here = _enclosing(types, m.start())
+        if rm is None:
+            owners = ancestors(here[0]) if here else []
+        elif rm.group(1) in table:
+            owners = ancestors(rm.group(1))
+        else:
+            t = _expr_type(rm.group(1), m.start(), scan, table, types)
+            owners = ancestors(norm(t)) if t else []
+        key = next((k for k in ((o, m.group(1), len(args)) for o in owners) if k in groups), None)
+        if key is None and not owners and any(k[1:] == (m.group(1), len(args)) for k in over):
+            raise CsError("%scannot tell whose `%s` this calls, and a type of %s overloads it "
+                          "by parameter type. Call it through a variable of a declared type."
+                          % (_at(path, text, m.start()), m.group(1), "/".join(
+                              sorted(k[0] for k in over if k[1:] == (m.group(1), len(args))))))
+        if key not in over:
+            continue
+        ats = [arg_type(a, m.start()) for a in args]
+        fits = [pts for pts in dict.fromkeys(over[key])
+                if all(fit(a, p) for a, p in zip(ats, pts))]
+        fits = best(fits, ats)
+        if len(fits) != 1:
+            raise CsError("%scannot tell which `%s` overload this calls: they differ by parameter "
+                          "type, and the argument types here are %s. Put the arguments in typed "
+                          "locals first." % (_at(path, text, m.start()), m.group(1),
+                                             ", ".join(a or "unknown" for a in ats)))
+        edits.append((m.start(), m.end(1), mangle(m.group(1), fits[0])))
+    for s, e, r in sorted(edits, reverse=True):
+        text = text[:s] + r + text[e:]
+    return text
+
+
+def _dict_key_compare(text, table):
+    """A struct used as a `Dictionary` key gets the `compare` the map under
+    it orders by: its fields in order, by `<` -- so a key is found again
+    exactly when every field `==`s, which is `Vector2.Equals`."""
+    # ponytail: a NaN field compares equal to everything, which breaks the
+    # map's ordering; C# finds such a key by `Equals` (never, for `Vector2`).
+    keys = set()
+    todo = [k for k in re.findall(r"(?<![\w.])Dictionary\s*<\s*([\w.]+)\s*,", _blank(text))]
+    while todo:
+        k = todo.pop()
+        info = table.get(k)
+        if k in keys or not info or info["kind"] != "struct":
+            continue
+        keys.add(k)
+        todo += [t for t, _f in info["fields"] if (table.get(t) or {}).get("kind") == "struct"]
+    for _kind, name, _start, brace, _close in sorted(_find_types(text), key=lambda t: -t[3]):
+        if name not in keys:
+            continue
+        body = " ".join(
+            ("{ int c = %s.compare(o.%s); if (c != 0) { return c; } }" % (f, f))
+            if (table.get(t) or {}).get("kind") == "struct" else
+            "if (%s < o.%s) { return -1; } if (%s > o.%s) { return 1; }" % (f, f, f, f)
+            for t, f in table[name]["fields"])
+        text = text[:brace + 1] + " public int compare(const %s &o) { %s return 0; }" % (name, body) \
+            + text[brace + 1:]
+    return text
+
+
+def _struct_default_ctors(text, table):
+    """A struct with constructors keeps C#'s implicit `S()`, which zeroes it.
+
+    Without it, a field or local of the type had nothing to construct it by.
+    The zeroing is the field initializers `_zero_scalar_fields` wrote.
+    """
+    for _kind, name, _start, brace, _close in sorted(_find_types(text), key=lambda t: -t[3]):
+        info = table.get(name) or {}
+        defaulted = re.search(r"(?<![\w.~])%s\s*\((?:[^()=,]+=[^(),]+,?)+\)\s*[{:]" % re.escape(name),
+                              text[brace:_close])
+        if info.get("kind") == "struct" and info["ctors"] and 0 not in info["ctors"] and not defaulted:
+            text = text[:brace + 1] + " %s() { }" % name + text[brace + 1:]
+    return text
+
+
 def _zero_scalar_fields(text, table):
     """`public int n;` -> `public int n = 0;` in a class or struct.
 
@@ -2734,6 +3174,40 @@ def _lower_accessor_properties(text, names):
     return text
 
 
+def _field_accessors(text, names):
+    """A plain field named like some type's property gets that property's
+    `get_N`/`set_N` pair too: `.N` is rewritten by name, whatever the
+    receiver, so `Vector2.x` beside a `Site.x` property became `v.get_x()`."""
+    # ponytail: instance fields only -- a static field `T.N` sharing a
+    # property's name still reaches C as `T.get_N()`.
+    if not names:
+        return text
+    scan = _blank(text)
+    adds = []
+    for kind, _name, _start, brace, close in _find_types(text):
+        if kind not in ("class", "struct"):
+            continue
+        top, depth = [], 0
+        for c in scan[brace + 1:close]:
+            depth += c == "{"
+            top.append(c if depth == 0 or c in "{}" else " ")
+            depth -= c == "}"
+        top = "".join(top)
+        acc = ""
+        for m in re.finditer(r"(?:^|(?<=[;{}]))\s*(?:(?:public|private|protected|internal|readonly)\s+)*"
+                             r"([\w.]+(?:\s*<[^;{}()=]*>)?(?:\s*\[\s*\])*)\s+"
+                             r"(\w+(?:\s*=[^;,{}]*)?(?:\s*,\s*\w+(?:\s*=[^;,{}]*)?)*)\s*;", top):
+            for f in re.findall(r"(?:^|,)\s*(\w+)", m.group(2)):
+                if f in names and not re.search(r"\bget_%s\s*\(" % f, top):
+                    acc += (" %s get_%s() { return %s; } void set_%s(%s __v) { %s = __v; }"
+                            % (m.group(1), f, f, f, m.group(1), f))
+        if acc:
+            adds.append((close, acc + " "))
+    for at, s in sorted(adds, reverse=True):
+        text = text[:at] + s + text[at:]
+    return text
+
+
 def _lower_auto_properties(text):
     """`int Count { get; set; }` -> field + get_Count / set_Count.
 
@@ -2759,6 +3233,15 @@ def _lower_auto_properties(text):
 
     text = cpprust._sub_code(prop.pattern, repl, text)
     text = _lower_accessor_properties(text, names)
+    text = _field_accessors(text, set(names))
+    # `R.value` of a static property is `R::value` by now (_lower_static_calls)
+    statics = set(re.findall(r"(?<![\w.])static\s+[\w.:<>,\[\] ]+?\s+get_(\w+)\s*\(\s*\)",
+                             _blank(text)))
+    for name in sorted(statics, key=len, reverse=True):
+        text = cpprust._sub_code(r"::%s\s*=(?!=)\s*([^;]+);" % re.escape(name),
+                                 lambda m, n=name: "::set_%s(%s);" % (n, m.group(1)), text)
+        text = cpprust._sub_code(r"::%s\b(?!\s*\()" % re.escape(name),
+                                 lambda m, n=name: "::get_%s()" % n, text)
     for name in sorted(set(names), key=len, reverse=True):
         # Read-modify-write through the accessors: `c.A += 4`, `c.A++`.
         # Through the getter alone it was `get_A() += 4`, not an lvalue.
@@ -3224,7 +3707,7 @@ def _closes_generic(scan, i):
     j = i - 1
     while j >= 0 and scan[j] in " \t":
         j -= 1
-    if j < 0 or not (scan[j].isalnum() or scan[j] in "_>]"):
+    if j < 0 or not (scan[j].isalnum() or scan[j] in "_>]*"):
         return False
     stmt = max(scan.rfind(";", 0, i), scan.rfind("{", 0, i),
                scan.rfind("}", 0, i)) + 1
@@ -3324,7 +3807,7 @@ def _type_table(text):
             info["statics"] = dict(
                 (m.group(2), re.sub(r"\s+", "", m.group(1)))
                 for m in re.finditer(
-                    r"(?<![\w.])static\s+(?:readonly\s+)?([A-Za-z_][\w.]*"
+                    r"(?<![\w.])(?:static\s+(?:readonly\s+)?|const\s+)([A-Za-z_][\w.]*"
                     r"(?:\s*<[^;=(){}]*>)?(?:\s*\[\s*\])*)\*?\s+([A-Za-z_]\w*)\s*[;=]",
                     scan[brace + 1:close]))
         table[name] = info
@@ -3996,6 +4479,77 @@ def _helper_text(kind, typ):
             % (typ, typ, size, size))
 
 
+_BCL_ALIASES = {"Int64": "long", "UInt64": "ulong", "Int32": "int", "UInt32": "uint",
+                "Int16": "short", "UInt16": "ushort", "Byte": "byte", "SByte": "sbyte",
+                "Single": "float", "Double": "double", "Boolean": "bool"}
+_BCL_CONSTS = {
+    ("float", "MaxValue"): "3.40282347E+38f", ("float", "MinValue"): "-3.40282347E+38f",
+    ("float", "Epsilon"): "1.401298E-45f", ("float", "NaN"): "(0.0f / 0.0f)",
+    ("float", "PositiveInfinity"): "(1.0f / 0.0f)", ("float", "NegativeInfinity"): "(-1.0f / 0.0f)",
+    ("double", "MaxValue"): "1.7976931348623157E+308", ("double", "MinValue"): "-1.7976931348623157E+308",
+    ("double", "Epsilon"): "4.94065645841247E-324", ("double", "NaN"): "(0.0 / 0.0)",
+    ("double", "PositiveInfinity"): "(1.0 / 0.0)", ("double", "NegativeInfinity"): "(-1.0 / 0.0)",
+    ("int", "MaxValue"): "2147483647", ("int", "MinValue"): "(-2147483647 - 1)",
+    ("uint", "MaxValue"): "4294967295u", ("uint", "MinValue"): "0u",
+    ("long", "MaxValue"): "9223372036854775807L", ("long", "MinValue"): "(-9223372036854775807L - 1L)",
+    ("ulong", "MaxValue"): "18446744073709551615UL", ("ulong", "MinValue"): "0UL",
+    ("short", "MaxValue"): "32767", ("short", "MinValue"): "(-32768)",
+    ("ushort", "MaxValue"): "65535", ("byte", "MaxValue"): "255", ("byte", "MinValue"): "0",
+}
+#: one-argument libm functions System.Math reaches, by C# name
+_LIBM_NAMES = {"Sqrt": "sqrt", "Sin": "sin", "Cos": "cos", "Tan": "tan", "Asin": "asin",
+               "Acos": "acos", "Atan": "atan", "Exp": "exp", "Log": "log", "Log10": "log10",
+               "Floor": "floor", "Ceiling": "ceil", "Round": "rint", "Truncate": "trunc"}
+_LIBM1 = sorted(set(_LIBM_NAMES.values()) | {"fabs"})
+
+
+def _math_minmax():
+    out = []
+    for t in ("int", "long", "float", "double"):
+        nan = " if (a != a) { return a; }" if t in ("float", "double") else ""
+        out.append("public static %s Max(%s a, %s b) { if (a > b) { return a; }%s return b; } "
+                   "public static %s Min(%s a, %s b) { if (a < b) { return a; }%s return b; } "
+                   % (t, t, t, nan, t, t, t, nan))
+    return "".join(out)
+
+
+# System.Math as C# over libm, on line 1 so no line moves. Round is
+# banker's rounding, as `rint` is in the default rounding mode; Max/Min
+# follow Mono's (Unity's) NaN rule. ponytail: Abs(int.MinValue) wraps where
+# .NET throws OverflowException.
+_MATH_PRELUDE = (
+    "public static class Math { public const double PI = 3.141592653589793; "
+    "public const double E = 2.718281828459045; "
+    + "".join("public static double %s(double d) { return %s(d); } " % kv
+              for kv in sorted(_LIBM_NAMES.items()))
+    + "public static double Atan2(double y, double x) { return atan2(y, x); } "
+    "public static double Pow(double x, double y) { return pow(x, y); } "
+    "public static int Abs(int v) { return v < 0 ? -v : v; } "
+    "public static long Abs(long v) { return v < 0 ? -v : v; } "
+    "public static float Abs(float v) { return (float)fabs(v); } "
+    "public static double Abs(double v) { return fabs(v); } "
+    + _math_minmax()
+    + "public static bool __IsNaN(double d) { return d != d; } "
+    "public static bool __IsInf(double d) { return d == d && d - d != d - d; } } ")
+
+
+def _lower_bcl_numerics(text):
+    """System's numeric surface: `Int64` is `long`, `float.MaxValue` its
+    literal, `float.IsNaN(x)` a Math helper, `System.Math` the prelude's."""
+    declared = set(re.findall(r"(?<![\w.])(?:class|struct|enum)\s+(\w+)", _blank(text)))
+    alias = [n for n in _BCL_ALIASES if n not in declared]
+    if alias:
+        text = cpprust._sub_code(r"(?<![\w.])(?:System\s*\.\s*)?(%s)(?!\w)" % "|".join(alias),
+                                 lambda m: _BCL_ALIASES[m.group(1)], text)
+    text = cpprust._sub_code(r"(?<![\w.])System\s*\.\s*(?=Math\s*\.)", lambda m: "", text)
+    text = cpprust._sub_code(r"(?<![\w.])(float|double)\s*\.\s*Is(NaN|Infinity)\s*\(",
+                             lambda m: "Math.__Is%s(" % ("NaN" if m.group(2) == "NaN" else "Inf"),
+                             text)
+    return cpprust._sub_code(
+        r"(?<![\w.])(float|double|u?int|u?long|u?short|byte)\s*\.\s*(\w+)(?![\w(])",
+        lambda m: _BCL_CONSTS.get((m.group(1), m.group(2)), m.group(0)), text)
+
+
 def _emit_plain_helpers(text, need):
     """Insert the helpers `need` names, each where its types are complete.
 
@@ -4011,6 +4565,9 @@ def _emit_plain_helpers(text, need):
     # File scope, ahead of everything: declared inside a namespace, cpprust
     # would prefix `abort` with it, and the libc symbol would go missing.
     head = ["void abort(void); "]
+    if ("math", "") in need:
+        head.append("".join("double %s(double); " % f for f in _LIBM1) +
+                    "double atan2(double, double); double pow(double, double); ")
     if ("zero", "") in need:
         head.append("static void _cs_zero(unsigned char *p, int n) { "
                     "int i = 0; while (i < n) { p[i] = 0; i = i + 1; } } ")
@@ -4189,6 +4746,40 @@ def _enum_decl(text, scan, name, start, brace, close, path):
     return repl, end, names
 
 
+def _rename_shadowed_enums(text):
+    """An enum whose name some type also declares a member by (Clipper's
+    `EdgeSide Side;` beside Delaunay's `enum Side`): the enum is
+    `Side__enum` wherever it is a type or qualifies a member -- not after a
+    `.`, not as a declared name, and not bare inside a type declaring the
+    member, where the name is the member."""
+    scan = _blank(text)
+    types = _find_types(text)
+    names = {t[1] for t in types if t[0] == "enum"}
+    owners = {}
+    for m in re.finditer(r"(?<![\w.])([A-Za-z_][\w<>,.?\[\]]*)\s+([A-Za-z_]\w*)"
+                         r"\s*(?=[;=,)\[{])", scan):
+        if m.group(2) in names and m.group(1) not in _NOT_A_TYPE | {"enum"}:
+            here = [t for t in types if t[0] != "enum" and t[3] < m.start() < t[4]]
+            if here:
+                owners.setdefault(m.group(2), []).append(min(here, key=lambda t: t[4] - t[3]))
+    edits = []
+    for name, own in owners.items():
+        for m in re.finditer(r"(?<![\w.])%s(?![\w])" % re.escape(name), scan):
+            after = scan[m.end():]
+            if re.match(r"\s*[;=,)\[{]", after) and re.search(
+                    r"[\w>\]?]\s+$", scan[:m.start()]) and not re.search(
+                    r"(?<![\w])enum\s+$", scan[:m.start()]):
+                continue                        # a declared name
+            if not re.match(r"\s*\.", after) and \
+                    not re.match(r"\s+[A-Za-z_]\w*\s*[;=,)({]", after) and any(
+                    t[3] < m.start() < t[4] for t in own):
+                continue                        # the member, bare -- not a declaration's type
+            edits.append((m.start(), m.end(), name + "__enum"))
+    for a, b, r in sorted(edits, reverse=True):
+        text = text[:a] + r + text[b:]
+    return text
+
+
 def _lower_enums(text, path):
     """C# enums onto `enum T_values { T_A, .. }; typedef <base> T;`.
 
@@ -4199,6 +4790,7 @@ def _lower_enums(text, path):
     """
     text = cpprust._sub_code(_FLAGS_ATTR.pattern,
                              lambda m: " " * len(m.group(0)), text)
+    text = _rename_shadowed_enums(text)
     scan = _blank(text)
     types = _find_types(text)
     enums = [t for t in types if t[0] == "enum"]
@@ -4469,7 +5061,7 @@ def _declared_in(scan, lo, hi, name):
     # The type arguments are balanced (`_GENERIC_ARGS`): `[^;{}()=]*` ran on across
     # `List<P> a, List<C> b` and read `b` as a `List<P> a, List<C>`.
     pat = (r"(?<![\w.])([A-Za-z_][\w.]*(?:\s*%s)?(?:\s*\[\s*\])*)"
-           r"(?:\*?\s+|\s*&\s*)%s\s*(?=[=;,)]|in\b)"
+           r"(?:\*?\s+|\s*\*?\s*&\s*)%s\s*(?=[=;,)]|in\b)"
            % (_GENERIC_ARGS, re.escape(name)))
     for m in re.finditer(pat, scan[lo:hi]):
         if m.group(1) in _NOT_A_TYPE:
@@ -4605,26 +5197,223 @@ _LIST_MEMBERS = {
     "Contains": (1, "(_cs_list_index_{e}({r}, {0}) >= 0)"),
     "IndexOf": (1, "_cs_list_index_{e}({r}, {0})"),
     "Remove": (1, "_cs_list_remove_{e}({r}, {0})"),
+    "Reverse": (0, "std::reverse({r}.begin(), {r}.end())"),
 }
 
 
-def _list_property_storage(text, table):
+def _hoist_owning_args(text):
+    """`F(G(x))` where `G` returns a collection -> `List<E> __ownN = G(x);`
+    just before the statement, then `F(__ownN)`. A collection parameter is
+    borrowed (`const List<E> &`), and a call result has no address to lend."""
+    # ponytail: only `return F(..)`, `x = F(..)`, `T x = F(..)` and `F(..);`
+    # with plain names before the argument -- where hoisting keeps the C#
+    # evaluation order. Anything else is left to the refusal it gets now.
+    scan = _blank(text)
+    rets, other = {}, set()
+    for m in re.finditer(r"(?<![\w.])((?:List|Dictionary|HashSet)\s*%s)\s+(\w+)\s*\("
+                         % _GENERIC_ARGS, scan):
+        rets.setdefault(m.group(2), set()).add(re.sub(r"\s+", "", m.group(1)))
+    for m in re.finditer(r"(?:static|public|private|protected|internal|override|virtual)"
+                         r"\s+([\w.]+)\s*(?:\[\s*\])?\s+(\w+)\s*\(", scan):
+        other.add(m.group(2))
+    rets = {k: next(iter(v)) for k, v in rets.items() if len(v) == 1 and k not in other}
+    n = 0
+    new = r"(?<![\w.])new\s+((?:List|Dictionary|HashSet)\s*%s)\s*\(" % _GENERIC_ARGS
+    while True:
+        scan = _blank(text)
+        hit = None
+        for m in re.finditer(r"(?<!\w)(\w+)\s*\(|" + new, scan):
+            if m.group(1) is None:              # `new List<E>(..)`: an owner nobody holds
+                start, ty = m.start(), re.sub(r"\s+", "", m.group(2))
+            elif m.group(1) in rets:
+                start, ty = m.start(), rets[m.group(1)]
+            else:
+                continue
+            while m.group(1) is not None:     # take the receiver chain `A.B.G(` along
+                q = re.search(r"(\w+)\s*\.\s*$", scan[:start])
+                if not q:
+                    break
+                start = q.start()
+            pre = scan[:start].rstrip()
+            close = cpprust._match_paren(scan, m.end() - 1)
+            if not pre.endswith(("(", ",")) or close is None or \
+                    not scan[close + 1:].lstrip().startswith((")", ",")):
+                continue
+            s = max(pre.rfind(";"), pre.rfind("{"), pre.rfind("}")) + 1
+            hm = re.fullmatch(r"\s*(?:return\s+|[\w.<>\[\], ]+?\s*=\s*)?[\w.\s]*?(\w+)\s*\(\s*"
+                              r"(?:[\w.]+\s*,\s*)*", scan[s:start])
+            if not hm or hm.group(1) in ("Add", "Insert", "Push", "Enqueue"):
+                continue                # a collection's own insert moves it in
+            s += len(scan[s:start]) - len(scan[s:start].lstrip())
+            hit = (s, start, close + 1, ty)
+            break
+        if hit is None:
+            return text
+        s, a, e, ty = hit
+        tmp = "__own%d" % n
+        n += 1
+        text = "%s%s %s = %s; %s%s%s" % (text[:s], ty, tmp, text[a:e],
+                                          text[s:a], tmp, text[e:])
+    return text
+
+
+def _lower_stacks(text):
+    """`Stack<T>` as the `List<T>` it is underneath: `Push` is `Add`, `Peek`
+    the last element, `Pop` a method of the calling class that takes it off."""
+    # ponytail: only a stack reached by its declared name (`s`, `this.s`);
+    # empty `Pop`/`Peek` stop on the index check, as the unhandled
+    # InvalidOperationException would -- a `catch` for it is not seen.
+    scan = _blank(text)
+    decl = r"(?<![\w.])Stack\s*(%s)\s+(\w+)" % _GENERIC_ARGS
+    found = list(re.finditer(decl, scan))
+    if not found:
+        return text
+    types = _find_types(text)
+    # by class: two classes may each have a `_pool`
+    elem = {}
+    for m in found:
+        owner = _enclosing(types, m.start())
+        elem[(owner and owner[0], m.group(2))] = m.group(1)[1:-1].strip()
+    edits, k = [], 0
+    alt = "|".join(map(re.escape, sorted({n for _c, n in elem}, key=len, reverse=True)))
+    for m in re.finditer(r"(?<![\w.])((?:this\s*\.\s*)?(%s))\s*\.\s*(Push|Pop|Peek)\s*\(\s*(\)?)" % alt, scan):
+        r, op = text[m.start(1):m.end(1)], m.group(3)
+        if op == "Push":
+            edits.append((m.start(3), m.end(3), "Add"))
+            continue
+        if not m.group(4):
+            continue
+        if op == "Peek":
+            edits.append((m.start(), m.end(), "%s[%s.Count - 1]" % (r, r)))
+            continue
+        here = _enclosing(types, m.start())
+        if here is None or (here[0], m.group(2)) not in elem:
+            continue
+        k += 1
+        T = elem[(here[0], m.group(2))]
+        edits.append((m.start(), m.end(), "__stack_pop%d(%s)" % (k, r)))
+        edits.append((here[2], here[2], " static %s __stack_pop%d(List<%s> s) { %s v = s[s.Count - 1]; "
+                      "s.RemoveAt(s.Count - 1); return v; } " % (T, k, T, T)))
+    for a, b, rep in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        text = text[:a] + rep + text[b:]
+    return cpprust._sub_code(r"(?<![\w.])Stack(?=\s*<)", lambda _m: "List", text)
+
+
+def _sort_methods(k, stat, elem, arg, table, where):
+    """`xs.Sort(cmp)` as methods of the calling class: `__sort<k>(xs)`.
+
+    .NET's `ArraySortHelper` introsort step for step -- median of three,
+    insertion sort at 16 or fewer, heapsort past a depth of
+    2 * (floor(log2 n) + 1) -- because the sort is unstable and the order
+    it leaves equal elements in is observable.
+    """
+    T = elem
+    dm = re.match(r"delegate\s*\(\s*([\w.<>*]+)\s+(\w+)\s*,\s*([\w.<>*]+)\s+(\w+)\s*\)\s*(\{.*\})\s*$",
+                  arg, re.S)
+    if dm:
+        # ponytail: the body is lifted into a method, so a captured local
+        # fails to compile rather than being shared; no closure support.
+        cmp = "%sint __cmp%d(%s %s, %s %s) %s" % (stat, k, dm.group(1), dm.group(2),
+                                                  dm.group(3), dm.group(4), dm.group(5))
+    elif re.fullmatch(r"[A-Za-z_][\w.]*", arg):
+        cmp = "%sint __cmp%d(%s a, %s b) { return %s.Compare(a, b); }" % (stat, k, T, T, arg)
+    elif arg == "":
+        base = T.rstrip("*").strip()
+        info = table.get(base) or {}
+        if base in _ARENA:
+            # Comparer<T>.Default: GenericComparer for IComparable<T>,
+            # otherwise ObjectComparer, which short-circuits `a == b`.
+            same = "" if re.search(r"IComparable\s*<", info.get("base", "")) \
+                else "if (a == b) { return 0; } "
+            body = ("%sif (a == null) { return b == null ? 0 : -1; } if (b == null) { return 1; } "
+                    "return a.CompareTo(b);" % same)
+        elif info.get("kind") == "struct":
+            body = "return a.CompareTo(b);"
+        else:
+            body = ("if (a < b) { return -1; } if (a > b) { return 1; } if (a == b) { return 0; } "
+                    "if (a != a) { return b != b ? 0 : -1; } return 1;")
+        cmp = "%sint __cmp%d(%s a, %s b) { %s }" % (stat, k, T, T, body)
+    else:
+        raise CsError("%s`List.Sort(%s)`: the comparer is an anonymous `delegate (T a, T b) { .. }`, "
+                      "an `IComparer<T>` variable, or none." % (where, arg.split("\n")[0]))
+    s = {"k": k, "s": stat, "T": T}
+    return (" " + cmp + """ %(s)svoid __sgt%(k)d(List<%(T)s> &keys, int i, int j) {
+ if (i != j && __cmp%(k)d(keys[i], keys[j]) > 0) { %(T)s t = keys[i]; keys[i] = keys[j]; keys[j] = t; } }
+ %(s)svoid __swp%(k)d(List<%(T)s> &keys, int i, int j) {
+ if (i != j) { %(T)s t = keys[i]; keys[i] = keys[j]; keys[j] = t; } }
+ %(s)svoid __down%(k)d(List<%(T)s> &keys, int i, int n, int lo) {
+ %(T)s d = keys[lo + i - 1];
+ while (i <= (n >> 1)) { int child = 2 * i;
+  if (child < n && __cmp%(k)d(keys[lo + child - 1], keys[lo + child]) < 0) { child = child + 1; }
+  if (!(__cmp%(k)d(d, keys[lo + child - 1]) < 0)) { break; }
+  keys[lo + i - 1] = keys[lo + child - 1]; i = child; }
+ keys[lo + i - 1] = d; }
+ %(s)svoid __intro%(k)d(List<%(T)s> &keys, int lo, int hi, int depth) {
+ while (hi > lo) { int size = hi - lo + 1;
+  if (size <= 16) {
+   if (size == 2) { __sgt%(k)d(keys, lo, hi); return; }
+   if (size == 3) { __sgt%(k)d(keys, lo, hi - 1); __sgt%(k)d(keys, lo, hi); __sgt%(k)d(keys, hi - 1, hi); return; }
+   int i = lo;
+   while (i < hi) { %(T)s t = keys[i + 1]; int j = i;
+    while (j >= lo && __cmp%(k)d(t, keys[j]) < 0) { keys[j + 1] = keys[j]; j = j - 1; }
+    keys[j + 1] = t; i = i + 1; }
+   return; }
+  if (depth == 0) { int n = size; int h = n >> 1;
+   while (h >= 1) { __down%(k)d(keys, h, n, lo); h = h - 1; }
+   h = n; while (h > 1) { __swp%(k)d(keys, lo, lo + h - 1); __down%(k)d(keys, 1, h - 1, lo); h = h - 1; }
+   return; }
+  depth = depth - 1;
+  int mid = lo + ((hi - lo) >> 1);
+  __sgt%(k)d(keys, lo, mid); __sgt%(k)d(keys, lo, hi); __sgt%(k)d(keys, mid, hi);
+  %(T)s pivot = keys[mid];
+  __swp%(k)d(keys, mid, hi - 1);
+  int left = lo; int right = hi - 1;
+  while (left < right) {
+   left = left + 1; while (__cmp%(k)d(keys[left], pivot) < 0) { left = left + 1; }
+   right = right - 1; while (__cmp%(k)d(pivot, keys[right]) < 0) { right = right - 1; }
+   if (left >= right) { break; }
+   __swp%(k)d(keys, left, right); }
+  __swp%(k)d(keys, left, hi - 1);
+  __intro%(k)d(keys, left + 1, hi, depth);
+  hi = left - 1; } }
+ %(s)svoid __sort%(k)d(List<%(T)s> &keys) {
+ int n = keys.size(); int lg = 0;
+ while ((n >> lg) > 1) { lg = lg + 1; }
+ if (n > 1) { __intro%(k)d(keys, 0, n - 1, 2 * (lg + 1)); } }
+""" % s).replace("\n", " ")
+
+
+def _list_property_storage(text, table, explicit=False):
     """Reads of a `List`-typed auto-property go to its storage, `_Items`.
 
     The getter returns the list by value. In C# it returns the same list,
     so `b.Items[1] = 5` and `foreach (.. in b.Items)` see the object's own;
     through a copy the first would write to a temporary and be lost.
     Assignments to the property are left to its setter.
+
+    `explicit`: instead, a collection property whose getter is only
+    `return field;` (or `=> field;`) reads that field.
     """
     props = {}
-    for cname, info in table.items():
-        for ftype, fname in info.get("fields", ()):
-            if fname in info.get("props", ()) and _list_element(ftype):
-                props.setdefault(fname, set()).add(cname)
-    if not props:
-        return text
     scan = _blank(text)
     types = _find_types(text)
+    if explicit:
+        for kind, cname, start, brace, close in types:
+            fields = {f for _t, f in (table.get(cname) or {}).get("fields", ())}
+            for m in re.finditer(
+                    r"(?<![\w.])((?:List|Dictionary|HashSet|Stack|Queue)\s*<[^;{}()=]*>)\s+(\w+)\s*"
+                    r"(?:\{\s*get\s*(?:\{\s*return\s+(\w+)\s*;\s*\}|=>\s*(\w+)\s*;)|=>\s*(\w+)\s*;)",
+                    scan[brace + 1:close]):
+                field = m.group(3) or m.group(4) or m.group(5)
+                if field in fields and _enclosing(types, brace + 1 + m.start())[0] == cname:
+                    props.setdefault(m.group(2), {})[cname] = field
+    else:
+        for cname, info in table.items():
+            for ftype, fname in info.get("fields", ()):
+                if fname in info.get("props", ()) and _list_element(ftype):
+                    props.setdefault(fname, {})[cname] = "_" + fname
+    if not props:
+        return text
     edits = []
     pat = r"(?<![\w])(%s)(?![\w])" % "|".join(
         re.escape(n) for n in sorted(props, key=len, reverse=True))
@@ -4654,7 +5443,7 @@ def _list_property_storage(text, table):
                                                 name) is not None:
                     continue            # not in a body, or a local shadows it
         if owner in props[name]:
-            edits.append((m.start(), m.end(), "_" + name))
+            edits.append((m.start(), m.end(), props[name][owner]))
     for start, end, repl in sorted(edits, reverse=True):
         text = text[:start] + repl + text[end:]
     return text
@@ -4891,13 +5680,37 @@ def _lower_list_members(text, table, path, need):
             edits.append((rstart, m.end(), "%s.%s()"
                           % (recv, LIST_METHODS["Count"])))
             continue
+        am = re.match(r"\s*=(?!=)([^;]*);", after)
+        if member == "Capacity" and am:
+            # ponytail: no reserve, only the setter's throw when below Count.
+            edits.append((rstart, m.end() + am.end() - 1, "_cs_check_insert(%s.size(), %s)"
+                          % (recv, text[m.end() + am.start(1):m.end() + am.end(1)].strip())))
+            need.add(("check", ""))
+            continue
+        om = re.match(r"\s*\(", after)
+        if member == "Sort" and om:
+            op = m.end() + om.end() - 1
+            close = cpprust._match_paren(scan, op)
+            here = _enclosing(types, start)
+            span = here and _method_span(scan, here[1], here[2], start)
+            if span is None or (table.get(elem) or {}).get("kind") == "class":
+                raise CsError("%s`List<%s>.Sort` is lowered for a list of primitives, structs or "
+                              "`[MaxInstances]` references, inside a method." % (_at(path, text, start), elem))
+            k = len(re.findall(r"\b__sort\d+\(", text)) + len(edits)
+            stat = "static " if re.search(r"(?<![\w])static\b", scan[span[0]:span[1]]) else ""
+            edits.append((rstart, close + 1, "__sort%d(%s)" % (k, recv)
+                          + "\n" * text[rstart:close].count("\n")))
+            edits.append((here[2], here[2], _sort_methods(
+                k, stat, elem, cpprust._strip_comments(text[op + 1:close]).strip(),
+                table, _at(path, text, start))))
+            continue
         if member not in _LIST_MEMBERS:
             if re.match(r"\s*\(", after) or member in ("Capacity",):
                 raise CsError(
                     "%s`List.%s` is not in the C# subset yet. The `List<T>` "
                     "members that are: `Add`, `Insert`, `RemoveAt`, "
-                    "`Remove`, `Clear`, `Contains`, `IndexOf`, `Count`, and "
-                    "indexing." % (_at(path, text, start), member))
+                    "`Remove`, `Clear`, `Contains`, `IndexOf`, `Reverse`, "
+                    "`Sort`, `Count`, and indexing." % (_at(path, text, start), member))
             continue
         arity, form = _LIST_MEMBERS[member]
         om = re.match(r"\s*\(", after)
@@ -5081,6 +5894,32 @@ def _qualify_type_named_fields(text, table):
     return text
 
 
+def _expand_using_aliases(text):
+    """`using Path = List<IntPoint>;` -> `List<IntPoint>` wherever `Path` is
+    written, to the end of the block declaring it.
+
+    The type passes read `List<..>` to know a list; through a typedef they
+    did not, and a `Path` parameter was copied, its `.Count` unlowered.
+    """
+    # ponytail: textual -- a member or local spelled like the alias in its
+    # scope would be rewritten too; `.Name` member accesses are not.
+    while True:
+        scan = _blank(text)
+        m = re.search(r"(?:^|(?<=[;{}]))[ \t]*using\s+(\w+)\s*=\s*([^;]+);", scan, re.MULTILINE)
+        if m is None:
+            return text
+        depth, end = 0, len(text)
+        for i in range(m.end(), len(scan)):
+            depth += {"{": 1, "}": -1}.get(scan[i], 0)
+            if depth < 0:
+                end = i
+                break
+        target = text[m.start(2):m.end(2)].strip()
+        body = cpprust._sub_code(r"(?<![\w.])%s(?![\w])" % re.escape(m.group(1)),
+                                 lambda _m: target, text[m.end():end])
+        text = text[:m.start()] + " " * (m.end() - m.start()) + body + text[end:]
+
+
 def _drop_using_directives(text):
     """`using System;` goes; `using X = Y;` stays.
 
@@ -5089,14 +5928,35 @@ def _drop_using_directives(text):
     rather than translated.
     """
     scan = _blank(text)
+    ours = _namespace_names(scan)
     out, pos = [], 0
-    for m in re.finditer(r"^[ \t]*using\s+([\w.]+)\s*;[ \t]*$",
+    # inline too: a unit reopens a type's namespace and its usings on one line
+    for m in re.finditer(r"(?:^|(?<=[;{}]))[ \t]*using\s+([\w.]+)\s*;",
                          scan, re.MULTILINE):
         out.append(text[pos:m.start()])
-        out.append(" " * (m.end() - m.start()))
+        parts = m.group(1).split(".")
+        if all(p in ours for p in parts):
+            # a namespace of this unit: its names, flattened to `B_x` (a
+            # nested namespace takes its own name only), are what the bare
+            # spellings mean
+            out.append("using namespace %s;" % parts[-1])
+        else:
+            out.append(" " * (m.end() - m.start()))
         pos = m.end()
     out.append(text[pos:])
-    return "".join(out)
+    text = "".join(out)
+    # `Utils.IDisposable` -> `Utils::IDisposable`: a name qualified by this
+    # unit's namespaces, spelled the way the C++ half flattens it.
+    if ours:
+        nss = "|".join(map(re.escape, sorted(ours, key=len, reverse=True)))
+        scan = _blank(text)
+        for m in reversed(list(re.finditer(
+                r"(?<![\w.:])((?:(?:%s)\s*\.\s*)+)([A-Za-z_]\w*)" % nss, scan))):
+            if re.search(r"(?<![\w])namespace\s*$", scan[max(0, m.start() - 20):m.start()]):
+                continue
+            inner = re.split(r"\s*\.\s*", m.group(1).strip().rstrip(". \t"))[-1]
+            text = text[:m.start()] + "%s::%s" % (inner, m.group(2)) + text[m.end():]
+    return text
 
 
 _ATTRIBUTE = re.compile(r"^[ \t]*\[\s*(\w+)[^\]\n]*\][ \t]*$", re.MULTILINE)
@@ -5171,7 +6031,8 @@ def _lower_arena_classes(text):
     types = _find_types(text)
     for kind, name, start, brace, close in types:
         head = scan[start:brace]
-        if kind == "class" and re.search(r":\s*(?:System\s*\.\s*)?Attribute\b", head):
+        # An exception class goes too: a `throw` carries no object here.
+        if kind == "class" and re.search(r":\s*(?:System\s*\.\s*)?(?:Attribute|\w*Exception)\b", head):
             a = start
             # its own attribute lines above it go too ([AttributeUsage(..)])
             while True:
@@ -5205,7 +6066,31 @@ def _lower_arena_classes(text):
         text = text[:a] + r + text[b:]
     if not _ARENA:
         return text
-    alt = "|".join(re.escape(n) for n in sorted(_ARENA, key=len, reverse=True))
+    # An interface whose every implementor is an arena class can only ever
+    # name an arena object, so a variable of it is a `I*` reference too.
+    impls = {}
+    for kind, tname, start, brace, close in types:
+        head = scan[start:brace]
+        if ":" in head and kind != "enum":
+            for _o, b in _split_depth(head.split(":", 1)[1]):
+                impls.setdefault(re.sub(r"\s+", "", b), []).append(tname)
+    ifaces = {n for k, n, *_ in types if k == "interface"}
+    # a generic interface by instantiation: `IComparer<Node>`
+    refs = set(_ARENA) | {n for n in impls if n.split("<")[0] in ifaces
+                          and all(t in _ARENA for t in impls[n])}
+    alt = "|".join(r"\s*".join(map(re.escape, re.findall(r"\w+|\W", n)))
+                   for n in sorted(refs, key=len, reverse=True))
+    # `T a, b;` -> `T a; T b;`: as `T* a, b` only `a` would be a reference
+    scan = _blank(text)
+    edits = []
+    for m in re.finditer(r"(?:(?<=[;{}])|^)(\s*)((?:(?:public|private|protected|internal|static|readonly)\s+)*)"
+                         r"(%s)\s+([A-Za-z_]\w*[^;{}]*,[^;{}]*);" % alt, scan, re.MULTILINE):
+        parts = _split_depth(text[m.start(4):m.end(4)])
+        if len(parts) > 1 and all(re.match(r"^\s*[A-Za-z_]\w*\s*(?:=[^=].*)?$", p, re.S) for _o, p in parts):
+            edits.append((m.start(2), m.end(), " ".join(
+                "%s%s %s;" % (text[m.start(2):m.end(2)], m.group(3), p.strip()) for _o, p in parts)))
+    for a, b, r in reversed(edits):
+        text = text[:a] + r + text[b:]
     # a type use: `T x`, `T[] x`, `T F(`, a generic argument, a cast
     text = cpprust._sub_code(
         r"(?<![\w.])(%s)(?=(?:\s*\[\s*\])*\s+[A-Za-z_]\w*\s*[;=,)(\[{])" % alt,
@@ -5239,6 +6124,7 @@ def _lower_operators(text, path):
     """
     scan = _blank(text)
     edits = []
+    unary = {}
     for kind, tname, start, brace, close in _find_types(text):
         if kind not in ("class", "struct"):
             continue
@@ -5256,6 +6142,13 @@ def _lower_operators(text, path):
             popen = brace + 1 + m.end() - 1
             pclose = cpprust._match_paren(scan, popen)
             params = [a for a in split_call_args(text[popen + 1:pclose]) if a.strip()]
+            pm1 = re.match(r"^\s*([\w.]+)\s+\w+\s*$", params[0]) if len(params) == 1 else None
+            if pm1 and op in _UNARY_NAMES and pm1.group(1) == tname:
+                # a static method, which _lower_unary_uses calls
+                k = at + m.group(0).index("operator")
+                edits.append((k, popen, "__op_%s" % _UNARY_NAMES[op]))
+                unary.setdefault(tname, set()).add(op)
+                continue
             if op not in _BINARY_OPERATORS or len(params) != 2:
                 raise CsError(
                     "%s`operator %s` with %d operand%s is not in the C# subset yet: only the binary "
@@ -5278,17 +6171,67 @@ def _lower_operators(text, path):
                 continue
             fbody = text[bopen:bclose + 1]
             sbody = scan[bopen:bclose + 1]
-            # `a.X` -> `this->X`, a bare `a` -> `(*this)`
-            def left(mm):
-                return "this->" if mm.group(0).endswith(".") else "(*this)"
-            sub = []
-            for mm in re.finditer(r"(?<![\w.])%s(?![\w])(\s*\.)?" % re.escape(ln), sbody):
-                sub.append((mm.start(), mm.end(), "this->" if mm.group(1) else "(*this)"))
-            for a, b, rep in sorted(sub, reverse=True):
-                fbody = fbody[:a] + rep + fbody[b:]
+            if re.search(r"(?<![\w.])throw(?![\w])", sbody):
+                raise CsError("%s`operator %s` throws. An operator is called inside an expression, "
+                              "where a failure cannot be checked; that is not in the C# subset yet. "
+                              "Write a method." % (_at(path, text, at), op))
+
+            def assigned(name):
+                return re.search(r"(?<![\w.])%s(?:\s*\.\s*\w+)*\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)|"
+                                 r"(?:\+\+|--)\s*%s(?![\w])|(?<![\w.])%s\s*(?:\+\+|--)"
+                                 % ((re.escape(name),) * 3), sbody)
+            # Operands are values in C#: one the body assigns is a copy here.
+            copies = []
+            if assigned(ln):
+                copies.append("%s %s = (*this);" % (tname, ln))
+            else:
+                # `a.X` -> `this->X`, a bare `a` -> `(*this)`
+                sub = []
+                for mm in re.finditer(r"(?<![\w.])%s(?![\w])(\s*\.)?" % re.escape(ln), sbody):
+                    sub.append((mm.start(), mm.end(), "this->" if mm.group(1) else "(*this)"))
+                for a, b, rep in sorted(sub, reverse=True):
+                    fbody = fbody[:a] + rep + fbody[b:]
             # `const R &`, the one spelling cpprust's call sites pass a pointer for
             rparam = ("const %s &%s" % (rt, rn)) if rt == tname else ("%s %s" % (rt, rn))
-            edits.append((at, bclose + 1, "%s operator %s(%s) %s" % (m.group(1), op, rparam, fbody)))
+            if rt == tname and assigned(rn):
+                rparam = "const %s &__%s" % (rt, rn)
+                copies.append("%s %s = __%s;" % (rt, rn, rn))
+            if copies:
+                fbody = "{ " + " ".join(copies) + fbody[1:]
+            edits.append((at, bclose + 1, "%s operator %s(%s)%s %s" % (
+                m.group(1), op, rparam, "\n" * text.count("\n", at, bopen), fbody)))
+    for a, b, rep in sorted(edits, reverse=True):
+        text = text[:a] + rep + text[b:]
+    return _lower_unary_uses(text, unary) if unary else text
+
+
+#: A user-defined unary operator's static method (`__op_neg`).
+_UNARY_NAMES = {"-": "neg", "~": "not", "!": "lnot", "+": "pos"}
+
+
+def _lower_unary_uses(text, unary):
+    """`-x` with `x` (a name or member chain) of a type declaring `operator
+    -(T)`: `T.__op_neg(x)`. An operand this cannot type is left, and C
+    refuses the struct operand."""
+    scan = _blank(text)
+    types = _find_types(text)
+    table = _type_table(text)
+    edits = []
+    for m in re.finditer(r"([-~!+])\s*(this\.)?([A-Za-z_][\w.]*)(?![\w.(\[])", scan):
+        prev = scan[:m.start()].rstrip()
+        if prev and not (prev[-1] in "(,=+-*/%<>!&|^?:[{;"
+                         or re.search(r"(?<![\w.])return$", prev)):
+            continue
+        if scan[m.start():m.start() + 2] in ("++", "--") or (
+                prev and prev[-1] in "+-" and prev[-1] == m.group(1)):
+            continue
+        typ = _expr_type((m.group(2) or "") + m.group(3), m.start(3), scan,
+                         table, types)
+        typ = (typ or "").split(".")[-1]
+        if m.group(1) in unary.get(typ, ()):
+            edits.append((m.start(), m.end(), "%s.__op_%s(%s)" % (
+                typ, _UNARY_NAMES[m.group(1)],
+                text[m.start(2) if m.group(2) else m.start(3):m.end()])))
     for a, b, rep in sorted(edits, reverse=True):
         text = text[:a] + rep + text[b:]
     return text
@@ -5336,6 +6279,48 @@ def _lower_ref_out(text):
     return text
 
 
+def _lower_object_protocol(text):
+    """`override bool Equals(object o)` / `override int GetHashCode()` that
+    nothing calls: only boxing reaches them, and this subset has no
+    `object`, so they go (lines kept). A boxed struct compared by
+    reference -- `(object)a == (object)b`, `(object)a == null` -- is two
+    fresh boxes, or a box and null: `false` (`!=`: `true`)."""
+    scan = _blank(text)
+    structs = {t[1] for t in _find_types(text) if t[0] == "struct"}
+    decl = re.compile(r"(?:(?:public|protected|internal|private)\s+)*override\s+"
+                      r"(?:bool\s+Equals\s*\(\s*(?:System\s*\.\s*)?[oO]bject\s+\w+\s*\)"
+                      r"|int\s+GetHashCode\s*\(\s*\))\s*\{")
+    spans = []
+    for m in decl.finditer(scan):
+        close = cpprust._match_brace(scan, m.end() - 1)
+        if close is not None:
+            spans.append((m.start(), close + 1))
+    outside = "".join(scan[a:b] for a, b in zip(
+        [0] + [e for _s, e in spans], [s for s, _e in spans] + [len(scan)]))
+    if spans and not re.search(r"\.\s*(?:Equals|GetHashCode)\s*\(", outside):
+        for a, b in reversed(spans):
+            text = text[:a] + "\n" * text[a:b].count("\n") + text[b:]
+    if not structs:
+        return text
+    types = _find_types(text)
+    table = _type_table(text)
+    scan = _blank(text)
+    boxed = r"\(\s*object\s*\)\s*(\w+)"
+
+    def is_struct(name, pos):
+        t = _expr_type(name, pos, scan, table, types)
+        return (t or "").split(".")[-1] in structs
+
+    edits = []
+    for m in re.finditer(r"%s\s*(==|!=)\s*(?:%s|(null))(?![\w])" % (boxed, boxed), scan):
+        if is_struct(m.group(1), m.start(1)) and (
+                m.group(4) or is_struct(m.group(3), m.start(3))):
+            edits.append((m.start(), m.end(), "false" if m.group(2) == "==" else "true"))
+    for a, b, r in sorted(edits, reverse=True):
+        text = text[:a] + r + text[b:]
+    return text
+
+
 def _lower_unchecked(text):
     """`unchecked { .. }` -> `{ .. }`, `unchecked(e)` -> `(e)`.
 
@@ -5368,6 +6353,10 @@ def translate(text, path="<cs>", coost=False):
     # text, editor hooks). CRUST is defined, as UNITY_STANDALONE is for
     # unity_pack; inactive regions are blanked, lines kept.
     text = blank_inactive_pp_regions(text, {"CRUST"})
+    text = _expand_using_aliases(text)
+    # `System.Collections.Generic.List<T>` is the `List<T>` every pass reads
+    text = cpprust._sub_code(r"(?<![\w.])System\s*\.\s*Collections\s*\.\s*Generic\s*\.\s*(?=[A-Za-z_])",
+                             lambda m: "", text)
     if coost:
         import tools.cs2cpp_strings as cs_strings
         try:
@@ -5375,7 +6364,19 @@ def translate(text, path="<cs>", coost=False):
         except cs_strings.StrError as e:
             raise CsError("%s:%s: %s" % (os.path.basename(path), e.offset or 1,
                                          e.message))
+    if re.search(r"(?<![\w.])IComparer\s*<", _blank(text)) and \
+            not re.search(r"(?<![\w.])interface\s+IComparer\b", _blank(text)):
+        # System.Collections.Generic's, on line 1 so no line moves
+        text = "public interface IComparer<T> { int Compare(T x, T y); } " + text
+    text = _lower_bcl_numerics(text)
+    math = bool(re.search(r"(?<![\w.])Math\s*\.", _blank(text))) and \
+        not re.search(r"(?<![\w.])class\s+Math\b", _blank(text))
+    if math:
+        text = _MATH_PRELUDE + text
     text = _lower_arena_classes(text)
+    text = _hoist_owning_args(text)
+    text = _lower_stacks(text)
+    text = _lower_object_protocol(text)
     text = _lower_unchecked(text)
     text = _lower_ref_out(text)
     text = _lower_operators(text, path)
@@ -5388,12 +6389,15 @@ def translate(text, path="<cs>", coost=False):
     table = _type_table(text)
     text = _lower_static_init(text, table)
     table = _type_table(text)
+    text = _lower_typed_overloads(text, table, path)
     _check_static_fields(text, table, path)
     text = _lower_ctor_initializers(text, table, path)
     text = _zero_scalar_fields(text, table)
+    text = _struct_default_ctors(text, table)
+    text = _dict_key_compare(text, table)
     text = _mask_shifts(text)
     _check_declaration_order(text, table, shared, path)
-    need = set()
+    need = {("math", "")} if math else set()
     # Before the generic attribute pass, which would drop a whole-line
     # `[StructLayout]` without reading its `Pack`.
     text = _lower_struct_layout(text, table, path)
@@ -5419,8 +6423,10 @@ def translate(text, path="<cs>", coost=False):
     # turned into `x.set_P(1)` like any other.
     text = _lower_memory_marshal(text, table, path, need)
     _check_strings(text, path, coost)
+    text = _lower_base_calls(text, table)
     _check_unsupported_forms(text, table, path)
     text = _borrow_interface_params(text, table, path)
+    text = _list_property_storage(text, table, explicit=True)
     # Before initializers: `xs.Add(new T { .. })` becomes a declaration.
     # To a fixed point: a member inside another's argument -- the
     # `xs.Count` of `xs.RemoveAt(xs.Count - 1)` -- overlaps the outer call's
@@ -5453,6 +6459,7 @@ def translate(text, path="<cs>", coost=False):
     text = _lower_this(text)
     text = _lower_literals(text)
     text = lower_body(text, OWNED)
+    text = _lower_finally(text, path)
     text = _lower_throw_catch(text)
     text = _lower_lambdas(text)
     text = _lower_new(text, shared)
