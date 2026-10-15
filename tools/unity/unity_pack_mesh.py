@@ -158,7 +158,7 @@ def emit_collect(p, plan, class_ids, c_ident, has_basis):
     Emitted always (0 triangles without meshes), so a host can call it."""
     meshes = plan.get("meshes") or []
     draws = plan.get("mesh_draws") or []
-    p("/* MeshFilter / MeshRenderer: textured triangles (tools/unity_pack_mesh.py) */")
+    p("/* MeshFilter / MeshRenderer: textured triangles (tools/unity/unity_pack_mesh.py) */")
     if not draws:
         p("int engine_collect_tris(EngineTri *out, int max) { (void)out; (void)max; return 0; }")
         p("")

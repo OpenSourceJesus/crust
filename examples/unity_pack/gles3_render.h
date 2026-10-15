@@ -18,6 +18,7 @@
 #include <GLES3/gl31.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "engine_draw.h"
 
 extern float Camera_main_pos_x;
@@ -58,9 +59,6 @@ int engine_upload_handles(uint32_t *dst, int max_words)
 #ifndef MAX_DRAWS
 #define MAX_DRAWS 4096
 #endif
-#ifndef MAX_TEX
-#define MAX_TEX 512
-#endif
 #ifndef MAX_HANDLE_WORDS
 #define MAX_HANDLE_WORDS 65536
 #endif
@@ -93,7 +91,7 @@ static const char *G3_FRAG_SRC =
     "}\n";
 
 static GLfloat g3_vert[MAX_FLOATS];
-static GLuint g3_tex[MAX_TEX];
+static GLuint *g3_tex;
 static GLuint g3_white_tex;
 static int g3_tex_n;
 static GLuint g3_prog;
@@ -235,8 +233,9 @@ static int g3_upload_textures(void)
 {
     int i;
     g3_tex_n = engine_texture_count();
-    if (g3_tex_n > MAX_TEX)
-        g3_tex_n = MAX_TEX;
+    g3_tex = g3_tex_n > 0 ? (GLuint *)calloc((size_t)g3_tex_n, sizeof(GLuint)) : 0;
+    if (g3_tex_n > 0 && !g3_tex)
+        return 0;
     {
         static const unsigned char white[4] = { 255, 255, 255, 255 };
         glGenTextures(1, &g3_white_tex);

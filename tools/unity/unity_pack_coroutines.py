@@ -58,7 +58,7 @@ import re
 
 import tools.cs2cpp as cs2cpp
 
-from tools.unity_pack_collections import _match, _class_body_open
+from tools.unity.unity_pack_collections import _match, _class_body_open
 
 _TYPE = r"[A-Za-z_][\w.]*(?:\s*<[^<>;()]*>)?(?:\s*\[\s*\])?"
 _NOT_TYPES = frozenset(("return", "yield", "new", "else", "case", "goto",

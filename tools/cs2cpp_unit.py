@@ -63,14 +63,38 @@ def chunks_of(path, text):
             top.append(t)
             end = t[4]
     scan = cs2cpp._blank(text)
+    # A type inside `namespace N { .. }` is cut out with its namespace around
+    # it -- reopened, which C# allows -- so reordering cannot split a block.
+    # The file's `using` directives go inside each, where an alias is scoped
+    # to the type it came with, as it is to the file in C#. Both on the
+    # type's own first line, so no line moves.
+    spaces = []
+    for m in re.finditer(r"(?<![\w.])namespace\s+([\w.]+)\s*\{", scan):
+        spaces.append((m.group(1), m.end() - 1, cs2cpp._match_brace_at(scan, m.end() - 1)))
+    usings = re.findall(r"^[ \t]*(using\s+[^;(]*;)", scan, re.MULTILINE)
+    pre = " ".join(text[scan.index(u):scan.index(u) + len(u)] for u in dict.fromkeys(usings))
+
+    def lead_free(seg):
+        """`seg` without `using` lines, namespace heads and braces -- what
+        a type's attributes and comments sit in."""
+        s = re.sub(r"^[ \t]*using\s+[^;(]*;", lambda m: " " * len(m.group(0)), seg, flags=re.MULTILINE)
+        s = re.sub(r"(?<![\w.])namespace\s+[\w.]+\s*\{", lambda m: " " * len(m.group(0)), s)
+        s = re.sub(r"^\s*;", lambda m: m.group(0)[:-1] + " ", s)  # `struct S { };`
+        return s.replace("{", " ").replace("}", " ")
+
     out, prev = [], 0
     for kind, name, start, brace, close in top:
-        out.append(Chunk(path, text[prev:close + 1], text.count("\n", 0, prev) + 1,
-                         name, _bases_of(scan, start, brace)))
+        chain = [s for s in spaces if s[1] < start and (s[2] is None or start < s[2])]
+        lead = text[prev:start]
+        head = "".join("namespace %s { " % n for n, _b, _c in chain) + pre + " "
+        body = lead_free(lead) + text[start:close + 1] + " }" * len(chain)
+        out.append(Chunk(path, head + body,
+                         text.count("\n", 0, prev) + 1, name, _bases_of(scan, start, brace)))
         prev = close + 1
-    tail = text[prev:]
-    if tail.strip():
-        out.append(Chunk(path, tail, text.count("\n", 0, prev) + 1))
+    tail = re.sub(r"^;|[{}\s]", "", cs2cpp._blank(text[prev:]).strip())
+    if tail:
+        raise UnitError("%s: something other than a type follows the last type: `%s`"
+                        % (os.path.basename(path), tail[:40]))
     return out
 
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // The part of the UnityEngine API that managed code can use in a hybrid unity_pack build (--hybrid, --managed): script methods the packer cannot lower
 // to C (or that --managed moves) run here, on DotNetAnywhere, from their own C# source.  Pure C#: nothing in this file talks to the packed engine.  What
-// does (a class's fields, its transform, Time) is generated beside it by tools/unity_pack_hybrid.py, from the same accessors the lowered C code uses.
+// does (a class's fields, its transform, Time) is generated beside it by tools/unity/unity_pack_hybrid.py, from the same accessors the lowered C code uses.
 //
 // What is here is the part of UnityEngine that is plain math and plain data: the vector, quaternion, colour and rectangle types, and Mathf.  They follow
 // Unity's own definitions (Euler angles are ZXY, `a * b` applies b first, Mathf.Repeat / DeltaAngle as Unity has them), so a method gives the same answer

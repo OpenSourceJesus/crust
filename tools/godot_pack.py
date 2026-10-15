@@ -48,7 +48,7 @@ if __name__ == "__main__":
         os.path.abspath(__file__))))
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-from tools.unity_pack_common import PackError, _progress, _read
+from tools.unity.unity_pack_common import PackError, _progress, _read
 
 __all__ = [
     "GdCall",
@@ -1186,7 +1186,7 @@ def scene_objects(proj, scene_path, scene_index=0, cameras=None):
         if gd_curves:
             objects[-1]["anim_curves"] = gd_curves
         if node.type == "Line2D":
-            # drawn as the scene's lines are (tools/unity_pack_lines.py)
+            # drawn as the scene's lines are (tools/unity/unity_pack_lines.py)
             objects[-1]["line_renderer"] = _line2d(
                 node, props, glob, "%s:%d" % (godot_display_path(node.scene),
                                              node.line))
@@ -1414,7 +1414,7 @@ def _line2d(node, props, glob, where):
     it goes into the AnimationCurve table as is; it clamps outside its
     points.
     """
-    import tools.unity_pack_lines as _lines
+    import tools.unity.unity_pack_lines as _lines
     pts = []
     pv = props.get("points")
     if isinstance(pv, GdCall) and pv.name == "PackedVector2Array":
@@ -1542,7 +1542,7 @@ def _sprite_texture(node):
 def _load_texture(node, path, _cache={}):
     """(w, h, bottom-up RGBA) of a PNG, refused at *node*'s texture line
     when unity_pack's decoder cannot read it."""
-    from tools.unity_pack_sprites import _load_png_rgba
+    from tools.unity.unity_pack_sprites import _load_png_rgba
     key = (path, os.path.getmtime(path))
     if key not in _cache:
         try:
@@ -1562,7 +1562,7 @@ def _sprite(node, xf):
     `region_rect`, then to `frame` of `hframes` x `vframes`, as Godot's
     Sprite2D::_get_rects does. `offset` and `centered` place the rect;
     `flip_h` / `flip_v` mirror the texture in place."""
-    from tools.unity_pack_sprites import _crop_rgba
+    from tools.unity.unity_pack_sprites import _crop_rgba
     props = node.props
     path, atlas = _sprite_texture(node)
     if path is None:
@@ -3073,11 +3073,11 @@ def adapt_csharp(path, text, project_types=(), handlers=(),
     if _INPUT[0] is None and GODOT_ROOT[0]:
         _INPUT[0] = _InputPlan(GODOT_ROOT[0])
     # SpriteEffects2D (the GPU path's effect byte): this node is its
-    # gameObject, then Unity's desugaring (tools/unity_pack_gpu2d.py)
+    # gameObject, then Unity's desugaring (tools/unity/unity_pack_gpu2d.py)
     # (unity_pack's pack() may have desugared the project's files already:
     # `__sprite_fx(this, ..)`)
     if "SpriteEffect" in text or "__sprite_fx" in text:
-        import tools.unity_pack_gpu2d as _gfx
+        import tools.unity.unity_pack_gpu2d as _gfx
         text = re.sub(r"((?:SpriteEffects2D\s*\.\s*(?:Set|Clear)|"
                       r"(?<![\w.])__sprite_fx)\s*\(\s*)this\b(?!\s*\.)",
                       r"\1gameObject", text)
@@ -4297,7 +4297,7 @@ def main(argv=None):
             "[--gpu-batch]\n"
             "  (a directory holding project.godot)\n")
         return 2
-    import tools.unity_pack as unity_pack
+    import tools.unity.unity_pack as unity_pack
     saved = sys.argv
     sys.argv = [saved[0]] + args
     try:

@@ -1,6 +1,6 @@
 /* Display a packed Unity scene (engine.c + data.c) via surfaceless GLES2.
  *
- *     python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
+ *     python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
  *     # copy or -I this file's sibling engine_draw.h from the pack output
  *     gcc -O3 -c /tmp/upack/engine.c -o /tmp/upack/engine.o
  *     gcc -O0 -c /tmp/upack/data.c   -o /tmp/upack/data.o
@@ -59,9 +59,6 @@ void engine_draw_camera(int k) { (void)k; }
 #ifndef MAX_DRAWS
 #define MAX_DRAWS 4096
 #endif
-#ifndef MAX_TEX
-#define MAX_TEX 512
-#endif
 #define VERT_STRIDE 8
 #define MAX_FLOATS (6 * VERT_STRIDE)
 
@@ -91,7 +88,7 @@ static const char *FRAG_SRC =
 
 static unsigned char pixels[WIDTH * HEIGHT * 4];
 static GLfloat vert_buf[MAX_FLOATS];
-static GLuint gl_tex[MAX_TEX];
+static GLuint *gl_tex;
 static GLuint view_white_tex;
 static int tex_n;
 static GLint u_tex_loc;
@@ -330,8 +327,9 @@ static int upload_textures(void)
 {
     int i;
     tex_n = engine_texture_count();
-    if (tex_n > MAX_TEX)
-        tex_n = MAX_TEX;
+    gl_tex = tex_n > 0 ? (GLuint *)calloc((size_t)tex_n, sizeof(GLuint)) : 0;
+    if (tex_n > 0 && !gl_tex)
+        return 0;
     {
         static const unsigned char white[4] = { 255, 255, 255, 255 };
         glGenTextures(1, &view_white_tex);

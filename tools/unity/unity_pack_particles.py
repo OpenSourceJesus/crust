@@ -22,7 +22,7 @@ import math
 import re
 
 import tools.cs2cpp as cs2cpp
-import tools.unity_pack_common as _cmn
+import tools.unity.unity_pack_common as _cmn
 
 #: At most this many live particles a system (and maxNumParticles).
 PER_SYSTEM_CAP = 512
@@ -145,7 +145,7 @@ def emit_api(p, plan):
 
     def f(v):
         return "%sf" % repr(float(v))
-    p("/* ParticleSystems (tools/unity_pack_particles.py) */")
+    p("/* ParticleSystems (tools/unity/unity_pack_particles.py) */")
     arr("int", "go", [str(int(s["go_index"]) if s.get("go_index") is not None else -1)
                       for s in ps])
     arr("int", "base", [str(b) for b in base])

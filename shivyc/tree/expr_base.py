@@ -115,6 +115,12 @@ class _LExprNode(_ExprNode):
 
     def lvalue(self, il_code, symbol_table, c):
         """Return an LValue object representing this node."""
+        if il_code.probe and not self._cache_lvalue:
+            prev = il_code.set_range(self.r)
+            try:
+                return self._lvalue(il_code, symbol_table, c)
+            finally:
+                il_code.restore_range(prev)
         if not self._cache_lvalue:
             prev = il_code.set_range(self.r)
             try:

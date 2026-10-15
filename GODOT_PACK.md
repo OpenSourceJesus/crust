@@ -57,7 +57,7 @@ and typed values across lines — `Vector2(..)`, `ExtResource("..")`,
 `a + b`, `a - b`, `v * s`, `s * v`, `a * b` (component-wise), `v / s`,
 `a / b`, `-v`, `==` / `!=` (exact, as GodotSharp's `Equals`), and `+=` `-=`
 `*=` `/=` -- typed and rewritten into the engine's component-wise helpers
-(`tools/unity_pack_vectors.py`), whatever the operands: locals, fields,
+(`tools/unity/unity_pack_vectors.py`), whatever the operands: locals, fields,
 `Position`, a method's result, `(a - b)`. A node's own `Position` /
 `GlobalPosition` is a vector too: read whole, and assigned any vector
 expression.
@@ -159,7 +159,7 @@ cc -DBATCH -I out -I examples/unity_pack -I examples/unity_pack/include \
 ```
 
 A Godot pack takes unity_pack's GPU path as a Unity one does
-(`tools/unity_pack_gpu2d.py`, `examples/unity_pack/gles3_batch.h`): every
+(`tools/unity/unity_pack_gpu2d.py`, `examples/unity_pack/gles3_batch.h`): every
 Sprite2D's texture -- a sprite-sheet frame, a region, an AtlasTexture, each
 cropped at import -- is a rectangle of one atlas, and the frame is one
 instanced draw call. Its sprites are the draw list's, in Godot's order

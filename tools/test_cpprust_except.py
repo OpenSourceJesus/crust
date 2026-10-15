@@ -177,17 +177,20 @@ int main(void) {
 """)
         self.assertEqual("e 7\n", out)
 
-    def test_fallible_call_embedded_in_another_call_is_refused(self):
-        """The statement-level check runs after the statement -- too late
-        once the enclosing call has consumed the poisoned value. The
-        model refuses what it cannot check."""
-        self.refuses("""#include <stdio.h>
-int c(void) except { raise 7; }
+    def test_fallible_call_embedded_in_another_call_is_checked_in_place(self):
+        """The statement-level check would run after the statement -- too
+        late once the enclosing call has consumed the poisoned value -- so
+        an embedded call is checked where it is made: `printf` never runs."""
+        out = self.run_c("""#include <stdio.h>
+int c(int x) except { if (x) { raise 7; } return 5; }
 int main(void) {
-    try { printf("%d", c()); } except (long e) { }
+    try { printf("a %d\\n", c(0)); printf("b %d\\n", c(1)); }
+    except (long e) { printf("e %ld\\n", e); }
+    try { if (c(0) > 4) { printf("c\\n"); } } except (long e) { }
     return 0;
 }
-""", "argument to another call", "bind it to a local")
+""")
+        self.assertEqual("a 5\ne 7\nc\n", out)
 
 
 @unittest.skipUnless(_have_gcc(), "gcc not available")

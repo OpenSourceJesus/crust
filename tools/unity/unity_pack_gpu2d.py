@@ -81,7 +81,7 @@ def normal_maps(textures, root):
     `_NormalMap`), as RGBA its size (a sheet slice cropped as the sprite
     is), or None."""
     import re
-    from tools.unity_pack_sprites import (_load_png_rgba, _parse_sprite_sheet,
+    from tools.unity.unity_pack_sprites import (_load_png_rgba, _parse_sprite_sheet,
                                           _crop_rgba)
     guid_path = {}
     for dp, dns, fns in os.walk(root or "."):
@@ -223,7 +223,7 @@ def emit_engine(p, plan):
     if not atlas:
         return
     np = len(atlas["pages"])
-    p("/* ---- the 2D GPU path (tools/unity_pack_gpu2d.py) ---- */")
+    p("/* ---- the 2D GPU path (tools/unity/unity_pack_gpu2d.py) ---- */")
     p("extern const int _engine_atlas_side;")
     p("extern const int _engine_atlas_pages;")
     for k in range(np):

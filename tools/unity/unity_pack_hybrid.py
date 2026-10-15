@@ -2,7 +2,7 @@
 """unity_pack --hybrid: a script method the packer cannot lower to C runs as managed code on DotNetAnywhere.
 
 Without --hybrid a method with C# left in it after lowering becomes an empty stub and a `CS8000` warning: the method does nothing at run time.
-With it, such a method keeps its own C# source, compiled (mcs) against a small managed UnityEngine (tools/unity_pack_managed/UnityShim.cs)
+With it, such a method keeps its own C# source, compiled (mcs) against a small managed UnityEngine (tools/unity/unity_pack_managed/UnityShim.cs)
 and run by DotNetAnywhere, which is linked into the player.  The packed engine is not changed:
 
     native  engine.c    Spark_Tally(i)  ->  ccs_b_Spark_Tally(i)   (hybrid_glue.c: DNA_Find / DNA_Call)   ->  managed Spark.__Tally(i)
@@ -25,7 +25,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
+REPO = os.path.dirname(os.path.dirname(HERE))
 SHIM = os.path.join(HERE, "unity_pack_managed", "UnityShim.cs")
 ASSEMBLY = "hybrid.managed.dll"
 
@@ -718,7 +718,7 @@ RANDOM_HELPERS = ("Random_Range_i", "Random_Range_f", "Random_value", "Random_In
 
 
 def _random_class(natives):
-    """UnityEngine.Random over the runtime helpers the packer's own lowering uses (tools/unity_pack_runtime.py): Range of ints and of floats, value,
+    """UnityEngine.Random over the runtime helpers the packer's own lowering uses (tools/unity/unity_pack_runtime.py): Range of ints and of floats, value,
     InitState, one shared xorshift state, so managed and lowered code draw the same sequence.  apply() asks the packer to emit the helpers
     (plan["_cs_str_used"]) when managed code uses Random, whether or not lowered code did."""
     natives["ccs_x_rand_range_i"] = ("int", ["int", "int"], "int ccs_x_rand_range_i(int a, int b) { return Random_Range_i(a, b); }")
@@ -1000,7 +1000,7 @@ def ffi_manifest(natives):
 def original_body(path, cname, mname, nparams):
     """The body of method *mname* (with *nparams* parameters) of class *cname*, as written in the project's file *path*, before the packer's source
     rewrites (extension calls, collections, coroutines, input actions ...) -- or None when it is not there exactly once."""
-    import tools.unity_pack_common as common
+    import tools.unity.unity_pack_common as common
     import tools.cs2cpp as cs2cpp
     text = common.SOURCE_ORIGINAL.get(os.path.abspath(path)) if path else None
     if not text:

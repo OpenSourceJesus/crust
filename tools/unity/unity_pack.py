@@ -14,9 +14,9 @@ builtins and authored MonoBehaviours. Types with
 the attribute) refuse a second add and print Unity's error; others
 GetOrAdd into a pre-sized pool.
 
-    python3 tools/unity_pack.py <project>
-    python3 tools/unity_pack.py <project> -o <outdir>
-    python3 tools/unity_pack.py <project> -o <outdir> --force
+    python3 tools/unity/unity_pack.py <project>
+    python3 tools/unity/unity_pack.py <project> -o <outdir>
+    python3 tools/unity/unity_pack.py <project> -o <outdir> --force
 
 Default output is $TMPDIR/<project-folder>/<productName>[.exe], a linked
 player (GLFW window when glfw3 is present, otherwise the headless host).
@@ -37,21 +37,21 @@ import sys
 import math
 import copy
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import tools.cs2cpp as cs2cpp
-import tools.unity_pack_runtime as runtime  # noqa: E402
+import tools.unity.unity_pack_runtime as runtime  # noqa: E402
 
 # unity_pack is split by subsystem; each module's names are re-exported here.
-from tools.unity_pack_common import *  # noqa: E402,F401,F403
-from tools.unity_pack_physics import *  # noqa: E402,F401,F403
-from tools.unity_pack_sprites import *  # noqa: E402,F401,F403
-from tools.unity_pack_ui import *  # noqa: E402,F401,F403
-from tools.unity_pack_anim import *  # noqa: E402,F401,F403
-from tools.unity_pack_audio import *  # noqa: E402,F401,F403
-from tools.unity_pack_build import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_ui import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_anim import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_audio import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_build import *  # noqa: E402,F401,F403
 import tools.godot_pack as _godot  # noqa: E402
-import tools.unity_pack_vectors as _vec  # noqa: E402
+import tools.unity.unity_pack_vectors as _vec  # noqa: E402
 
 # C# helpers that moved to cs2cpp; the old names stay for callers and tests.
 _c_string = cs2cpp.c_string
@@ -210,7 +210,7 @@ def _empty_instance_lists(plan):
     exists in the packed game, so nothing that runs can fill the list
     (`_drop_empty_instance_lists`; an instance one through a handle,
     `_handle_field_access`). ponytail: `Add(null)` would fill one."""
-    import tools.unity_pack_common as _cm
+    import tools.unity.unity_pack_common as _cm
     # every project script, not only the analyzed ones: a class no scene
     # places is not analyzed
     bases = {k: list(v) for k, v in (plan.get("mb_bases") or {}).items()}
@@ -380,7 +380,7 @@ _PS_NAMED_VARIABLE = re.compile(
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
     "Exists", "Delete", "CreateText", "OpenText", "Copy",
-    # tools/unity_pack_runtime.py
+    # tools/unity/unity_pack_runtime.py
     "ReadAllText", "ReadAllLines",
 })
 
@@ -701,7 +701,7 @@ _ADDABLE_BUILTINS = frozenset((
     "Animation",
     "Animator",
     "AudioSource",
-    "LineRenderer",     # spare rows (tools/unity_pack_lines.py)
+    "LineRenderer",     # spare rows (tools/unity/unity_pack_lines.py)
 ))
 
 # Unity marks these with [DisallowMultipleComponent] — a second AddComponent
@@ -727,13 +727,13 @@ _GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
 _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
 
-# ParticleSystem: read, simulated and drawn (tools/unity_pack_particles.py).
+# ParticleSystem: read, simulated and drawn (tools/unity/unity_pack_particles.py).
 _PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
-import tools.unity_pack_particles as _parts
-import tools.unity_pack_curves as _curves
-import tools.unity_pack_lines as _lines
-import tools.unity_pack_tilemap as _tm
-import tools.unity_pack_mesh as _mesh
+import tools.unity.unity_pack_particles as _parts
+import tools.unity.unity_pack_curves as _curves
+import tools.unity.unity_pack_lines as _lines
+import tools.unity.unity_pack_tilemap as _tm
+import tools.unity.unity_pack_mesh as _mesh
 
 
 
@@ -2966,7 +2966,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if kind in _JOINT2D_KINDS:
             rec["joint2d"] = _parse_joint2d(kind, block)
         if kind == "MonoBehaviour" and "m_LightType:" in block:
-            import tools.unity_pack_gpu2d as _gpu
+            import tools.unity.unity_pack_gpu2d as _gpu
             _l2d = _gpu.parse_light2d(block)
             if _l2d:
                 rec["light2d"] = _l2d
@@ -3356,7 +3356,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 vec3_fields.update(k.get("vec3_fields") or {})
                 struct_values.update(k.get("struct_values") or {})
                 # AnimationCurve fields: keys and wrap modes, serialized
-                # inline (tools/unity_pack_curves.py).
+                # inline (tools/unity/unity_pack_curves.py).
                 try:
                     anim_curves.update(
                         _curves.parse_curve_fields(k.get("raw") or ""))
@@ -9219,7 +9219,7 @@ def _rename_shadowed_params(cl, m):
 def _extra_roots(plan, cname):
     """Methods the scene / the engine calls by name: Animation Events, and
     InputAction callbacks."""
-    import tools.unity_pack_input as _inp
+    import tools.unity.unity_pack_input as _inp
     return (set((plan.get("anim_event_methods") or {}).get(cname, ()))
             | set(_inp.ROOTS.get(cname, ())))
 
@@ -10966,7 +10966,7 @@ def _emit_engine_gameobject_tables(
         p("    }")
         p("    return _engine_go_layer[go];")
         p("}")
-    import tools.unity_pack_common as _cmm
+    import tools.unity.unity_pack_common as _cmm
     if _cmm.SOURCE_LAYER_MATRIX:
         p("static const unsigned _engine_layer_matrix[32] = { %s };"
           % ", ".join("%du" % v for v in _cmm.SOURCE_LAYER_MATRIX))
@@ -15537,7 +15537,7 @@ def _emit_engine_class_groups(
                        % _FORCE_MANAGED[(site.get("path") or "", cs_line)], m["name"])
             hy_ok = False
             if plan.get("hybrid") and not coll_param:
-                import tools.unity_pack_hybrid as _hy
+                import tools.unity.unity_pack_hybrid as _hy
                 hy_ok = _hy.signature_ok(
                     cs2cpp.parse_params(m.get("args") or ""), m.get("ret"))
                 hy_info = {"name": m["name"], "sym": sym, "params": hy_params,
@@ -19461,8 +19461,8 @@ def emit_engine(plan, analyses, used_apis):
     keyboard_keys = set()
     for a in analyses:
         keyboard_keys |= set(a.get("keyboard_keys") or [])
-    import tools.unity_pack_common as _cm
-    import tools.unity_pack_input as _inp
+    import tools.unity.unity_pack_common as _cm
+    import tools.unity.unity_pack_input as _inp
     _ia_code, _ia_keys, _ia_hints = _inp.engine_tables(_cm.SOURCE_INPUT_ACTIONS)
     if _cm.SOURCE_INPUT_ACTIONS:
         keyboard_keys |= set(_ia_keys)
@@ -19553,7 +19553,7 @@ def emit_engine(plan, analyses, used_apis):
         # a mesh draws while its GameObject is active (unity_pack_mesh)
         or bool(plan.get("mesh_draws"))
         # SpriteEffects2D: effects are per GameObject
-        or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0])
+        or bool(__import__("tools.unity.unity_pack_common", fromlist=["x"]).FX_USED[0])
         # a script's sprite / tint applies to its GameObject's draws
         or "Renderer.sprite" in used_apis or "SpriteRenderer.color" in used_apis)
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
@@ -19571,7 +19571,7 @@ def emit_engine(plan, analyses, used_apis):
     light_n = int(plan.get("light_count") or 0)
     light_cap = light_n + int(add_budget.get("Light") or 0)
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    p("/* generated by tools/unity_pack.py — do not edit */")
+    p("/* generated by tools/unity/unity_pack.py — do not edit */")
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
@@ -19789,6 +19789,12 @@ def emit_engine(plan, analyses, used_apis):
             p("    std::string s = k;")
             p("    return &m[s];")
             p("}")
+            p("static int %s(std::map<std::string, %s> &m, const char *k) {"
+              % (cs2cpp.map_at_string_helper(model, v).replace(
+                  "_at_", "_has_", 1), v))
+            p("    std::string s = k;")
+            p("    return m.count(s) != 0;")
+            p("}")
         p("")
     if want_transform_matrix:
         p("/* Unity Matrix4x4 — column-major; TRS from live Transform. */")
@@ -19917,9 +19923,9 @@ def emit_engine(plan, analyses, used_apis):
     _parts.emit_api(p, plan)
     _curves.emit_c(p, plan)
     _lines.emit_api(p, plan)
-    import tools.unity_pack_common as _cmx
+    import tools.unity.unity_pack_common as _cmx
     if _cmx.GPU_BATCH[0]:
-        import tools.unity_pack_gpu2d as _gfx
+        import tools.unity.unity_pack_gpu2d as _gfx
         _fx_cap = len(plan.get("go_names") or []) + 256
         _gfx.emit_effects(p, _fx_cap, subtree=_godot_free_tree(plan, _fx_cap)
                           if plan.get("godot") else None)
@@ -19931,7 +19937,7 @@ def emit_engine(plan, analyses, used_apis):
     if "InputManager.Using" in used_apis:
         p("extern int engine_input_using_keyboard;")
         p("extern int engine_input_using_mouse;")
-        p("extern int engine_input_using_gamepad;")
+        p("extern int engine_gamepad_connected;")
         p("extern int engine_input_using_phone;")
     if want_ui:
         p("extern float engine_pointer_x; /* screen px, origin bottom-left */")
@@ -21415,6 +21421,8 @@ def emit_engine(plan, analyses, used_apis):
         p("        }")
         p("        n = w;")
         p("    }")
+        if plan.get("tmp_live") and plan.get("tmp_text_set"):
+            p("    n = _tl_draws(out, n, max);")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
@@ -21428,7 +21436,7 @@ def emit_engine(plan, analyses, used_apis):
         _emit_camera_pass(p, plan)
     _emit_bounds(p, plan)
     if _want_gpu_sprites:
-        import tools.unity_pack_gpu2d as _gpu
+        import tools.unity.unity_pack_gpu2d as _gpu
         p(_gpu.HEADER.split("int engine_atlas_side")[0])   # the typedef
         _gpu.emit_engine(p, plan)
         p(_gpu.LIGHT_HEADER.split("int engine_collect_lights2d")[0])
@@ -21718,10 +21726,10 @@ def _emit_runtime_layout(p, plan, want_ui, want_destroy):
 
 def emit_engine_draw_h():
     """Public draw-list API written next to engine.c so hosts stay in sync."""
-    import tools.unity_pack_common as _cmn
+    import tools.unity.unity_pack_common as _cmn
     text = _emit_engine_draw_h_base()
     if _cmn.GPU_BATCH[0]:
-        import tools.unity_pack_gpu2d as _gpu
+        import tools.unity.unity_pack_gpu2d as _gpu
         k = text.rfind("#endif")
         text = text[:k] + _gpu.HEADER + "\n" + text[k:]
     return text
@@ -21729,7 +21737,7 @@ def emit_engine_draw_h():
 
 def _emit_engine_draw_h_base():
     return (
-        "/* generated by tools/unity_pack.py — do not edit */\n"
+        "/* generated by tools/unity/unity_pack.py — do not edit */\n"
         "#ifndef UNITY_PACK_ENGINE_DRAW_H\n"
         "#define UNITY_PACK_ENGINE_DRAW_H\n"
         "\n"
@@ -24391,6 +24399,11 @@ def _int_idents(cl, plan, body, site):
                 out.add("%s_get_%s" % (oidn, name))
                 if ocname == cl.get("name"):
                     out.add(name)
+        for f in ocl.get("class_consts") or ():
+            if f.get("static") and f.get("ty") in _CS_INT_TYPES:
+                out.add("%s_%s" % (oidn, f["name"]))
+                if ocname == cl.get("name"):
+                    out.add(f["name"])
     return out
 
 
@@ -25996,7 +26009,7 @@ def _lower_physics2d_queries(text):
         r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
         r"defaultContactOffset\b", "0.01f", text)
     scan = cs2cpp._blank(text)
-    # the *All results' lists (tools/unity_pack_physics.desugar_layers)
+    # the *All results' lists (tools/unity/unity_pack_physics.desugar_layers)
     for n in set(re.findall(r"(?<![\w.])List\s*<\s*(?:RaycastHit2D|Collider2D)\s*>"
                             r"\s+(\w+)\s*=\s*Physics2D_", scan)):
         text = cs2cpp.code_sub(r"(?<![\w.])%s\s*\.\s*Count\b" % re.escape(n),
@@ -27246,7 +27259,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # `enabled` is the authored m_Enabled: crust runs every packed script
     # enabled, so it is 1 where every row was authored enabled and no
     # script writes it (a write is not lowered, its method stubs)
-    import tools.unity_pack_common as _cme
+    import tools.unity.unity_pack_common as _cme
     insts = cl.get("instances") or []
     bases = plan.get("mb_bases") or {}
     written = _cme.SOURCE_ENABLED_WRITTEN
@@ -27374,7 +27387,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text, string_arrays = _lower_string_arrays(
         text, plan.setdefault("_cs_str_used", set()))
     # Mathf / Random / Parse / Path / Directory / File reads: the runtime
-    # table (tools/unity_pack_runtime.py), while the text is still C#.
+    # table (tools/unity/unity_pack_runtime.py), while the text is still C#.
     if "_cs_require_nonempty(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_require_nonempty")
     for _h in ("_cs_idx2", "_cs_idx3", "_cs_ll_first", "_cs_ll_last", "_cs_switch_str",
@@ -27405,6 +27418,17 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?<![\w.])base\s*\.\s*(Awake|OnEnable|OnDisable)\s*\(\s*\)\s*;?",
         lambda m: "/* base.%s */" % m.group(1), text)
+    # `d.TryGetValue(k, out x)` with x a declared local: ContainsKey, then
+    # the indexer read. ponytail: d and k are read twice, so only a
+    # call-free d and a name or literal k; `out var x` stays refused
+    _locals = _declared_names(text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(\w+(?:\s*\.\s*\w+)*)\s*\.\s*TryGetValue\s*\(\s*"
+        r"(\w+|\"[^\"\\\n]*\")\s*,\s*out\s+(\w+)\s*\)",
+        lambda m: m.group(0) if m.group(3) not in _locals else
+        "(%s.ContainsKey(%s) ? (%s = %s[%s], true) : false)" % (
+            m.group(1), m.group(2), m.group(3), m.group(1), m.group(2)),
+        text)
     # an InputAction callback's subscriber: this instance
     text = cs2cpp.code_sub(r"(?<![\w.])__ia_self\b", "(int)i", text)
     # gameObject.SetActive(x) → GameObject_SetActive(this GO, x).
@@ -27430,10 +27454,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"InputSystem\s*\.\s*onDeviceChange\s*-=\s*[^;]+;",
         "/* InputSystem.onDeviceChange -= */", text)
-    # Authored InputManager.Using* → host flags (keyboard/mouse default on).
+    # Authored InputManager.Using* → host flags (keyboard/mouse default on);
+    # a gamepad is the host's live one, set each frame.
+    # ponytail: onDeviceChange is dropped above, so a script that reads these
+    # only from it (Start + onDeviceChange) misses a gamepad plugged in later.
     text = cs2cpp.code_sub(
         r"(?:[\w.]+\.)?InputManager\s*\.\s*Using(Gamepad|Keyboard|Mouse|Phone)\b",
-        lambda m: "engine_input_using_%s" % m.group(1).lower(),
+        lambda m: "engine_gamepad_connected" if m.group(1) == "Gamepad"
+        else "engine_input_using_%s" % m.group(1).lower(),
         text)
     # Nested InputDevice enum members (declaration order when unspecified).
     _input_dev = {
@@ -28354,6 +28382,32 @@ def _tmp_text_sets(text, cl):
     return out
 
 
+_TMP_TEXT_LIVE = re.compile(
+    r'(?<![\w.])((?:(\w+)\s*\.\s*[iI]nstance\s*\.\s*|this\s*\.\s*)?(\w+))'
+    r'\s*\.\s*text\s*=(?!=)\s*((?:[^;{}"\n]|"(?:[^"\\\n]|\\.)*")+);')
+
+
+def _tmp_text_live(text, cname, plan):
+    """The `f.text = expr;` / `Cls.instance.f.text = expr;` statements in
+    *text* (a method of *cname*) that _tmp_text_sets does not bake: drawn
+    at run time from per-glyph textures (_emit_tmp_text_set).
+    [(match, class, field)]"""
+    classes = plan.get("classes") or {}
+    baked = {m.start() for m, _n, _l in
+             _tmp_text_sets(text, classes.get(cname) or {})}
+    out = []
+    for m in _TMP_TEXT_LIVE.finditer(text):
+        if m.start() in baked:
+            continue
+        owner = m.group(2) or cname
+        oc = classes.get(owner)
+        if oc and any(f["name"] == m.group(3) and not f.get("static")
+                      and (f.get("ty") or "").split(".")[-1] in _TMP_TYPES
+                      for f in oc.get("fields") or []):
+            out.append((m, owner, m.group(3)))
+    return out
+
+
 def _tmp_text_variants(plan, analyses):
     """Bake each text a `f.text = v;` (_tmp_text_sets) can give its TMP:
     an own string field's authored value per instance, or the literal.
@@ -28364,7 +28418,7 @@ def _tmp_text_variants(plan, analyses):
     ponytail: a text whose bake overflows its rect differently from the
     row's draws at the row's size, so it is left out (stops if set)."""
     refs = plan.get("go_field_refs") or {}
-    want = {}
+    want, live = {}, set()
     for a in analyses:
         for c in a.get("classes") or []:
             cl = plan["classes"].get(c["name"])
@@ -28373,6 +28427,13 @@ def _tmp_text_variants(plan, analyses):
             vals = {f["name"]: f["values"]
                     for f in cl.get("string_fields") or []}
             for meth in c.get("methods") or []:
+                for _m, owner, f in _tmp_text_live(
+                        meth.get("body") or "", c["name"], plan):
+                    plan["tmp_text_set"] = True
+                    for go in refs.get((owner, f)) or []:
+                        if go >= 0:
+                            live.add(go)
+                            want.setdefault(go, set())
                 for m, name, lit in _tmp_text_sets(meth.get("body") or "", cl):
                     plan["tmp_text_set"] = True
                     for k, go in enumerate(refs.get((c["name"], m.group(1)))
@@ -28407,6 +28468,11 @@ def _tmp_text_variants(plan, analyses):
                 "canvas); setting it stops the player\n" % go)
             continue
         b = tmp["bake"]
+        if go in live:
+            if not empty:
+                empty.append(add(bytes(4), 1, 1, ""))
+            plan.setdefault("tmp_live", []).append(
+                _tmp_live_glyphs(go, tmp, sp, add, empty[0]))
         for t in sorted(want[go]):
             if t == (tmp.get("text") or ""):
                 rows.append((go, t, int(sp["tex_id"])))
@@ -28427,6 +28493,55 @@ def _tmp_text_variants(plan, analyses):
     plan["tmp_texts"] = rows
 
 
+def _tmp_live_glyphs(go, tmp, sp, add, empty):
+    """The run-time layout of the TMP on *go* (_emit_tmp_text_set): its
+    rect and font metrics, and a white texture per printable ASCII glyph
+    the font has, baked at the largest size the TMP draws at.
+
+    ponytail: ASCII only and one line; a string with a newline or another
+    character stops the player when set."""
+    b = tmp["bake"]
+    font = _load_tmp_font_asset(b["font"])
+    ps = float(font["point_size"]) or 1.0
+    asc, desc = float(font["ascent"]), float(font["descent"])
+    bh0 = max(1, int(round(abs(float(b["box_h"])))))
+    size = float(b["size"])
+    if b.get("auto_size"):
+        size = min(float(b["auto_size"][1]),
+                   bh0 * ps / max(asc - desc, 1e-6))
+    scale = size / ps
+    glyphs = []
+    for c in range(32, 127):
+        gi = font["chars"].get(c)
+        g = font["glyphs"].get(gi) if gi is not None else None
+        if not g:
+            continue
+        w = max(1, int(math.ceil(float(g["w"]) * scale)))
+        h = max(1, int(math.ceil(float(g["h"]) * scale)))
+        tex = -1
+        if float(g["w"]) > 0 and float(g["h"]) > 0:
+            out = bytearray(w * h * 4)
+            _blit_tmp_glyph(out, w, h, font, g, 0.0, 0.0, float(w),
+                            float(h), (1.0, 1.0, 1.0, 1.0))
+            tex = add(bytes(out), w, h, chr(c))
+        glyphs.append((c, tex, float(g["adv"]), float(g["bx"]),
+                       float(g["by"]), float(g["w"]), float(g["h"])))
+    return {
+        "go": go, "empty": empty, "glyphs": glyphs,
+        "bw": max(1, int(round(abs(float(b["box_w"]))))), "bh": bh0,
+        "sx": float(sp.get("draw_sx", 1.0)),
+        "sy": float(sp.get("draw_sy", 1.0)),
+        "fx": float(sp.get("shift_fx", 0.0)),
+        "fy": float(sp.get("shift_fy", 0.0)),
+        "size": float(b["size"]),
+        "auto": tuple(b["auto_size"]) if b.get("auto_size") else None,
+        "h_align": int(tmp.get("h_align") or 1),
+        "v_align": int(tmp.get("v_align") or 256),
+        "wrap": bool(tmp.get("wrap")),
+        "clip": int(tmp.get("overflow_mode") or 0) != 0,
+        "ps": ps, "asc": asc, "desc": desc}
+
+
 _TMP_TEXT_SET_HEAD = ("static void TMP_Text_set_text(int go, const char *s,"
                       " const char *cls, const char *method,"
                       " const char *path, int line)")
@@ -28441,6 +28556,9 @@ def _emit_tmp_text_set(p, plan):
     """`f.text = v;` (_tmp_text_sets): the GO draws the texture baked for
     *s* (_tmp_text_variants); a text not baked for it stops the player."""
     rows = plan.get("tmp_texts") or []
+    live = plan.get("tmp_live") or []
+    if live:
+        _emit_tmp_live(p, live)
     p(_TMP_TEXT_SET_HEAD + " {")
     if rows:
         p("    static const int _go[%d] = { %s };" % (
@@ -28454,10 +28572,147 @@ def _emit_tmp_text_set(p, plan):
     if rows:
         p("    for (k = 0; k < %d; k = k + 1)" % len(rows))
         p("        if (_go[k] == go && strcmp(_s[k], s ? s : \"\") == 0) {")
+        if live:
+            p("            _tl_set(go, 0);")
         p("            Renderer_set_sprite(go, _tex[k]);")
         p("            return;")
         p("        }")
+    if live:
+        p("    if (_tl_set(go, s ? s : \"\")) return;")
     p("    _engine_unlowered_at(\"TMP_Text.text\", path, line);")
+    p("}")
+
+
+def _emit_tmp_live(p, live):
+    """TMP texts set at run time (_tmp_live_glyphs): `_tl_set` keeps the
+    text and swaps the TMP's draw to a transparent one, `_tl_draws` (at the
+    end of engine_collect_draws) adds a quad per glyph over it, laid out as
+    _rasterize_tmp_text lays out one line."""
+    n = len(live)
+    gs = [g for t in live for g in t["glyphs"]]
+    p("static const int _tl_go[%d] = { %s };" % (
+        n, ", ".join(str(t["go"]) for t in live)))
+    p("static const int _tl_empty[%d] = { %s };" % (
+        n, ", ".join(str(t["empty"]) for t in live)))
+    # bw bh sx sy fx fy size lo hi ps asc desc
+    p("static const float _tl_f[%d][12] = { %s };" % (n, ", ".join(
+        "{ %s }" % ", ".join("%sf" % repr(float(v)) for v in (
+            t["bw"], t["bh"], t["sx"], t["sy"], t["fx"], t["fy"], t["size"],
+            (t["auto"] or (0, 0))[0], (t["auto"] or (0, 0))[1], t["ps"],
+            t["asc"], t["desc"])) for t in live)))
+    # h_align v_align auto wrap clip first-glyph glyph-count
+    off = 0
+    ints = []
+    for t in live:
+        ints.append("{ %d, %d, %d, %d, %d, %d, %d }" % (
+            t["h_align"], t["v_align"], 1 if t["auto"] else 0,
+            1 if t["wrap"] else 0, 1 if t["clip"] else 0,
+            off, len(t["glyphs"])))
+        off += len(t["glyphs"])
+    p("static const int _tl_i[%d][7] = { %s };" % (n, ", ".join(ints)))
+    p("static const int _tl_gc[%d] = { %s };" % (
+        len(gs), ", ".join(str(g[0]) for g in gs)))
+    p("static const int _tl_gt[%d] = { %s };" % (
+        len(gs), ", ".join(str(g[1]) for g in gs)))
+    # adv bx by w h (font units)
+    p("static const float _tl_gm[%d][5] = { %s };" % (len(gs), ", ".join(
+        "{ %s }" % ", ".join("%sf" % repr(v) for v in g[2:]) for g in gs)))
+    p("static char _tl_text[%d][128];" % n)
+    p("static int _tl_on[%d];" % n)
+    p("static int _tl_glyph(int k, int c) {")
+    p("    int j;")
+    p("    for (j = _tl_i[k][5]; j < _tl_i[k][5] + _tl_i[k][6]; j = j + 1)")
+    p("        if (_tl_gc[j] == c) return j;")
+    p("    return -1;")
+    p("}")
+    p("/* The size *s* draws at in TMP *k* and its width (rect pixels);")
+    p("   0 when it cannot be drawn: not printable ASCII, or past a rect")
+    p("   that wraps or clips. */")
+    p("static int _tl_layout(int k, const char *s, float *size, float *w) {")
+    p("    const float *f = _tl_f[k];")
+    p("    float adv = 0.f, end = 0.f;")
+    p("    int j, words = 0, gap = 1;")
+    p("    for (j = 0; s[j]; j = j + 1) {")
+    p("        int g;")
+    p("        if (s[j] < 32 || s[j] > 126 || j >= 127) return 0;")
+    p("        if (s[j] != ' ' && gap) words = words + 1;")
+    p("        gap = s[j] == ' ';")
+    p("        g = _tl_glyph(k, s[j]);")
+    p("        if (g < 0) continue;")
+    p("        adv = adv + _tl_gm[g][0];")
+    p("        if (s[j] != ' ') end = adv;")
+    p("    }")
+    p("    *size = f[6];")
+    # ponytail: auto size shrinks one word to the rect's width, as TMP does
+    # before it breaks a word; words that would wrap stop instead
+    p("    if (_tl_i[k][2]) {")
+    p("        float hi = f[1] * f[9] / (f[10] - f[11] > 1e-6f ? f[10] - f[11] : 1e-6f);")
+    p("        if (f[8] < hi) hi = f[8];")
+    p("        *size = hi;")
+    p("        if ((!_tl_i[k][3] || words < 2) && end > 0.f && f[0] * f[9] / end < hi)")
+    p("            *size = f[0] * f[9] / end;")
+    p("        if (*size < f[7]) *size = f[7];")
+    p("    }")
+    p("    *w = end * *size / f[9];")
+    p("    return !((_tl_i[k][3] || _tl_i[k][4]) && *w > f[0] + 1e-3f);")
+    p("}")
+    p("/* *s* drawn live on TMP *go* (0: back to its baked texts); 0 when")
+    p("   *go* has no live text or *s* cannot be drawn. */")
+    p("static int _tl_set(int go, const char *s) {")
+    p("    float size, w;")
+    p("    int k;")
+    p("    for (k = 0; k < %d; k = k + 1) {" % n)
+    p("        if (_tl_go[k] != go) continue;")
+    p("        if (!s) { _tl_on[k] = 0; return 1; }")
+    p("        if (!_tl_layout(k, s, &size, &w)) return 0;")
+    p("        strcpy(_tl_text[k], s);")
+    p("        _tl_on[k] = 1;")
+    p("        Renderer_set_sprite(go, _tl_empty[k]);")
+    p("        return 1;")
+    p("    }")
+    p("    return 0;")
+    p("}")
+    p("static int _tl_draws(EngineDraw *out, int n, int max) {")
+    p("    int n0 = n, d, k, j;")
+    p("    for (d = 0; d < n0; d = d + 1)")
+    p("        for (k = 0; k < %d; k = k + 1) {" % n)
+    p("            const float *f = _tl_f[k];")
+    p("            float size, tw, sc, W, H, ux, uy, ox, oy, vh, top, pen;")
+    p("            if (!_tl_on[k] || _tl_go[k] != out[d].go"
+      " || out[d].tex != _tl_empty[k]) continue;")
+    p("            if (!_tl_layout(k, _tl_text[k], &size, &tw)) continue;")
+    p("            sc = size / f[9];")
+    p("            W = 2.f * out[d].half_w / f[2];")
+    p("            H = 2.f * out[d].half_h / f[3];")
+    p("            ux = W / f[0];")
+    p("            uy = H / f[1];")
+    p("            ox = -f[4] * W - 0.5f * W;")
+    p("            oy = -f[5] * H - 0.5f * H;")
+    p("            vh = (f[10] - f[11]) * sc;")
+    p("            top = _tl_i[k][1] & 1024 ? vh"
+      " : _tl_i[k][1] & 512 ? (f[1] + vh) * 0.5f : f[1];")
+    p("            pen = _tl_i[k][0] & 4 ? f[0] - tw"
+      " : _tl_i[k][0] & 2 ? (f[0] - tw) * 0.5f : 0.f;")
+    p("            for (j = 0; _tl_text[k][j]; j = j + 1) {")
+    p("                int g = _tl_glyph(k, _tl_text[k][j]);")
+    p("                if (g < 0) continue;")
+    p("                if (_tl_gt[g] >= 0 && n < max) {")
+    p("                    const float *m = _tl_gm[g];")
+    p("                    float lx = ox + (pen + (m[1] + 0.5f * m[3]) * sc) * ux;")
+    p("                    float ly = oy + (top - f[10] * sc"
+      " + (m[2] - 0.5f * m[4]) * sc) * uy;")
+    p("                    out[n] = out[d];")
+    p("                    out[n].x = out[d].x + out[d].m00 * lx + out[d].m01 * ly;")
+    p("                    out[n].y = out[d].y + out[d].m10 * lx + out[d].m11 * ly;")
+    p("                    out[n].half_w = 0.5f * m[3] * sc * ux;")
+    p("                    out[n].half_h = 0.5f * m[4] * sc * uy;")
+    p("                    out[n].tex = _tl_gt[g];")
+    p("                    n = n + 1;")
+    p("                }")
+    p("                pen = pen + _tl_gm[g][0] * sc;")
+    p("            }")
+    p("        }")
+    p("    return n;")
     p("}")
 
 
@@ -28478,6 +28733,19 @@ def _trap_tmp_writes(body, plan, site):
                 "TMP_Text_set_text(%s, %s, %s, %s, %s, %d);" % (
                     m.group(1), '""' if m.group(2) == "null" else m.group(2),
                     _c_string(site["class"]),
+                    _c_string(site.get("method") or "?"),
+                    _c_string(site.get("path") or "<cs>"), line)
+            ) + body[m.end():]
+        lgo = {t["go"] for t in plan.get("tmp_live") or []}
+        refs = plan.get("go_field_refs") or {}
+        for m, owner, f in reversed(_tmp_text_live(body, site["class"], plan)):
+            if not lgo & set(refs.get((owner, f)) or []):
+                continue
+            line = ft.count("\n", 0, _body_src_off(
+                ft, at, body, m.start())) + 1 if ft else 0
+            body = body[:m.start()] + (
+                "TMP_Text_set_text(%s, %s, %s, %s, %s, %d);" % (
+                    m.group(1), m.group(4), _c_string(site["class"]),
                     _c_string(site.get("method") or "?"),
                     _c_string(site.get("path") or "<cs>"), line)
             ) + body[m.end():]
@@ -28532,7 +28800,7 @@ def _trap_shallow_calls(body, plan, site):
 
     ponytail: a receiver is typed by name across the file (one type per
     name), and the arguments are not evaluated before the stop."""
-    import tools.unity_pack_common as _cm
+    import tools.unity.unity_pack_common as _cm
     if plan.get("strict") or not site or not _cm.SHALLOW_METHODS:
         return body
     ft = site.get("file_text") or ""
@@ -29115,7 +29383,7 @@ def emit_data(plan, used_apis=None):
     lights = plan.get("lights") or []
     light_cap = len(lights) + light_budget
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    p("/* generated by tools/unity_pack.py — scene tables, compile -O0 */")
+    p("/* generated by tools/unity/unity_pack.py — scene tables, compile -O0 */")
     if plan.get("soa"):
         p("/* SoA: positions live in _Class_pos[N][dims], not in the struct */")
     p("#include <stdint.h>")
@@ -29224,11 +29492,13 @@ def emit_data(plan, used_apis=None):
         for key in sorted(keyboard_keys):
             p("int engine_keyboard_%s = 0;" % key)
     if "InputManager.Using" in used_apis:
-        # Desktop defaults: keyboard+mouse present, no gamepad/phone.
+        # Desktop defaults: keyboard+mouse present, no phone; the host sets
+        # engine_gamepad_connected.
         p("int engine_input_using_keyboard = 1;")
         p("int engine_input_using_mouse = 1;")
-        p("int engine_input_using_gamepad = 0;")
         p("int engine_input_using_phone = 0;")
+        if not plan.get("want_gamepad"):
+            p("int engine_gamepad_connected = 0;")
     if plan.get("want_gamepad"):
         p("/* Host: the first gamepad -- GLFW's layout: buttons A B X Y LB RB")
         p("   Back Start Guide LThumb RThumb Up Right Down Left; axes LX LY RX")
@@ -29731,7 +30001,7 @@ def emit_data(plan, used_apis=None):
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
         if plan.get("gpu_atlas"):
-            import tools.unity_pack_gpu2d as _gpu
+            import tools.unity.unity_pack_gpu2d as _gpu
             _gpu.emit_data(p, plan)
         p("const int _engine_tex_w[%d] = { %s };" % (
             len(textures),
@@ -29932,7 +30202,7 @@ def _init_num(v, kind):
 def emit_main():
     """Headless host so `make` links: tick a second, print draw count."""
     return (
-        "/* generated by tools/unity_pack.py — replace for a real host */\n"
+        "/* generated by tools/unity/unity_pack.py — replace for a real host */\n"
         "#include <stdio.h>\n"
         "#include \"engine_draw.h\"\n"
         "\n"
@@ -30452,7 +30722,7 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     *objects* is extended in place with prefab instances. Returns analyses.
     """
-    import tools.unity_pack_common as _common
+    import tools.unity.unity_pack_common as _common
     _common.SHALLOW_METHODS.clear()
     if _godot.is_godot_project(root):
         return _godot.analyze_scripts(root, objects, analyze_script)
@@ -30650,7 +30920,7 @@ def emit_handles_h(plan):
     """engine_handles.h: the stream layout, for the host that uploads it."""
     streams, total = _handle_streams(plan)
     lines = [
-        "/* generated by tools/unity_pack.py -- packed handles for the GPU */",
+        "/* generated by tools/unity/unity_pack.py -- packed handles for the GPU */",
         "/* Upload engine_upload_handles() into a GLES 3.1 SSBO at binding 1;",
         "   shaders/handles.glsl reads it. OFF and WORDS count 32-bit words. */",
         "#ifndef ENGINE_HANDLES_H",
@@ -30719,7 +30989,7 @@ def emit_handles_glsl(plan):
     3.1 is what has SSBOs and `bitfieldExtract`."""
     streams, total = _handle_streams(plan)
     lines = [
-        "/* generated by tools/unity_pack.py -- packed handles (GLES 3.1+) */",
+        "/* generated by tools/unity/unity_pack.py -- packed handles (GLES 3.1+) */",
         "/* Include after `#version 310 es`. The host uploads",
         "   engine_upload_handles() (%d words) into binding 1. Each accessor"
         % max(1, total),
@@ -30755,7 +31025,7 @@ def emit_soa_positions_glsl(plan):
     """
     lines = []
     p = lines.append
-    p("/* generated by tools/unity_pack.py — SoA position buffer layout */")
+    p("/* generated by tools/unity/unity_pack.py — SoA position buffer layout */")
     p("/* OpenGL / GLSL target. Requires SSBO (std430) or upload as vec4[]. */")
     p("#version 310 es")
     p("precision highp float;")
@@ -31046,7 +31316,7 @@ def _crust_compile_c(text, path, defines=None, analyses=None, source_text=None):
         for d in defines:
             cmd.extend(["-D", d])
         cmd.extend(["-o", obj, src])
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
         if r.returncode != 0:
             err = (r.stderr or r.stdout or "").strip()
@@ -31148,8 +31418,9 @@ def _fingerprint_entries(root, box2d_root=None, coost_root=None):
     """
     root = os.path.abspath(root)
     entries = []
-    tools_dir = os.path.dirname(os.path.abspath(__file__))
-    names = sorted(n for n in os.listdir(tools_dir)
+    unity_dir = os.path.dirname(os.path.abspath(__file__))
+    tools_dir = os.path.dirname(unity_dir)
+    names = sorted("unity/" + n for n in os.listdir(unity_dir)
                    if n.startswith("unity_pack") and n.endswith(".py"))
     for name in names + ["cs2cpp.py", "cpprust.py"]:
         e = _file_fingerprint_entry(os.path.join(tools_dir, name), tools_dir)
@@ -31422,7 +31693,7 @@ def _write_if_different(path, text):
 
 def _cpp_twin(c_text):
     """C emit → C++-subset twin header for cpprust (same as pack())."""
-    head = "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+    head = "/* generated by tools/unity/unity_pack.py — C++ subset for cpprust */\n"
     if not c_text.startswith("/*"):
         return head + c_text
     # one copy: data.c is ~600 MB, and a split then a concat made two
@@ -31449,15 +31720,15 @@ def pack(root, outdir, *args, **kwargs):
     """Pack a Unity (or Godot) project. See `_pack_impl`.
 
     Static helper classes and extension methods are rewritten at the source
-    level first (tools/unity_pack_extensions.py): the analysis and the
+    level first (tools/unity/unity_pack_extensions.py): the analysis and the
     lowering read the rewritten text through `SOURCE_OVERLAY`, and every
     original line stays on its line, so diagnostics point at the author's.
     """
-    import tools.unity_pack_common as _common
-    import tools.unity_pack_extensions as _ext
+    import tools.unity.unity_pack_common as _common
+    import tools.unity.unity_pack_extensions as _ext
     _common.GPU_BATCH[0] = bool(kwargs.pop("gpu_batch", False))
     files = {}
-    import tools.unity_pack_gpu2d as _gpu2d
+    import tools.unity.unity_pack_gpu2d as _gpu2d
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in (
             "Library", "Temp", "Logs", "obj", "Packages", ".godot", ".git")]
@@ -31482,11 +31753,11 @@ def pack(root, outdir, *args, **kwargs):
     _common.FX_USED[0] = bool(_fx_changed)
     overlay = _ext.desugar_project(files) if files else {}
     # Stack / Queue / HashSet, as the List the packer lowers
-    # (tools/unity_pack_collections.py).
-    import tools.unity_pack_collections as _coll
-    import tools.unity_pack_physics as _phys
+    # (tools/unity/unity_pack_collections.py).
+    import tools.unity.unity_pack_collections as _coll
+    import tools.unity.unity_pack_physics as _phys
     _layer_names = _phys.read_layer_names(root)
-    import tools.unity_pack_input as _inp
+    import tools.unity.unity_pack_input as _inp
     _common.SOURCE_INPUT_ACTIONS[:] = []
     _inp.HANDLERS[:] = []
     _inp.ROOTS.clear()
@@ -31530,8 +31801,8 @@ def pack(root, outdir, *args, **kwargs):
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
         t = _coll.desugar_string_switch(t)
-        # Coroutines, as state machines (tools/unity_pack_coroutines.py).
-        import tools.unity_pack_coroutines as _co
+        # Coroutines, as state machines (tools/unity/unity_pack_coroutines.py).
+        import tools.unity.unity_pack_coroutines as _co
         t = _co.desugar_coroutines(t)
         if t != files[fp] or fp in _fx_changed:
             overlay[fp] = t
@@ -31584,12 +31855,12 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
 
     gpu_physics: run the 2D physics on the gpu-physics-engine circle solver
     instead of Box2D-Packed (True, or the checkout's path; also
-    $GPU_PHYSICS_ROOT or ../gpu-physics-engine). See tools/unity_pack_gpu_physics.py.
+    $GPU_PHYSICS_ROOT or ../gpu-physics-engine). See tools/unity/unity_pack_gpu_physics.py.
 
     managed: run whole script classes as managed C# on DotNetAnywhere instead
     of lowering them (implies hybrid): "*" for every script class, or a
     collection of class names. A class whose managed code cannot be built
-    keeps its lowered C (tools/unity_pack_hybrid.py).
+    keeps its lowered C (tools/unity/unity_pack_hybrid.py).
 
     2D physics (Rigidbody2D, Collider2D) is Box2D-Packed: box2d_unity.py from
     the Box2D-Packed checkout at *box2d_root*, $BOX2D_PACKED_ROOT, or a
@@ -31602,7 +31873,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
     if gpu_physics:
-        import tools.unity_pack_gpu_physics as _gpuphys
+        import tools.unity.unity_pack_gpu_physics as _gpuphys
         physics_key = "gpu:" + _gpuphys.fingerprint(gpu_physics)
     if managed:
         hybrid = True
@@ -31834,9 +32105,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     plan["tiles"] = [{k: v for k, v in o["sprite"].items() if k != "tex_rgba"}
                      for o in tiles
                      if o.get("sprite") and "tex_id" in o["sprite"]]
-    import tools.unity_pack_common as _cmn
+    import tools.unity.unity_pack_common as _cmn
     if _cmn.GPU_BATCH[0]:
-        # the 2D GPU path's atlas (tools/unity_pack_gpu2d.py) -- built once
+        # the 2D GPU path's atlas (tools/unity/unity_pack_gpu2d.py) -- built once
         # every texture is in the table (see below)
         plan["_gpu_batch"] = True
     _ensure_texture_guids(
@@ -31847,7 +32118,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         for cl in plan["classes"].values() for f in cl.get("fields") or []
         if f.get("ty") == "Sprite" for o in cl.get("instances") or []}
         - {None}), asset_guids)
-    # a MeshRenderer's material's _MainTex (tools/unity_pack_mesh.py)
+    # a MeshRenderer's material's _MainTex (tools/unity/unity_pack_mesh.py)
     for _o in objects:
         _md = _o.get("mesh_draw")
         if not _md or not _md.get("mat_guid"):
@@ -32016,17 +32287,17 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     if isinstance(managed, str) and managed != "*":
         managed = [m for m in managed.split(",") if m]       # ("A,B", as on the command line)
     plan["managed"] = "*" if managed == "*" else (set(managed) if managed else set())
-    import tools.unity_pack_common as _common
+    import tools.unity.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
     if plan.get("_gpu_batch"):
-        import tools.unity_pack_gpu2d as _gpu
+        import tools.unity.unity_pack_gpu2d as _gpu
         os.makedirs(outdir, exist_ok=True)
         plan["gpu_atlas"] = _gpu.build_atlas(plan.get("textures") or [], outdir, root)
         _gpu.build_lights(plan, _load_sorting_layers(root))
     engine = emit_engine(plan, analyses, used_apis)
-    import tools.unity_pack_hybrid as _hybrid
+    import tools.unity.unity_pack_hybrid as _hybrid
     if plan.get("hybrid"):
-        # a method the lowering left a stub: managed code on DotNetAnywhere where that compiles (tools/unity_pack_hybrid.py)
+        # a method the lowering left a stub: managed code on DotNetAnywhere where that compiles (tools/unity/unity_pack_hybrid.py)
         plan["_root"] = root
         engine = _hybrid.apply(plan, engine, outdir, _report_stub, _progress)
     else:
@@ -32137,7 +32408,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
                       box2d_inject=bool(physics_inject),
                       gpu_physics=bool(gpu_physics and plan.get("box2d_physics"))))
     if plan.get("box2d_physics") and gpu_physics:
-        import tools.unity_pack_gpu_physics as _gpuphys
+        import tools.unity.unity_pack_gpu_physics as _gpuphys
         _gpuphys.emit(outdir, plan, gpu_physics)
         for stale in ("physics_box2d.c", "box2d_inject.json"):
             if os.path.exists(os.path.join(outdir, stale)):

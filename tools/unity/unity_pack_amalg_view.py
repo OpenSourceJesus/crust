@@ -8,7 +8,7 @@ Crust's wasm back end compiles a single translation unit. This stitches:
   data.c         (arrays only; structs already in engine.c)
   gles2_view.c   (with #include \"engine_draw.h\" removed)
 
-    python3 tools/unity_pack_amalg_view.py /tmp/upack \\
+    python3 tools/unity/unity_pack_amalg_view.py /tmp/upack \\
         examples/unity_pack/gles2_view.c -o /tmp/upack/amalg.c
 """
 
@@ -59,7 +59,7 @@ def main() -> int:
                         "/* engine_draw.h already included above */")
 
     out = []
-    out.append("/* amalgamated by tools/unity_pack_amalg_view.py — do not edit */\n")
+    out.append("/* amalgamated by tools/unity/unity_pack_amalg_view.py — do not edit */\n")
     out.append(header)
     out.append("\n")
     out.append(engine)

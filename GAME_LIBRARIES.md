@@ -5,7 +5,7 @@ it by *generating an engine*: every Unity or Godot API a project uses is
 emulated by C that the packer writes for that project -- the transform tables,
 the GameObject tables, physics glue, input, UI, strings, coroutines. That code
 lives in the packers as Python that prints C, and there is a lot of it: about
-46,000 lines across `tools/unity_pack*.py` and `tools/godot_pack.py`
+46,000 lines across `tools/unity/unity_pack*.py` and `tools/godot_pack.py`
 (`unity_pack.py` alone is about 27,000). Every new API is more of it, and each
 one is written twice -- once as the C it should become, once as the Python that
 prints that C for each shape of project.
@@ -30,7 +30,7 @@ ways that keep it plain C# that Unity compiles as before: its README has a
 | [Box2D-Packed](https://github.com/crustos/box2d) | 2D physics: bodies, shapes, joints, contacts -- already the backend of unity_pack's and godot_pack's Rigidbody2D | **exists** |
 | [coost](https://github.com/crustos/coost) | the runtime underneath: strings (`fastring`), JSON, files, TCP / HTTP | **exists** |
 | [Futile](https://github.com/crustos/Futile) | a code-centric 2D scene graph and batched sprite renderer: nodes, containers, sprites, labels, atlases, touch | **planned** (3 of 66 scripts translate) |
-| [Unity-2D-Destruction](https://github.com/crustos/Unity-2D-Destruction) | fracturing sprites into physics fragments (Delaunay / Voronoi, Clipper) | **in progress** (9 runtime files translate; tested in `tools/unity_pack_test_fast.py`) |
+| [Unity-2D-Destruction](https://github.com/crustos/Unity-2D-Destruction) | fracturing sprites into physics fragments (Delaunay / Voronoi, Clipper) | **in progress** (9 runtime files translate; tested in `tools/unity/unity_pack_test_fast.py`) |
 | [DTerrain](https://github.com/crustos/DTerrain) | destructible, paintable bitmap terrain with colliders | **planned** (8 of 28 scripts translate) |
 
 Together they cover the things small 2D games are made of: drawing, a scene
@@ -256,7 +256,7 @@ silently.
 
 The translations are checked against the real thing: the C# subset against
 Mono (`tests/test_csrust.py`), the packers against Unity's and Godot's
-documented semantics (`tools/unity_pack_test_fast.py`,
+documented semantics (`tools/unity/unity_pack_test_fast.py`,
 `tools/godot_pack_test_fast.py`). An optimisation adds a test that packs a
 project with and without it and compares what the game does.
 

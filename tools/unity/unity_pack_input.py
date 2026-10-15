@@ -459,7 +459,7 @@ def engine_tables(actions):
     nb = max(1, len(binds))
     out = []
     p = out.append
-    p("/* The Input System's InputActions (code-defined; tools/unity_pack_input.py) */")
+    p("/* The Input System's InputActions (code-defined; tools/unity/unity_pack_input.py) */")
     starts, counts = [], []
     for a in range(len(actions)):
         rows = [b for b in binds if b[0] == a]

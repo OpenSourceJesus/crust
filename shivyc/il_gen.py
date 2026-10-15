@@ -19,6 +19,9 @@ class ILCode:
         """Initialize IL code."""
         self.commands = {}
         self.cur_func = None
+        # A throwaway copy (`copy_code`) that a type is probed on: nodes do
+        # not cache lvalues built in it, which only it defines.
+        self.probe = False
         # Range of the source construct currently being lowered. Every command
         # added while it is set inherits it, which is how the IL acquires
         # source positions without each of the ~100 emit sites passing one.
@@ -58,6 +61,7 @@ class ILCode:
         original.
         """
         new = ILCode()
+        new.probe = True
         new.commands = {name: self.commands[name].copy()
                         for name in self.commands}
         new.cur_func = self.cur_func

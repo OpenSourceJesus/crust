@@ -45,7 +45,7 @@ eval "$(
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - <<PY
 import os, sys
 sys.path.insert(0, "$ROOT")
-import tools.unity_pack as up
+import tools.unity.unity_pack as up
 root = "$PROJECT"
 outdir = os.environ.get("OUT") or up.default_pack_dir(root)
 _c, product = up.player_identity(root)
@@ -57,7 +57,7 @@ PY
 
 echo "== packing $PROJECT → $OUT =="
 PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -u "$ROOT/tools/unity_pack.py" "$PROJECT" -o "$OUT" "${LAYOUT[@]}"
+  python3 -u "$ROOT/tools/unity/unity_pack.py" "$PROJECT" -o "$OUT" "${LAYOUT[@]}"
 
 if [[ ! -x "$EXE" ]]; then
   echo "unity_pack did not produce executable: $EXE" >&2

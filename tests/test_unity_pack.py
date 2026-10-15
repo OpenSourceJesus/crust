@@ -31,7 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-import tools.unity_pack as unity_pack  # noqa: E402
+import tools.unity.unity_pack as unity_pack  # noqa: E402
 
 # MiniScene, the small board-and-coins project the emit tests pack. The copy in
 # examples/ is scripts-only (see .gitignore), so the tests use this complete one.
@@ -51,7 +51,7 @@ needs_coost = unittest.skipUnless(
 
 def _gpu_physics_root():
     try:
-        import tools.unity_pack_gpu_physics as g
+        import tools.unity.unity_pack_gpu_physics as g
         return g.find_root()
     except Exception:
         return None
@@ -2374,7 +2374,7 @@ class TestSoa(unittest.TestCase):
 
     def test_soa_cli_removed_aos_flag(self):
         r = subprocess.run(
-            [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
+            [sys.executable, os.path.join(ROOT, "tools", "unity", "unity_pack.py"),
              "--soa", tempfile.mkdtemp(prefix="upack-empty-"),
              "-o", tempfile.mkdtemp(prefix="upack-soa-gone-")],
             capture_output=True, text=True)
@@ -2383,7 +2383,7 @@ class TestSoa(unittest.TestCase):
         root = self._tiny_moving_project()
         d_aos = tempfile.mkdtemp(prefix="upack-aos-cli-")
         r = subprocess.run(
-            [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
+            [sys.executable, os.path.join(ROOT, "tools", "unity", "unity_pack.py"),
              root, "-o", d_aos, "--aos"],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -2392,7 +2392,7 @@ class TestSoa(unittest.TestCase):
             self.assertNotIn("_Host_pos[", f.read())
         d_soa = tempfile.mkdtemp(prefix="upack-soa-cli-")
         r = subprocess.run(
-            [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
+            [sys.executable, os.path.join(ROOT, "tools", "unity", "unity_pack.py"),
              root, "-o", d_soa],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -2599,7 +2599,7 @@ class TestBox2DIntegration(unittest.TestCase):
     @needs_box2d
     @needs_coost
     def test_triggers_and_rigidbody_api(self):
-        import tools.unity_pack_features as F
+        import tools.unity.unity_pack_features as F
         tmp = tempfile.mkdtemp(prefix="upack-b2d-it-")
         ok, report = F.run_project("box2d", F.box2d_project, tmp, False)
         self.assertTrue(ok, "\n".join(report))
@@ -2609,7 +2609,7 @@ class TestBox2DIntegration(unittest.TestCase):
     def test_same_through_physics_inject(self):
         # --physics-inject: triggers came from sensor event arrays only, and
         # stayed silent there; injected now, as the contacts are.
-        import tools.unity_pack_features as F
+        import tools.unity.unity_pack_features as F
         tmp = tempfile.mkdtemp(prefix="upack-b2d-inj-")
         ok, report = F.run_project("box2d-inject", F.box2d_project, tmp, False,
                                    inject=True)
@@ -2624,7 +2624,7 @@ class TestGpuPhysics(unittest.TestCase):
 
     @needs_coost
     def test_scene_runs_on_the_gpu_solver(self):
-        import tools.unity_pack_features as F
+        import tools.unity.unity_pack_features as F
         tmp = tempfile.mkdtemp(prefix="upack-gpu-")
         ok, report = F.run_project("gpu", F.gpu_physics_project, tmp, False, gpu_physics=_GPU_ROOT)
         self.assertTrue(ok, "\n".join(report))
@@ -2634,14 +2634,14 @@ class TestGpuPhysics(unittest.TestCase):
     @needs_coost
     def test_joints_and_kinematic_platform(self):
         # a hinge pendulum holds its length, a rope goes taut, a kinematic platform lifts a ball
-        import tools.unity_pack_features as F
+        import tools.unity.unity_pack_features as F
         tmp = tempfile.mkdtemp(prefix="upack-gpu-j-")
         ok, report = F.run_project("gpu", F.gpu_joints_project, tmp, False, gpu_physics=_GPU_ROOT)
         self.assertTrue(ok, "\n".join(report))
 
     @needs_coost
     def test_unmapped_joints_are_refused(self):
-        import tools.unity_pack_features as F
+        import tools.unity.unity_pack_features as F
         tmp = tempfile.mkdtemp(prefix="upack-gpu-no-")
         F.box2d_project(os.path.join(tmp, "p"))
         with self.assertRaises(unity_pack.PackError) as cm:
@@ -2654,7 +2654,7 @@ class TestPositionAssignInUnbracedIf(unittest.TestCase):
     first stayed under the `if`: every instance of the class had its y (and z) set."""
 
     def test_assignment_stays_under_the_if(self):
-        import tools.unity_pack as up
+        import tools.unity.unity_pack as up
         out = up._rewrite_new_vector_assigns(
             "if (mode == 2) transform.position = new Vector3(-3f, 7f, 0f);\nelse x = 1;", "M", two_d=False)
         self.assertIn("if (mode == 2) { M_set_pos_x(i, (-3f)); M_set_pos_y(i, (7f)); M_set_pos_z(i, (0f)); }", out)
@@ -2695,12 +2695,12 @@ class TestAuthoredZeroValues(unittest.TestCase):
 
 
 class TestExtensionDesugar(unittest.TestCase):
-    """tools/unity_pack_extensions.py on its own: no pack, no compiler."""
+    """tools/unity/unity_pack_extensions.py on its own: no pack, no compiler."""
 
     def test_native_set_world_scale_chain_is_left_alone(self):
         # SetX / SetZ inside SetWorldScale(..) are the packer's own; a
         # project's SetZ anywhere else is an extension call like any other.
-        import tools.unity_pack_extensions as X
+        import tools.unity.unity_pack_extensions as X
         ext = ("public static class Extensions {\n"
                "    public static Vector2 SetZ(this Vector2 v, float z)"
                " { return v; }\n"
@@ -2714,7 +2714,7 @@ class TestExtensionDesugar(unittest.TestCase):
         self.assertIn("Vector2 q = Extensions.SetZ(v, 2);", out)
 
     def test_extension_block_keeps_every_line(self):
-        import tools.unity_pack_extensions as X
+        import tools.unity.unity_pack_extensions as X
         src = ("public static class U\n{\n    extension (GameObject go)\n"
                "    {\n        public bool On => go.activeSelf;\n"
                "        public int Twice(int n) { return n * 2; }\n    }\n}\n")
@@ -2725,7 +2725,7 @@ class TestExtensionDesugar(unittest.TestCase):
 
 
 class TestRuntimeApis(unittest.TestCase):
-    """tools/unity_pack_runtime.py: Mathf, Random, Parse, Path, bools as
+    """tools/unity/unity_pack_runtime.py: Mathf, Random, Parse, Path, bools as
     C# prints them, and `new string[n]` -- packed, built and run."""
 
     def _run(self, body, fields=""):
@@ -2802,7 +2802,7 @@ class TestRuntimeApis(unittest.TestCase):
         self.assertEqual(out[:5], ["True", "6", "6", "-1", "-4"])
 
     def test_null_conditional_desugar_text(self):
-        import tools.unity_pack_collections as C
+        import tools.unity.unity_pack_collections as C
         self.assertEqual(C.desugar_null_conditional("x = a?.b?.c ?? 7;"),
                          "x = (a != null && a.b != null ? a.b.c : 7);")
         self.assertEqual(C.desugar_null_conditional("a?.b?.Go();"),
@@ -3352,7 +3352,7 @@ class TestOwnedStrings(unittest.TestCase):
         # coost is an optional checkout: nothing changes for a project
         # that does not use it, even with no checkout to be found.
         real = unity_pack.find_coost_root
-        import tools.unity_pack_common as common
+        import tools.unity.unity_pack_common as common
         unity_pack.find_coost_root = common.find_coost_root = lambda *a: None
         try:
             d = tempfile.mkdtemp(prefix="upack-nocoost-")
@@ -3365,7 +3365,7 @@ class TestOwnedStrings(unittest.TestCase):
             unity_pack.find_coost_root = common.find_coost_root = real
 
     def test_a_missing_checkout_is_an_error_naming_the_option(self):
-        import tools.unity_pack_common as common
+        import tools.unity.unity_pack_common as common
         real = common.find_coost_root
         common.find_coost_root = lambda *a: None
         try:
@@ -6290,7 +6290,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Move", cm.exception.message)
         # Supported WriteAllText / AppendAllText / WriteAllBytes /
         # ReadAllBytes / Exists / Delete / CreateText / OpenText / Copy, and
-        # ReadAllText / ReadAllLines (tools/unity_pack_runtime.py).
+        # ReadAllText / ReadAllLines (tools/unity/unity_pack_runtime.py).
         for ok in ('ReadAllText("a.txt")', 'ReadAllLines("a.txt")'):
             unity_pack.analyze_script(
                 path, src.replace('Move("a.txt", "b.txt")', ok))
@@ -6902,7 +6902,7 @@ class TestSystems(unittest.TestCase):
     def test_transform_unsupported_member_is_cs1061(self):
         """A real Transform member the pack does not lower -> CS8000 "not
         packed yet" (not undeclared, and not CS1061: DetachChildren exists).
-        An invented member keeps CS1061 (tools/unity_pack_test_fast.py)."""
+        An invented member keeps CS1061 (tools/unity/unity_pack_test_fast.py)."""
         src = (
             "using UnityEngine;\n"
             "\n"
@@ -8854,13 +8854,16 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Assets", assets[font])
 
     def test_gles_host_draw_tex_limits_cover_large_ui(self):
-        """Host MAX_DRAWS/MAX_TEX must fit menus with 100+ UI sprites/textures."""
-        for name in ("gles2_window.c", "gles2_view.c"):
+        """Hosts fit menus with 100+ UI sprites and upload every texture: a
+        pack's runtime TMP variants come last (Slime Jump's tips are 675 of
+        771), so a fixed texture cap drops exactly those."""
+        for name in ("gles2_window.c", "gles2_view.c", "gles3_render.h"):
             path = os.path.join(ROOT, "examples", "unity_pack", name)
             with open(path) as f:
                 src = f.read()
             self.assertRegex(src, r"#define MAX_DRAWS\s+4096")
-            self.assertRegex(src, r"#define MAX_TEX\s+512")
+            self.assertNotIn("MAX_TEX", src)
+            self.assertRegex(src, r"calloc\(\(size_t\)\w*tex_n")
 
     def test_sprite_mode_multiple_crops_by_file_id(self):
         """Multiple spriteMode: Image fileID selects spriteSheet rect, not full PNG."""
@@ -15342,7 +15345,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
 
     def test_refuses_input_action_and_ui_invent(self):
-        # (InputAction is supported now: tools/unity_pack_input.py)
+        # (InputAction is supported now: tools/unity/unity_pack_input.py)
         cases = [
             (
                 "using UnityEngine;\n"
@@ -16811,7 +16814,7 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="upack-b2d-none-")
         old = os.environ.pop("BOX2D_PACKED_ROOT", None)
         # Patch where _load_box2d_unity looks it up (unity_pack_physics).
-        import tools.unity_pack_physics as physics
+        import tools.unity.unity_pack_physics as physics
         find = physics.find_box2d_root
         physics.find_box2d_root = lambda box2d_root=None: None
         try:
@@ -17814,6 +17817,34 @@ class TestSceneManager(unittest.TestCase):
             engine = f.read()
         body = engine[engine.index("static void User_Update"):]
         self.assertIn("engine_input_using_mouse", body[:body.index("}")])
+
+    def test_input_manager_using_gamepad_is_the_host_gamepad(self):
+        root = self._project(
+            {"InputManager": "using UnityEngine;\n"
+                             "public class InputManager : MonoBehaviour {\n"
+                             "    public static bool UsingGamepad {\n"
+                             "        get { return false; }\n"
+                             "    }\n"
+                             "    public int n;\n}\n",
+             "User": "using UnityEngine;\n"
+                     "public class User : MonoBehaviour {\n"
+                     "    public int n;\n"
+                     "    void Update() {\n"
+                     "        if (InputManager.UsingGamepad) n = n + 1;\n"
+                     "    }\n}\n"},
+            [("Only", [("I", "InputManager"), ("U", "User")])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        body = engine[engine.index("static void User_Update"):]
+        self.assertIn("engine_gamepad_connected", body[:body.index("}")])
+        r = subprocess.run([_CC, "-w", "-o", os.path.join(d, "a.out")]
+                           + [os.path.join(d, s) for s in ("engine.c", "data.c", "main.c")]
+                           + ["-lm"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
 
     def test_single_scene_without_scene_manager_has_no_scene_runtime(self):
         root = self._project(

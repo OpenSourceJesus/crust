@@ -151,9 +151,6 @@ extern const char engine_product_name[];
 #ifndef MAX_DRAWS
 #define MAX_DRAWS 4096
 #endif
-#ifndef MAX_TEX
-#define MAX_TEX 512
-#endif
 /* xy + rgba + uv */
 #define VERT_STRIDE 8
 #define MAX_FLOATS (6 * VERT_STRIDE)
@@ -183,7 +180,7 @@ static const char *FRAG_SRC =
 static GLfloat vert_buf[MAX_FLOATS];
 static GLuint prog;
 static GLuint vbo;
-static GLuint gl_tex[MAX_TEX];
+static GLuint *gl_tex;
 static int tex_n;
 static GLint u_tex_loc;
 static float world_left, world_right, world_bottom, world_top;
@@ -344,8 +341,9 @@ static int upload_textures(void)
 {
     int i;
     tex_n = engine_texture_count();
-    if (tex_n > MAX_TEX)
-        tex_n = MAX_TEX;
+    gl_tex = tex_n > 0 ? (GLuint *)calloc((size_t)tex_n, sizeof(GLuint)) : 0;
+    if (tex_n > 0 && !gl_tex)
+        return 0;
     {
         static const unsigned char white[4] = { 255, 255, 255, 255 };
         glGenTextures(1, &white_tex);

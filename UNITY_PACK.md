@@ -1,6 +1,6 @@
 # UNITY_PACK — packed engine from a Unity (or Godot) subset
 
-`tools/unity_pack.py` reads a project, looks at **which Unity C# API
+`tools/unity/unity_pack.py` reads a project, looks at **which Unity C# API
 the scripts actually call** and **how many objects the scene places**,
 then emits two C files:
 
@@ -199,20 +199,20 @@ per platform. See the comments in the generated compilers.
 ## CLI
 
 ```
-python3 tools/unity_pack.py examples/unity_pack/MiniScene
+python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene
 # sources + player → $TMPDIR/MiniScene/MiniScene
 # (Windows: MiniScene.exe). -o <dir> overrides the directory only.
 
-python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
+python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
 /tmp/upack/MiniScene
 
-python3 tools/unity_pack.py <project> --strict   # a stub is an error
-python3 tools/unity_pack_test_fast.py            # newer fixes' tests, ~seconds
-python3 tools/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
-python3 tools/unity_pack.py <project> --coost PATH   # coost checkout (string locals)
-python3 tools/unity_pack.py <project> --hybrid       # a method that cannot be lowered runs managed
-python3 tools/unity_pack.py <project> --managed      # every script class runs managed
-python3 tools/unity_pack.py <project> --managed=Player,Ball   # only these
+python3 tools/unity/unity_pack.py <project> --strict   # a stub is an error
+python3 tools/unity/unity_pack_test_fast.py            # newer fixes' tests, ~seconds
+python3 tools/unity/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
+python3 tools/unity/unity_pack.py <project> --coost PATH   # coost checkout (string locals)
+python3 tools/unity/unity_pack.py <project> --hybrid       # a method that cannot be lowered runs managed
+python3 tools/unity/unity_pack.py <project> --managed      # every script class runs managed
+python3 tools/unity/unity_pack.py <project> --managed=Player,Ball   # only these
 ```
 
 ### Managed code on DotNetAnywhere (`--hybrid`, `--managed`)
@@ -231,8 +231,8 @@ lowered: ...`), so `--managed` never makes a pack that worked worse.
 
 State is held once, natively: the managed class is a handle on the object's
 index, and its fields are properties over the same packed arrays the lowered
-code uses (`tools/unity_pack_hybrid.py`, the managed `UnityEngine` is
-`tools/unity_pack_managed/UnityShim.cs`). Instance and static methods and
+code uses (`tools/unity/unity_pack_hybrid.py`, the managed `UnityEngine` is
+`tools/unity/unity_pack_managed/UnityShim.cs`). Instance and static methods and
 overloads cross the boundary, with number and bool parameters and returns;
 `transform.position` (the world one, composed through script parents by the
 engine's own helpers; 2D classes read z as 0), `localPosition`, `parent` (null
@@ -347,7 +347,7 @@ examples/unity_pack/run_gles2_wasm.sh         # soft GLES under node
 
 `engine_draw.h` is written next to `engine.c` so the viewer stays in sync
 with the typedef. Wasm builds one amalgamated TU via
-`tools/unity_pack_amalg_view.py` (the wasm back end does not link multiple
+`tools/unity/unity_pack_amalg_view.py` (the wasm back end does not link multiple
 files). The windowed hosts need `glfw3` and a display; they are not part
 of the headless test path. Building a viewer *with crust* fails today for
 any scene with a Camera: crust ignores `__attribute__((weak))` on
@@ -373,10 +373,10 @@ with `-O3 -fno-math-errno` so `sinf`/`cosf`/`sqrtf` loops can autovec.
 or AoS gather benchmarks:
 
 ```
-python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/soa
-python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/aos --aos
-python3 tools/unity_pack_bench_upload.py      # packed SoA vs AoS (MiniScene)
-python3 tools/unity_pack_bench_csharp.py      # C SoA vs C# class AoS gather
+python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene -o /tmp/soa
+python3 tools/unity/unity_pack.py examples/unity_pack/MiniScene -o /tmp/aos --aos
+python3 tools/unity/unity_pack_bench_upload.py      # packed SoA vs AoS (MiniScene)
+python3 tools/unity/unity_pack_bench_csharp.py      # C SoA vs C# class AoS gather
 ```
 
 `unity_pack_bench_csharp.py` times the same CPU-side upload shape the
@@ -500,7 +500,7 @@ the initializer forms are in *Runtime* below. A `string[]` field and a
 
 **Equality.** `a == b` and `a != b` on strings compare their text, as C#
 does -- `_cs_str_Equals`, from the typed expression pass
-(`tools/unity_pack_vectors.py`) that also lowers Vector2 operators: an
+(`tools/unity/unity_pack_vectors.py`) that also lowers Vector2 operators: an
 operand is a string when it is a literal, a string local, field or
 parameter, a `.c_str()`, a concatenation or a call the engine says returns
 one. They compared pointers, true only when the compiler happened to merge
@@ -524,12 +524,12 @@ into, and the engine's `#ifndef CRUST_NO_POSIX_MKDIR` belongs to the
 compiler.) The checkout's files are part of the pack's input fingerprint.
 
 `TestOwnedStrings` packs, builds and runs each case, and so does
-`tools/unity_pack_features.py` (below).
+`tools/unity/unity_pack_features.py` (below).
 
 ## Runtime: `Mathf`, `Random`, `Parse`, `Path`, `Directory`, `File` reads, `StringBuilder`, `JsonUtility`
 
 Common .NET and Unity static APIs are one table,
-`tools/unity_pack_runtime.py`: each C# spelling maps to an engine helper,
+`tools/unity/unity_pack_runtime.py`: each C# spelling maps to an engine helper,
 its C (in the subset cpprust lowers) and its result type, so the typed
 concatenation and `Debug.Log` format a result as they format anything else.
 Only the helpers a pack uses are emitted, with the ones they call.
@@ -615,7 +615,7 @@ culture's general form, `MM/dd/yyyy HH:mm:ss`, not the machine's culture.
 A `static class` has no instances, so there is nothing to pack it as;
 until now any call into one (`Util.Twice(hp)`) left the calling method a
 stub. They are rewritten at the source level first
-(`tools/unity_pack_extensions.py`), and the analysis and the lowering read
+(`tools/unity/unity_pack_extensions.py`), and the analysis and the lowering read
 the rewritten text (`SOURCE_OVERLAY` in `unity_pack_common`):
 
 * a C# 14 extension block -- `extension (GameObject go) { .. }` -- becomes
@@ -713,7 +713,7 @@ positions (their rotation and scale are not applied).
 ## Collections: Stack, Queue, HashSet, List members, `T[,]`
 
 `Stack<T>`, `Queue<T>` and `HashSet<T>` were refused; they are rewritten at
-the source level (`tools/unity_pack_collections.py`, in the same overlay as
+the source level (`tools/unity/unity_pack_collections.py`, in the same overlay as
 the extension methods) into the `List<T>` the packer lowers -- so locals,
 instance fields, statics and every element type the list lowering has work
 for them too:
@@ -761,7 +761,7 @@ parameter is left for the stub check.
 ## Coroutines
 
 An `IEnumerator` method of a MonoBehaviour that `yield`s is rewritten at
-the source level (`tools/unity_pack_coroutines.py`) into a state machine
+the source level (`tools/unity/unity_pack_coroutines.py`) into a state machine
 of private fields and methods of its class -- things the packer lowers
 like any other:
 
@@ -800,7 +800,7 @@ a `Coroutine` kept in a variable.
 
 In a file that builds, converts or hashes bytes -- `Encoding`, `Convert`'s
 Base64, `MD5` / `SHA256`, `BitConverter`, or a sized `new byte[n]` -- a
-`byte[]` is a `List<byte>` (`tools/unity_pack_collections.py`), and the
+`byte[]` is a `List<byte>` (`tools/unity/unity_pack_collections.py`), and the
 byte APIs are runtime helpers over it:
 
 | C# | |
@@ -832,7 +832,7 @@ kept in a variable -- is left as written, and the method is reported.
 ## Vector2 arithmetic
 
 `Vector2` locals, parameters and results are the engine's C struct, and C
-has no operators on structs. `tools/unity_pack_vectors.py` types each
+has no operators on structs. `tools/unity/unity_pack_vectors.py` types each
 expression of a lowered method -- a `Vector2` local or parameter,
 `Vector2_make(..)` (a packed Vector2 field, a `new Vector2`), a helper or a
 project method that returns one -- and lowers every operator with a
@@ -851,7 +851,7 @@ workgroup memory on a GPU, are plain C). The checkout is `PATH`, `$GPU_PHYSICS_R
 `../gpu-physics-engine`; `pack(..., gpu_physics=True | PATH)` is the API.
 
 ```
-python3 tools/unity_pack.py MyGame --gpu-physics ../gpu-physics-engine -o out
+python3 tools/unity/unity_pack.py MyGame --gpu-physics ../gpu-physics-engine -o out
 ```
 
 `unity_glue.py` in the engine generates `physics_gpu.c` for the same `engine_box2d_*` contract
@@ -1087,7 +1087,7 @@ aliases: buttonSouth / aButton / crossButton ..; the triggers press past
 triggers and dpad `ReadValue()`; `var gp = Gamepad.current; if (gp == null)
 ..` works (it was refused).
 
-**InputAction** (tools/unity_pack_input.py): an action's bindings are
+**InputAction** (tools/unity/unity_pack_input.py): an action's bindings are
 resolved when the project is packed -- the code's (`new InputAction(binding:
 ..)`, `AddBinding`, `AddCompositeBinding("2DVector" / "1DAxis").With(..)`),
 or, for none, the Inspector's (the scene's `m_SingletonActionBindings`) --
@@ -1104,7 +1104,7 @@ the pack can read is reported. Interactions, processors, action assets and
 PlayerInput are not read. (A multi-name field declaration, `int a, b;`,
 still declares the first name alone.)
 
-**AnimationCurve** (tools/unity_pack_curves.py): a script's curve field,
+**AnimationCurve** (tools/unity/unity_pack_curves.py): a script's curve field,
 `public AnimationCurve speed;`, is read from the scene -- its keys (time,
 value, in / out slope) and its wrap modes -- into one table of every curve,
 and `speed.Evaluate(t)` / `speed.length` are Unity's: between two keys the
@@ -1159,7 +1159,7 @@ used to get CS1061, `Translate` included. The runtime helpers a method uses
 only with string concatenation, and an engine without it failed with
 `undeclared identifier`.
 
-**LineRenderer** (tools/unity_pack_lines.py): its points (`m_Positions`,
+**LineRenderer** (tools/unity/unity_pack_lines.py): its points (`m_Positions`,
 in world space, or offset by its GameObject's position in local space), its
 width (`widthMultiplier` times `widthCurve`, through the AnimationCurve table)
 and its color (`colorGradient`: Blend, linear between keys and clamped at the
@@ -1179,7 +1179,7 @@ scaled GameObject, and a PerceptualBlend gradient. The component used to be
 dropped without a word: the scene reader's list of component kinds did not
 name it.
 
-**ParticleSystem** (tools/unity_pack_particles.py): the component's main,
+**ParticleSystem** (tools/unity/unity_pack_particles.py): the component's main,
 emission and shape modules are read -- lifetime, speed, size and color (a
 constant, or random between two; a curve's scalar), gravity modifier,
 duration, looping, play on awake, simulation space and speed, rate over
@@ -1258,7 +1258,7 @@ local, parameter) is an `int` -- a field's scene value is its `m_Bits` --
 an unknown name is no bit / -1). A `RaycastHit2D` is a bool wherever C#
 converts it: `if (hit)`, `hit ? a : b`, `hit && ..`.
 
-## Fast feature check: `tools/unity_pack_features.py`
+## Fast feature check: `tools/unity/unity_pack_features.py`
 
 The full suite packs a few hundred projects and takes most of a quarter
 hour. For the features being added now there is a fast check: it packs one
@@ -1267,10 +1267,10 @@ physics scene, each holding every feature under test, builds and runs them,
 and compares what they print with what C# prints. About half a minute.
 
 ```
-python3 tools/unity_pack_features.py              # unity, godot, box2d
-python3 tools/unity_pack_features.py godot -v     # one project, every line
-python3 tools/unity_pack_features.py --keep       # keep the packed projects
-python3 tools/unity_pack_features.py --asan       # players under ASan + UBSan
+python3 tools/unity/unity_pack_features.py              # unity, godot, box2d
+python3 tools/unity/unity_pack_features.py godot -v     # one project, every line
+python3 tools/unity/unity_pack_features.py --keep       # keep the packed projects
+python3 tools/unity/unity_pack_features.py --asan       # players under ASan + UBSan
 ```
 
 Each check is a C# method of its own, called from `Start`, printing lines
@@ -1293,7 +1293,7 @@ Fixture: `examples/unity_pack/SystemsScene`.
 
 ## Source layout
 
-`tools/unity_pack.py` is split by subsystem. Each module holds whole
+`tools/unity/unity_pack.py` is split by subsystem. Each module holds whole
 functions moved out of it unchanged, and unity_pack re-exports every name,
 so `unity_pack.<name>` keeps working for callers and tests. Modules import
 only the ones above them in this list:
@@ -1494,14 +1494,14 @@ a `SetActive` line only if that line is itself lowered (one inside a
 lambda had carried the lambda into the C). `TestStubDiagnostics` pins
 each.
 
-**The gate: `tools/unity_pack_golden.py`.** Every step of the move must
+**The gate: `tools/unity/unity_pack_golden.py`.** Every step of the move must
 leave the packed output exactly as it was, or change it on purpose and
 show where:
 
 ```
-python3 tools/unity_pack_golden.py check      # re-pack every case, compare
-python3 tools/unity_pack_golden.py check -v   # ... with diffs
-python3 tools/unity_pack_golden.py record     # after an intended change
+python3 tools/unity/unity_pack_golden.py check      # re-pack every case, compare
+python3 tools/unity/unity_pack_golden.py check -v   # ... with diffs
+python3 tools/unity/unity_pack_golden.py record     # after an intended change
 ```
 
 The corpus is every `unity_pack.pack(..)` call `tests/test_unity_pack.py`
@@ -1526,7 +1526,7 @@ the cache and are checked when present.
 [crustos/Unity-2D-Destruction](https://github.com/crustos/Unity-2D-Destruction)
 is the crust port of the Unity 2D Destruction library (its runtime scripts; the
 Editor code is not part of it). Clone it beside crust; the fast tests then
-check it (`TestUnity2DDestruction` in `tools/unity_pack_test_fast.py`, or set
+check it (`TestUnity2DDestruction` in `tools/unity/unity_pack_test_fast.py`, or set
 `UNITY_2D_DESTRUCTION`).
 
 The parts:

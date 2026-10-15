@@ -2,7 +2,7 @@
 """unity_pack: Physics: Rigidbody / Rigidbody2D / Collider tables, physics materials, collision
 messages, and the Box2D-Packed checkout (box2d_unity.py) for 2D physics.
 
-Moved out of tools/unity_pack.py unchanged; unity_pack re-exports every name
+Moved out of tools/unity/unity_pack.py unchanged; unity_pack re-exports every name
 here, so `unity_pack.<name>` keeps working."""
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import copy
 import tools.cs2cpp as cs2cpp  # noqa: E402
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-from tools.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
 
 __all__ = [
     '_COLLISION2D_MSGS',
@@ -807,7 +807,7 @@ def find_box2d_root(box2d_root=None):
     directory beside this repository. None when there is none."""
     candidates = [box2d_root, os.environ.get("BOX2D_PACKED_ROOT"),
                   os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                      os.path.abspath(__file__)))), "box2d")]
+                      os.path.dirname(os.path.abspath(__file__))))), "box2d")]
     for c in candidates:
         if c and os.path.isfile(os.path.join(c, "box2d_unity.py")):
             return os.path.abspath(c)

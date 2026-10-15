@@ -5,9 +5,9 @@ time, by `tools/cs2cpp.py`. Each step must leave the packed output exactly
 as it was -- or change it on purpose, and then show precisely where. This
 records what the packer emits for a corpus of projects and checks it again.
 
-    python3 tools/unity_pack_golden.py record   # run the unity tests, record
-    python3 tools/unity_pack_golden.py check    # re-pack every case, compare
-    python3 tools/unity_pack_golden.py check -v # ... and print the diffs
+    python3 tools/unity/unity_pack_golden.py record   # run the unity tests, record
+    python3 tools/unity/unity_pack_golden.py check    # re-pack every case, compare
+    python3 tools/unity/unity_pack_golden.py check -v # ... and print the diffs
 
 The corpus is every `unity_pack.pack(..)` call `tests/test_unity_pack.py`
 makes: the tests author small projects of their own, so recording them
@@ -39,10 +39,10 @@ import sys
 import tempfile
 import unittest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 
-import tools.unity_pack as unity_pack  # noqa: E402
+import tools.unity.unity_pack as unity_pack  # noqa: E402
 
 CORPUS = os.path.join(ROOT, "tests", "unity_golden", "corpus.json")
 CACHE = os.path.join(tempfile.gettempdir(), "unity_golden_cache")

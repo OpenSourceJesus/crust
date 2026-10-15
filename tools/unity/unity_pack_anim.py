@@ -2,7 +2,7 @@
 """unity_pack: Animation: AnimationClip and AnimatorController parsing, keyframes and
 sprite curves, and the packed animation tables.
 
-Moved out of tools/unity_pack.py unchanged; unity_pack re-exports every name
+Moved out of tools/unity/unity_pack.py unchanged; unity_pack re-exports every name
 here, so `unity_pack.<name>` keeps working."""
 
 from __future__ import annotations
@@ -17,10 +17,10 @@ import copy
 import tools.cs2cpp as cs2cpp  # noqa: E402
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-from tools.unity_pack_common import *  # noqa: E402,F401,F403
-from tools.unity_pack_physics import *  # noqa: E402,F401,F403
-from tools.unity_pack_sprites import *  # noqa: E402,F401,F403
-from tools.unity_pack_ui import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_ui import *  # noqa: E402,F401,F403
 
 __all__ = [
     '_anim_sprite_guids',
@@ -483,7 +483,7 @@ def _build_animation_tables(plan):
             tracks.append({"begin": len(tkeys), "count": len(tr["keys"]),
                            "prop": tr["prop"], "path": tr["path"]})
             tkeys.extend(key_row(k) for k in tr["keys"])
-    from tools.unity_pack import _class_has_position  # (imports this module)
+    from tools.unity.unity_pack import _class_has_position  # (imports this module)
     binds = []
     rot_cls, scale_cls = set(), set()
     for pl in players:
@@ -917,7 +917,7 @@ def _emit_animator_runtime(p, plan):
     def f(v):
         return "%sf" % repr(float(v)) if abs(v) < 1e29 else (
             "1e30f" if v > 0 else "-1e30f")
-    p("/* AnimatorController state machines (tools/unity_pack_anim.py) */")
+    p("/* AnimatorController state machines (tools/unity/unity_pack_anim.py) */")
     arr("int", "_Animr_go", [a["go"] for a in A])
     arr("int", "_Animr_lb", [a["layer_begin"] for a in A])
     arr("int", "_Animr_lc", [a["layer_count"] for a in A])

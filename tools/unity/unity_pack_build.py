@@ -2,7 +2,7 @@
 """unity_pack: Building the player: the generated Makefile and the executable, including the
 Box2D-Packed glue for 2D physics.
 
-Moved out of tools/unity_pack.py unchanged; unity_pack re-exports every name
+Moved out of tools/unity/unity_pack.py unchanged; unity_pack re-exports every name
 here, so `unity_pack.<name>` keeps working."""
 
 from __future__ import annotations
@@ -17,12 +17,12 @@ import copy
 import tools.cs2cpp as cs2cpp  # noqa: E402
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
-from tools.unity_pack_common import *  # noqa: E402,F401,F403
-from tools.unity_pack_physics import *  # noqa: E402,F401,F403
-from tools.unity_pack_sprites import *  # noqa: E402,F401,F403
-from tools.unity_pack_ui import *  # noqa: E402,F401,F403
-from tools.unity_pack_anim import *  # noqa: E402,F401,F403
-from tools.unity_pack_audio import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_ui import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_anim import *  # noqa: E402,F401,F403
+from tools.unity.unity_pack_audio import *  # noqa: E402,F401,F403
 
 __all__ = [
     'build_player_executable',
@@ -35,9 +35,9 @@ def emit_makefile(outdir, box2d=False, box2d_inject=False, gpu_physics=False):
     """Makefile for the packed player. With *box2d*, the player links the
     Box2D-Packed glue (physics_box2d.c) and box2d/libbox2d.a, which
     build_player_executable builds with box2d_pack."""
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     py = sys.executable
-    # gpu_physics: physics_gpu.c over gpu-physics-engine's runtime (tools/unity_pack_gpu_physics.py)
+    # gpu_physics: physics_gpu.c over gpu-physics-engine's runtime (tools/unity/unity_pack_gpu_physics.py)
     # in place of Box2D-Packed; box2d is True for any 2D physics, so gpu_physics wins
     if gpu_physics:
         box2d = False
@@ -45,13 +45,13 @@ def emit_makefile(outdir, box2d=False, box2d_inject=False, gpu_physics=False):
     physics_libs = " box2d/libbox2d.a -lpthread" if box2d else ""
     gpu_rule = ""
     if gpu_physics:
-        import tools.unity_pack_gpu_physics as _gp
+        import tools.unity.unity_pack_gpu_physics as _gp
         gpu_objs = _gp.OBJECTS
         physics_objs = " physics_gpu.o" + "".join(" gpuphys/%s" % o for o in gpu_objs)
         gpu_rule = ("physics_gpu.o: physics_gpu.c\n\t$(CC) -O3 -c -o $@ $< -I .\n"
                     "gpuphys/%.o: gpuphys/%.c\n\t$(CC) -O2 -c -o $@ $< -I gpuphys\n")
-    # --hybrid (tools/unity_pack_hybrid.py): DotNetAnywhere and the managed assembly are part of the player
-    import tools.unity_pack_hybrid as _hybrid
+    # --hybrid (tools/unity/unity_pack_hybrid.py): DotNetAnywhere and the managed assembly are part of the player
+    import tools.unity.unity_pack_hybrid as _hybrid
     hybrid = os.path.isfile(os.path.join(outdir, "hybrid_glue.c")) and _hybrid.dna_home() is not None
     hybrid_objs = " hybrid_glue.o" if hybrid else ""
     hybrid_libs = " $(DNA_BUILD)/libdna_ffi.a -lpthread" if hybrid else ""
@@ -223,8 +223,8 @@ def build_player_executable(outdir, product, box2d_root=None, box2d_lto=False):
                       "-I", outdir, "-I", os.path.join(outdir, "gpuphys")])
             physics_objs.append(obj)
 
-    # --hybrid: DotNetAnywhere and the managed assembly (tools/unity_pack_hybrid.py)
-    import tools.unity_pack_hybrid as _hybrid
+    # --hybrid: DotNetAnywhere and the managed assembly (tools/unity/unity_pack_hybrid.py)
+    import tools.unity.unity_pack_hybrid as _hybrid
     hybrid_objs, hybrid_libs = _hybrid.link_inputs(outdir, cc, _run, _progress)
     physics_objs = physics_objs + hybrid_objs
     physics_libs = physics_libs + hybrid_libs
@@ -233,7 +233,7 @@ def build_player_executable(outdir, product, box2d_root=None, box2d_lto=False):
     # and ES 2.0 for hardware without it (UNITY_PACK_GLES2=1).
     host = os.path.normpath(os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "examples", "unity_pack",
+        "..", "..", "examples", "unity_pack",
         "gles2_window.c" if os.environ.get("UNITY_PACK_GLES2")
         else "gles3_window.c"))
     use_window = False

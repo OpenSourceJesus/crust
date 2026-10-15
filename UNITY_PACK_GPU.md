@@ -54,13 +54,13 @@ layout tests.
 
 ```
 # SoA float[N][2|3] — default; stream tables on upload
-python3 tools/unity_pack.py MiniScene -o /tmp/soa
+python3 tools/unity/unity_pack.py MiniScene -o /tmp/soa
 
 # compact AoS — gather on upload
-python3 tools/unity_pack.py MiniScene -o /tmp/aos --aos
+python3 tools/unity/unity_pack.py MiniScene -o /tmp/aos --aos
 
 # SoA float[N][4] — GPU UBO / vec4 friendly; .w = instance id
-python3 tools/unity_pack.py MiniScene -o /tmp/soa4 --soa-vec4
+python3 tools/unity/unity_pack.py MiniScene -o /tmp/soa4 --soa-vec4
 ```
 
 Gameplay still goes through `Class_get_pos_x(i)` / setters; only storage
@@ -70,7 +70,7 @@ and `engine_upload_positions` change.
 
 The target: every 2D sprite in **one draw call**, each sprite a 16-bit
 index plus packed bytes, lit by URP 2D lights -- the renderer counterpart
-of Box2D-Packed's 16-bit indices. Code: `tools/unity_pack_gpu2d.py` (pack
+of Box2D-Packed's 16-bit indices. Code: `tools/unity/unity_pack_gpu2d.py` (pack
 side), `examples/unity_pack/gles3_batch.h` (GLES 3.1 renderer); build a
 viewer with it as `gles3_view.c -DBATCH`.
 

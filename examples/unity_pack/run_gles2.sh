@@ -39,7 +39,7 @@ done
 
 mkdir -p "$OUT"
 echo "== packing $PROJECT → $OUT =="
-PYTHONUNBUFFERED=1 python3 -u "$ROOT/tools/unity_pack.py" "$PROJECT" -o "$OUT" "${LAYOUT[@]}"
+PYTHONUNBUFFERED=1 python3 -u "$ROOT/tools/unity/unity_pack.py" "$PROJECT" -o "$OUT" "${LAYOUT[@]}"
 echo "== compiling engine.c (-O3) ($(wc -c < "$OUT/engine.c") bytes) =="
 "$CC" -O3 -c -o "$OUT/engine.o" "$OUT/engine.c"
 echo "== compiling data.c (-O0) ($(wc -c < "$OUT/data.c") bytes) =="
