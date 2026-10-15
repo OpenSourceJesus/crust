@@ -24397,6 +24397,11 @@ def _int_idents(cl, plan, body, site):
                 out.add("%s_get_%s" % (oidn, name))
                 if ocname == cl.get("name"):
                     out.add(name)
+        for f in ocl.get("class_consts") or ():
+            if f.get("static") and f.get("ty") in _CS_INT_TYPES:
+                out.add("%s_%s" % (oidn, f["name"]))
+                if ocname == cl.get("name"):
+                    out.add(f["name"])
     return out
 
 
