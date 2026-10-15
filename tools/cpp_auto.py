@@ -530,7 +530,7 @@ def _declared_types(text):
             # and the member after it is on the next line, so `private:` on
             # its own line hid every field that followed from this scan.
             r"(?:^|[;{}(,:\n])\s*(?:const\s+|static\s+)*"
-            r"([A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*(\*+|&)?\s*"
+            r"([A-Za-z_][\w:]*(?:\s*<(?:[^<>;{}()]|<(?:[^<>;{}()]|<[^<>;{}()]*>)*>)*>)?)\s*(\*+|&)?\s*"
             r"(\w+)\s*(?=([;=,)\[]))", text):
         base, star, name = m.group(1), m.group(2) or "", m.group(3)
         if base in _KEYWORDS and base not in _BUILTIN:
@@ -1432,6 +1432,7 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
     if not _NAMESPACE.search(scan) and not _USING_NS.search(scan):
         return text
     produced = set()
+    child_of, parents = {}, {}
 
     # Out-of-line definitions -- `void litehtml::css::parse_selectors(..)`
     # -- look their bodies up in the enclosing namespace. That is done once,
@@ -1508,11 +1509,23 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         # block renames `now_ms` to `co_now_ms` inside the second outer
         # block's still-nested `now`, and that block then saw `co_now_ms`
         # as its own declaration and emitted `co_now_co_now_ms`.
-        renaming = [name for name in declared if name not in produced]
+        # A name an inner namespace of *this* one produced is still this
+        # namespace's to prefix: `D { U { IDisp } }` is `D_U_IDisp`, as every
+        # qualified use from outside will spell it.
+        parent = None
+        for pm in _NAMESPACE.finditer(scan[:m.start()]):
+            po = scan.index("{", pm.start())
+            pc = _match(scan, po, "{", "}")
+            if pc is not None and po < m.start() < pc:
+                parent = pm.group(1)
+        parents.setdefault(ns, parent)
+        renaming = [name for name in declared
+                    if name not in produced or child_of.get(name) == ns]
         pat = _flatten_pattern(renaming)
         if pat is not None:
             body = _sub_flattened(body, _blank_like(body), pat, ns)
         produced.update("%s_%s" % (ns, name) for name in renaming)
+        child_of.update(("%s_%s" % (ns, name), parent) for name in renaming)
         text = text[:m.start()] + body + text[close + 1:]
         scan = _blank_like(text)
         # A qualified reference from outside, and any `using` for it.
@@ -1535,11 +1548,15 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         # author spelled `N_x`, and reports a clash of the entity with
         # itself.
         produced.update("%s_%s" % (ns, n) for n in _union)
+        child_of.update(("%s_%s" % (ns, n), parent) for n in _union
+                        if "%s_%s" % (ns, n) not in child_of)
         scan = _blank_like(text)
         # And the *unqualified* references from the namespace's other blocks.
         # They share this scope, so a class in one header derives from a
         # class in another by its bare name; once this block is flattened,
         # that name is only reachable as `N_x`.
+        # Not a name an inner namespace already flattened (`U_x`): the
+        # in-block rename above skipped it too, so the definition kept it.
         text = _rename_in_blocks(text, _blank_like(text), ns, declared)
         scan = _blank_like(text)
 
@@ -1558,10 +1575,15 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
     if not opened:
         return text
     provides = {}
-    for ns, line in opened:
-        for name in set(re.findall(r"\b%s(\w+)\b" % re.escape(ns + "_"),
+    # the same namespace opened twice is still one provider; a nested one
+    # (`using namespace U;` for `D::U`) provides under its full prefix
+    for ns in dict.fromkeys(ns for ns, _line in opened):
+        full, p = ns, parents.get(ns)
+        while p:
+            full, p = p + "_" + full, parents.get(p)
+        for name in set(re.findall(r"\b%s(\w+)\b" % re.escape(full + "_"),
                                    scan)):
-            provides.setdefault(name, []).append(ns)
+            provides.setdefault(name, []).append(full)
     for name in sorted(provides):
         if len(provides[name]) > 1:
             raise AutoError(
