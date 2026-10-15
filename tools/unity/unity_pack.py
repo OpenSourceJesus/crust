@@ -19937,7 +19937,7 @@ def emit_engine(plan, analyses, used_apis):
     if "InputManager.Using" in used_apis:
         p("extern int engine_input_using_keyboard;")
         p("extern int engine_input_using_mouse;")
-        p("extern int engine_input_using_gamepad;")
+        p("extern int engine_gamepad_connected;")
         p("extern int engine_input_using_phone;")
     if want_ui:
         p("extern float engine_pointer_x; /* screen px, origin bottom-left */")
@@ -27454,10 +27454,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"InputSystem\s*\.\s*onDeviceChange\s*-=\s*[^;]+;",
         "/* InputSystem.onDeviceChange -= */", text)
-    # Authored InputManager.Using* → host flags (keyboard/mouse default on).
+    # Authored InputManager.Using* → host flags (keyboard/mouse default on);
+    # a gamepad is the host's live one, set each frame.
+    # ponytail: onDeviceChange is dropped above, so a script that reads these
+    # only from it (Start + onDeviceChange) misses a gamepad plugged in later.
     text = cs2cpp.code_sub(
         r"(?:[\w.]+\.)?InputManager\s*\.\s*Using(Gamepad|Keyboard|Mouse|Phone)\b",
-        lambda m: "engine_input_using_%s" % m.group(1).lower(),
+        lambda m: "engine_gamepad_connected" if m.group(1) == "Gamepad"
+        else "engine_input_using_%s" % m.group(1).lower(),
         text)
     # Nested InputDevice enum members (declaration order when unspecified).
     _input_dev = {
@@ -29488,11 +29492,13 @@ def emit_data(plan, used_apis=None):
         for key in sorted(keyboard_keys):
             p("int engine_keyboard_%s = 0;" % key)
     if "InputManager.Using" in used_apis:
-        # Desktop defaults: keyboard+mouse present, no gamepad/phone.
+        # Desktop defaults: keyboard+mouse present, no phone; the host sets
+        # engine_gamepad_connected.
         p("int engine_input_using_keyboard = 1;")
         p("int engine_input_using_mouse = 1;")
-        p("int engine_input_using_gamepad = 0;")
         p("int engine_input_using_phone = 0;")
+        if not plan.get("want_gamepad"):
+            p("int engine_gamepad_connected = 0;")
     if plan.get("want_gamepad"):
         p("/* Host: the first gamepad -- GLFW's layout: buttons A B X Y LB RB")
         p("   Back Start Guide LThumb RThumb Up Right Down Left; axes LX LY RX")

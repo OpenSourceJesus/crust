@@ -17815,6 +17815,34 @@ class TestSceneManager(unittest.TestCase):
         body = engine[engine.index("static void User_Update"):]
         self.assertIn("engine_input_using_mouse", body[:body.index("}")])
 
+    def test_input_manager_using_gamepad_is_the_host_gamepad(self):
+        root = self._project(
+            {"InputManager": "using UnityEngine;\n"
+                             "public class InputManager : MonoBehaviour {\n"
+                             "    public static bool UsingGamepad {\n"
+                             "        get { return false; }\n"
+                             "    }\n"
+                             "    public int n;\n}\n",
+             "User": "using UnityEngine;\n"
+                     "public class User : MonoBehaviour {\n"
+                     "    public int n;\n"
+                     "    void Update() {\n"
+                     "        if (InputManager.UsingGamepad) n = n + 1;\n"
+                     "    }\n}\n"},
+            [("Only", [("I", "InputManager"), ("U", "User")])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        body = engine[engine.index("static void User_Update"):]
+        self.assertIn("engine_gamepad_connected", body[:body.index("}")])
+        r = subprocess.run([_CC, "-w", "-o", os.path.join(d, "a.out")]
+                           + [os.path.join(d, s) for s in ("engine.c", "data.c", "main.c")]
+                           + ["-lm"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
     def test_single_scene_without_scene_manager_has_no_scene_runtime(self):
         root = self._project(
             {"Tally": "using UnityEngine;\n"
