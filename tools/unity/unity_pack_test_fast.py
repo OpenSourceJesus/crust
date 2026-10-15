@@ -4235,6 +4235,30 @@ class TestStaticPropertyIncrement(unittest.TestCase):
         self.assertEqual(out, ["n 2 2"])
 
 
+class TestDictTryGetValue(unittest.TestCase):
+    """Slime Jump's SaveAndLoadManager.GetInt: `if (saveData.intDict
+    .TryGetValue(key, out output)) return output; else return value;` on
+    a static instance of a plain class."""
+
+    @needs_cc
+    def test_found_and_default(self):
+        sd = ("using System.Collections.Generic;\npublic class SaveData {\n"
+              "    public Dictionary<string, int> intDict = new Dictionary<string, int>();\n}\n")
+        gm = ("using UnityEngine;\npublic class Gm : MonoBehaviour {\n"
+              "    static SaveData saveData = new SaveData();\n"
+              "    public static int GetInt (string key, int value = 0) {\n"
+              "        int output = 0;\n"
+              "        if (saveData.intDict.TryGetValue(key, out output))\n"
+              "            return output;\n"
+              "        else\n"
+              "            return value;\n    }\n"
+              "    public static void SetInt (string key, int value) { saveData.intDict[key] = value; }\n}\n")
+        src = script("P", "Gm.SetInt(\"a\", 5); Debug.Log(\"g \" + Gm.GetInt(\"a\", 9) + \" \" + Gm.GetInt(\"b\", 9));")
+        out = run_frames(self, pack(self, project(self, {"P": src, "Gm": gm, "SaveData": sd},
+                                                  [("P",), ("Gm",)])), 1)
+        self.assertEqual(out, ["g 5 9"])
+
+
 class TestInstantiateUnpackedChild(unittest.TestCase):
     """Slime Jump's Player.Respawn: `Instantiate(hpBarTrs.GetChild(0).gameObject,
     hpBarTrs)` of a child with no script. The method lowers; the clone stops

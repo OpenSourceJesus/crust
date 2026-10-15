@@ -19789,6 +19789,12 @@ def emit_engine(plan, analyses, used_apis):
             p("    std::string s = k;")
             p("    return &m[s];")
             p("}")
+            p("static int %s(std::map<std::string, %s> &m, const char *k) {"
+              % (cs2cpp.map_at_string_helper(model, v).replace(
+                  "_at_", "_has_", 1), v))
+            p("    std::string s = k;")
+            p("    return m.count(s) != 0;")
+            p("}")
         p("")
     if want_transform_matrix:
         p("/* Unity Matrix4x4 — column-major; TRS from live Transform. */")
@@ -27405,6 +27411,17 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?<![\w.])base\s*\.\s*(Awake|OnEnable|OnDisable)\s*\(\s*\)\s*;?",
         lambda m: "/* base.%s */" % m.group(1), text)
+    # `d.TryGetValue(k, out x)` with x a declared local: ContainsKey, then
+    # the indexer read. ponytail: d and k are read twice, so only a
+    # call-free d and a name or literal k; `out var x` stays refused
+    _locals = _declared_names(text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(\w+(?:\s*\.\s*\w+)*)\s*\.\s*TryGetValue\s*\(\s*"
+        r"(\w+|\"[^\"\\\n]*\")\s*,\s*out\s+(\w+)\s*\)",
+        lambda m: m.group(0) if m.group(3) not in _locals else
+        "(%s.ContainsKey(%s) ? (%s = %s[%s], true) : false)" % (
+            m.group(1), m.group(2), m.group(3), m.group(1), m.group(2)),
+        text)
     # an InputAction callback's subscriber: this instance
     text = cs2cpp.code_sub(r"(?<![\w.])__ia_self\b", "(int)i", text)
     # gameObject.SetActive(x) → GameObject_SetActive(this GO, x).
