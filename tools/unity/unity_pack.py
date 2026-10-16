@@ -32522,6 +32522,14 @@ def main():
             names = [n.strip() for n in a.split("=", 1)[1].split(",") if n.strip()]
             managed = "*" if "*" in names else (set(names) | (managed if isinstance(managed, set) else set()))
             args.remove(a)
+    packed = False
+    if "--packed" in args:
+        packed = True
+        args.remove("--packed")
+    engine = False
+    if "--engine" in args:
+        engine = True
+        args.remove("--engine")
     gpu_batch = False
     if "--gpu-batch" in args:
         gpu_batch = True
@@ -32605,6 +32613,20 @@ def main():
         return 2
     if outdir is None:
         outdir = default_pack_dir(args[0])
+    if engine and not packed:
+        # CCSharp backend (tools/unity/unity_pack_ccs.py); falls back to the packed path when the engine does not cover the project.
+        import tools.unity.unity_pack_ccs as _ccs
+        if not _ccs.available():
+            sys.stderr.write("unity_pack: --engine needs CCSharp beside this repo (or $CCSHARP_HOME); using the packed path\n")
+        else:
+            _assets = _asset_guid_map(args[0])
+            objs, _l, cams, _h = _load_scenes_lights_cameras(args[0], _assets)
+            prefabs = _ccs.collect_prefabs(args[0], objs, _assets)
+            ok, why = _ccs.eligible(objs, cams, prefabs)
+            if ok:
+                os.makedirs(outdir, exist_ok=True)
+                return _ccs.build(objs, cams, outdir, run=False, prefabs=prefabs)
+            sys.stderr.write("unity_pack: --engine: %s; using the packed path\n" % why)
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
                     strict=strict, gpu_handles=gpu_handles, gpu_batch=gpu_batch,
