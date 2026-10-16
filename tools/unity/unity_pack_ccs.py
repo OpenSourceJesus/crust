@@ -21,11 +21,17 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 
 # Component keys the engine has no class for yet.  A scene record that has any of them set goes to the packed path.
 UNSUPPORTED_KEYS = (
-    "canvas", "rigidbody2d", "collider2d", "ui_text", "ui_image", "ui_button", "particle_system", "animator",
+    "canvas", "ui_text", "ui_image", "ui_button", "particle_system", "animator",
     "audio_source", "light", "tilemap",
 )
+COLLIDER_KINDS = ("box", "circle", "capsule_h", "capsule_v", "polygon")
+# guid -> PhysicsMaterial2D {friction, bounciness, friction_combine, bounce_combine}, set by build()
+MATERIALS = {}
+
 # Messages a script declares without `override` in Unity; the engine's MonoBehaviour has them virtual.
-MESSAGES = ("Awake", "Start", "Update", "LateUpdate", "OnDestroy")
+MESSAGES = ("Awake", "Start", "Update", "LateUpdate", "FixedUpdate", "OnDestroy",
+            "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
+            "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D")
 
 
 def ccsharp_home():
@@ -42,6 +48,9 @@ def eligible(objects, cameras, prefabs=()):
         for k in UNSUPPORTED_KEYS:
             if o.get(k):
                 return False, "%s uses %s" % (o.get("name"), k)
+        col = o.get("collider2d")
+        if col and col.get("kind") not in COLLIDER_KINDS:
+            return False, "%s uses a %s collider" % (o.get("name"), col.get("kind"))
         if o.get("father_id") or o.get("child_ids"):
             by_xf = {r.get("xf_id"): r for r in objects}
             if o.get("father_id") and o["father_id"] not in by_xf:
@@ -93,7 +102,8 @@ def prepare_script(text):
     """A Unity script as the engine's C#: `[Shared]` is CCSharp's to refuse, and the messages are `override`."""
     text = re.sub(r"^[ \t]*\[Shared\][ \t]*\r?\n", "", text, flags=re.M)
     for m in MESSAGES:
-        text = re.sub(r"(public\s+)(void\s+%s\s*\()" % m, r"\1override \2", text)
+        # `void Update(`, `private void Update(` and `public void Update(` all become `public override void Update(`
+        text = re.sub(r"(?m)^([ \t]*)(?:(?:public|private|protected|internal)[ \t]+)?(void[ \t]+%s[ \t]*\()" % m, r"\1public override \2", text)
     return text
 
 
@@ -153,6 +163,41 @@ def prefab_name(pf):
     return "Prefab_%s" % re.sub(r"\W", "_", pf["guid"])
 
 
+_JOINT_CLASSES = {0: "HingeJoint2D", 1: "DistanceJoint2D", 2: "SpringJoint2D", 3: "FixedJoint2D", 4: "SliderJoint2D", 5: "WheelJoint2D",
+                  6: "FrictionJoint2D", 7: "RelativeJoint2D", 8: "TargetJoint2D"}
+
+
+def _jf(v):
+    return _f(v) if v == v and abs(v) < 1e30 else "0f"
+
+
+def _jb(v):
+    return "true" if v else "false"
+
+
+# (C# field, record key, how to spell it).  Infinite thresholds (an unbreakable joint) are not sent: the engine does not break joints.
+_JOINT_FIELDS = (
+    ("useLimits", "use_limits", _jb), ("lower", "lower", _jf), ("upper", "upper", _jf),
+    ("useMotor", "use_motor", _jb), ("motorSpeed", "motor_speed", _jf), ("maxMotor", "motor_max", _jf),
+    ("distance", "distance", _jf), ("autoConfigureDistance", "auto_distance", _jb), ("maxDistanceOnly", "max_distance_only", _jb),
+    ("frequency", "frequency", _jf), ("dampingRatio", "damping", _jf),
+    ("angle", "angle", _jf), ("autoConfigureAngle", "auto_angle", _jb),
+    ("maxForce", "max_force", _jf), ("maxTorque", "max_torque", _jf), ("correctionScale", "correction", _jf),
+    ("autoConfigureOffset", "auto_offset", _jb), ("angularOffset", "offset_angle", _jf), ("autoConfigureTarget", "auto_target", _jb),
+)
+
+
+def _material(col, rb):
+    """The PhysicsMaterial2D a collider uses: its own, else its Rigidbody2D's, else Unity's defaults (friction 0.4, bounciness 0, Average)."""
+    for rec in (col, rb or {}):
+        g = rec.get("material_guid")
+        if g and g.lower() in MATERIALS:
+            m = MATERIALS[g.lower()]
+            return {"friction": m["friction"], "bounciness": m["bounciness"],
+                    "friction_combine": int(m.get("friction_combine", 0)), "bounce_combine": int(m.get("bounce_combine", 0))}
+    return {"friction": 0.4, "bounciness": 0.0, "friction_combine": 0, "bounce_combine": 0}
+
+
 def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
     """C# that builds the GameObjects of `gs` (a scene's or a prefab's): returns (lines, {xf_id: variable}).  `pf_var` is {guid: "SceneData.pfN"},
     the template a script field that refers to a prefab is given."""
@@ -173,7 +218,7 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
         if o.get("layer"):
             out.append("%s.layer = %d;" % (v, o["layer"]))
         for k, r in enumerate(g):
-            if not r.get("class"):
+            if not (r.get("class") and r.get("script")):   # (a scriptless object has a made-up class name)
                 continue
             c = "%ss%d_%d" % (pfx, i, k)
             out.append("%s %s = new %s();" % (r["class"], c, r["class"]))
@@ -187,6 +232,48 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
                 if guid in pf_var and decl.get(fname, "").endswith("GameObject"):
                     out.append("%s.%s = %s;" % (c, fname, pf_var[guid]))
             out.append("%s.Attach(%s);" % (v, c))
+        rb = o.get("rigidbody2d")
+        if rb:
+            b = "%srb%d" % (pfx, i)
+            out.append("Rigidbody2D %s = new Rigidbody2D();" % b)
+            out.append("%s.bodyType = (RigidbodyType2D)%d;" % (b, int(rb.get("body_type", 0))))
+            out.append("%s.mass = %s; %s.gravityScale = %s; %s.drag = %s;" % (
+                b, _f(rb.get("mass", 1.0)), b, _f(rb.get("gravity_scale", 1.0)), b, _f(rb.get("linear_damping", 0.0))))
+            out.append("%s.velocity = new Vector2(%s, %s);" % (b, _f(rb.get("vel_x", 0.0)), _f(rb.get("vel_y", 0.0))))
+            if rb.get("freeze_rot"):
+                out.append("%s.freezeRotation = true;" % b)
+            if rb.get("ang_vel"):
+                out.append("%s.angularVelocity = %s;" % (b, _f(rb["ang_vel"])))
+            out.append("%s.Attach(%s);" % (v, b))
+        col = o.get("collider2d")
+        if col and col.get("kind") in COLLIDER_KINDS:
+            cc = "%scol%d" % (pfx, i)
+            kind = col["kind"]
+            cls = {"box": "BoxCollider2D", "circle": "CircleCollider2D", "polygon": "PolygonCollider2D"}.get(kind, "CapsuleCollider2D")
+            out.append("%s %s = new %s();" % (cls, cc, cls))
+            out.append("%s.isTrigger = %s;" % (cc, "true" if col.get("is_trigger") else "false"))
+            out.append("%s.enabled = %s;" % (cc, "true" if col.get("enabled", True) else "false"))
+            mat = _material(col, rb)
+            out.append("%s.friction = %s; %s.bounciness = %s;" % (cc, _f(mat["friction"]), cc, _f(mat["bounciness"])))
+            if mat["friction_combine"] or mat["bounce_combine"]:
+                out.append("%s.frictionCombine = %d; %s.bounceCombine = %d;" % (cc, mat["friction_combine"], cc, mat["bounce_combine"]))
+            ox, oy = col.get("offset_x", 0.0), col.get("offset_y", 0.0)
+            if kind == "polygon":
+                # the outline is cut into convex pieces here; the points carry the collider's offset
+                import tools.unity.unity_pack_physics as _ph
+                for tri in _ph._triangulate_paths(col.get("paths") or []):
+                    for (px, py) in tri:
+                        out.append("%s.AddPoint(%s, %s);" % (cc, _f(px + ox), _f(py + oy)))
+                    out.append("%s.EndPiece();" % cc)
+            else:
+                out.append("%s.offset = new Vector2(%s, %s);" % (cc, _f(ox), _f(oy)))
+                if kind == "circle":
+                    out.append("%s.radius = %s;" % (cc, _f(col.get("radius", 0.5))))
+                else:
+                    out.append("%s.size = new Vector2(%s, %s);" % (cc, _f(col.get("size_x", 1.0)), _f(col.get("size_y", 1.0))))
+                    if kind == "capsule_h":
+                        out.append("%s.vertical = false;" % cc)
+            out.append("%s.Attach(%s);" % (v, cc))
         sp = o.get("sprite")
         if sp and sp.get("has_sprite"):
             r = "%sr%d" % (pfx, i)
@@ -198,6 +285,31 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
             out.append("%s.sortingOrder = %d;" % (r, sp.get("sorting_order", 0)))
             out.append("%s.sortingLayer = %d;" % (r, sp.get("sorting_layer", 0) or 0))
             out.append("%s.Attach(%s);" % (v, r))
+    rb_of = {}
+    for i, g in enumerate(gs):
+        rec = g[0].get("rigidbody2d")
+        if rec and rec.get("file_id") is not None:
+            rb_of[str(rec["file_id"])] = "%srb%d" % (pfx, i)
+    for i, g in enumerate(gs):
+        for k, jt in enumerate(g[0].get("joints2d") or []):
+            cls = _JOINT_CLASSES[jt["kind"]]
+            jv = "%sj%d_%d" % (pfx, i, k)
+            out.append("%s %s = new %s();" % (cls, jv, cls))
+            out.append("%s.enabled = %s;" % (jv, "true" if jt.get("enabled", 1) else "false"))
+            if jt.get("connected_fid") is not None and str(jt["connected_fid"]) in rb_of:
+                out.append("%s.connectedBody = %s;" % (jv, rb_of[str(jt["connected_fid"])]))
+            out.append("%s.enableCollision = %s;" % (jv, "true" if jt.get("collide") else "false"))
+            out.append("%s.autoConfigureConnectedAnchor = %s;" % (jv, "true" if jt.get("auto_anchor", 1) else "false"))
+            out.append("%s.anchor = new Vector2(%s, %s); %s.connectedAnchor = new Vector2(%s, %s);" % (
+                jv, _f(jt["anchor"][0]), _f(jt["anchor"][1]), jv, _f(jt["canchor"][0]), _f(jt["canchor"][1])))
+            for fld, key, conv in _JOINT_FIELDS:
+                val = jt.get(key)
+                if val is None:
+                    continue
+                out.append("%s.%s = %s;" % (jv, fld, conv(val)))
+            lo, tg = jt.get("offset") or (0.0, 0.0), jt.get("target") or (0.0, 0.0)
+            out.append("%s.linearOffset = new Vector2(%s, %s); %s.target = new Vector2(%s, %s);" % (jv, _jf(lo[0]), _jf(lo[1]), jv, _jf(tg[0]), _jf(tg[1])))
+            out.append("%so%d.Attach(%s);" % (pfx, i, jv))
     for i, g in enumerate(gs):
         if g[0].get("father_id") in var_of:
             out.append("%so%d.transform.parent = %s.transform;" % (pfx, i, var_of[g[0]["father_id"]]))
@@ -309,10 +421,13 @@ def write_project(objects, cameras, outdir, frames=60, prefabs=()):
     return cs
 
 
-def build(objects, cameras, outdir, run=False, prefabs=()):
+def build(objects, cameras, outdir, run=False, prefabs=(), materials=None):
     """Lower and build the project; returns the ccs2c exit code."""
+    MATERIALS.clear()
+    MATERIALS.update(materials or {})
     cs = write_project(objects, cameras, outdir, prefabs=prefabs)
-    cmd = [sys.executable, os.path.join(ccsharp_home(), "crust", "ccs2c.py"), cs, "--unity-engine", "--name=game",
+    physics = physics_for(objects, prefabs)
+    cmd = [sys.executable, os.path.join(ccsharp_home(), "crust", "ccs2c.py"), cs, "--unity-engine", "--physics=" + physics, "--name=game",
            "--convert=" + os.path.join(outdir, "cpp"), "--c", "-o", os.path.join(outdir, "game.c"),
            "--exe=" + os.path.join(outdir, "game")]
     if run:
@@ -320,7 +435,39 @@ def build(objects, cameras, outdir, run=False, prefabs=()):
     rc = subprocess.call(cmd)
     if rc == 0:
         write_host_files(objects, cameras, outdir, prefabs)
+        if physics == "box2d":
+            write_physics_files(outdir)
     return rc
+
+
+def physics_for(objects, prefabs=()):
+    """"box2d" (Box2D-Packed under the engine's Physics2D) when a record has a Rigidbody2D or a collider, else "managed" (nothing to link).
+    $CCS_PHYSICS=managed|box2d overrides."""
+    forced = os.environ.get("CCS_PHYSICS")
+    if forced:
+        return forced
+    for o in all_records(objects, prefabs):
+        if o.get("rigidbody2d") or o.get("collider2d"):
+            return "box2d"
+    return "managed"
+
+
+def write_physics_files(outdir):
+    """What a host links with when the program uses Box2D-Packed: outdir/physics/{pb2.c, pb2.h, libbox2d.a, include/}, and physics/link.txt with the
+    compiler arguments (relative to outdir)."""
+    import shutil
+    sys.path.insert(0, os.path.join(ccsharp_home(), "crust"))
+    import ccs2c
+    args = ccs2c.physics_link("box2d")                  # ["-I", shim, "-I", include, pb2.c, libbox2d.a, "-lpthread"]
+    dest = os.path.join(outdir, "physics")
+    os.makedirs(dest, exist_ok=True)
+    shim, inc, src, lib = args[1], args[3], args[4], args[5]
+    for f in (src, os.path.join(shim, "pb2.h"), lib):
+        shutil.copy(f, dest)
+    shutil.rmtree(os.path.join(dest, "include"), ignore_errors=True)
+    shutil.copytree(inc, os.path.join(dest, "include"))
+    with open(os.path.join(dest, "link.txt"), "w") as f:
+        f.write("-I physics -I physics/include physics/pb2.c physics/libbox2d.a -lpthread -lm\n")
 
 
 def host_shim(objects, cameras, prefabs=()):

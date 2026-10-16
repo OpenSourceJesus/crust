@@ -32625,7 +32625,7 @@ def main():
             ok, why = _ccs.eligible(objs, cams, prefabs)
             if ok:
                 os.makedirs(outdir, exist_ok=True)
-                return _ccs.build(objs, cams, outdir, run=False, prefabs=prefabs)
+                return _ccs.build(objs, cams, outdir, run=False, prefabs=prefabs, materials=_load_physics_materials(_assets)[0])
             sys.stderr.write("unity_pack: --engine: %s; using the packed path\n" % why)
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
