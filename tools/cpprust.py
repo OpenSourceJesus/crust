@@ -5731,6 +5731,11 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             rows.append("%s (*%s)(%s);" % (s["ret"], s["name"], args))
         if not ext_root:
             head.append("struct %s_vtable { %s };" % (cname, " ".join(rows)))
+            if rtti:
+                # A `dynamic_cast` to the class is a reference to its descriptor, and a function template instantiated for the class can be
+                # emitted before the table is defined (the bodies follow every struct, but the tables come with each class's own).  A tentative
+                # definition lets the use come first.
+                head.append("static const struct %s_vtable %s__vtable;" % (cname, cname))
 
     parts = []
     if base:
@@ -6622,13 +6627,26 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 arena_n = int(str(_am.definit).strip())
             except ValueError:
                 arena_n = None
+    if arena_n is not None:
+        info["arena_n"] = arena_n             # (an abstract base has the N but no arena: `T__free` is still written for it)
     if arena_n is not None and not abstract:
+        info["arena_own"] = True
         out.append("static %s %s__arena[%d]; static int %s__arena_n;"
                    % (cname, cname, arena_n, cname))
+        # Slots given back one at a time (`T__free`, below): a stack of indices, taken before the arena grows.
+        out.append("static int %s__free_list[%d]; static int %s__free_n;" % (cname, arena_n, cname))
+        info["arena_n"] = arena_n
         drop = info.get("dtor") and "%s_drop(&%s__arena[k]); " % (cname, cname) or ""
         out.append("%s void %s__arena_reset(void) { int k; for (k = 0; k < %s__arena_n; "
-                   "k = k + 1) { %s} %s__arena_n = 0; }"
-                   % (stor, cname, cname, drop, cname))
+                   "k = k + 1) { %s} %s__arena_n = 0; %s__free_n = 0; }"
+                   % (stor, cname, cname, drop, cname, cname))
+        # `T__free_slot(p)`: one object back (it is dropped, zeroed, and its slot is the next `new T` takes).  `T__free(p)`, which finds the
+        # arena a pointer belongs to when it is a `Base *`, is written once every class is known (translate).
+        dropp = info.get("dtor") and "%s_drop(p); " % cname or ""
+        mprotos.append("%s void %s__free_slot(%s *p);" % (stor, cname, cname))
+        out.append("%s void %s__free_slot(%s *p) { %smemset(p, 0, sizeof(%s)); %s__free_list[%s__free_n] = (int)(p - %s__arena); "
+                   "%s__free_n = %s__free_n + 1; }"
+                   % (stor, cname, cname, dropp, cname, cname, cname, cname, cname, cname))
     if wants_new and not abstract:
         wants_new = set(wants_new)
         # One allocator per constructor, so `new T(a, b)` reaches the same
@@ -6641,8 +6659,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             alloc = ent["alloc"] if ent else "%s__alloc" % cname
             if arena_n is not None:
                 body = ["%s *__p;" % cname,
-                        "if (%s__arena_n >= %d) { abort(); }" % (cname, arena_n),
-                        "__p = &%s__arena[%s__arena_n]; %s__arena_n = %s__arena_n + 1;"
+                        "if (%s__free_n > 0) { %s__free_n = %s__free_n - 1; __p = &%s__arena[%s__free_list[%s__free_n]]; }"
+                        % (cname, cname, cname, cname, cname, cname),
+                        "else { if (%s__arena_n >= %d) { abort(); }" % (cname, arena_n),
+                        "__p = &%s__arena[%s__arena_n]; %s__arena_n = %s__arena_n + 1; }"
                         % (cname, cname, cname, cname),
                         "memset(__p, 0, sizeof(%s));" % cname]
             else:
@@ -10615,6 +10635,17 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             if cls not in cinfo:
                 return None
             fields = cinfo[cls]["fields"]
+            # `_base` is the synthesized hop to the base class, not a declared
+            # field. Field qualification has already written the *path* to an
+            # inherited member (`this->_base.t`), so a chain that goes on
+            # through it -- `this->_base.t->Get()` -- has to step into the
+            # base here, as `_named_object` does, or the call is left as a
+            # method call on a struct, which C does not have.
+            if (fld == _BASE_MEMBER and fld not in fields
+                    and cinfo[cls].get("base")):
+                expr = "%s%s%s" % (expr, "->" if is_ptr else ".", _BASE_MEMBER)
+                cls, is_ptr = cinfo[cls]["base"], False
+                continue
             if fld not in fields:
                 return None
             # Inherited fields sit inside `_base`, so the recorded path is
@@ -10707,12 +10738,20 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 if fent is not None and is_ptr and fm.group(1) == "." and not (
                         fent[0] in cinfo and re.match(
                             r"\s*(?:(?:\.|->)\s*\w+\s*\(|\[|\.)", look[after:])):
-                    return "%s->%s" % (expr, fm.group(2)), after
+                    return "%s->%s" % (expr, cinfo[cls]["paths"].get(fm.group(2), fm.group(2))), after
+                # `f()->id` where `id` is inherited: it sits inside `_base`, and the walk that qualifies a named object's fields never saw this
+                # expression, whose head is a call.  (A field that is not inherited is its own path, and is left as written.)
+                if (fent is not None and is_ptr and fm.group(1) == "->"
+                        and cinfo[cls]["paths"].get(fm.group(2), fm.group(2)) != fm.group(2)
+                        and not (fent[0] in cinfo and re.match(
+                            r"\s*(?:(?:\.|->)\s*\w+\s*\(|\[|\.)", look[after:]))):
+                    return "%s->%s" % (expr, cinfo[cls]["paths"][fm.group(2)]), after
                 if fent and fent[0] in cinfo and re.match(
                         r"\s*(?:(?:\.|->)\s*\w+\s*\(|\[)", look[after:]) or (
                         fent and fent[0] in cinfo and is_ptr
                         and re.match(r"\s*\.", look[after:])):
-                    expr = "%s%s%s" % (expr, "->" if is_ptr else ".", fm.group(2))
+                    expr = "%s%s%s" % (expr, "->" if is_ptr else ".",
+                                       cinfo[cls]["paths"].get(fm.group(2), fm.group(2)))     # an inherited field is reached through `_base`
                     cls, is_ptr = fent[0], bool(fent[1])
                     addressable = True
                     pos = after
@@ -14319,6 +14358,25 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                 pieces.append(_src_mark(_src_line(text, at_start)))
             pieces.append(body)
         pieces.append(_src_mark(_src_line(text, prev)))
+    # `T__free(p)` for every arena class: a `Base *` may point into the arena of any class that derives from it, and the slot goes back to the arena
+    # it came from (found by address).
+    arena_names = [n for n, ci in cinfo.items() if ci.get("arena_n")]
+    if arena_names:
+        def _derives(d, a):
+            while d:
+                if d == a:
+                    return True
+                d = (cinfo.get(d) or {}).get("base")
+            return False
+        frees = []
+        for a in sorted(arena_names):
+            fam = [d for d in sorted(arena_names) if cinfo[d].get("arena_own") and _derives(d, a)]
+            tests = " ".join(
+                "if ((char *)p >= (char *)%s__arena && (char *)p < (char *)(%s__arena + %d)) { %s__free_slot((%s *)p); return; }"
+                % (d, d, cinfo[d]["arena_n"], d, d) for d in fam)
+            fwd_protos.append("static void %s__free(%s *p);" % (a, a))
+            frees.append("static void %s__free(%s *p) { %s }" % (a, a, tests))
+        pieces.append("\n" + "\n".join(frees) + "\n")
     pieces.append(text[prev:])
     for pi, units, start in hoist_slots:
         # Each moved definition carries an anchor naming the line its class
