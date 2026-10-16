@@ -791,6 +791,42 @@ class N { public: int V; N(int v) { V = v; } N *Make(int k) { return new N(k); }
         self.assertIn("N_Make(a, ", out)
 
 
+class TestCallThroughInheritedPointerField(Base):
+    """`t->Get()` where `t` is a pointer field the class *inherits*.
+
+    Found building a Unity-like engine in C# (CC#): every script reads `transform->position` through the field `Component` declares, and a script is
+    two classes down from it. Field qualification writes the path to an inherited member (`this->_base.t`), so by the time calls are lowered the
+    receiver chain goes through the synthesized `_base` hop. `_named_object` knew to step through it, but the call pass's `resolve` did not: it
+    found no field called `_base`, gave up, and left `this->_base.t->Get()` in the C, a method call on a struct. An own field was fine, and so was
+    an inherited one that is used as a value; only a call through an inherited pointer was lost.
+    """
+
+    BASE = """
+class T { public: int x; int Get() { return x; } int Twice(int k) { return x * k; } };
+class A { public: T *t; };
+class B : public A { public: };
+"""
+
+    def test_one_level_up(self):
+        out = self.assertLowers(self.BASE + "class D : public A { public: int Go() { return t->Get(); } };",
+                                "T_Get(this->_base.t)")
+        self.assertNotIn("->Get(", out)
+
+    def test_two_levels_up(self):
+        out = self.assertLowers(self.BASE + "class D : public B { public: int Go() { return t->Get(); } };",
+                                "T_Get(this->_base._base.t)")
+        self.assertNotIn("->Get(", out)
+
+    def test_with_arguments_and_a_second_call(self):
+        out = self.assertLowers(self.BASE + "class D : public B { public: int Go() { return t->Get() + t->Twice(3); } };",
+                                "T_Get(this->_base._base.t)", "T_Twice(this->_base._base.t, 3)")
+        self.assertNotIn("->Twice(", out)
+
+    def test_an_own_field_is_unchanged(self):
+        out = self.assertLowers("class T { public: int x; int Get() { return x; } };\n"
+                                "class D { public: T *t; int Go() { return t->Get(); } };", "T_Get(this->t)")
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 
@@ -819,3 +855,55 @@ def _main():
 
 if __name__ == "__main__":
     _main()
+
+
+class TestInheritedFieldOffACallResult(Base):
+    """`f(x)->id` where `id` is inherited: the field sits inside `_base`.
+
+    Found with CC# generic methods (`go.GetComponent<Coin>()->hp`): the walk that qualifies a named object's fields never saw an expression whose head is
+    a call, so the path to an inherited member was not written and the C read a member the struct does not have.
+    """
+
+    HIER = """
+class A { public: int id; };
+class B : public A { public: int w; };
+class Box { public: B *b; B *getb() { return b; } template <class T> T *get() { return (T *)b; } };
+"""
+
+    def test_method_result(self):
+        self.assertLowers(self.HIER + "int f(Box *x) { return x->getb()->id; }", "Box_getb(x)->_base.id")
+
+    def test_template_method_result(self):
+        self.assertLowers(self.HIER + "int f(Box *x) { return x->get<B>()->id; }", "Box_get_B(x)->_base.id")
+
+    def test_own_field_is_left_alone(self):
+        out = self.assertLowers(self.HIER + "int f(Box *x) { return x->getb()->w; }", "Box_getb(x)->w")
+        self.assertNotIn("_base.w", out)
+
+
+class TestRttiVtableUsedBeforeDefinition(Base):
+    """A function template instantiated for a class can be emitted before that class's table is defined; under `--rtti` the table is declared first."""
+
+    def test_forward_declared(self):
+        import tools.cpprust as cpprust
+        src = ("class A { public: virtual int f() { return 1; } };\nclass B : public A { public: int f() { return 2; } };\n"
+               "class Box { public: A *a; template <class T> T *get() { return dynamic_cast<T *>(a); } };\n"
+               "B *go(Box *x) { return x->get<B>(); }\n")
+        out = cpprust.translate(src, path="t.cc", any_order=True, bodies_last=True, rtti=True)
+        self.assertIn("static const struct B_vtable B__vtable;", out)
+        self.assertLess(out.index("static const struct B_vtable B__vtable;"), out.index("_cpp_dyncast((void *)(this->a)"))
+
+
+class TestArenaFree(Base):
+    """A slot given back (`T__free`) is the next one `new T` takes; a `Base *` is freed into the arena of the class it points into."""
+
+    SRC = ("class A { public: static const int __max_instances = 2; int id; virtual int f() { return 1; } };\n"
+           "class B : public A { public: static const int __max_instances = 2; int f() { return 2; } };\n")
+
+    def test_free_list_and_dispatcher(self):
+        out = self.assertLowers(self.SRC + "void go(A *a) { A__free(a); }\nB *mk() { return new B(); }",
+                                "B__free_slot", "B__free_list", "A__free(A *p)")
+        self.assertIn("(char *)B__arena", out)
+
+    def test_alloc_takes_the_free_list_first(self):
+        self.assertLowers(self.SRC + "B *mk() { return new B(); }", "B__free_n > 0")
