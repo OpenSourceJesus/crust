@@ -3554,6 +3554,7 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
             "name": nm.group(1), "params": params, "pack": pack,
             "spec_args": spec_args,
             "ctor_of": encl if encl == nm.group(1) else None,
+            "encl": encl,
             "start": m.start(), "end": k + 1,
             "decl_only": body_open is None,
             "fparams": [q for q in fparams if q],
@@ -3611,25 +3612,8 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         if t.get("spec_args") is not None:
             specialised.setdefault(t["name"], []).append(t["spec_args"])
 
-    out, last, names = [], 0, []
-    for t in sorted(tmpl, key=lambda t: t["start"]):
-        if t.get("spec_args") is not None:
-            # An explicit specialisation is already a definition. Drop the
-            # empty `template<>` head -- C has nothing to do with it, and
-            # left in place it reached the C front end verbatim -- and give
-            # it the mangled name the general template's instantiations
-            # use, so a call reaches it by the same symbol.
-            spec = text[t["start"]:t["end"]]
-            spec = spec[_match(spec, spec.index("<"), "<", ">") + 1:]
-            suffix = "_".join(_mangle_targ(a) for a in t["spec_args"])
-            spec = re.sub(
-                r"(?<![\w])%s\s*<[^<>()]*>\s*(?=\()" % re.escape(t["name"]),
-                "%s_%s" % (t["name"], suffix), spec, count=1)
-            out.append(text[last:t["start"]])
-            out.append(spec)
-            last = t["end"]
-            names.append("%s_%s" % (t["name"], suffix))
-            continue
+    def _collect(t):
+        """The arguments `t` is instantiated with, from the calls spelled in the file (and, for a recursive template, in its own copies)."""
         args = []
         for u in ([] if t.get("ctor_of") else re.finditer(
                 r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
@@ -3691,13 +3675,17 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                 op_at = u.end() - 1
                 cl = _match_paren(scan, op_at)
                 cargs = ([a.strip()
-                          for a in _split_top(scan[op_at + 1:cl])]
+                          for a in _split_top(scan[op_at + 1:cl]) if a.strip()]
                          if cl is not None else [])
                 fits = [o for o in siblings
                         if _template_fits_call(o, cargs, scan, u.start())]
-                if len(fits) == 1 and fits[0] is not t:
+                # Overloads are a class's own: `Component::GetComponent<T>()` and `GameObject::GetComponent<T>()` are two templates of
+                # one name that both fit a call, and each is instantiated for it (the call reaches one of them); only two of *one*
+                # class that fit alike are ambiguous.
+                if fits and not any(o is t for o in fits):
                     continue
-                if len(fits) > 1 and t is not fits[0]:
+                same = [o for o in fits if o.get("encl") == t.get("encl")]
+                if len(same) > 1 and t is not same[0]:
                     raise CppError(
                         "%s:%d: `%s<%s>` matches %d overloads of `%s` that "
                         "this pass cannot tell apart. It selects on argument "
@@ -3706,7 +3694,7 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                         "names."
                         % (os.path.basename(path),
                            _src_line(text, u.start()), t["name"],
-                           u.group(1).strip(), len(fits), t["name"]))
+                           u.group(1).strip(), len(same), t["name"]))
             got = [_eval_int_targ(a.strip())
                    for a in _split_top(u.group(1)) if a.strip()]
             # A pack absorbs everything after the fixed parameters, so its
@@ -3776,6 +3764,70 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                                    _MAX_INSTANTIATIONS))
                         args.append(got2)
                         queue.append(got2)
+        return args
+
+    # Which arguments each template is instantiated with -- to a fixpoint over every template, not only the file's own calls. A call inside a
+    # template's body is skipped above (its arguments may still be the enclosing template's parameters), so a template called only from another
+    # template's instantiated copy -- `Eng::Clone<T>(x)` in `Box::Copy<T>`, once `Copy<Box>` exists -- was never instantiated, its body was
+    # blanked, and the copy called a function that did not exist.  Each instantiation's substituted body is scanned for spelled calls to any
+    # template until no new instantiation appears.
+    pre_args = {}
+    for t in tmpl:
+        if t.get("spec_args") is None:
+            pre_args[id(t)] = _collect(t)
+    general = [t for t in tmpl if t.get("spec_args") is None and not t.get("ctor_of")]
+    rounds, changed = 0, True
+    while changed:
+        changed = False
+        rounds += 1
+        if rounds > _MAX_INSTANTIATIONS:
+            raise CppError("%s: function templates kept instantiating one another past %d rounds. A template that calls another needs a "
+                           "chain that ends." % (os.path.basename(path), _MAX_INSTANTIATIONS))
+        for t in general:
+            body0 = text[t["start"]:t["end"]]
+            body0 = body0[_match(body0, body0.index("<"), "<", ">") + 1:]
+            for got in list(pre_args[id(t)]):
+                one = _strip_comments(_substitute_template(t, got, body0))
+                for o in general:
+                    for u in re.finditer(r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(o["name"]), one):
+                        got2 = [_eval_int_targ(a.strip()) for a in _split_top(u.group(1)) if a.strip()]
+                        if len(got2) < len(o["params"]) if o.get("pack") else len(got2) != len(o["params"]):
+                            continue
+                        siblings = [x for x in general if x["name"] == o["name"]]
+                        if len(siblings) > 1:
+                            op_at = u.end() - 1
+                            cl = _match_paren(one, op_at)
+                            cargs = ([a.strip() for a in _split_top(one[op_at + 1:cl]) if a.strip()]
+                                     if cl is not None else [])
+                            fits = [x for x in siblings if _template_fits_call(x, cargs, one, u.start())]
+                            same = [x for x in fits if x.get("encl") == o.get("encl")]
+                            if not same or same[0] is not o:
+                                continue
+                        if got2 in specialised.get(o["name"], []) or got2 in pre_args[id(o)]:
+                            continue
+                        pre_args[id(o)].append(got2)
+                        changed = True
+
+    out, last, names = [], 0, []
+    for t in sorted(tmpl, key=lambda t: t["start"]):
+        if t.get("spec_args") is not None:
+            # An explicit specialisation is already a definition. Drop the
+            # empty `template<>` head -- C has nothing to do with it, and
+            # left in place it reached the C front end verbatim -- and give
+            # it the mangled name the general template's instantiations
+            # use, so a call reaches it by the same symbol.
+            spec = text[t["start"]:t["end"]]
+            spec = spec[_match(spec, spec.index("<"), "<", ">") + 1:]
+            suffix = "_".join(_mangle_targ(a) for a in t["spec_args"])
+            spec = re.sub(
+                r"(?<![\w])%s\s*<[^<>()]*>\s*(?=\()" % re.escape(t["name"]),
+                "%s_%s" % (t["name"], suffix), spec, count=1)
+            out.append(text[last:t["start"]])
+            out.append(spec)
+            last = t["end"]
+            names.append("%s_%s" % (t["name"], suffix))
+            continue
+        args = pre_args[id(t)]
         body = text[t["start"]:t["end"]]
         # Drop the `template<..>` head; what is left is an ordinary
         # function once the parameters are gone.
@@ -3850,10 +3902,12 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
     out.append(text[last:])
     text = "".join(out)
 
-    # And the call sites, now that the copies exist to be called.
-    scan_now = _strip_comments(text)
+    # And the call sites, now that the copies exist to be called.  The scan is taken again for each template: renaming `Copy<Box>(` to
+    # `Copy_Box(` shortens the text, and a scan taken once read every later call's arguments at a shifted offset.
     for t in tmpl:
-        def _fix(u, _t=t):
+        scan_now = _strip_comments(text)
+
+        def _fix(u, _t=t, scan_now=scan_now):
             got = [_eval_int_targ(a.strip())
                    for a in _split_top(u.group(1)) if a.strip()]
             suffix = "_".join(_mangle_targ(a) for a in got)
@@ -3869,7 +3923,7 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                 cl = _match_paren(scan_now, op_at) \
                     if op_at < len(scan_now) else None
                 cargs = ([a.strip()
-                          for a in _split_top(scan_now[op_at + 1:cl])]
+                          for a in _split_top(scan_now[op_at + 1:cl]) if a.strip()]
                          if cl is not None else [])
                 fits = [o for o in sibs
                         if _template_fits_call(o, cargs, scan_now, u.start())]
@@ -7768,6 +7822,26 @@ def _rewrite_scopes(text, type_info, path="<cpp>"):
 
 
 
+def _file_scope_objects(look, type_info):
+    """{name: class} for the objects of a class declared at file scope (`static fastring Log_text;`, which a static data member is by now).
+
+    They are named like locals, so assigning to one goes through `operator=` -- before, `Log_text = s;` stayed a struct copy, and `s` was dropped
+    under it, leaving the global holding freed memory. They are not `live`: the program owns them for its whole run, so no scope drops them."""
+    depth = 0
+    top = []
+    for k, ch in enumerate(look):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        top.append(depth == 0)
+    found = {}
+    for m in re.finditer(r"(?m)^[ \t]*(?:static\s+)?(\w+)\s+(\w+)\s*(?:;|=)", look):
+        if top[m.start()] and m.group(1) in type_info and type_info[m.group(1)].get("dtor"):
+            found[m.group(2)] = m.group(1)
+    return found
+
+
 def _rewrite_scopes_inner(text, type_info, _pos):
     """Emit ctor calls at local decls and dtor calls on every exit from scope.
 
@@ -7918,7 +7992,14 @@ def _rewrite_scopes_inner(text, type_info, _pos):
         return None
 
     out = []
-    scopes = [_Frame("file", None)]
+    file_objects = _file_scope_objects(look, type_info)
+
+    def file_frame():
+        fr = _Frame("file", None)
+        fr.vals.update(file_objects)
+        return fr
+
+    scopes = [file_frame()]
     aggs = 0               # depth of enclosing struct/union/enum bodies
     tmp = [0]              # counter for return-value temporaries
     mvn = [0]              # counter for materialised move temporaries
@@ -8038,7 +8119,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             for ctype, vname in ([] if dead else reversed(fr.live)):
                 out.append(_drop_stmt(type_info, ctype, vname))
             if not scopes:
-                scopes = [_Frame("file", None)]
+                scopes = [file_frame()]
             out.append(text[i])
             i += 1
             continue

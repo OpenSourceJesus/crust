@@ -853,6 +853,59 @@ def _main():
     unittest.main(argv=[sys.argv[0]] + argv, verbosity=2)
 
 
+class TestStaticMemberTemplates(Base):
+    """Static member templates as CCSharp emits them (its UnityEngine's `Object.FindObjectsOfType<T>()` and `Engine.Clone<T>(x)`)."""
+
+    SRC = """
+class Eng {
+public:
+    template <class T> static T *Clone(T *x) { return x; }
+};
+class Box {
+public:
+    int v;
+    template <class T> static T *Copy(T *x) { return Eng::Clone<T>(x); }
+    template <class T> static int Count() { return 1; }
+    template <class T> static int Count(bool all) { return all ? 2 : 1; }
+};
+int main() {
+    Box b;
+    b.v = 3;
+    Box *p = Box::Copy<Box>(&b);
+    return p->v + Box::Count<Box>() + Box::Count<Box>(true);
+}
+"""
+
+    def test_a_template_called_only_from_another_template_is_instantiated(self):
+        self.assertLowers(self.SRC, "Box * Eng_Clone_Box(Box *x)", "return Eng_Clone_Box(x);")
+
+    def test_a_call_with_no_arguments_selects_the_overload_with_no_parameters(self):
+        self.assertLowers(self.SRC, "static int Box_Count_Box(void)", "Box_Count_Box() + Box_Count_Box_v(true)")
+
+
+class TestStaticMemberObjects(Base):
+    """A static data member of a class with a destructor (CCSharp's `static string` field), assigned from a local: it is copied in, not left a
+    struct copy of a local that is then dropped (the static held freed memory, and the next use read garbage)."""
+
+    SRC = """
+class Str {
+public:
+    char *p;
+    Str() { p = 0; }
+    Str(const Str &o) { p = o.p; }
+    Str &operator=(const Str &o) { p = o.p; return *this; }
+    ~Str() { p = 0; }
+};
+class Log { public: static Str text; };
+Str Log::text;
+void Go() { Str s; Log::text = s; }
+int main() { Go(); return 0; }
+"""
+
+    def test_assigning_to_a_static_member_goes_through_operator_assign(self):
+        self.assertLowers(self.SRC, "Str__assign(&Log_text, &s);")
+
+
 if __name__ == "__main__":
     _main()
 
