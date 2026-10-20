@@ -115,6 +115,199 @@ def declared_fields(classes, cls):
     return out
 
 
+# Asset GUID -> path (the packer's map, set by write_project), and the AudioClips a scene refers to: guid -> (variable, name, seconds, rate, channels)
+ASSET_PATHS = {}
+CLIPS = {}
+
+
+def clip_expr(guid):
+    """`SceneData.clipN`, the AudioClip of a sound asset, or None when the asset is not a sound file.
+    ponytail: WAV is read (its length, rate, channels: stdlib `wave`); another format's clip has length 0.  No samples: the host has no audio yet."""
+    path = ASSET_PATHS.get(guid)
+    if not path or os.path.splitext(path)[1].lower() not in (".wav", ".ogg", ".mp3", ".aif", ".aiff", ".flac"):
+        return None
+    if guid not in CLIPS:
+        secs, rate, ch = 0.0, 44100, 1
+        if path.lower().endswith(".wav"):
+            import wave
+            try:
+                with wave.open(path) as w:
+                    rate, ch = w.getframerate(), w.getnchannels()
+                    secs = w.getnframes() / float(rate or 1)
+            except (wave.Error, OSError, EOFError):
+                pass
+        CLIPS[guid] = ("clip%d" % len(CLIPS), os.path.splitext(os.path.basename(path))[0], secs, rate, ch)
+    return "SceneData." + CLIPS[guid][0]
+
+
+def ref_expr(fid, ty, obj_of):
+    """The object a scene reference (fileID `fid`) names, as an expression of the field's declared type `ty`; None when it is not in this scene
+    or prefab (an asset), or the type is not one an object or a component can be.
+    ponytail: a component is found by type on the object (GetComponent<T>), so of two of one type on one object the first is taken.  Upgrade path:
+    each script record carrying its own MonoBehaviour fileID (the primary record merges them all)."""
+    fid = str(fid)
+    go = obj_of.get(fid) if "@" not in fid else obj_of.get("@" + fid.split("@")[-1])
+    in_prefab = "@" in fid
+    t = (ty or "").strip()
+    if in_prefab and go is None and t.split(".")[-1] == "AudioClip":
+        return clip_expr(fid.split("@")[-1])
+    if not in_prefab and ("#" + fid) in obj_of and t.split(".")[-1] not in ("GameObject", "Transform"):
+        return obj_of["#" + fid]            # that very script
+    if go is None or not t or t.endswith("]") or t.startswith("System.") or t in ("string", "int", "float", "bool", "double", "object"):
+        return None
+    short = t.split(".")[-1]
+    if short == "GameObject":
+        return go
+    if short == "Transform":
+        return "%s.transform" % go
+    if in_prefab and obj_of.get(":managed"):
+        # the one its fileID names in the template (a prefab script has its sourceId); else (a built-in component) the first of its type
+        return "(UnityEngine.Object.FindSource<%s>(%s, %sL) ?? %s.GetComponentInChildren<%s>(true))" % (t, go, int(fid.split("@")[0]), go, t)
+    # (in a prefab's template the component may be on an object below its root: the first of its type there)
+    return ("%s.GetComponentInChildren<%s>(true)" if in_prefab else "%s.GetComponent<%s>()") % (go, t)
+
+
+def _element_type(ty):
+    """`T` of `T[]` or `List<T>`, else None."""
+    t = (ty or "").strip()
+    if t.endswith("[]"):
+        return t[:-2]
+    m = re.match(r"^(?:System\.Collections\.Generic\.)?List<(.+)>$", t)
+    return m.group(1) if m else None
+
+
+def scene_refs(c, decl, r, obj_of):
+    """`c.field = <object>;` for a script's scene references (single ones and arrays / lists of them), public fields only."""
+    out = []
+    for fname, fid in sorted((r.get("object_refs") or {}).items()):
+        e = ref_expr(fid, decl.get(fname), obj_of) if fname in decl else None
+        if e is not None:
+            out.append("%s.%s = %s;" % (c, fname, e))
+    for fname, fids in sorted((r.get("object_ref_arrays") or {}).items()):
+        ty = decl.get(fname)
+        elem = _element_type(ty)
+        if elem is None:
+            continue
+        # an asset that is not loaded (an AudioClip, a Sprite ...) is a null slot: the array keeps its length, which scripts index by
+        items = [(ref_expr(f, elem, obj_of) or "null") if str(f) != "0" else "null" for f in fids]
+        if ty.strip().endswith("[]"):
+            out.append("%s.%s = new %s[] { %s };" % (c, fname, elem, ", ".join(items)))
+        else:
+            out.append("%s.%s = new System.Collections.Generic.List<%s> { %s };" % (c, fname, elem, ", ".join(items)))
+    return out
+
+
+def _class_info(classes, ty):
+    t = (ty or "").strip()
+    return classes.get(t) or classes.get(t.split(".")[-1]) or {}
+
+
+_VECTORS = {"Vector2": "xy", "Vector3": "xyz", "Vector4": "xyzw", "Vector2Int": "xy", "Vector3Int": "xyz", "Quaternion": "xyzw", "Color": "rgba"}
+
+
+def scalar_values(path, decl, rec, classes):
+    """`path.k = v;` for the scene's plain values of the public fields `decl` (a script's, or an embedded value's): numbers and bools, an enum
+    (stored as its number), a string, and Vector2 / Vector3 / Vector2Int / Vector3Int."""
+    out = []
+    nums = rec.get("fields") or {}
+    for k, val in sorted(nums.items()):
+        ty = decl.get(k)
+        if ty is None:
+            continue
+        lit = field_literal(ty, val)
+        if lit is None and _class_info(classes, ty).get("kind") == "enum" and float(val) == int(val):
+            lit = "(%s)%d" % (ty, int(val))
+        if lit is not None:
+            out.append("%s.%s = %s;" % (path, k, lit))
+    for k, val in sorted((rec.get("str_fields") or {}).items()):
+        if decl.get(k) == "string" and k not in nums:
+            out.append('%s.%s = "%s";' % (path, k, _cs_string(val)))
+    done = set()
+    # a vector stored as its components (`location_x`, `location_y`: the record's own fields), and a Rect / RectInt embedded in the value
+    for k, ty in sorted(decl.items()):
+        short = (ty or "").split(".")[-1]
+        comps = _VECTORS.get(short)
+        if comps and k + "_" + comps[0] in nums and k + "_" + comps[1] in nums:
+            vals = [nums.get(k + "_" + ch, 1.0 if ch in "aw" and short in ("Color", "Quaternion") else 0.0) for ch in comps]
+            lit = ", ".join(str(int(round(float(x)))) if short.endswith("Int") else _f(x) for x in vals)
+            out.append("%s.%s = new %s(%s);" % (path, k, short, lit))
+            done.add(k)
+        sv = (rec.get("struct_values") or {}).get(k)
+        if short in ("Rect", "RectInt") and sv:
+            f = sv.get("fields") or {}
+            if all(c in f for c in ("x", "y", "width", "height")):
+                vals = [f[c] for c in ("x", "y", "width", "height")]
+                out.append("%s.%s = new %s(%s);" % (path, k, short, ", ".join(str(int(v)) if short == "RectInt" else _f(v) for v in vals)))
+                done.add(k)
+    for k, vals in sorted((rec.get("num_arrays") or {}).items()):
+        ty = (decl.get(k) or "").strip()
+        elem = _element_type(ty)
+        if elem in ("float", "int", "double", "long", "short", "byte"):
+            lits = ", ".join(field_literal(elem, v) for v in vals)
+            out.append("%s.%s = %s;" % (path, k, ("new %s[] { %s }" if ty.endswith("[]") else "new System.Collections.Generic.List<%s> { %s }") % (elem, lits)))
+    for key, n in (("vec2_fields", 2), ("vec3_fields", 3)):
+        for k, v in sorted((rec.get(key) or {}).items()):
+            if k in done:
+                continue
+            short = (decl.get(k) or "").split(".")[-1]
+            if short in ("Vector2", "Vector3"):
+                vals = list(v) + [0.0] * (int(short[-1]) - len(v))
+                out.append("%s.%s = new %s(%s);" % (path, k, short, ", ".join(_f(x) for x in vals[:int(short[-1])])))
+            elif short in ("Vector2Int", "Vector3Int"):
+                vals = list(v) + [0.0] * (int(short[-4]) - len(v))
+                out.append("%s.%s = new %s(%s);" % (path, k, short, ", ".join(str(int(round(x))) for x in vals[:int(short[-4])])))
+    return out
+
+
+_ELEMS = [0]
+
+
+def embedded_arrays(path, decl, rec, classes, obj_of, managed, depth=0):
+    """An array or List<T> of embedded [Serializable] values (`areaZones`): one object per element, given the serializer's defaults (on a
+    managed engine) and then its scene values.  Each element is built in a block of its own, as `__eN`."""
+    out = []
+    for k, items in sorted((rec.get("struct_arrays") or {}).items()):
+        ty = decl.get(k)
+        elem = _element_type(ty)
+        info = _class_info(classes, elem)
+        if elem is None or info.get("kind") not in ("class", "struct") or depth > 10:
+            continue
+        is_list = not ty.strip().endswith("[]")
+        out.append("%s.%s = %s;" % (path, k, "new System.Collections.Generic.List<%s>()" % elem if is_list else "new %s[%d]" % (elem, len(items))))
+        for i, item in enumerate(items):
+            e = "__e%d" % _ELEMS[0]
+            _ELEMS[0] += 1
+            # (a class with no parameterless constructor is made as Unity's serializer makes it: no constructor runs)
+            make = "new %s()" % elem if info.get("new", True) else "(%s)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(%s))" % (elem, elem)
+            body = ["%s %s = %s;" % (elem, e, make)]
+            if managed and info.get("kind") == "class":
+                body.append("SerializedDefaults.CreateFields(%s);" % e)
+            body += nested_values(e, elem, item, classes, obj_of, depth + 1)
+            body.append("%s.%s.Add(%s);" % (path, k, e) if is_list else "%s.%s[%d] = %s;" % (path, k, i, e))
+            out.append("{ " + " ".join(body) + " }")
+    return out
+
+
+def nested_values(path, ty, sv, classes, obj_of=None, depth=0):
+    """Assignments of an embedded [Serializable] value's scene values (`path.k = v;`), for the public fields of class `ty` (and theirs, nested):
+    numbers, strings, Vector2 and scene references.  The class is looked up by its full name first (two classes may share a short one)."""
+    cls = (ty or "").strip()
+    if cls not in classes:
+        cls = cls.split(".")[-1]
+    if depth > 10 or cls not in classes:
+        return []
+    decl = declared_fields(classes, cls)
+    out = []
+    if obj_of is not None:
+        out += scene_refs(path, decl, sv, obj_of)
+    out += scalar_values(path, decl, sv, classes)
+    for k, inner in sorted((sv.get("struct_values") or {}).items()):
+        if k in decl:
+            out += nested_values("%s.%s" % (path, k), decl[k], inner, classes, obj_of, depth + 1)
+    out += embedded_arrays(path, decl, sv, classes, obj_of, obj_of is not None and obj_of.get(":managed"), depth + 1)
+    return out
+
+
 def field_literal(ty, val):
     """The C# literal of a scene value for a field of type `ty`, or None when the engine cannot set it (a reference, a vector ...)."""
     if ty == "float" or ty == "double":
@@ -222,6 +415,24 @@ def _lit(v):
     return None
 
 
+def scene_records(objects, hierarchy=()):
+    """The scene as emit_groups takes it: the object records, a record for each transform-only GameObject (an empty parent the
+    loader keeps in `hierarchy` only), and each baked tilemap tile as a GameObject with a SpriteRenderer."""
+    out = [o for o in objects if not o.get("tile")]
+    have = {o.get("xf_id") for o in out}
+    for h in hierarchy:
+        if h.get("xf_id") not in have and h.get("local_pos") is not None:
+            out.append(dict(h, local_scale=h.get("local_scale") or (1.0, 1.0, 1.0)))
+            have.add(h["xf_id"])
+    for i, t in enumerate(o for o in objects if o.get("tile")):
+        sp = t["sprite"]
+        half = math.atan2(sp.get("m10", 0.0), sp.get("m00", 1.0)) / 2
+        out.append({"name": "Tile", "go_id": "tile%d" % i, "active": 1, "layer": sp.get("layer", 0), "sprite": sp,
+                    "local_pos": (sp["x"], sp["y"], sp.get("z", 0.0)), "local_rot": (0.0, 0.0, math.sin(half), math.cos(half)),
+                    "local_scale": (sp.get("scale_x", 1.0), sp.get("scale_y", 1.0), 1.0)})
+    return out
+
+
 def all_records(objects, prefabs=()):
     """The scene's records and every prefab's: what textures and scripts are collected over."""
     out = list(objects)
@@ -296,11 +507,39 @@ def _material(col, rb):
     return {"friction": 0.4, "bounciness": 0.0, "friction_combine": 0, "bounce_combine": 0}
 
 
-def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
+@functools.lru_cache(maxsize=None)
+def script_order(script):
+    """The script's Script Execution Order (its .meta `executionOrder`), 0 without one."""
+    try:
+        with open(script + ".meta", encoding="utf-8", errors="replace") as f:
+            m = re.search(r"(?m)^\s*executionOrder:\s*(-?\d+)", f.read())
+    except OSError:
+        return 0
+    return int(m.group(1)) if m else 0
+
+
+def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var, cameras=(), in_prefab=False):
     """C# that builds the GameObjects of `gs` (a scene's or a prefab's): returns (lines, {xf_id: variable}).  `pf_var` is {guid: "SceneData.pfN"},
     the template a script field that refers to a prefab is given."""
     out = []
-    var_of = {g[0].get("xf_id"): "%so%d" % (pfx, i) for i, g in enumerate(gs)}
+    ui = dna_available()        # the uGUI classes are the managed engine's
+    var_of = {g[0]["xf_id"]: "%so%d" % (pfx, i) for i, g in enumerate(gs) if g[0].get("xf_id") is not None}
+    # every fileID on an object (it, its transform, its components) -> the object's variable: what a reference field is resolved through
+    obj_of = {}
+    for i, g in enumerate(gs):
+        for r in g:
+            for fid in [r.get("go_id"), r.get("xf_id")] + list(r.get("comp_ids") or []) + list(r.get("mb_ids") or []):
+                if fid is not None:
+                    obj_of.setdefault(str(fid), "%so%d" % (pfx, i))
+    for guid, var in pf_var.items():        # `fid@guid`: an object of a prefab asset, found in its template
+        obj_of["@" + guid] = var
+    obj_of[":managed"] = ui                 # (a prefab's component is found by its fileID on a managed engine)
+    for i, g in enumerate(gs):              # a script's own MonoBehaviour fileID -> that very script (of two of one type on an object)
+        for k, r in enumerate(g):
+            if r.get("class") and r.get("script") and r.get("own_mb_id"):
+                obj_of["#" + str(r["own_mb_id"])] = "%ss%d_%d" % (pfx, i, k)
+    refs = []                   # (script variable, declared fields, record): their scene references, set once every object exists
+    tiles_of = {}               # tile asset guid -> the Tile made for it (one each, shared by every cell that shows it)
     for i, g in enumerate(gs):
         o = g[0]
         v = "%so%d" % (pfx, i)
@@ -315,20 +554,21 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
             out.append("%s.SetActive(false);" % v)
         if o.get("layer"):
             out.append("%s.layer = %d;" % (v, o["layer"]))
+        if ui and o.get("rect"):
+            out.append("RectTransform %srt%d = %s.MakeRect();" % (pfx, i, v))
         for k, r in enumerate(g):
             if not (r.get("class") and r.get("script")):   # (a scriptless object has a made-up class name)
                 continue
             c = "%ss%d_%d" % (pfx, i, k)
             out.append("%s %s = new %s();" % (r["class"], c, r["class"]))
             decl = declared_fields(classes, r["class"])
-            for fname, val in sorted((r.get("fields") or {}).items()):
-                lit = field_literal(decl.get(fname), val) if fname in decl else None
-                if lit is not None:
-                    out.append("%s.%s = %s;" % (c, fname, lit))
-            for fname, ref in sorted((r.get("object_refs") or {}).items()):
-                guid = str(ref).split("@")[-1]
-                if guid in pf_var and decl.get(fname, "").endswith("GameObject"):
-                    out.append("%s.%s = %s;" % (c, fname, pf_var[guid]))
+            out += scalar_values(c, decl, r, classes)
+            refs.append((c, decl, r))
+            if in_prefab and ui and r.get("own_mb_id"):
+                out.append("%s.sourceId = %sL;" % (c, int(r["own_mb_id"])))
+            order = script_order(r["script"])
+            if order:
+                out.append("%s.executionOrder = %d;" % (c, order))
             out.append("%s.Attach(%s);" % (v, c))
         rb = o.get("rigidbody2d")
         if rb:
@@ -363,6 +603,10 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
                     for (px, py) in tri:
                         out.append("%s.AddPoint(%s, %s);" % (cc, _f(px + ox), _f(py + oy)))
                     out.append("%s.EndPiece();" % cc)
+                for path in col.get("paths") or []:        # the outlines as authored, which points / GetPath give back
+                    out += ["%s.AddPathPoint(%s, %s);" % (cc, _f(px), _f(py)) for (px, py) in path]
+                    out.append("%s.EndPath(%d);" % (cc, len(path)))
+                out.append("%s.pathOffset = new Vector2(%s, %s);" % (cc, _f(ox), _f(oy)))
             else:
                 out.append("%s.offset = new Vector2(%s, %s);" % (cc, _f(ox), _f(oy)))
                 if kind == "circle":
@@ -373,7 +617,7 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
                         out.append("%s.vertical = false;" % cc)
             out.append("%s.Attach(%s);" % (v, cc))
         sp = o.get("sprite")
-        if sp and sp.get("has_sprite"):
+        if sp and sp.get("has_sprite") and not (ui and o.get("ui_image")):      # (a UI image is an Image, not a sprite in the world)
             r = "%sr%d" % (pfx, i)
             out.append("SpriteRenderer %s = new SpriteRenderer();" % r)
             out.append("%s.spriteId = %d;" % (r, tex_ids.get(sp.get("tex_path"), -1)))
@@ -408,44 +652,223 @@ def emit_groups(gs, classes, tex_ids, pfx, ind, pf_var):
             lo, tg = jt.get("offset") or (0.0, 0.0), jt.get("target") or (0.0, 0.0)
             out.append("%s.linearOffset = new Vector2(%s, %s); %s.target = new Vector2(%s, %s);" % (jv, _jf(lo[0]), _jf(lo[1]), jv, _jf(tg[0]), _jf(tg[1])))
             out.append("%so%d.Attach(%s);" % (pfx, i, jv))
+        if ui:
+            out += _ui_components(g[0], "%so%d" % (pfx, i), "%sui%d" % (pfx, i))
+            out += _tilemap_components(g[0], "%so%d" % (pfx, i), "%stm%d" % (pfx, i), tiles_of, pfx)
+            out += _builtin_components(g[0], "%so%d" % (pfx, i), "%sbi%d" % (pfx, i))
+            out += _audio_sources(g[0], "%so%d" % (pfx, i), "%sau%d" % (pfx, i))
+            if g[0].get("animator_controller"):
+                # ponytail: the Animator without its controller (states and clips are not loaded): Play and speed work, nothing animates.
+                # Upgrade path: the controller asset's states and the clips' curves (the packed path's _build_animation_tables).
+                out += ["Animator %sanim%d = new Animator();" % (pfx, i), "%so%d.Attach(%sanim%d);" % (pfx, i, pfx, i)]
     for i, g in enumerate(gs):
         if g[0].get("father_id") in var_of:
-            out.append("%so%d.transform.parent = %s.transform;" % (pfx, i, var_of[g[0]["father_id"]]))
+            out.append("%so%d.transform.SetParent(%s.transform, false);" % (pfx, i, var_of[g[0]["father_id"]]))
+    out += _cameras(cameras, obj_of, var_of, pfx)      # before the references: a script's `camera` field is one of them
+    for c, decl, r in refs:                 # every object exists now: a reference may point at one made later
+        out += scene_refs(c, decl, r, obj_of)
+        # after Attach, which gave the [Serializable] fields their objects (SerializedDefaults.CreateFields): their scene values go in
+        for fname, sv in sorted((r.get("struct_values") or {}).items()):
+            if fname in decl:
+                out += nested_values("%s.%s" % (c, fname), decl[fname], sv, classes, obj_of)
+        out += embedded_arrays(c, decl, r, classes, obj_of, ui)
+    for i, g in enumerate(gs):              # after the parenting: an anchored position is measured from the parent's rectangle
+        rect = g[0].get("rect") if ui else None
+        if rect:
+            rt = "%srt%d" % (pfx, i)
+            for prop, key, dflt in (("anchorMin", "anchor_min", (0.5, 0.5)), ("anchorMax", "anchor_max", (0.5, 0.5)), ("pivot", "pivot", (0.5, 0.5)),
+                                    ("sizeDelta", "size_delta", (0.0, 0.0)), ("anchoredPosition", "anchored_position", (0.0, 0.0))):
+                x, y = rect.get(key) or dflt
+                out.append("%s.%s = new Vector2(%s, %s);" % (rt, prop, _f(x), _f(y)))
     return [ind + l for l in out], var_of
 
 
-def scene_source(objects, cameras, classes=None, prefabs=()):
+def _cameras(cameras, obj_of, var_of, pfx):
+    """The scene's cameras: each on its own GameObject when the scene made one (it has scripts, or children), else on a new one under its parent.
+    Camera.main is the first camera tagged MainCamera (Engine.mainCamera is otherwise the last one attached)."""
+    out, main = [], None
+    for j, c in enumerate(cameras):
+        cv = "%scam%d" % (pfx, j)
+        go = obj_of.get(str(c.get("cam_file_id")))
+        if go is None:
+            go = "%scgo%d" % (pfx, j)
+            p = c["local_pos"]
+            out.append('GameObject %s = new GameObject("%s");' % (go, _cs_string(c["name"])))
+            out.append("%s.transform.localPosition = new Vector3(%s, %s, %s);" % (go, _f(p[0]), _f(p[1]), _f(p[2])))
+            if c.get("father_id") in var_of:
+                out.append("%s.transform.SetParent(%s.transform, false);" % (go, var_of[c["father_id"]]))
+        out.append("Camera %s = new Camera();" % cv)
+        out.append("%s.orthographicSize = %s;" % (cv, _f(c.get("orthographic_size", 5.0))))
+        out.append("%s.background = new Color(%s, %s, %s, 1f);" % (cv, _f(c.get("bg_r", 0)), _f(c.get("bg_g", 0)), _f(c.get("bg_b", 0))))
+        out.append("%s.Attach(%s);" % (go, cv))
+        if main is None and c.get("main"):
+            main = cv
+    if main is not None:
+        out.append("Engine.mainCamera = %s;" % main)
+    return out
+
+
+def _color(c):
+    return "new Color(%s, %s, %s, %s)" % (_f(c.get("r", 1.0)), _f(c.get("g", 1.0)), _f(c.get("b", 1.0)), _f(c.get("a", 1.0)))
+
+
+def _tilemap_components(o, v, c, tiles_of, pfx):
+    """A Grid and a Tilemap with its authored cells, for scripts to ask (cellBounds, GetTile, WorldToCell ...); the baked tile sprites are what
+    is drawn.  ponytail: a Tile has no sprite (tile assets are not loaded): a script reading tile.sprite gets null."""
+    out = []
+    gr = o.get("grid")
+    if gr:
+        (cw, ch), (gw, gh) = gr["cell"], gr["gap"]
+        out += ["Grid %sg = new Grid();" % c, "%sg.SetCellSize(new Vector3(%s, %s, 0f)); %sg.SetCellGap(new Vector3(%s, %s, 0f));" % (
+            c, _f(cw), _f(ch), c, _f(gw), _f(gh)), "%s.Attach(%sg);" % (v, c)]
+    tm = o.get("tilemap")
+    if tm:
+        ax, ay = tm["anchor"]
+        out += ["UnityEngine.Tilemaps.Tilemap %st = new UnityEngine.Tilemaps.Tilemap();" % c, "%st.tileAnchor = new Vector3(%s, %s, 0f);" % (c, _f(ax), _f(ay)),
+                "%s.Attach(%st);" % (v, c)]
+        for x, y, guid in tm["cells"]:
+            if guid not in tiles_of:
+                tiles_of[guid] = "%stile%d" % (pfx, len(tiles_of))
+                out.append("UnityEngine.Tilemaps.Tile %s = ScriptableObject.CreateInstance<UnityEngine.Tilemaps.Tile>();" % tiles_of[guid])
+            out.append("%st.SetTile(new Vector3Int(%d, %d, 0), %s);" % (c, x, y, tiles_of[guid]))
+    return out
+
+
+# Unity's own MonoBehaviours the loader makes in their own way (or never: the record's other keys stand for them)
+_BUILTIN_DONE = {"Image", "Button", "TextMeshProUGUI", "TextMeshPro", "Canvas", "Text", "Slider", "Toggle", "Scrollbar", "ScrollRect", "RawImage"}
+
+
+@functools.lru_cache(maxsize=None)
+def engine_classes():
+    """{class name: full name} of the managed engine's classes (unity-engine-managed), from their sources: the namespace a class is declared in."""
+    found = {}
+    d = os.path.join(ccsharp_home(), "unity-engine-managed")
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else ():
+        if not f.endswith(".cs"):
+            continue
+        with open(os.path.join(d, f), encoding="utf-8-sig") as fh:
+            text = fh.read()
+        spaces = [(m.start(), m.group(1)) for m in re.finditer(r"(?m)^namespace\s+([\w.]+)", text)]
+        for m in re.finditer(r"(?m)^\s*public\s+(?:sealed\s+|partial\s+)?class\s+(\w+)", text):
+            ns = [n for at, n in spaces if at < m.start()]
+            found.setdefault(m.group(1), (ns[-1] + "." if ns else "") + m.group(1))
+    return found
+
+
+def _builtin_components(o, v, c):
+    """The Unity package MonoBehaviours on the object (EventSystem, an input module, a raycaster, a layout group ...) that the managed engine
+    has a class of: made, so that a script's GetComponent or reference finds them.  Their settings are not read (the engine's defaults)."""
+    out = []
+    known = engine_classes()
+    for k, (name, _fid, enabled) in enumerate(o.get("builtin_mbs") or ()):
+        full = known.get(name)
+        if full is None or name in _BUILTIN_DONE:
+            continue
+        out.append("%s %s%d = new %s();" % (full, c, k, full))
+        if not enabled:
+            out.append("%s%d.enabled = false;" % (c, k))
+        out.append("%s.Attach(%s%d);" % (v, c, k))
+    return out
+
+
+def _audio_sources(o, v, c):
+    """The object's AudioSources with their settings.  ponytail: no clip (audio assets are not loaded, and the host has no audio yet): a script
+    that plays one plays silence.  Upgrade path: the clips decoded into the host's sounds (AudioClip.FromHost)."""
+    out = []
+    for k, a in enumerate(o.get("audiosources") or ()):
+        a_ = "%s%d" % (c, k)
+        out += ["AudioSource %s = new AudioSource();" % a_,
+                "%s.playOnAwake = %s; %s.loop = %s; %s.mute = %s;" % (a_, "true" if a.get("play_on_awake", 1) else "false", a_, "true" if a.get("loop") else "false",
+                                                                   a_, "true" if a.get("mute") else "false"),
+                "%s.volume = %s; %s.pitch = %s;" % (a_, _f(a.get("volume", 1.0)), a_, _f(a.get("pitch", 1.0)))]
+        if not a.get("enabled", 1):
+            out.append("%s.enabled = false;" % a_)
+        out.append("%s.Attach(%s);" % (v, a_))
+    return out
+
+
+def _ui_components(o, v, c):
+    """The uGUI components of record `o`, on GameObject `v` (variables named from `c`).
+    ponytail: geometry, colours, text and switches only: an Image has no sprite yet and a Button no onClick listeners (the packer does not
+    load UI sprites or persistent calls for the engine); the upgrade path is the packed path's _bake_ui_images and its onClick table."""
+    out = []
+    cv = o.get("canvas")
+    if cv:
+        out += ["Canvas %sc = new Canvas();" % c, "%sc.renderMode = (RenderMode)%d;" % (c, cv.get("render_mode", 0)),
+                "%sc.planeDistance = %s; %sc.sortingOrder = %d; %sc.overrideSorting = %s;" % (
+                    c, _f(cv.get("plane_distance", 100.0)), c, cv.get("sorting_order", 0), c, "true" if cv.get("override_sorting") else "false")]
+        if not cv.get("enabled", 1):
+            out.append("%sc.enabled = false;" % c)
+        out.append("%s.Attach(%sc);" % (v, c))
+    im = o.get("ui_image")
+    if im:
+        out += ["UnityEngine.UI.Image %si = new UnityEngine.UI.Image();" % c, "%si.color = %s;" % (c, _color(im)),
+                "%si.type = (UnityEngine.UI.Image.Type)%d; %si.preserveAspect = %s; %si.pixelsPerUnitMultiplier = %s;" % (
+                    c, im.get("image_type", 0), c, "true" if im.get("preserve_aspect") else "false", c, _f(im.get("pixels_per_unit_multiplier", 1.0)))]
+        if not im.get("enabled", 1):
+            out.append("%si.enabled = false;" % c)
+        out.append("%s.Attach(%si);" % (v, c))
+    tmp = o.get("ui_tmp")
+    if tmp:
+        out += ["TMPro.TextMeshProUGUI %st = new TMPro.TextMeshProUGUI();" % c, '%st.text = "%s";' % (c, _cs_string(tmp.get("text") or "")),
+                "%st.fontSize = %s; %st.color = %s;" % (c, _f(tmp.get("font_size", 36.0)), c, _color(tmp)), "%s.Attach(%st);" % (v, c)]
+    bt = o.get("ui_button")
+    if bt:
+        out += ["UnityEngine.UI.Button %sb = new UnityEngine.UI.Button();" % c,
+                "%sb.interactable = %s;" % (c, "false" if bt.get("interactable", 1) in (0, False) else "true")]
+        if bt.get("enabled", 1) in (0, False):
+            out.append("%sb.enabled = false;" % c)
+        out.append("%s.Attach(%sb);" % (v, c))
+    return out
+
+
+def scene_source(objects, cameras, classes=None, prefabs=(), project=None):
     """SceneData.cs: the scene as code, and a Prefab subclass for each prefab.  `classes` is describe()'s account of the scripts: a scene field is set
-    on the script that declares it."""
+    on the script that declares it.  `project` ({"company", "product", "scenes"}) is told to Application and SceneManager when the scripts use them
+    (setting them otherwise would bring in the managed half of the engine for nothing)."""
     classes = classes or {}
+    CLIPS.clear()
     tex_ids = textures(objects, prefabs)[1]
     pf_var = {pf["guid"]: "SceneData.pf%d" % i for i, pf in enumerate(prefabs)}
-    out = ["using UnityEngine;", ""]
+    out = ["using UnityEngine;"] + ["using %s;" % ns for ns in (project or {}).get("namespaces", ())] + [""]
     for pf in prefabs:                      # a prefab is code that builds it; Instantiate(template) calls it
         gs = groups(pf["objects"])
-        lines, var_of = emit_groups(gs, classes, tex_ids, "", "        ", pf_var)
+        lines, var_of = emit_groups(gs, classes, tex_ids, "", "        ", pf_var, in_prefab=True)
         roots = [i for i, g in enumerate(gs) if g[0].get("father_id") not in var_of]
         out += ["class %s : Prefab" % prefab_name(pf), "{", "    public override GameObject Create()", "    {"] + lines
         out += ["        return o%d;" % (roots[0] if roots else 0), "    }", "}", ""]
     out += ["static class SceneData", "{"]
     for i, pf in enumerate(prefabs):
         out.append("    public static GameObject pf%d;" % i)
-    out += ["    public static void Load()", "    {"]
-    for i, pf in enumerate(prefabs):        # templates first: a script field may refer to one
-        out += ['        pf%d = new GameObject("%s");' % (i, _cs_string(pf["name"])), "        pf%d.SetActive(false);" % i,
-                "        pf%d.prefab = new %s();" % (i, prefab_name(pf)), "        Engine.Forget(pf%d);" % i]
-    lines, var_of = emit_groups(groups(objects), classes, tex_ids, "", "        ", pf_var)
-    out += lines
-    for j, c in enumerate(cameras):
-        v = "c%d" % j
-        p = c["local_pos"]
-        out.append('        GameObject %s = new GameObject("%s");' % (v, _cs_string(c["name"])))
-        out.append("        %s.transform.localPosition = new Vector3(%s, %s, %s);" % (v, _f(p[0]), _f(p[1]), _f(p[2])))
-        out.append("        Camera %sc = new Camera();" % v)
-        out.append("        %sc.orthographicSize = %s;" % (v, _f(c.get("orthographic_size", 5.0))))
-        out.append("        %sc.background = new Color(%s, %s, %s, 1f);" % (v, _f(c.get("bg_r", 0)), _f(c.get("bg_g", 0)), _f(c.get("bg_b", 0))))
-        out.append("        %s.Attach(%sc);" % (v, v))
-    out += ["    }", "}", ""]
+    # Load builds the prefab templates once and the scene; Build is the scene alone, which SceneManager.LoadScene runs again (through SceneLoad)
+    out += ["    public static void Load()", "    {", "        MakeClips();", "        Engine.sceneLoader = new SceneLoad();"]
+    if project and project.get("managed_api"):
+        out += ['        Application.companyName = "%s";' % _cs_string(project.get("company") or "DefaultCompany"),
+                '        Application.productName = "%s";' % _cs_string(project.get("product") or "Player"),
+                "        UnityEngine.SceneManagement.SceneManager.sceneNames = new string[] { %s };"
+                % ", ".join('"%s"' % _cs_string(n) for n in (project.get("scenes") or [""]))]
+    matrix = (project or {}).get("layer_matrix")
+    if matrix and any(m != 0xFFFFFFFF for m in matrix):
+        out += ["        Physics2D.layerMasks.Add(%d);" % (m - (1 << 32) if m >= 1 << 31 else m) for m in matrix]
+    names = (project or {}).get("layer_names")
+    if names and project.get("layer_api"):
+        out.append("        LayerMask.layerNames = new string[] { %s };" % ", ".join('"%s"' % _cs_string(names.get(k, "")) for k in range(32)))
+    # templates first: a script field may refer to one, and read its fields as Unity's scripts do (`bulletPrefab.moveSpeed`).  Each is built once,
+    # inactive and out of the scene (Engine.Forget); Instantiate builds another.  Last found first: a prefab is found through the ones that refer to it.
+    # ponytail: two prefabs that refer to each other -- the first built sees the other's template still null.
+    for i in reversed(range(len(prefabs))):
+        out += ["        pf%d = new %s().Create();" % (i, prefab_name(prefabs[i])), "        pf%d.SetActive(false);" % i,
+                "        pf%d.prefab = new %s();" % (i, prefab_name(prefabs[i])), "        Engine.Forget(pf%d);" % i]
+    out += ["        Build();", "    }", "", "    public static void Build()", "    {",
+            "        Engine.loadingScene = true;          // (the scene's objects get Unity's negative instance IDs)"]
+    lines, var_of = emit_groups(groups(objects), classes, tex_ids, "", "        ", pf_var, cameras)
+    out += lines + ["        Engine.loadingScene = false;"]
+    out += ["    }", ""]
+    # the AudioClips the scene refers to, made once (CLIPS was filled while the objects above were written)
+    out += ["    public static AudioClip %s;" % v for v, _n, _s, _r, _c in CLIPS.values()]
+    out += ["    static void MakeClips()", "    {"] + ['        %s = AudioClip.FromHost("%s", -1, %s, %d, %d);' % (v, _cs_string(n), _f(secs), rate, ch)
+                                                      for v, n, secs, rate, ch in CLIPS.values()] + ["    }"]
+    out += ["}", "", "class SceneLoad : SceneLoader", "{", "    public override void Load(int buildIndex) { SceneData.Build(); }", "}", ""]
     return "\n".join(out)
 
 
@@ -456,12 +879,23 @@ def collect_prefabs(root, objects, assets):
     guids = up._guid_map(root, asset_guids=assets)
     found, order = {}, []
 
+    def ids(v):
+        # the references of a record or of an embedded value: single ones, arrays, and those of the values nested in it
+        for ref in (v.get("object_refs") or {}).values():
+            yield str(ref)
+        for arr in (v.get("object_ref_arrays") or {}).values():
+            for ref in arr:
+                yield str(ref)
+        for inner in (v.get("struct_values") or {}).values():
+            for ref in ids(inner):
+                yield ref
+
     def refs_of(recs):
         for o in recs:
-            for ref in (o.get("object_refs") or {}).values():
-                g = str(ref).split("@")[-1]
+            for ref in ids(o):
+                g = ref.split("@")[-1]
                 path = assets.get(g)
-                if path and path.endswith(".prefab") and g not in found:
+                if "@" in ref and path and path.endswith(".prefab") and g not in found:
                     yield g, path
 
     pending = list(refs_of(objects))
@@ -469,8 +903,9 @@ def collect_prefabs(root, objects, assets):
         g, path = pending.pop(0)
         if g in found:
             continue
-        recs = up._parsed_prefab_objects(path, guids, assets)[0]
-        recs = [dict(r) for r in recs]
+        # with its own PrefabInstances expanded, as a scene's are (a prefab built from another one: a variant, a nested prefab)
+        parsed = up.parse_unity_yaml(up._expand_unstripped_prefab_instances(up._read(path), assets), guid_to_script=guids, asset_guids=assets)
+        recs = scene_records([dict(r) for r in parsed[0]], parsed[3])
         up._attach_sprite_textures(recs, assets)
         found[g] = {"guid": g, "name": os.path.splitext(os.path.basename(path))[0], "objects": recs}
         order.append(g)

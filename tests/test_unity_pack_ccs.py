@@ -63,6 +63,65 @@ class TestPlugins(unittest.TestCase):
         self.assertIn("public int Size { get { throw", t)
 
 
+class TestLoader(unittest.TestCase):
+    def test_scene_to_csharp_without_cs2cpp(self):
+        import tools.unity.unity_pack as up
+        root = os.path.join(ROOT, "tests/fixtures/MiniScene")
+        assets = up._asset_guid_map(root)
+        objs, _l, cams, _h = up._load_scenes_lights_cameras(root, assets)
+        prefabs = ccs.collect_prefabs(root, objs, assets)
+        self.assertEqual(ccs.eligible(objs, cams, prefabs), (True, ""))
+        self.assertIn("new GameObject(", ccs.scene_source(objs, cams, {}, prefabs))
+        self.assertFalse([m for m in sys.modules if m in ("tools.cs2cpp", "tools.cpprust", "tools.csrust")])
+
+    def test_scene_references_resolve_through_the_objects_ids(self):
+        ids = {"10": "o1", "11": "o1", "20": "o2"}
+        r = {"object_refs": {"go": "10", "tr": "11", "img": "20", "asset": "999"}, "object_ref_arrays": {"all": ["10", "0", "20"]}}
+        decl = {"go": "UnityEngine.GameObject", "tr": "UnityEngine.Transform", "img": "UnityEngine.UI.Image", "asset": "UnityEngine.Sprite",
+                "all": "UnityEngine.GameObject[]"}
+        self.assertEqual(ccs.scene_refs("s", decl, r, ids), ["s.go = o1;", "s.img = o2.GetComponent<UnityEngine.UI.Image>();", "s.tr = o1.transform;",
+                                                             "s.all = new UnityEngine.GameObject[] { o1, null, o2 };"])
+
+    def test_vectors_enums_and_rects_take_their_scene_values(self):
+        decl = {"location": "UnityEngine.Vector2Int", "box": "UnityEngine.Rect", "kind": "NS.Kind", "p": "UnityEngine.Vector3"}
+        r = {"fields": {"location_x": 24.0, "location_y": 3.0, "kind": 2}, "vec3_fields": {"p": (1.0, 2.0, 3.0)},
+             "struct_values": {"box": {"fields": {"x": 5, "y": 6, "width": 7, "height": 8}}}}
+        self.assertEqual(ccs.scalar_values("o", decl, r, {"Kind": {"kind": "enum"}}),
+                         ["o.kind = (NS.Kind)2;", "o.box = new Rect(5.0f, 6.0f, 7.0f, 8.0f);", "o.location = new Vector2Int(24, 3);",
+                          "o.p = new Vector3(1.0f, 2.0f, 3.0f);"])
+
+    def test_an_array_of_embedded_values_gets_an_object_per_element(self):
+        classes = {"Zone": {"kind": "class", "base": None, "fields": {"name": "string", "collider": "UnityEngine.Collider2D"}}}
+        r = {"struct_arrays": {"zones": [{"str_fields": {"name": "Cave"}, "object_refs": {"collider": "12"}}]}}
+        out = ccs.embedded_arrays("w", {"zones": "NS.Zone[]"}, r, classes, {"12": "o3", ":managed": True}, True)
+        self.assertEqual(out[0], "w.zones = new NS.Zone[1];")
+        self.assertIn('.collider = o3.GetComponent<UnityEngine.Collider2D>(); ', out[1])
+        self.assertIn('.name = "Cave"; w.zones[0] = ', out[1])
+
+    def test_nested_scene_values_are_assigned_through_the_field_path(self):
+        classes = {"Clamped": {"base": None, "fields": {"value": "float", "range": "NS.Range", "label": "string"}},
+                   "Range": {"base": None, "fields": {"min": "float", "max": "float"}}}
+        sv = {"fields": {"value": 1}, "str_fields": {"value": "1", "label": "hi"}, "vec2_fields": {},
+              "struct_values": {"range": {"fields": {"max": 5.5}, "str_fields": {}, "vec2_fields": {}}}}
+        self.assertEqual(ccs.nested_values("s.c", "NS.Clamped", sv, classes),
+                         ['s.c.value = 1.0f;', 's.c.label = "hi";', 's.c.range.max = 5.5f;'])
+
+    def test_script_order_comes_from_the_meta(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cs = os.path.join(d, "A.cs")
+            open(cs, "w").write("class A {}")
+            open(cs + ".meta", "w").write("fileFormatVersion: 2\nMonoImporter:\n  executionOrder: -5\n")
+            self.assertEqual(ccs.script_order(cs), -5)
+            self.assertEqual(ccs.script_order(os.path.join(d, "B.cs")), 0)
+
+    def test_a_prefab_child_finds_its_parent_in_the_prefab(self):
+        pf = {"objects": [{"name": "root", "xf_id": 1}, {"name": "child", "xf_id": 2, "father_id": 1}]}
+        self.assertEqual(ccs.eligible([], [], [pf]), (True, ""))
+        self.assertFalse(ccs.eligible([{"name": "orphan", "xf_id": 3, "father_id": 1}], [], [pf])[0])
+
+
+@unittest.skipUnless(ccs.available(), "CCSharp not beside this repo")
 class TestMiniScene(unittest.TestCase):
     def test_runs(self):
         with tempfile.TemporaryDirectory() as d:
