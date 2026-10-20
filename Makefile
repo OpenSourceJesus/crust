@@ -178,10 +178,10 @@ test_gles2_wasm:
 test_godot_fast:
 	python3 tools/godot_pack_test_fast.py
 
-# Packed Unity MiniScene → GLES2 view (native surfaceless).
+# Unity scenes built with CCSharp (tools/unity/unity_pack.py).
 #     make test_unity_gles2
 test_unity_gles2:
-	python3 -m unittest tests.test_unity_pack.TestGLES2View -v
+	python3 -m unittest tests.test_unity_pack_ccs -v
 
 SEED  ?= 1
 COUNT ?= 200
