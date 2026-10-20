@@ -99,6 +99,23 @@ def _go_of(rec):
     return m.group(1) if m else None
 
 
+def tilemaps(by_id):
+    """{GameObject fileID: {"grid": {"cell", "gap"}} or {"tilemap": {"anchor", "cells": [(x, y, tile guid or None)]}}} for the scene's Grids and
+    Tilemaps as components (what scripts call: cellBounds, GetTile, WorldToCell ...); bake_tiles is what is drawn."""
+    out = {}
+    for rec in by_id.values():
+        go, part = _go_of(rec), rec.get("tilemap_part")
+        if go is None or part not in ("grid", "tilemap"):
+            continue
+        if part == "grid":
+            out.setdefault(go, {})["grid"] = {"cell": rec["grid"]["cell"], "gap": rec["grid"]["gap"]}
+        else:
+            tm = rec["tilemap"]
+            cells = [(x, y, (tm["sprites"][si][1] if si < len(tm["sprites"]) and tm["sprites"][si] else None)) for x, y, si, _mi, _ci in tm["tiles"]]
+            out.setdefault(go, {})["tilemap"] = {"anchor": tm["anchor"], "cells": cells}
+    return out
+
+
 def bake_tiles(by_id, world_trs, quat_xy_basis):
     """Each drawn tile of the scene's Tilemaps: a sprite dict (world x / y,
     the basis m00..m11 with its scale apart in scale_x / scale_y)."""

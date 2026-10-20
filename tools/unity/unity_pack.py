@@ -2741,8 +2741,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- \{fileID:\s*-?\d+"
                 r"[^}\n]*\}[ \t]*\n?)+)", block):
             if not fm.group(1).startswith("m_"):
-                rec.setdefault("object_ref_arrays", {})[fm.group(1)] = \
-                    re.findall(r"fileID:\s*(-?\d+)", fm.group(2))
+                # an element of another asset (a prefab) is "fid@guid", as a single reference is
+                rec.setdefault("object_ref_arrays", {})[fm.group(1)] = [
+                    ("%s@%s" % (a, g.lower()) if g and a != "0" else a) for a, g in
+                    re.findall(r"fileID:\s*(-?\d+)(?:,\s*guid:\s*([0-9a-fA-F]+))?", fm.group(2))]
+        sa = _embedded_arrays(block)
+        if sa:
+            rec["struct_arrays"] = sa
         # Number arrays: name:\n  - 0.5\n  - 1 ...
         for fm in re.finditer(
                 r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- [-+.\deE]+[ \t]*\n?)+)",
@@ -3215,10 +3220,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
 
     # PrefabInstance m_AddedComponents (and any MB whose m_GameObject points
     # at a stripped GO) are not listed on the GO's m_Component — reverse-map
-    # them so DeactivateBasedOnInputDevice / nested scripts still pack.
+    # them so DeactivateBasedOnInputDevice / nested scripts still pack, and a
+    # prefab variant's added components (a Rigidbody2D) are its object's.
+    # (every component kind: a variant's added Rigidbody2D or collider is as unlisted as an added script)
     mbs_by_go = {}
     for rec in by_id.values():
-        if rec.get("kind") != "MonoBehaviour":
+        if rec.get("kind") in (None, "GameObject", "PrefabInstance"):
             continue
         raw = rec.get("raw") or ""
         gm = re.search(
@@ -3292,6 +3299,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         vec3_fields = {}
         anim_curves = {}
         struct_values = {}
+        struct_arrays = {}
         sprite = None
         ui_image = None
         ui_button = None
@@ -3355,6 +3363,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
                 struct_values.update(k.get("struct_values") or {})
+                struct_arrays.update(k.get("struct_arrays") or {})
                 # AnimationCurve fields: keys and wrap modes, serialized
                 # inline (tools/unity/unity_pack_curves.py).
                 try:
@@ -3611,6 +3620,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
                 "has_tmp": bool(ui_tmp),
+                "local_pos": local_pos,
+                "local_rot": local_rot,
+                "local_scale": local_scale,
             })
         if cam is not None:
             cameras.append({
@@ -3807,7 +3819,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "object_ref_arrays": object_ref_arrays,
             "num_arrays": num_arrays,
             "struct_values": struct_values,
+            "struct_arrays": struct_arrays,
             "mb_ids": mb_ids,
+            "own_mb_id": str(prim.get("file_id")) if prim is not None else None,   # the primary script's own MonoBehaviour
             "mb_enabled": _mb_enabled((prim or {}).get("raw") or ""),
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
@@ -3877,8 +3891,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "object_refs": dict(k.get("object_refs") or {}),
                 "object_ref_arrays": dict(k.get("object_ref_arrays") or {}),
                 "num_arrays": dict(k.get("num_arrays") or {}),
+                "vec2_fields": dict(k.get("vec2_fields") or {}),
+                "vec3_fields": dict(k.get("vec3_fields") or {}),
                 "struct_values": dict(k.get("struct_values") or {}),
+                "struct_arrays": dict(k.get("struct_arrays") or {}),
                 "mb_ids": [str(k.get("file_id"))],
+                "own_mb_id": str(k.get("file_id")),
                 "mb_enabled": _mb_enabled(k.get("raw") or ""),
                 "comp_ids": [str(c.get("file_id")) for c in kids
                              if c.get("file_id") is not None],
@@ -3981,6 +3999,37 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     _annotate_ui_eventtrigger_targets(objects, by_id, guid_to_script)
     # set last: the prefab parses above call this function too
     parse_unity_yaml.tiles = tiles
+    # On the records themselves (so a prefab's, parsed here too, have them): its Grid / Tilemap components, and the MonoBehaviours of Unity's
+    # own packages on it (EventSystem, an input module, a layout group ...), by script name -- what the CCSharp loader makes as components.
+    side = _tm.tilemaps(by_id)
+    for rec in by_id.values():
+        if rec.get("kind") != "MonoBehaviour":
+            continue
+        gm = re.search(r"m_Script:\s*\{fileID:\s*-?\d+,\s*guid:\s*([0-9a-fA-F]+)", rec.get("raw") or "")
+        path = (asset_guids or {}).get(gm.group(1).lower()) if gm else None
+        go = _tm._go_of(rec)
+        if go is None or not path or not path.endswith(".cs") or not re.search(r"(^|[\\/])(Packages|PackageCache)[\\/]", path):
+            continue
+        side.setdefault(go, {}).setdefault("builtin_mbs", []).append(
+            (os.path.splitext(os.path.basename(path))[0], str(rec.get("file_id")), int(_mb_enabled(rec.get("raw") or ""))))
+    # every component that names its GameObject, which a PrefabInstance's added components (on a stripped GameObject) are not listed on: a
+    # reference to one resolves through them; an added AudioSource is made too
+    named = {}
+    for rec in by_id.values():
+        go = _tm._go_of(rec)
+        if go is not None and rec.get("kind") not in (None, "GameObject"):
+            named.setdefault(go, []).append(rec)
+    for rec in objects + hierarchy:
+        go = str(rec.get("go_id"))
+        rec.update(side.get(go, {}))
+        have = set(str(x) for x in rec.get("comp_ids") or [])
+        extra = [c for c in named.get(go, []) if str(c.get("file_id")) not in have]
+        if extra:
+            rec["comp_ids"] = list(rec.get("comp_ids") or []) + [str(c.get("file_id")) for c in extra]
+            heard = set(str(a.get("file_id")) for a in rec.get("audiosources") or [])
+            for c in extra:
+                if c.get("kind") == "AudioSource" and c.get("audiosource") and str(c.get("file_id")) not in heard:
+                    rec["audiosources"] = list(rec.get("audiosources") or []) + [dict(c["audiosource"], file_id=c.get("file_id"))]
     return objects, lights, cameras, hierarchy
 
 
@@ -10062,6 +10111,23 @@ def _scene_prefab_instances(scene_text):
     return list(insts.values())
 
 
+def _embedded_arrays(block):
+    """``{field: [value, ...]}`` of the arrays of embedded [Serializable] values in *block* (``areaZones:\n  - corners: []\n    collider: ..``),
+    each element read as _embedded_values reads one."""
+    out = {}
+    for fm in re.finditer(r"(?m)^  (\w+):[ \t]*\n((?:  - \w+:[^\n]*(?:\n|$)(?:    [^\n]*(?:\n|$))*)+)", block):
+        if fm.group(1).startswith("m_"):
+            continue
+        items = re.split(r"(?m)^  - ", fm.group(2))[1:]
+        vals = []
+        for it in items:
+            lines = it.rstrip("\n").split("\n")
+            body = "\n".join(["    " + lines[0]] + lines[1:]) + "\n"
+            vals.append(_embedded_values("  item:\n" + body).get("item", {}))
+        out[fm.group(1)] = vals
+    return out
+
+
 def _embedded_values(block):
     """``{field: {"fields", "str_fields", "object_refs", "vec2_fields",
     "struct_values"}}`` of the embedded [Serializable] values in a
@@ -10084,6 +10150,10 @@ def _embedded_values(block):
             ref = re.fullmatch(r"\{fileID:\s*(-?\d+)\}", raw)
             if ref and ref.group(1) != "0":
                 v["object_refs"][key] = ref.group(1)
+            # another asset's object (a prefab's component): "fid@guid", as a component's own fields have it
+            aref = re.fullmatch(r"\{fileID:\s*(-?\d+),\s*guid:\s*([0-9a-fA-F]+),\s*type:\s*\d+\}", raw)
+            if aref and aref.group(1) != "0":
+                v["object_refs"][key] = "%s@%s" % (aref.group(1), aref.group(2).lower())
             vec = re.fullmatch(r"\{x:\s*([^,}]+),\s*y:\s*([^,}]+)\}", raw)
             if vec:
                 v["vec2_fields"][key] = (float(vec.group(1)),
@@ -10091,9 +10161,19 @@ def _embedded_values(block):
             st = _yaml_scalar_text(raw)
             if st is not None:
                 v["str_fields"][key] = st
+        # lists of references and of numbers in it, as a component's own are read
+        for am in re.finditer(r"(?m)^  (\w+):[ \t]*\n((?:  - \{fileID:\s*-?\d+[^}\n]*\}[ \t]*(?:\n|$))+)", sub):
+            v.setdefault("object_ref_arrays", {})[am.group(1)] = [
+                ("%s@%s" % (a, g.lower()) if g and a != "0" else a) for a, g in
+                re.findall(r"fileID:\s*(-?\d+)(?:,\s*guid:\s*([0-9a-fA-F]+))?", am.group(2))]
+        for am in re.finditer(r"(?m)^  (\w+):[ \t]*\n((?:  - [-+.\deE]+[ \t]*(?:\n|$))+)", sub):
+            v.setdefault("num_arrays", {})[am.group(1)] = [float(x) for x in re.findall(r"- ([-+.\deE]+)", am.group(2))]
         inner = _embedded_values(sub)
         if inner:
             v["struct_values"] = inner
+        arrs = _embedded_arrays(sub)
+        if arrs:
+            v["struct_arrays"] = arrs
         out[fm.group(1)] = v
     return out
 
