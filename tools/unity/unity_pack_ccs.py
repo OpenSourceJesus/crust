@@ -5,11 +5,13 @@ The project's scripts are C#; CCSharp (https://github.com/crustos/CCSharp) lower
 unity_pack's scene loader, writes the scene as C# (`SceneData.cs`: `new GameObject`, `Attach`), copies the scripts, and hands
 the lot to `ccs2c.py --unity-engine`.
 
-`eligible(objects, cameras)` says whether the engine covers the project; when it does not, unity_pack falls back to the packed
-(data-oriented, C-emitted) path -- see `--packed`.
+`eligible(objects, cameras)` says whether the engine covers the project; when it does not, unity_pack refuses it.
 
     CCSHARP_HOME   the CCSharp checkout (default ../CCSharp beside this repo)
+    DNA_HOME       DotNetAnywhere, for scripts outside the Crust subset (default ../DotNetAnywhere beside CCSharp)
 """
+import math
+import functools
 import os
 import re
 import shutil
@@ -24,12 +26,14 @@ UNSUPPORTED_KEYS = (
     "canvas", "ui_text", "ui_image", "ui_button", "particle_system", "animator",
     "audio_source", "light", "tilemap",
 )
+# Of those, the ones the managed engine has (scene_source builds them): a project with DotNetAnywhere may use them.
+MANAGED_KEYS = ("canvas", "ui_image", "ui_button", "tilemap")
 COLLIDER_KINDS = ("box", "circle", "capsule_h", "capsule_v", "polygon")
 # guid -> PhysicsMaterial2D {friction, bounciness, friction_combine, bounce_combine}, set by build()
 MATERIALS = {}
 
 # Messages a script declares without `override` in Unity; the engine's MonoBehaviour has them virtual.
-MESSAGES = ("Awake", "Start", "Update", "LateUpdate", "FixedUpdate", "OnDestroy",
+MESSAGES = ("Awake", "OnEnable", "Start", "Update", "LateUpdate", "FixedUpdate", "OnDisable", "OnDestroy",
             "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
             "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D")
 
@@ -38,25 +42,49 @@ def ccsharp_home():
     return os.environ.get("CCSHARP_HOME") or os.path.join(os.path.dirname(REPO), "CCSharp")
 
 
+def project_identity(root):
+    """(companyName, productName) from ProjectSettings, else Unity's defaults (DefaultCompany, the project folder's name)."""
+    company, product = "DefaultCompany", os.path.basename(os.path.abspath(root).rstrip(os.sep)) or "Player"
+    path = os.path.join(root, "ProjectSettings", "ProjectSettings.asset")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        for key in ("companyName", "productName"):
+            m = re.search(r"(?m)^\s*%s:\s*(.*?)\s*$" % key, text)
+            if m and m.group(1).strip("'\""):
+                if key == "companyName":
+                    company = m.group(1).strip("'\"")
+                else:
+                    product = m.group(1).strip("'\"")
+    return company, product
+
+
 def available():
     return os.path.exists(os.path.join(ccsharp_home(), "crust", "ccs2c.py"))
 
 
+def dna_available():
+    """DotNetAnywhere where CCSharp's --dna looks for it ($DNA_HOME, default ../DotNetAnywhere)."""
+    home = os.environ.get("DNA_HOME") or os.path.join(os.path.dirname(ccsharp_home()), "DotNetAnywhere")
+    return os.path.exists(os.path.join(home, "native", "src", "Host.h"))
+
+
 def eligible(objects, cameras, prefabs=()):
     """(ok, why): ok when every record uses only what the engine covers."""
-    for o in all_records(objects, prefabs):
-        for k in UNSUPPORTED_KEYS:
-            if o.get(k):
-                return False, "%s uses %s" % (o.get("name"), k)
-        col = o.get("collider2d")
-        if col and col.get("kind") not in COLLIDER_KINDS:
-            return False, "%s uses a %s collider" % (o.get("name"), col.get("kind"))
-        if o.get("father_id") or o.get("child_ids"):
-            by_xf = {r.get("xf_id"): r for r in objects}
-            if o.get("father_id") and o["father_id"] not in by_xf:
+    managed = dna_available()
+    for records in [objects] + [pf["objects"] for pf in prefabs]:     # a parent is looked for in the same scene or prefab
+        xf_ids = {r.get("xf_id") for r in records}
+        for o in records:
+            for k in UNSUPPORTED_KEYS:
+                if o.get(k) and not (managed and k in MANAGED_KEYS):
+                    return False, "%s uses %s" % (o.get("name"), k)
+            col = o.get("collider2d")
+            if col and col.get("kind") not in COLLIDER_KINDS:
+                return False, "%s uses a %s collider" % (o.get("name"), col.get("kind"))
+            if o.get("father_id") and o["father_id"] not in xf_ids:
                 return False, "%s: parent is not a plain object" % o.get("name")
-        if o.get("script") and not os.path.exists(o["script"]):
-            return False, "%s: script file missing" % o.get("name")
+            if o.get("script") and not os.path.exists(o["script"]):
+                return False, "%s: script file missing" % o.get("name")
     return True, ""
 
 
@@ -72,7 +100,7 @@ def describe(script_texts):
             with open(os.path.join(d, name), "w") as f:
                 f.write(text)
         out = os.path.join(work, "describe.json")
-        ccs2c.to_cpp([d], unity_engine=True, describe=out, workdir=work)
+        ccs2c.to_cpp([d], unity_engine=True, describe=out, workdir=work, dna=dna_available())
         with open(out) as f:
             return json.load(f)
 
@@ -98,19 +126,89 @@ def field_literal(ty, val):
     return None
 
 
-def prepare_script(text):
-    """A Unity script as the engine's C#: `[Shared]` is CCSharp's to refuse, and the messages are `override`."""
-    text = re.sub(r"^[ \t]*\[Shared\][ \t]*\r?\n", "", text, flags=re.M)
-    for m in MESSAGES:
+# The engine classes a script may derive from that have the MonoBehaviour messages virtual (MonoBehaviour and Unity's UI), and ScriptableObject's.
+MB_ROOTS = {"MonoBehaviour", "Behaviour", "UIBehaviour", "Selectable", "Button", "Toggle", "ToggleGroup", "Slider", "Scrollbar", "ScrollRect",
+            "InputField", "Graphic", "MaskableGraphic", "Image", "RawImage", "Text", "TMP_Text", "TextMeshProUGUI", "TextMeshPro", "EventSystem",
+            "BaseInputModule", "BaseRaycaster", "GraphicRaycaster", "LayoutGroup", "HorizontalOrVerticalLayoutGroup", "HorizontalLayoutGroup",
+            "VerticalLayoutGroup", "GridLayoutGroup", "ContentSizeFitter", "LayoutElement", "AspectRatioFitter", "CanvasScaler", "Mask",
+            "RectMask2D", "BaseMeshEffect", "Shadow", "Outline"}
+SO_MESSAGES = ("Awake", "OnEnable", "OnDisable", "OnDestroy", "OnValidate", "Reset")
+
+
+def prepare_scripts(texts):
+    """{name: text} of Unity scripts as the engine's C#: `[Shared]` is CCSharp's to refuse, and a message (`void Update()`) is `public override` --
+    in a class whose ancestry (followed through all the scripts) reaches MonoBehaviour or one of Unity's UI classes, and for ScriptableObject its
+    own messages; a method of that name in any other class (a plain `Timer.Start()`) is left alone."""
+    bases = {}
+    for t in texts.values():
+        for m in re.finditer(r"(?<!\w)(?:class|struct)\s+(\w+)(?:\s*<[^>{]*>)?\s*:\s*([\w.]+)", t):
+            bases.setdefault(m.group(1), m.group(2).split(".")[-1])
+
+    def root(c):
+        seen = set()
+        while c in bases and c not in seen:
+            seen.add(c)
+            c = bases[c]
+        return c
+
+    out = {}
+    for name, text in texts.items():
+        text = re.sub(r"^[ \t]*\[Shared\][ \t]*\r?\n", "", text, flags=re.M)
+        scan = _CS_NOISE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+        spans = []                                  # (start, end, class): each class's body, to find the class a method is in
+        for m in re.finditer(r"(?<!\w)(?:class|struct)\s+(\w+)[^{;]*\{", scan):
+            depth, k = 0, m.end() - 1
+            while k < len(scan):
+                if scan[k] == "{": depth += 1
+                elif scan[k] == "}":
+                    depth -= 1
+                    if depth == 0: break
+                k += 1
+            spans.append((m.end(), k, m.group(1)))
+
+        def allowed(at):
+            inner = [sp for sp in spans if sp[0] <= at < sp[1]]
+            if not inner: return ()
+            r = root(max(inner, key=lambda sp: sp[0])[2])
+            return MESSAGES if r in MB_ROOTS else SO_MESSAGES if r == "ScriptableObject" else ()
+
         # `void Update(`, `private void Update(` and `public void Update(` all become `public override void Update(`
-        text = re.sub(r"(?m)^([ \t]*)(?:(?:public|private|protected|internal)[ \t]+)?(void[ \t]+%s[ \t]*\()" % m, r"\1public override \2", text)
-    return text
+        # (`protected override void OnEnable(` -- a script deriving Unity's UI -- is public too: the engine's messages are public).  A base
+        # script's `public virtual void Awake(` too: left virtual it opened a slot of its own, so its subclasses' overrides were never called.
+        pat = re.compile(r"(?m)^([ \t]*)((?:(?:public|private|protected|internal|virtual|override|new|abstract|sealed)[ \t]+)*)(void[ \t]+(%s)[ \t]*\()"
+                         % "|".join(MESSAGES))
+        pieces, last = [], 0
+        for m in pat.finditer(scan):
+            if m.group(4) not in allowed(m.start()):
+                continue
+            mods = m.group(2).split()
+            keep = "".join(k + " " for k in ("abstract", "sealed") if k in mods)
+            pieces.append(text[last:m.start()])
+            pieces.append(m.group(1) + "public " + keep + "override " + text[m.start(3):m.end()])
+            last = m.end()
+        pieces.append(text[last:])
+        out[name] = "".join(pieces)
+    return out
+
+
+def prepare_script(text):
+    """One script (its classes' ancestry read from it alone)."""
+    return prepare_scripts({"_": text})["_"]
+
+
+# comments, strings and directives, blanked before classes and methods are looked for
+_CS_NOISE_RE = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:[^"]|"")*"|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
 
 
 def _f(x):
-    s = repr(float(x))
-    if "e" in s or "inf" in s or "nan" in s:
-        s = "%.9g" % float(x)
+    x = float(x)
+    if x != x:
+        return "float.NaN"
+    if x in (float("inf"), float("-inf")):
+        return "float.PositiveInfinity" if x > 0 else "float.NegativeInfinity"
+    s = repr(x)
+    if "e" in s:
+        s = "%.9g" % x
     return s + "f"
 
 
@@ -156,7 +254,7 @@ def groups(objects):
 
 
 def _cs_string(x):
-    return x.replace("\\", "\\\\").replace('"', '\\"')
+    return x.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
 
 def prefab_name(pf):
@@ -398,40 +496,236 @@ class Program
 """
 
 
-def write_project(objects, cameras, outdir, frames=60, prefabs=()):
-    """Write the C# project to outdir/cs; returns its folder."""
+def ilspycmd():
+    """ILSpy's command line (decompiles a managed plugin DLL to C#): CCSharp's build/tools (`dotnet tool install ilspycmd --tool-path
+    build/tools`), else on the PATH, else None."""
+    local = os.path.join(ccsharp_home(), "build", "tools", "ilspycmd")
+    return local if os.path.exists(local) else shutil.which("ilspycmd")
+
+
+def unclash(text):
+    """An obfuscated assembly decompiled: a private field may share its name with a method of its class (`private string a;` beside
+    `private void a(..)`), which IL allows and C# does not.  The field is renamed (`a__f`), its uses being the name not followed by `(`, within
+    its class -- a private member is not seen outside it."""
+    decl = re.compile(r"(?m)^[ \t]*(?:private|internal)[ \t]+(?:static[ \t]+|readonly[ \t]+)*[\w<>\[\],. ]+?[ \t]+(\w+)[ \t]*(?:;|=)")
+    for m in list(re.finditer(r"(?<!\w)(?:class|struct)\s+\w+[^{;]*\{", text))[::-1]:
+        depth, k = 0, m.end() - 1
+        while k < len(text):
+            if text[k] == "{": depth += 1
+            elif text[k] == "}":
+                depth -= 1
+                if depth == 0: break
+            k += 1
+        body = text[m.end():k]
+        fields = set(decl.findall(body))
+        methods = set(re.findall(r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|virtual|override|abstract|new)[ \t]+)*[\w<>\[\],. ]+?[ \t]+(\w+)[ \t]*\(", body))
+        for name in fields & methods:
+            body = re.sub(r"(?<![\w])%s\b(?!\s*[(<])" % re.escape(name), name + "__f", body)
+        text = text[:m.end()] + body + text[k:]
+    return text
+
+
+_OBFUSCATED = re.compile(r"Dotfuscator|ObfuscatedByAttribute|SmartAssembly|ConfusedByAttribute|BabelObfuscator")
+
+
+def surface_only(text):
+    """The non-private surface of decompiled C#: types and their non-private members, constructors with empty bodies and every other body
+    throwing NotSupportedException; private members dropped.  For an obfuscated plugin, whose private members IL lets share names and differ only
+    by return type -- not C# -- and whose internals a game reaches only through its editor-time tools (2DColliderGen's outline tracer)."""
+    THROW = '{ throw new System.NotSupportedException("the internals of an obfuscated plugin are not compiled"); }'
+
+    def end_of(s, i, open_ch, close_ch):
+        depth = 0
+        while i < len(s):
+            if s[i] == open_ch: depth += 1
+            elif s[i] == close_ch:
+                depth -= 1
+                if depth == 0: return i
+            elif s[i] == '"':
+                i += 1
+                while i < len(s) and s[i] != '"': i += 2 if s[i] == "\\\\" else 1
+            i += 1
+        return len(s) - 1
+
+    def members(body, kind):
+        out, i = [], 0
+        while i < len(body):
+            j = i
+            while j < len(body) and body[j] not in "{;=":
+                if body[j] == "(": j = end_of(body, j, "(", ")")
+                elif body[j] == "[": j = end_of(body, j, "[", "]")
+                j += 1
+            if j >= len(body):
+                break
+            header = body[i:j]
+            if body[j] == "=" and body[j:j + 2] == "=>":           # expression body: up to its `;`
+                k = j
+                while body[k] != ";":
+                    k = end_of(body, k, "(", ")") if body[k] == "(" else end_of(body, k, "{", "}") if body[k] == "{" else k
+                    k += 1
+                out.append(member(header, "=>", "", kind))
+                i = k + 1
+            elif body[j] == "=":                                     # a field with an initialiser
+                k = j
+                while body[k] != ";":
+                    k = end_of(body, k, "(", ")") if body[k] == "(" else end_of(body, k, "{", "}") if body[k] == "{" else k
+                    k += 1
+                out.append(member(header, "=", body[j:k], kind))
+                i = k + 1
+            elif body[j] == ";":
+                out.append(member(header, ";", "", kind))
+                i = j + 1
+            else:
+                k = end_of(body, j, "{", "}")
+                out.append(member(header, "{", body[j + 1:k], kind))
+                i = k + 1
+        return "".join(m for m in out if m)
+
+    def member(header, how, rest, kind):
+        h = header.strip()
+        words = re.sub(r"\[[^\]]*\]", " ", h).split()
+        if not words:
+            return ""
+        is_type = any(w in ("class", "struct", "interface", "enum") for w in words)
+        private = not any(w in ("public", "protected", "internal") for w in words) and kind != "interface"
+        if private and not (is_type and kind == "top"):
+            return ""
+        if is_type:
+            if "enum" in words:
+                return "\n" + h + " {" + rest + "}\n"
+            sub = "interface" if "interface" in words else "type"
+            return "\n" + h + " {" + members(rest, sub) + "\n}\n"
+        if kind == "interface" or how == ";":
+            return "\n\t" + h + ";"
+        if how == "=":
+            return "\n\t" + h + (rest + ";" if "const" in words else ";")
+        name_part = re.sub(r"\([^)]*\)", "", h)
+        if "(" in h and how in ("{", "=>"):                        # a method, constructor or operator
+            # a constructor is its name alone before `(`, once the modifiers are gone
+            before = re.sub(r"\[[^\]]*\]", " ", h[:h.index("(")]).split()
+            ctor = len([w for w in before if w not in ("public", "protected", "internal", "static", "extern", "unsafe", "new")]) == 1
+            sig = re.sub(r"\)\s*:\s*(?:base|this)\s*\(.*$", ")", h, flags=re.S)
+            return "\n\t" + sig + (" { }" if ctor else " " + THROW)
+        accessors = [a for a in ("get", "set") if how == "{" and re.search(r"\b%s\b" % a, rest)] or ["get"]
+        return "\n\t" + name_part + " { " + " ".join("%s %s" % (a, THROW) for a in accessors) + " }"
+
+    usings = "".join(l + "\n" for l in text.splitlines() if l.startswith("using "))
+    body = "\n".join(l for l in text.splitlines() if not l.startswith("using "))
+    return usings + members(body, "top") + "\n"
+
+
+def plugin_sources(dlls, outdir):
+    """C# for the project's managed plugin DLLs (a Unity project may ship code compiled, as 2DColliderGen ships its outline tracer): each one
+    decompiled once into outdir/plugins (again when the DLL changes), its `[assembly: ..]` attributes dropped.  A DLL that is not managed (a native
+    plugin) or that cannot be decompiled is left out, with a note."""
+    tool = ilspycmd()
+    out = []
+    if not dlls:
+        return out
+    if tool is None:
+        sys.stderr.write("unity_pack: %d plugin DLL(s) left out: ilspycmd is not installed (dotnet tool install ilspycmd --tool-path %s)\n"
+                         % (len(dlls), os.path.join(ccsharp_home(), "build", "tools")))
+        return out
+    cache = os.path.join(outdir, "plugins")
+    os.makedirs(cache, exist_ok=True)
+    for dll in dlls:
+        name = os.path.splitext(os.path.basename(dll))[0]
+        cs = os.path.join(cache, name + ".cs")
+        if not os.path.exists(cs) or os.path.getmtime(cs) < os.path.getmtime(dll):
+            work = os.path.join(cache, name + ".tmp")
+            shutil.rmtree(work, ignore_errors=True)
+            p = subprocess.run([tool, dll, "-o", work, "-lv", "CSharp7_3"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            made = [os.path.join(work, f) for f in os.listdir(work)] if os.path.isdir(work) else []
+            if p.returncode != 0 or not made:
+                sys.stderr.write("unity_pack: plugin %s left out (not a managed assembly?)\n" % os.path.basename(dll))
+                shutil.rmtree(work, ignore_errors=True)
+                continue
+            with open(made[0], encoding="utf-8-sig") as f:
+                text = re.sub(r"(?m)^\[assembly:.*\]\s*$", "", f.read())
+            # ponytail: an obfuscated plugin compiles as its public surface only (its bodies throw); a game that calls into it at run time needs
+            # the binary loaded instead -- DotNetAnywhere with UnityEngine and netstandard redirected to the engine and its corlib.
+            text = surface_only(text) if _OBFUSCATED.search(text) else unclash(text)
+            with open(cs, "w", encoding="utf-8") as f:
+                f.write(text)
+            shutil.rmtree(work, ignore_errors=True)
+        out.append(cs)
+    return out
+
+
+def reachable_scripts(attached, candidates):
+    """The attached scripts and every candidate script that defines a type they (transitively) name, in that order."""
+    from tools.unity.unity_pack_common import _CS_NOISE
+    scan = {}
+    for p in list(attached) + list(candidates):
+        if p not in scan:
+            with open(p, encoding="utf-8-sig") as f:
+                scan[p] = _CS_NOISE.sub(" ", f.read())
+    defines = {}
+    for p in candidates:
+        for n in re.findall(r"(?<!\w)(?:class|struct|interface|enum)\s+(\w+)", scan[p]):
+            defines.setdefault(n, []).append(p)
+            if n.endswith("Attribute"):                 # `[MaxInstances]` names MaxInstancesAttribute
+                defines.setdefault(n[:-len("Attribute")], []).append(p)
+    # ponytail: a type is "named" when its identifier appears anywhere in the file, so a local or member that shares
+    # a type's name pulls that script in too; upgrade path is CCSharp's --describe listing the types each file uses.
+    out, seen = [], set()
+    # extension methods are called without naming their class (`items.Remove(x)`), so a file that declares any is always in
+    todo = list(attached) + [p for p in candidates if re.search(r"\(\s*this\s+[\w.<>\[\], ]+\s+\w+", scan[p])]
+    while todo:
+        p = todo.pop(0)
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        for w in set(re.findall(r"\b[A-Za-z_]\w*\b", scan[p])):
+            todo += [q for q in defines.get(w, ()) if q not in seen]
+    return out
+
+
+def write_project(objects, cameras, outdir, frames=60, prefabs=(), scripts=(), project=None):
+    """Write the C# project to outdir/cs; returns its folder.  `scripts`: the project's other scripts (the helpers, base classes
+    and singletons the attached ones use)."""
     cs = os.path.join(outdir, "cs")
     shutil.rmtree(cs, ignore_errors=True)
     os.makedirs(cs)
-    seen, texts = set(), {}
-    for o in all_records(objects, prefabs):
-        sp = o.get("script")
-        if sp and sp not in seen:
-            seen.add(sp)
-            with open(sp) as f:
-                texts[os.path.basename(sp)] = prepare_script(f.read())
+    texts = {}
+    for sp in reachable_scripts([o.get("script") for o in all_records(objects, prefabs) if o.get("script")], scripts):
+        if os.path.basename(sp) not in texts:
+            with open(sp, encoding="utf-8-sig") as f:
+                texts[os.path.basename(sp)] = f.read()
+    texts = prepare_scripts(texts)
     for name, text in texts.items():
         with open(os.path.join(cs, name), "w") as f:
             f.write(text)
     classes = describe(texts) if texts else {}
+    project = dict(project or {})
+    project["managed_api"] = any(re.search(r"\b(?:Application|SceneManager|PlayerPrefs)\b", t) for t in texts.values())
+    project["layer_api"] = any(re.search(r"\bLayerMask\b", t) for t in texts.values())
+    ASSET_PATHS.clear()
+    ASSET_PATHS.update(project.get("assets") or {})
+    # ponytail: every top-level namespace the scripts declare is opened, so the scene names their classes as they do; two classes of one name
+    # in two of them would be ambiguous, and a class in a nested namespace is not reached.  Upgrade path: describe() reporting each class's namespace, and qualified names here.
+    project["namespaces"] = sorted({ns for t in texts.values() for ns in re.findall(r"(?m)^namespace\s+([\w.]+)", t)})
     with open(os.path.join(cs, "SceneData.cs"), "w") as f:
-        f.write(scene_source(objects, cameras, classes, prefabs))
+        f.write(scene_source(objects, cameras, classes, prefabs, project))
     with open(os.path.join(cs, "Program.cs"), "w") as f:
         f.write(MAIN_SOURCE % frames)
     return cs
 
 
-def build(objects, cameras, outdir, run=False, prefabs=(), materials=None):
+def build(objects, cameras, outdir, run=False, prefabs=(), materials=None, scripts=(), project=None):
     """Lower and build the project; returns the ccs2c exit code."""
     MATERIALS.clear()
     MATERIALS.update(materials or {})
-    cs = write_project(objects, cameras, outdir, prefabs=prefabs)
+    cs = write_project(objects, cameras, outdir, prefabs=prefabs, scripts=scripts, project=project)
     physics = physics_for(objects, prefabs)
     cmd = [sys.executable, os.path.join(ccsharp_home(), "crust", "ccs2c.py"), cs, "--unity-engine", "--physics=" + physics, "--name=game",
            "--convert=" + os.path.join(outdir, "cpp"), "--c", "-o", os.path.join(outdir, "game.c"),
            "--exe=" + os.path.join(outdir, "game")]
     if run:
         cmd.append("--run")
+    if dna_available():
+        cmd.append("--dna")     # a script outside the Crust subset runs on DotNetAnywhere; a project inside it stays all native
     rc = subprocess.call(cmd)
     if rc == 0:
         write_host_files(objects, cameras, outdir, prefabs)

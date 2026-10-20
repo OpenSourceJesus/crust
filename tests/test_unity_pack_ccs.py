@@ -6,14 +6,63 @@ import tools.unity.unity_pack_ccs as ccs
 
 
 class TestPrepare(unittest.TestCase):
+    def test_a_virtual_message_of_a_base_script_overrides_the_engine(self):
+        t = ccs.prepare_scripts({"S.cs": "class S<T> : MonoBehaviour {\n    public virtual void Awake () { }\n    protected abstract void Update ();\n}\n"
+                                         "class G : S<G> {\n    public override void Awake () { base.Awake (); }\n}\n"})["S.cs"]
+        self.assertIn("public override void Awake ()", t.split("class G")[0])
+        self.assertIn("public abstract override void Update ()", t)
+
     def test_shared_stripped_and_messages_overridden(self):
         t = ccs.prepare_script("[Shared]\npublic class A : MonoBehaviour {\n public void Update() {}\n public void Foo() {}\n}\n")
         self.assertNotIn("[Shared]", t)
         self.assertIn("public override void Update(", t)
         self.assertIn("public void Foo(", t)
 
+    def test_only_messages_of_engine_classes_are_overridden(self):
+        t = ccs.prepare_scripts({
+            "a.cs": "class Timer {\n public void Start() {}\n}\nclass Hero : Base<Hero> {\n void Update() {}\n protected override void OnEnable() {}\n}\n",
+            "b.cs": "class Base<T> : MonoBehaviour { }\nclass Data : ScriptableObject {\n void Awake() {}\n void Update() {}\n}\n"})
+        self.assertIn("public void Start()", t["a.cs"])
+        self.assertIn("public override void Update()", t["a.cs"])
+        self.assertIn("public override void OnEnable()", t["a.cs"])
+        self.assertIn("public override void Awake()", t["b.cs"])
+        self.assertIn("\n void Update()", t["b.cs"])
 
-@unittest.skipUnless(ccs.available(), "CCSharp not beside this repo")
+
+class TestReachable(unittest.TestCase):
+    def test_follows_named_types_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            def w(name, text):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write(text)
+                return os.path.join(d, name)
+            a = w("A.cs", "class A : MonoBehaviour { Helper h; // Unused\n }")
+            h = w("Helper.cs", 'class Helper { Base b; string s = "Unused"; }')
+            b = w("Base.cs", "class Base {}")
+            u = w("Unused.cs", "class Unused {}")
+            self.assertEqual(ccs.reachable_scripts([a], [h, b, u]), [a, h, b])
+            x = w("Ext.cs", "static class Ext { public static void Go(this A a) {} }")
+            m = w("MarkAttribute.cs", "class MarkAttribute : System.Attribute {}")
+            c = w("C.cs", "[Mark] class C : MonoBehaviour {}")
+            self.assertEqual(ccs.reachable_scripts([c], [x, m, u]), [c, x, m])
+
+
+class TestPlugins(unittest.TestCase):
+    def test_unclash_renames_a_private_field_named_as_a_method(self):
+        t = ccs.unclash("class P {\n\tprivate string a;\n\tprivate void a(int x) { this.a = \"\"; a(1); }\n}\nclass Q { public int a; }\n")
+        self.assertIn("private string a__f;", t)
+        self.assertIn("this.a__f = \"\"; a(1);", t)
+        self.assertIn("class Q { public int a; }", t)
+
+    def test_surface_only_keeps_the_public_api(self):
+        t = ccs.surface_only("using System;\npublic class F {\n\tprivate int a;\n\tpublic F() { a = 1; }\n\tpublic int Run(int x) { return a(x); }\n"
+                             "\tprivate int a(int x) { return x; }\n\tpublic int Size { get { return a; } }\n\tclass a { }\n}\n")
+        self.assertNotIn("private", t)
+        self.assertIn("public F() { }", t)
+        self.assertIn("public int Run(int x) { throw new System.NotSupportedException", t)
+        self.assertIn("public int Size { get { throw", t)
+
+
 class TestMiniScene(unittest.TestCase):
     def test_runs(self):
         with tempfile.TemporaryDirectory() as d:
