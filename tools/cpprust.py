@@ -525,11 +525,12 @@ def _except_zero(ret):
     """The dummy a poisoned return carries. Nobody reads it -- the caller
     tests the flag before the value -- but C wants one of the right shape."""
     ret = ret.strip()
-    if ret == "void":
-        return None
     if ret.endswith("*"):
         return "0"
-    if ret in ("float", "double"):
+    last = (ret.split() or [""])[-1]       # `static void`
+    if last == "void":
+        return None
+    if last in ("float", "double"):
         return "0.0"
     return "0"
 
@@ -721,6 +722,8 @@ def _lower_except(text, path="<cpp>"):
                     "is not `except` itself." % (os.path.basename(path), at))
             rs, ce, name = max(cands)
             types = fret.get(name, {"void"})
+            if re.match(r"\s*;", sl[ce + 1:]) and not re.search(r"(?:=|return)\s*$", sl[:rs]):
+                types = {"void"}                # the value is discarded
             if len(types) > 1:
                 # a value used in an expression is not a `void` overload's
                 types = types - {"void"}
@@ -974,7 +977,8 @@ def _lower_except(text, path="<cpp>"):
         body = text[ob + 1:cb]
         name = m.group(2)
         if name in fallible:
-            base = [("fn", fallible[name])]
+            # its own return type: an overload by name may return another
+            base = [("fn", _except_zero(m.group(1)))]
         else:
             base = [("none", None)]
         lb = _code_view(body)
@@ -4425,6 +4429,8 @@ class _RefSet(set):
     and the class of each `const T &` -- which a temporary may bind to."""
     ptr = frozenset()
     consts = {}
+    cls_ptrs = {}
+    cls_vals = {}
 
 
 def _ref_positions(params, names):
@@ -4432,7 +4438,15 @@ def _ref_positions(params, names):
     out = _RefSet()
     ptr = set()
     consts = {}
+    out.cls_ptrs = {}       # idx -> class of a `C *p` parameter
+    out.cls_vals = {}       # idx -> class of a by-value `C p` parameter
     for idx, p in enumerate(_split_top(params or "")):
+        pm = re.match(r"^\s*(?:const\s+)?([A-Za-z_]\w*)\s*\*\s*[A-Za-z_]\w*\s*$", p)
+        if pm and pm.group(1) in names:
+            out.cls_ptrs[idx] = pm.group(1)
+        pm = re.match(r"^\s*(?:const\s+)?([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*$", p)
+        if pm and pm.group(1) in names:
+            out.cls_vals[idx] = pm.group(1)
         if "&" in p:
             got = _parse_param(p, names)
             if got is not None:
@@ -4441,6 +4455,8 @@ def _ref_positions(params, names):
                     ptr.add(idx)
                 elif re.match(r"\s*const\s", p) and "*" not in p:
                     consts[idx] = got[0]
+            elif re.match(r"^\s*[A-Za-z_][\w:]*\s*<.*>\s*&\s*[A-Za-z_]\w*\s*$", p, re.S):
+                out.add(idx)        # `vector<int> &p`, before monomorphisation
     out.ptr = frozenset(ptr)
     out.consts = consts
     return out
@@ -4841,6 +4857,35 @@ def _declared_param_names(params):
     return out
 
 
+def _declared_local_names(body):
+    """Names a body declares as locals, every declarator of `T a, b = 1;`.
+
+    Field qualification skips them, as it skips a parameter: `float a;` in a
+    method of a class with a field `a` became `float this->a;`.
+    """
+    # ponytail: per body, not per block -- a field named in a sibling block
+    # of a same-named local is left bare (C# rejects most such bodies).
+    scan = _strip_comments(body)
+    out = set()
+    for m in re.finditer(r"(?<![\w.>])([A-Za-z_][\w:]*)(?:\s*<[^;{}()]*>)?"
+                         r"(?:\s*[*&]+\s*|\s+)([A-Za-z_]\w*)\s*(?=[=;,\[])", scan):
+        before = scan[:m.start()].rstrip()
+        if before and before[-1] not in ";{}" and not re.search(
+                r"(?<![\w])(?:const|static|unsigned|signed|struct|volatile|register|auto"
+                r"|for\s*\()$", before):
+            continue                    # `return a * b;` is not `a *b;`
+        if m.group(1) in ("return", "else", "case", "goto", "throw", "delete", "new",
+                          "sizeof", "typedef", "using", "namespace", "operator"):
+            continue
+        end = scan.find(";", m.end())
+        decl = scan[m.start(2):end if end >= 0 else len(scan)]
+        for part in _split_top(decl):
+            w = re.match(r"\s*[*&]*\s*([A-Za-z_]\w*)", part)
+            if w and w.group(1) not in _KEYWORDS:
+                out.add(w.group(1))
+    return out
+
+
 def _scalar_ref_names(params):
     """Names of parameters declared as a reference to a scalar."""
     out = []
@@ -5227,6 +5272,8 @@ def _external_info(name, dropfn):
 # The member a derived class stores its base in. Written once here because
 # both the path builder and the name walker have to agree on it.
 _BASE_MEMBER = "_base"
+#: a method's `T *&x` parameter while its body is lowered (`_emit_method`)
+_PREF = "__cpp_pref_"
 
 
 def _ivptr(bname):
@@ -5841,6 +5888,9 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["paths"][k] = "_base." + v
         for k, v in base_info["methods"].items():
             info["methods"][k] = dict((ar, dict(e)) for ar, e in v.items())
+    # `static const` name -> the class whose `Class_name` it is, inherited
+    info["sconsts"] = dict((base_info or {}).get("sconsts") or {})
+    info["sconsts"].update((x.name, cname) for x in cls.members if x.kind == "sconst")
     # `vdtor` is not propagated by hand: the destructor slot is inherited
     # through `slots` like any other, and is read back off it below.
 
@@ -6080,6 +6130,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         scalar_refs = _scalar_ref_names(params)
         pointer_refs = _pointer_ref_names(params)
         class_refs = _class_ref_names(params, names)
+        raw_params = params
         params = _lower_refs(params, _with_scalars(names))
         # `this` is a pointer, exactly as an `impl` method's `self` is --
         # unless the member is `static`, which by definition has no
@@ -6103,11 +6154,33 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
                 lambda _m: "(*%s)" % rname, inner)
         for rname in pointer_refs:
-            # One pass, so the text written is never scanned again: a bare
-            # `x` is `(*x)`, and `x.m` / `x->m` is `(*x)->m`.
-            inner = _sub_code(
-                r"(?<![\w.>&])%s(?![\w])(\s*(?:\.|->)(?=\s*[A-Za-z_]))?" % re.escape(rname),
-                lambda _m: ("(*%s)->" if _m.group(1) else "(*%s)") % rname, inner)
+            # A plain `T *` named `_PREF + x` until the end of `translate`,
+            # which makes every use `(*x)`: the receiver passes resolve a
+            # name, not `(*x)`, so `x->next.v` and `x.m()` were left unlowered.
+            # The header comes out `T *(*x)` -- C for `T **x`.
+            mark = _PREF + rname
+            inner = _sub_code(r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
+                              lambda _m: mark, inner)
+            arglist = re.sub(r"\*\s*\*\s*%s(?![\w])" % re.escape(rname),
+                             "* " + mark, arglist)
+        if class_refs:
+            # `a = b;` assigns the referred-to object; on the pointers the
+            # references became it rebound the parameter, silently. With a
+            # user `operator=` the bare `a` is the assignment pass's object;
+            # without one it is a struct copy, `(*a) = ..`.
+            ref_cls = {}
+            for part in _split_top(raw_params or ""):
+                pp = "&" in part and "*" not in part and _parse_param(part, names)
+                if pp:
+                    ref_cls[pp[2]] = pp[0]
+            alt = _type_alt(n for n in class_refs
+                            if not (known.get(ref_cls.get(n)) or {}).get("assign"))
+            if alt:
+                inner = _sub_code(
+                    r"((?:(?<=[;{})])|(?<=\belse)|^)\s*)(%s)(\s*=(?!=)\s*)(?:(%s)(\s*;))?" % (alt, alt),
+                    lambda m: "%s(*%s)%s%s" % (
+                        m.group(1), m.group(2), m.group(3),
+                        "(*%s)%s" % (m.group(4), m.group(5)) if m.group(4) else ""), inner)
         inner = _addr_of_class_refs(inner, class_refs)
         inner = _implicit_this(inner, mnames, static_calls, cname)
         # Bare member names inside a body refer to fields; qualify them.
@@ -6117,13 +6190,13 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # One alternation rather than a pass per field: each pass would have
         # to re-blank the body, and a field qualified by an earlier pass
         # would be re-examined by a later one.
-        if info["paths"]:
+        if info["paths"] and not static:
             # A parameter of the same name shadows the field, exactly as in
             # C++. Without this the bare `x` in `this->x = x` was qualified
             # into `this->x = this->x` -- which compiles, runs, and silently
             # ignores the argument. `position(int x, int y, ..)` is the usual
             # spelling of a constructor, so this was not a corner case.
-            shadowed = _declared_param_names(params)
+            shadowed = _declared_param_names(params) | _declared_local_names(inner)
             # A field whose name is also a class name is left alone. The two
             # collide in type position -- litehtml has a `document` field and
             # a `document` class -- and qualifying there turned
@@ -6142,11 +6215,11 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # bare use in a body names `Class_name` rather than going through
         # `this`. Done after the field qualification above, which never
         # sees them -- they are not in `info["paths"]`.
-        sconsts = [x.name for x in cls.members if x.kind == "sconst"]
+        sconsts = info["sconsts"]
         if sconsts:
             inner = _sub_code(
                 r"(?<![\w.>])(%s)\b" % _type_alt(sconsts),
-                lambda m: "%s_%s" % (cname, m.group(1)), inner)
+                lambda m: "%s_%s" % (sconsts[m.group(1)], m.group(1)), inner)
         # `Shape *twin() { return this; }` inside a derived class returns a
         # `Derived *` where a `Shape *` is declared. The base is the first
         # member, so the cast is address-preserving; without it the C
@@ -6929,6 +7002,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             emit("void", "%s_copy" % cname,
                  "const %s &o" % cname, " " + " ".join(lines))
             info["copy"] = True
+            # every member plain data all the way down: the copy is bitwise
+            info["trivial_copy"] = not info["dtor"] and not base and all(
+                not known[b]["dtor"] and (not known[b]["copy"] or known[b].get("trivial_copy"))
+                for _n, b in value_members if b in known)
             # And the implicit assignment, which C++ generates on the same
             # terms. It has to release what is already there first, and
             # guard self-assignment -- `a = a` would otherwise destroy the
@@ -7854,11 +7931,12 @@ def _rewrite_scopes_inner(text, type_info, _pos):
         r"(?<![\w.>])([A-Za-z_][\w]*)\s+(\w+)\s*=\s*(\w+)\s*;")
     conv_assign_re = re.compile(r"(?<![\w.>])(\w+)\s*=(?!=)\s*(\w+)\s*;")
     # `a == b` where `a` is a class with `operator==`. Longest spellings
-    # first, so `<=` is not read as `<`. Only a bare name on the left: this
-    # pass knows the type of a local, and an expression it would have to
-    # infer one for is left alone.
+    # first, so `<=` is not read as `<`. Each side is a name, a member chain
+    # or one subscript (`p->Pt`, `pg[i]`) that `_named_object` can type; an
+    # expression it would have to infer one for is left alone.
     cmp_re = re.compile(
-        r"(?<![\w.>])(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+(?:\s*(?:\.|->)\s*\w+)*)"
+        r"(?<![\w.>*])(\*\s*this\b|\w+(?:\s*(?:\.|->)\s*\w+)*(?:\s*\[[^\[\]]*\])?)\s*"
+        r"(==|!=|<=|>=|<|>)\s*(\w+(?:\s*(?:\.|->)\s*\w+)*(?:\s*\[[^\[\]]*\])?)"
         r"(?![\w(<]|\s*(?:\.|->|\[|\())")
     aug_re = re.compile(
         r"(?<![\w.>])(\w+)\s*([+\-*/%|&^])=(?!=)\s*([^;]+);")
@@ -8107,7 +8185,10 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                                 scopes[-1].ret_mark = len(out)
                             i = end + 1
                             continue
-                if end is not None and (drops or moved):
+                _rt = scopes[fidx].ret if fidx is not None else None
+                ctor_ret = bool(end is not None and _rt and _rt in type_info and re.match(
+                    r"^%s\s*\(" % re.escape(_rt), text[m.end():end].strip()))
+                if end is not None and (drops or moved or ctor_ret):
                     expr = text[m.end():end].strip()
                     # A `std::move` here is expression position, and the
                     # spill below is already the statement it needs: the
@@ -8124,8 +8205,21 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                         tmp[0] += 1
                         # Evaluate before destroying: the operand may read
                         # the very object that is about to be dropped.
-                        out.append("{ %s %s = (%s); %sreturn %s; }"
-                                   % (rtype, name, expr, drops, name))
+                        cm = re.match(r"^%s\s*\((.*)\)$" % re.escape(rtype), expr, re.S)
+                        rinfo = type_info.get(rtype) or {}
+                        cargs = [a for a in _split_top(cm.group(1)) if a.strip()] if cm else []
+                        ctor = (rinfo.get("ctors") or {}).get(len(cargs)) if cm else None
+                        if cm and (ctor or not cargs) and \
+                                _match_paren(expr, expr.index("(")) == len(expr) - 1:
+                            # `return T(..);`: `T(..)` is a constructor
+                            # call, which C has no expression for.
+                            out.append("{ %s %s; %s(&%s%s); %sreturn %s; }" % (
+                                rtype, name, ctor["fn"] if ctor else "%s_new" % rtype,
+                                name, "".join(", " + a.strip() for a in cargs),
+                                drops, name))
+                        else:
+                            out.append("{ %s %s = (%s); %sreturn %s; }"
+                                       % (rtype, name, expr, drops, name))
                     else:
                         out.append("{ %sreturn %s; }" % (drops, expr))
                     if _unconditional_at(look, m.start()):
@@ -8356,7 +8450,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                     i = m.end()
                     continue
             src = _copy_source(rhs, ctype, scopes, type_info)
-            if src is None and not info["dtor"] and not info["copy"]:
+            if src is None and not info["dtor"] and (not info["copy"] or info.get("trivial_copy")):
                 out.append(m.group(0))       # plain data: a bitwise copy is
                 # exactly what C++ would do. And `vname` is a `ctype` from here on:
                 # without it `T c = a + b; c == g` and `c + a` were not lowered.
@@ -8431,12 +8525,8 @@ def _rewrite_scopes_inner(text, type_info, _pos):
 
         m = cmp_re.match(look, i)
         if m and not aggs:
-            lhs = m.group(1)
-            ctype = None
-            for fr in reversed(scopes):
-                if lhs in fr.vals:
-                    ctype = fr.vals[lhs]
-                    break
+            found = _named_object(m.group(1), scopes, type_info)
+            lhs, ctype = found if found else (m.group(1), None)
             ent = (type_info.get(ctype) or {}).get("cmp", {}).get(m.group(2)) \
                 if ctype else None
             if ent is not None:
@@ -9128,6 +9218,8 @@ def _unaddressable_arg(a):
         return None
     if re.match(r'^(".*"|\'.*\')$', a, re.S):
         return "a literal has no address"
+    if a.startswith("({") and _match_paren(a, 0) == len(a) - 1:
+        return "a statement expression's value has no address"
     # A trailing `)` that closes a call opening after the first character:
     # `f(..)`, `o.m(..)`. Not a cast or a parenthesised name, which start
     # with the paren.
@@ -9846,6 +9938,78 @@ def _lower_functional_casts(text, scan):
     return "".join(out)
 
 
+def _in_open_paren(scan, pos):
+    """Whether a `(` opened before @pos is still open, within the statement."""
+    depth = 0
+    for k in range(pos - 1, -1, -1):
+        c = scan[k]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            if depth == 0:
+                return c == "("
+            depth -= 1
+        elif c in ";{}":
+            return False
+    return False
+
+
+def _unbraced_body(scan, start, pos):
+    """Whether the statement at @start, holding @pos, is the unbraced body
+    of an `if`/`else`/`do`/loop header it begins with."""
+    seg = scan[start:pos]
+    m = re.match(r"\s*(?:(else|do)\b|(?:if|while|for|switch)\s*\()", seg)
+    if not m:
+        return False
+    if m.group(1):
+        return True
+    close = _match_paren(scan, start + m.end() - 1)
+    return close is not None and close < pos
+
+
+_SCALAR_WORDS = {"bool", "char", "short", "int", "long", "float", "double", "unsigned",
+                 "signed", "const", "static", "size_t", "int8_t", "uint8_t", "int16_t",
+                 "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t"}
+
+
+def _plain_classes(scan):
+    """Classes with no destructor whose fields are scalars, pointers, enums
+    or plain classes: a copy of one owns nothing."""
+    bodies = {}
+    for m in re.finditer(r"(?<![\w])(class|struct|enum)\s+(\w+)[^;{}()]*\{", scan):
+        close = _match_brace(scan, m.end() - 1)
+        if close is not None:
+            bodies[m.group(2)] = (m.group(1), scan[m.end():close])
+    plain = {n for n, (k, _b) in bodies.items() if k == "enum"}
+    changed = True
+    while changed:
+        changed = False
+        for name, (kind, body) in bodies.items():
+            if name in plain or "~" in body:
+                continue
+            ok = True
+            depth, start = 0, 0
+            for k, c in enumerate(body):
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    start = k + 1
+                elif c == ";" and depth == 0:
+                    field, start = body[start:k], k + 1
+                    if "(" in field or "*" in field or re.search(r"\b(?:typedef|using)\b", field):
+                        continue
+                    field = re.sub(r"\b(?:public|private|protected)\s*:", " ", field)
+                    words = re.findall(r"[\w:]+", field.split("=")[0].split(",")[0].split("[")[0])[:-1]
+                    if any(w not in _SCALAR_WORDS and w not in plain for w in words):
+                        ok = False
+                        break
+            if ok:
+                plain.add(name)
+                changed = True
+    return plain
+
+
 def _materialise_ctor_temporaries(text, scan, path):
     """`Cls(a, b).method()` -> a hoisted local, then the call on it.
 
@@ -9868,7 +10032,9 @@ def _materialise_ctor_temporaries(text, scan, path):
     cls_names = set(re.findall(r"(?<![\w])(?:class|struct)\s+(\w+)", scan))
     if not cls_names:
         return text
-    edits, n = [], 0
+    # past the temporaries an earlier round hoisted
+    edits, n = [], 1 + max([int(k) for k in re.findall(r"__cpp_tmp(\d+)", scan)] or [-1])
+    plain = None
     # `Cls(..)` or `Tmpl<args>(..)`. A template's arguments sit between the
     # name and the parenthesis, so `h.c = Cell<int>();` used not to match,
     # and reached C as a call to `Cell_int()`, which is a type.
@@ -9901,11 +10067,56 @@ def _materialise_ctor_temporaries(text, scan, path):
                 if not re.search(r"(?<![\w])%s\s+\w+$" % re.escape(name),
                                  head_txt):
                     start, why = _stmt_start(scan, m.start())
-                    if start is not None:
+                    if start is not None and not _unbraced_body(scan, start, m.start()):
                         edits.append((start, m.start(), close + 1, name,
                                       text[op + 1:close], n, True))
                         n += 1
                         continue
+                    if start is not None:
+                        # `if (c) x = Cls(..); else ..`: built in place
+                        if plain is None:
+                            plain = _plain_classes(scan)
+                        if m.group(1) in plain and not m.group(2):
+                            edits.append((None, m.start(), close + 1, name,
+                                          text[op + 1:close], n, False))
+                            n += 1
+                            continue
+                        raise CppError(
+                            "%s:%d: `%s(..)` is assigned in the body of an unbraced "
+                            "`if`/`else`/loop, and hoisting it out would build it "
+                            "unconditionally. Add braces."
+                            % (os.path.basename(path), _src_line(scan, m.start()), name))
+        before = scan[:m.start()].rstrip()[-1:]
+        if before in ("(", ",") and _in_open_paren(scan, m.start()) \
+                and _prev_word(scan, m.start()) != "new":
+            # `f(a, Cls(b))`: an argument, hoisted like the `.method()` case.
+            # Where hoisting would change when it is built -- under `&&`,
+            # in a condition, in an unbraced `if` body -- a plain class is
+            # built in place, in a statement expression. The unclosed `(`
+            # keeps out an initializer list's `: A(1), B(2)`, whose `,` is
+            # in no parenthesis.
+            start, why = _stmt_start(scan, m.start())
+            if start is not None and _unbraced_body(scan, start, m.start()):
+                start, why = None, "is the body of an unbraced `if`/`else`/loop"
+            if start is None:
+                if plain is None:
+                    plain = _plain_classes(scan)
+                if m.group(1) in plain and not m.group(2):
+                    edits.append((None, m.start(), close + 1, name,
+                                  text[op + 1:close], n, False))
+                    n += 1
+                    continue
+                raise CppError(
+                    "%s:%d: `%s(..)` builds an object inside an expression that "
+                    "%s. The temporary has to be hoisted to a statement of its "
+                    "own, and hoisting it here would change when the "
+                    "constructor runs. Assign it to a local first."
+                    % (os.path.basename(path), _src_line(scan, m.start()),
+                       name, why))
+            edits.append((start, m.start(), close + 1, name,
+                          text[op + 1:close], n, False))
+            n += 1
+            continue
         if not (tail.startswith(".") or tail.startswith("->")):
             # A construction in a conditional operand is the one other
             # shape seen in practice, and it cannot be hoisted at all: the
@@ -9929,6 +10140,17 @@ def _materialise_ctor_temporaries(text, scan, path):
         if _prev_word(scan, m.start()) == "new":
             continue
         start, why = _stmt_start(scan, m.start())
+        if start is not None and _unbraced_body(scan, start, m.start()):
+            start, why = None, "is the body of an unbraced `if`/`else`/loop"
+        if start is None and re.match(r"\s*\.\s*\w+(?!\s*[\w(])", scan[close + 1:]):
+            # `Cls(..).field` of a plain class: built in place, as above
+            if plain is None:
+                plain = _plain_classes(scan)
+            if m.group(1) in plain and not m.group(2):
+                edits.append((None, m.start(), close + 1, name,
+                              text[op + 1:close], n, False))
+                n += 1
+                continue
         if start is None:
             raise CppError(
                 "%s:%d: `%s(..)` builds an object inside an expression that "
@@ -9944,9 +10166,22 @@ def _materialise_ctor_temporaries(text, scan, path):
         return text
     out, last = [], 0
     for start, s, e, name, args, idx, is_assign in edits:
+        tmp = "__cpp_tmp%d" % idx
+        # `(Cls(..)).m()`: the parentheses go with it, or `(tmp).m()` is not
+        # read as a call on an object
+        while s > (start or 0) and text[s - 1] == "(" \
+                and re.match(r"\)\s*(?:\.|->)", text[e:]) \
+                and not re.search(r"[\w)\]]\s*$", text[:s - 1]):
+            s, e = s - 1, e + 1
+        if start is None:
+            if s < last:
+                continue             # inside one already rewritten: next round
+            out.append(text[last:s])
+            out.append("({ %s %s = %s(%s); %s; })" % (name, tmp, name, args, tmp))
+            last = e
+            continue
         if start < last:
             continue                 # two in one statement: one pass each
-        tmp = "__cpp_tmp%d" % idx
         out.append(text[last:start])
         out.append("%s %s = %s(%s); " % (name, tmp, name, args))
         out.append(text[start:s])
@@ -10249,7 +10484,7 @@ def _args_hold_new(blanked):
     return _NEW_EXPR.search(_blank_strings(blanked)) is not None
 
 
-def _defers_to_nested(raw, scopes, lookup):
+def _defers_to_nested(raw, scopes, lookup, resolve=None, cinfo=None):
     """Does this argument list still hold a method call to be lowered first?
 
     Rewriting a call by reference *consumes* its arguments -- the scan
@@ -10277,6 +10512,15 @@ def _defers_to_nested(raw, scopes, lookup):
     for mm in re.finditer(r"(?<![\w.>])(\w+)\s*\[", raw):
         if lookup(scopes, mm.group(1)) is not None:
             return True
+    # and through a member chain (`take(this->v[0])`), only when the member
+    # does have one: a plain C array never gets rewritten, and would wait
+    if resolve is not None:
+        for mm in re.finditer(
+                r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\[", raw):
+            got = resolve(scopes, mm.group(1),
+                          [p for p in re.split(r"\s*(?:\.|->)\s*", mm.group(2)) if p])
+            if got and (cinfo.get(got[1]) or {}).get("index"):
+                return True
     return False
 
 
@@ -10825,6 +11069,32 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     def fix_args(raw, refs, scopes):
         """Insert `&` where a by-reference parameter wants an address."""
         parts = [rewrite_fields(p, scopes) for p in _split_top(raw)]
+        # A `D *` passed for a `B *` parameter: the conversion C++ makes
+        # implicitly. The layout base is a cast; a secondary base (an
+        # interface) is its vptr field, as an explicit `(B *)d` is.
+        for idx, want in getattr(refs, "cls_ptrs", {}).items():
+            a = parts[idx].strip() if idx < len(parts) else ""
+            sym = lookup(scopes, a) if re.match(r"^\w+$", a) else None
+            if sym is None or not sym[1] or sym[0] == want or sym[0] not in cinfo:
+                continue
+            owner = _ibase_owner(sym[0], want, cinfo)
+            if owner is not None:
+                parts[idx] = " ((%s *)&(%s)->%s%s)" % (want, a, owner, _ivptr(want))
+                continue
+            b = cinfo[sym[0]].get("base")
+            while b is not None and b != want:
+                b = (cinfo.get(b) or {}).get("base")
+            if b == want:
+                # the layout base: the same address. Through `void *`, as an
+                # `(I *)` cast spelled here is what the secondary-base check
+                # reads as one it could not adjust.
+                parts[idx] = " ((void *)%s)" % a
+        # A lowered `C &c` (a pointer now) passed where `C` is taken by value
+        for idx, want in getattr(refs, "cls_vals", {}).items():
+            a = parts[idx].strip() if idx < len(parts) else ""
+            sym = lookup(scopes, a) if re.match(r"^\w+$", a) else None
+            if sym is not None and sym[1] and sym[0] == want:
+                parts[idx] = " (*%s)" % a
         for idx in sorted(refs or ()):
             if idx >= len(parts):
                 continue
@@ -10991,6 +11261,13 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             m = decl_re.match(look, i)
             if m and _prev_word(look, i) not in ("struct", "typedef", "union"):
                 scopes[-1][m.group(4)] = (m.group(2), bool(m.group(3)))
+                semi = look.find(";", m.end())
+                if pdepth == 0 and semi > 0:
+                    # and the rest of `T a, b;`
+                    for part in _split_top(look[m.end():semi])[1:]:
+                        dm = re.match(r"^\s*(\*\s*)?(\w+)\s*(?:=.*)?$", part, re.S)
+                        if dm:
+                            scopes[-1][dm.group(2)] = (m.group(2), bool(dm.group(1)))
                 if m.group(1):
                     # Recorded beside the symbol, under a key no identifier
                     # can collide with. A method takes a plain `T *this` --
@@ -11655,7 +11932,7 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             op = m.end() - 1
             close = _match_paren(look, op)
             if close is not None and not _defers_to_nested(
-                    text[op + 1:close], scopes, lookup) \
+                    text[op + 1:close], scopes, lookup, resolve, cinfo) \
                     and not static_pending(text[op + 1:close]):
                 fn = m.group(1)
                 args = fix_args(text[op + 1:close], free_refs.get(fn), scopes)
@@ -12047,6 +12324,20 @@ public:
         }
         vn = vn - 1;
         return vd + idx;
+    }
+    /* Reverse in place, each element moved by its representation through
+       the spare slot past the end. */
+    void reverse() {
+        reserve(vn + 1);
+        int i = 0;
+        int j = vn - 1;
+        while (i < j) {
+            memmove(vd + vn, vd + i, (unsigned long)sizeof(T));
+            memmove(vd + i, vd + j, (unsigned long)sizeof(T));
+            memmove(vd + j, vd + vn, (unsigned long)sizeof(T));
+            i = i + 1;
+            j = j - 1;
+        }
     }
     T &operator[](int i) { return vd[i]; }
     T *begin() { return vd; }
@@ -13228,6 +13519,28 @@ _AUTO_LAMBDA = re.compile(r"(?<![\w.])auto\s+(\w+)\s*=\s*$")
 _CONTROL = frozenset(("if", "while", "for", "switch"))
 
 
+def _split_class_declarators(text, cinfo):
+    """`V a, *p, b(1, 2);` -> `V a; V *p; V b(1, 2);` for a class `V`.
+
+    The scope pass reads one declarator per declaration, so the rest were
+    neither constructed nor destroyed."""
+    if not cinfo:
+        return text
+    look = cpp_auto._blank_like(text)
+    pat = re.compile(r"((?:(?<=[;{}])|^)\s*(?:const\s+)?(?:%s))(\s+|\s*(?=\*))([^;{}]*,[^;{}]*);"
+                     % _type_alt(cinfo), re.M)
+    edits = []
+    for m in pat.finditer(look):
+        parts = _split_top(text[m.start(3):m.end(3)])
+        if len(parts) > 1 and all(re.match(r"^\s*\**\s*\w+\s*(?:\([^;]*\)|=[^;]*)?\s*$", p, re.S)
+                                  for p in parts):
+            edits.append((m.start(), m.end(), " ".join(
+                "%s %s;" % (text[m.start(1):m.end(1)], p.strip()) for p in parts)))
+    for a, b, r in reversed(edits):
+        text = text[:a] + r + text[b:]
+    return text
+
+
 def _stmt_start(text, idx):
     """`(start, None)` for the statement containing `idx`, or `(None, why)`.
 
@@ -13245,13 +13558,22 @@ def _stmt_start(text, idx):
         elif c in "([":
             if depth == 0:
                 word = _prev_word(text, j)
-                if word in _CONTROL:
+                kw = re.search(r"(\w+)\s*$", text[:j])
+                if word in ("if", "switch") and kw and _prev_word(text, kw.start()) != "else":
+                    # evaluated once, before the statement: hoisting is sound
+                    depth = 0
+                elif word in _CONTROL:
                     return None, ("the controlling expression of `%s`" % word)
                 depth = 0        # an enclosing call's argument list
             else:
                 depth -= 1
         elif depth == 0 and c in ";{}":
             seg = text[j + 1:idx]
+            # an unbraced body's own header: its condition is not an operand
+            hm = re.match(r"\s*(?:else\s+)?(?:if|while|for|switch)\s*\(", seg)
+            hc = hm and _match_paren(text, j + hm.end())
+            if hc and hc < idx:
+                seg = text[hc + 1:idx]
             for op in ("&&", "||", "?"):
                 if op in seg:
                     return None, "an operand of `%s`" % op
@@ -13944,8 +14266,14 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # pass above could not see it. Idempotent -- an already-lowered
     # `((int)(x))` has its type followed by `)`, not `(`.
     text = _lower_functional_casts(text, _strip_comments(text))
-    text = _materialise_ctor_temporaries(
-        text, _blank_strings(_strip_comments(text)), path)
+    # to a fixed point: one temporary per statement a round, and a hoisted
+    # `Cls(Inner(..))` still holds its inner one
+    while True:
+        lowered = _materialise_ctor_temporaries(
+            text, _blank_strings(_strip_comments(text)), path)
+        if lowered == text:
+            break
+        text = lowered
     scan = _blank_literal_braces(_strip_comments(text))
     text, _exc_used = _lower_except(text, path)
     if _exc_used:
@@ -14629,6 +14957,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # both here leaves those passes nothing unusual to see.
     if rtti:
         out = _lower_rtti(out, cinfo, path)
+    out = _split_class_declarators(out, cinfo)
     out = _rewrite_scopes(out, cinfo, path)
 
     # Rewriting a call copies its arguments through verbatim, so a receiver
@@ -14639,6 +14968,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         if nxt == out:
             break
         out = nxt
+    out = re.sub(r"\b%s(\w+)" % _PREF, r"(*\1)", out)
     # After the rewriting, not before: a conversion this pass *could*
     # adjust has already been lowered by now, so what is left is exactly
     # what it could not, which is what this reports.
