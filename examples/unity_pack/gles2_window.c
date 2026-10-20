@@ -119,6 +119,8 @@ UNITY_KEYS(UNITY_KEY_DECL)
 float engine_pointer_x __attribute__((weak)) = 0.f;
 float engine_pointer_y __attribute__((weak)) = 0.f;
 int engine_pointer_down __attribute__((weak)) = 0;
+/* All the mouse buttons held, as bits: 1 left, 2 right, 4 middle. */
+int engine_pointer_buttons __attribute__((weak)) = 0;
 /* Mouse wheel since the last frame (notches, y > 0 up / away); the engine
  * takes and zeroes it each tick. */
 float engine_scroll_x __attribute__((weak)) = 0.f;
@@ -428,6 +430,9 @@ static void poll_input_axes(GLFWwindow *win)
             - (float)(my * (double)Screen_height / (double)wh);
         engine_pointer_down =
             glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        engine_pointer_buttons = engine_pointer_down
+            | (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) << 1
+            | (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS) << 2;
     }
 }
 

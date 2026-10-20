@@ -1199,6 +1199,14 @@ def write_physics_files(outdir):
         f.write("-I physics -I physics/include physics/pb2.c physics/libbox2d.a -lpthread -lm\n")
 
 
+# The host's keys (examples/unity_pack/gles*_window.c UNITY_KEYS) and their Input System Key numbers.
+HOST_KEYS = ([(chr(c), 15 + c - ord("a")) for c in range(ord("a"), ord("z") + 1)] + [("digit0", 50)]
+             + [("digit%d" % d, 40 + d) for d in range(1, 10)]
+             + [("space", 1), ("enter", 2), ("tab", 3), ("escape", 60), ("backspace", 65), ("leftShift", 51), ("rightShift", 52),
+                ("leftAlt", 53), ("rightAlt", 54), ("leftCtrl", 55), ("rightCtrl", 56), ("leftArrow", 61), ("rightArrow", 62),
+                ("upArrow", 63), ("downArrow", 64)])
+
+
 def host_shim(objects, cameras, prefabs=()):
     """C appended to the lowered program: the engine_* functions a host (examples/unity_pack/gles*_window.c) calls, over the engine's
     Host* functions.  The program's own `main` is renamed `game_main`, so the host's `main` is the one that links."""
@@ -1215,10 +1223,27 @@ def host_shim(objects, cameras, prefabs=()):
         "int engine_texture_height(int id) { return _tex_h[id]; }",
         "const unsigned char *engine_texture_rgba(int id) { return _tex_px[id]; }",
         "float Time_deltaTime; /* the host sets it each frame */",
+        "extern int Screen_width, Screen_height; /* (defined below; the host may resize them) */",
+        "extern float engine_pointer_x, engine_pointer_y; extern int engine_pointer_down;",
+    ]
+    # the host's input globals (examples/unity_pack/gles*_window.c declares them weak, these win), read into the engine's InputState each frame
+    c += ["int engine_keyboard_connected, engine_pointer_buttons, engine_gamepad_connected, engine_gamepad_button[15];",
+          "float engine_scroll_x, engine_scroll_y, engine_gamepad_axis[6];",
+          "int %s;" % ", ".join("engine_keyboard_" + n for n, _k in HOST_KEYS)]
+    c += [
         "static int _loaded;",
         "void engine_tick(void) {",
         "    if (!_loaded) { _loaded = 1; SceneData_Load(); }",
-        "    UnityEngine_Time_deltaTime = Time_deltaTime > 0 ? Time_deltaTime : 1.0f / 60.0f;",
+        "    UnityEngine_Engine_HostSetDeltaTime(Time_deltaTime > 0 ? Time_deltaTime : 1.0f / 60.0f);",
+        "    UnityEngine_Engine_HostSetScreen(Screen_width, Screen_height);",
+        "    UnityEngine_InputState_HostSetKeyboard(engine_keyboard_connected);",
+    ] + ["    UnityEngine_InputState_HostSetKey(%d, engine_keyboard_%s);" % (k, n) for n, k in HOST_KEYS] + [
+        "    UnityEngine_InputState_HostSetPointer(engine_pointer_x, engine_pointer_y, engine_pointer_buttons | engine_pointer_down);",
+        "    UnityEngine_InputState_HostAddScroll(engine_scroll_x, engine_scroll_y);",
+        "    engine_scroll_x = 0; engine_scroll_y = 0;",
+        "    UnityEngine_InputState_HostSetPad(0, engine_gamepad_connected);",
+        "    for (int b = 0; b < 15; b++) UnityEngine_InputState_HostSetPadButton(0, b, engine_gamepad_button[b]);",
+        "    for (int a = 0; a < 6; a++) UnityEngine_InputState_HostSetPadAxis(0, a, engine_gamepad_axis[a]);",
         "    UnityEngine_Engine_Tick();",
         "}",
         "int engine_class_count(void) { return 0; }",
@@ -1261,12 +1286,75 @@ def host_shim(objects, cameras, prefabs=()):
         'const char *engine_console_log_path(void) { return ""; }',
         'const char *engine_data_path(void) { return ""; }',
         'const char *engine_persistent_data_path(void) { return ""; }',
-        "int engine_wants_quit(void) { return 0; }",
+        "int engine_wants_quit(void) { return UnityEngine_Engine_HostWantsQuit(); }",
         "int engine_position_floats(void) { return 0; }",
         "int engine_upload_positions(float *dst, int max) { (void)dst; (void)max; return 0; }",
         "",
     ]
     return "\n".join(c)
+
+
+# The engine functions the host interface calls: (C name, namespace, class, method, DNA_Find signature).  On a managed engine (--dna put it on
+# DotNetAnywhere) the lowered program has none of them, and each is a C function of that name calling the managed method instead.
+HOST_CALLS = (
+    ("SceneData_Load", "", "SceneData", "Load", ">v"),
+    ("UnityEngine_Engine_HostSetDeltaTime", "UnityEngine", "Engine", "HostSetDeltaTime", "f>v"),
+    ("UnityEngine_Engine_HostSetScreen", "UnityEngine", "Engine", "HostSetScreen", "ii>v"),
+    ("UnityEngine_InputState_HostSetKeyboard", "UnityEngine", "InputState", "HostSetKeyboard", "i>v"),
+    ("UnityEngine_InputState_HostSetKey", "UnityEngine", "InputState", "HostSetKey", "ii>v"),
+    ("UnityEngine_InputState_HostSetPointer", "UnityEngine", "InputState", "HostSetPointer", "ffi>v"),
+    ("UnityEngine_InputState_HostAddScroll", "UnityEngine", "InputState", "HostAddScroll", "ff>v"),
+    ("UnityEngine_InputState_HostSetPad", "UnityEngine", "InputState", "HostSetPad", "ii>v"),
+    ("UnityEngine_InputState_HostSetPadButton", "UnityEngine", "InputState", "HostSetPadButton", "iii>v"),
+    ("UnityEngine_InputState_HostSetPadAxis", "UnityEngine", "InputState", "HostSetPadAxis", "iif>v"),
+    ("UnityEngine_Engine_Tick", "UnityEngine", "Engine", "Tick", ">v"),
+    ("UnityEngine_Engine_HostCollect", "UnityEngine", "Engine", "HostCollect", ">i"),
+    ("UnityEngine_Engine_HostDrawF", "UnityEngine", "Engine", "HostDrawF", "ii>f"),
+    ("UnityEngine_Engine_HostDrawI", "UnityEngine", "Engine", "HostDrawI", "ii>i"),
+    ("UnityEngine_Engine_HostHasCamera", "UnityEngine", "Engine", "HostHasCamera", ">i"),
+    ("UnityEngine_Engine_HostCameraF", "UnityEngine", "Engine", "HostCameraF", "i>f"),
+    ("UnityEngine_Engine_HostWantsQuit", "UnityEngine", "Engine", "HostWantsQuit", ">i"),
+)
+
+
+def managed_host_calls(c_text):
+    """C functions, named as the lowered engine's, that call the managed engine's methods through DotNetAnywhere's host API (ccs_find and
+    ccs_call are the bridge glue's) -- for each one the lowered program does not define (what stayed native is called directly).
+    ponytail: one DNA_Call per value, so a frame of n sprites is about 13n calls.  Upgrade path: one call filling float and int arrays ('b')."""
+    out = []
+    for cname, ns, cls, meth, sig in HOST_CALLS:
+        if re.search(r"(?m)^[^;{}\n]*\b%s\s*\([^;{]*\)\s*\{" % cname, c_text):
+            continue
+        params, ret = sig.split(">")
+        ctype = {"i": "int", "f": "float"}
+        decl = ", ".join("%s a%d" % (ctype[p], k) for k, p in enumerate(params)) or "void"
+        args = ", ".join(("DNA_Int(a%d)" if p == "i" else "DNA_Float(a%d)") % k for k, p in enumerate(params))
+        rt = {"v": "void", "i": "int", "f": "float"}[ret]
+        body = ["    static DNA_Method *m;", "    DNA_Value r;"]
+        if params:
+            body.append("    DNA_Value a[%d] = { %s };" % (len(params), args))
+        body += ['    if (m == NULL) m = ccs_find("%s", "%s", "%s", "%s");' % (ns, cls, meth, sig),
+                 "    ccs_call(m, %s, %d, &r);" % ("a" if params else "NULL", len(params))]
+        if ret != "v":
+            body.append("    return r.u.%s;" % ret)
+        out += ["static %s %s(%s) {" % (rt, cname, decl)] + body + ["}"]
+    return "\n".join(out) + "\n"
+
+
+def write_dna_link(outdir):
+    """outdir/dna/link.txt: what a host links a managed engine with (DotNetAnywhere's headers and library, copied beside the program, since the
+    library is built for this program's [DllImport] table), and corlib.dll beside the player.  Nothing when the program is all native."""
+    sys.path.insert(0, os.path.join(ccsharp_home(), "crust"))
+    import ccs2c
+    home, bdir = ccs2c.dna_prepare(False)
+    ffi = os.path.exists(os.path.join(outdir, "cpp", "game.ffi.json"))
+    lib = os.path.join(bdir, "libdna_ffi.a" if ffi else "libdna.a")
+    d = os.path.join(outdir, "dna")
+    os.makedirs(d, exist_ok=True)
+    shutil.copy(lib, os.path.join(d, os.path.basename(lib)))
+    shutil.copy(os.path.join(bdir, "corlib.dll"), outdir)
+    with open(os.path.join(d, "link.txt"), "w") as f:
+        f.write("-I %s dna/%s -lpthread\n" % (os.path.join(home, "native", "src"), os.path.basename(lib)))
 
 
 def write_host_files(objects, cameras, outdir, prefabs=()):
@@ -1278,5 +1366,12 @@ def write_host_files(objects, cameras, outdir, prefabs=()):
         f.write(_up.emit_engine_draw_h())
     with open(os.path.join(outdir, "game.c")) as f:
         c = f.read()
+    glue = os.path.join(outdir, "cpp", "game.bridge.c")
+    extra = ""
+    if os.path.exists(glue):
+        # a managed half: its glue (whose `main` is renamed with the program's) and the host calls over it
+        with open(glue) as f:
+            extra = "\n" + f.read() + "\n" + managed_host_calls(c)
+        write_dna_link(outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
-        f.write("#define main game_main\n" + c + host_shim(objects, cameras, prefabs))
+        f.write("#define main game_main\n" + c + extra + host_shim(objects, cameras, prefabs))

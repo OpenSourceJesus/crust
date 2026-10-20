@@ -1,38 +1,29 @@
 #!/usr/bin/env bash
-# Pack a Unity project and run the GLFW / OpenGL ES player that unity_pack builds.
+# Build a Unity project with CCSharp (tools/unity/unity_pack.py) and run it in the GLFW / OpenGL ES window host.
 #
 #     ./examples/unity_pack/run_gles2_window.sh
-#     ./examples/unity_pack/run_gles2_window.sh --aos
 #     PROJECT=/path/to/project ./examples/unity_pack/run_gles2_window.sh
+#     UNITY_PACK_GLES2=1 ./examples/unity_pack/run_gles2_window.sh    # ES 2.0 host instead of ES 3.1
 #
-# Default output: $TMPDIR/<project folder>/<productName>
-# Override the directory with OUT=... (binary name stays productName).
+# Default output: $TMPDIR/<project folder>/player; override the directory with OUT=...
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PROJECT="${PROJECT:-$ROOT/examples/unity_pack/MiniScene}"
-LAYOUT=()
 
-for arg in "$@"; do
-  case "$arg" in
-    --soa)
-      echo "$0: --soa is gone; SoA is the default. Use --aos or --soa-vec4." >&2
-      exit 2
-      ;;
-    --aos) LAYOUT=(--aos) ;;
-    --soa-vec4) LAYOUT=(--soa-vec4) ;;
-    -h|--help)
-      echo "usage: $0 [--aos | --soa-vec4]"
-      echo "  PROJECT=...  Unity project (default: MiniScene)"
-      echo "  OUT=...    pack directory (default: \$TMPDIR/<project folder>)"
-      exit 0
-      ;;
-    *)
-      echo "unknown option: $arg (try --aos or --soa-vec4)" >&2
-      exit 2
-      ;;
-  esac
-done
+case "${1:-}" in
+  "") ;;
+  -h|--help)
+    echo "usage: $0"
+    echo "  PROJECT=...  Unity project (default: MiniScene)"
+    echo "  OUT=...      build directory (default: \$TMPDIR/<project folder>)"
+    exit 0
+    ;;
+  *)
+    echo "unknown option: $1" >&2
+    exit 2
+    ;;
+esac
 
 if ! pkg-config --exists glfw3; then
   echo "need glfw3 (pkg-config glfw3)" >&2
@@ -40,29 +31,23 @@ if ! pkg-config --exists glfw3; then
 fi
 
 PROJECT="$(cd "$PROJECT" && pwd)"
-# Resolve out dir + product binary the same way unity_pack.py does.
-eval "$(
-  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - <<PY
-import os, sys
-sys.path.insert(0, "$ROOT")
-import tools.unity.unity_pack as up
-root = "$PROJECT"
-outdir = os.environ.get("OUT") or up.default_pack_dir(root)
-_c, product = up.player_identity(root)
-exe = up.exe_filename(product)
-print("OUT=%s" % repr(outdir))
-print("EXE=%s" % repr(os.path.join(outdir, exe)))
-PY
-)"
+OUT="${OUT:-${TMPDIR:-/tmp}/$(basename "$PROJECT")}"
+HOST="$ROOT/examples/unity_pack/gles3_window.c"
+[[ -n "${UNITY_PACK_GLES2:-}" ]] && HOST="$ROOT/examples/unity_pack/gles2_window.c"
 
-echo "== packing $PROJECT → $OUT =="
+echo "== building $PROJECT → $OUT =="
 PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -u "$ROOT/tools/unity/unity_pack.py" "$PROJECT" -o "$OUT" "${LAYOUT[@]}"
+  python3 -u "$ROOT/tools/unity/unity_pack.py" "$PROJECT" -o "$OUT"
 
-if [[ ! -x "$EXE" ]]; then
-  echo "unity_pack did not produce executable: $EXE" >&2
-  exit 1
-fi
+# Box2D-Packed, when the project has physics: unity_pack_ccs writes the link arguments, relative to $OUT
+PHYS=()
+[[ -f "$OUT/physics/link.txt" ]] && read -ra PHYS < "$OUT/physics/link.txt"
+# DotNetAnywhere, when scripts (or the engine) run managed: the headers and runtime library; game.managed.dll and corlib.dll sit beside the player
+DNA=()
+[[ -f "$OUT/dna/link.txt" ]] && read -ra DNA < "$OUT/dna/link.txt"
+cd "$OUT"
+# shellcheck disable=SC2046
+"${CC:-gcc}" -O2 -w -o player "$HOST" engine.c -I . "${PHYS[@]}" "${DNA[@]}" $(pkg-config --cflags --libs glfw3) -lGLESv2 -lm
 
-echo "== GLFW window${LAYOUT[*]:+ (${LAYOUT[*]})}: $EXE (Application.Quit or window close) =="
-exec "$EXE"
+echo "== GLFW window: $OUT/player (Application.Quit or window close) =="
+exec ./player
