@@ -14,9 +14,7 @@ import re
 import sys
 import math
 import copy
-import tools.cs2cpp as cs2cpp  # noqa: E402
 
-import tools.cs2cpp as cs2cpp  # noqa: E402
 from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
 from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
 from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403

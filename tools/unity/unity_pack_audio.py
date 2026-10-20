@@ -13,9 +13,7 @@ import re
 import sys
 import math
 import copy
-import tools.cs2cpp as cs2cpp  # noqa: E402
 
-import tools.cs2cpp as cs2cpp  # noqa: E402
 from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
 from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
 from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
@@ -25,124 +23,7 @@ from tools.unity.unity_pack_anim import *  # noqa: E402,F401,F403
 __all__ = [
     '_audiosource_field_init_index',
     '_build_audiosource_tables',
-    '_rewrite_audiosource_api',
 ]
-
-
-def _rewrite_audiosource_api(text, cl, add_locals=None):
-    """Lower AudioSource playOnAwake/loop/volume/clip/Play/Stop / .gameObject."""
-    as_recvs = set()
-    for f in cl.get("fields") or []:
-        if f.get("ty") == "AudioSource":
-            as_recvs.add(f["name"])
-    for name, _ty, _bits, kind in cl.get("members") or []:
-        if str(kind) == "idx:AudioSource":
-            as_recvs.add(name)
-    for lm in re.finditer(r"\bAudioSource\s+(\w+)\b", text):
-        as_recvs.add(lm.group(1))
-    for name, ty in (add_locals or {}).items():
-        if ty == "AudioSource":
-            as_recvs.add(name)
-    if not as_recvs:
-        return text
-
-    def repl_go(m):
-        recv = m.group(1)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_owner_go[%s]" % recv
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*gameObject\b",
-        repl_go, text)
-
-    bool_map = {
-        "playOnAwake": "play_on_awake",
-        "loop": "loop",
-        "mute": "mute",
-    }
-
-    def repl_bool(m):
-        recv, prop, rhs = m.group(1), m.group(2), m.group(3).strip()
-        if recv not in as_recvs:
-            return m.group(0)
-        field = bool_map[prop]
-        if rhs in ("false", "False", "0"):
-            val = "0"
-        elif rhs in ("true", "True", "1"):
-            val = "1"
-        else:
-            val = "(%s) ? 1 : 0" % rhs
-        return "_AudioSource_%s[%s] = %s;" % (field, recv, val)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\s*=\s*([^;]+);",
-        repl_bool, text)
-
-    def repl_float(m):
-        recv, prop, rhs = m.group(1), m.group(2), m.group(3).strip()
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_%s[%s] = %s;" % (prop, recv, rhs)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\s*=\s*([^;]+);",
-        repl_float, text)
-
-    def repl_clip(m):
-        recv, rhs = m.group(1), m.group(2).strip()
-        if recv not in as_recvs:
-            return m.group(0)
-        if rhs == "null":
-            rhs = "-1"
-        return "_AudioSource_clip[%s] = %s;" % (recv, rhs)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*clip\s*=\s*([^;]+);",
-        repl_clip, text)
-
-    def repl_call(m):
-        recv, meth = m.group(1), m.group(2)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "AudioSource_%s(%s)" % (meth, recv)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(Play|Stop)\s*\(\s*\)",
-        repl_call, text)
-
-    # Bool/float reads: recv.volume / recv.loop
-    def repl_read_float(m):
-        recv, prop = m.group(1), m.group(2)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_%s[%s]" % (prop, recv)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\b",
-        repl_read_float, text)
-
-    def repl_read_bool(m):
-        recv, prop = m.group(1), m.group(2)
-        if recv not in as_recvs:
-            return m.group(0)
-        field = bool_map[prop]
-        return "_AudioSource_%s[%s]" % (field, recv)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\b",
-        repl_read_bool, text)
-
-    def repl_read_clip(m):
-        recv = m.group(1)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_clip[%s]" % recv
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*clip\b",
-        repl_read_clip, text)
-    return text
 
 
 def _build_audiosource_tables(plan):

@@ -126,7 +126,7 @@ class TestMiniScene(unittest.TestCase):
     def test_runs(self):
         with tempfile.TemporaryDirectory() as d:
             r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/unity/unity_pack.py"),
-                                os.path.join(ROOT, "tests/fixtures/MiniScene"), "--engine", "-o", d],
+                                os.path.join(ROOT, "tests/fixtures/MiniScene"), "-o", d],
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr[-500:])
             out = subprocess.run([os.path.join(d, "game")], capture_output=True, text=True).stdout
@@ -138,7 +138,7 @@ class TestMiniScene(unittest.TestCase):
                 'printf("%d %d %d %.2f\\n",n,engine_collect_cameras(c,2),engine_texture_count(),d[2].x);return 0;}\n')
         with tempfile.TemporaryDirectory() as d:
             subprocess.run([sys.executable, os.path.join(ROOT, "tools/unity/unity_pack.py"),
-                            os.path.join(ROOT, "tests/fixtures/MiniScene"), "--engine", "-o", d], check=True, capture_output=True)
+                            os.path.join(ROOT, "tests/fixtures/MiniScene"), "-o", d], check=True, capture_output=True)
             with open(os.path.join(d, "host.c"), "w") as f:
                 f.write(host)
             subprocess.run(["gcc", "-w", "-I", d, "-o", os.path.join(d, "host"), os.path.join(d, "host.c"),
@@ -152,7 +152,7 @@ class TestMiniScene(unittest.TestCase):
                 'printf("%d %d %.2f\\n",n,d[n-1].sorting_order,d[n-1].x);return 0;}\n')
         with tempfile.TemporaryDirectory() as d:
             r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/unity/unity_pack.py"),
-                                os.path.join(ROOT, "tests/fixtures/ComponentScene"), "--engine", "-o", d], capture_output=True, text=True)
+                                os.path.join(ROOT, "tests/fixtures/ComponentScene"), "-o", d], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr[-800:])
             with open(os.path.join(d, "host.c"), "w") as f:
                 f.write(host)
@@ -167,7 +167,7 @@ class TestMiniScene(unittest.TestCase):
                 'printf("%d %d\\n",n,engine_texture_count());return 0;}\n')
         with tempfile.TemporaryDirectory() as d:
             r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/unity/unity_pack.py"),
-                                os.path.join(ROOT, "tests/fixtures/PrefabScene"), "--engine", "-o", d], capture_output=True, text=True)
+                                os.path.join(ROOT, "tests/fixtures/PrefabScene"), "-o", d], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr[-800:])
             with open(os.path.join(d, "host.c"), "w") as f:
                 f.write(host)

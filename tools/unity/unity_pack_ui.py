@@ -14,9 +14,7 @@ import re
 import sys
 import math
 import copy
-import tools.cs2cpp as cs2cpp  # noqa: E402
 
-import tools.cs2cpp as cs2cpp  # noqa: E402
 from tools.unity.unity_pack_common import *  # noqa: E402,F401,F403
 from tools.unity.unity_pack_physics import *  # noqa: E402,F401,F403
 from tools.unity.unity_pack_sprites import *  # noqa: E402,F401,F403
@@ -37,7 +35,6 @@ __all__ = [
     '_UISPRITE_SIZE',
     '_UI_COMPONENT_FIELD_TYPES',
     '_UI_GETCOMPONENT_TYPES',
-    '_UNITY_API_RECT',
     '_annotate_ui_button_onclick_targets',
     '_annotate_ui_eventtrigger_targets',
     '_annotate_ui_persistent_mb_targets',
@@ -95,8 +92,6 @@ __all__ = [
     '_prefab_mod_rect',
     '_rasterize_tmp_text',
     '_rect_receiver',
-    '_rewrite_recttransform_apis',
-    '_rewrite_toggle_is_on',
     '_slider_normalized',
     '_snapshot_ui_rects_onto_hierarchy',
     '_ui_bake_pixel_scale',
@@ -2762,41 +2757,6 @@ def _link_scrollrects_scrollbars(plan):
                 bars[bi]["scroll_axis"] = int(axis)
 
 
-def _rewrite_toggle_is_on(text):
-    """``arr[i].isOn = v`` / ``toggle.isOn`` → ``Toggle_set/get_isOn``.
-
-    Runs after singleton/ref-array rewrites so ``Instance.toggles[i].isOn``
-    is already ``Class_toggles[i].isOn``. Index expr must stay on one
-    bracket pair (no DOTALL) so ``equipped[i]; … toggles[x].isOn`` cannot
-    merge into one match.
-    """
-    # Allow calls inside the index (IndexOf(x)) but not `;` / newlines / `]`.
-    idx = r"([^\]\n;]*)"
-    text = cs2cpp.code_sub(
-        r"(\w+)\s*\[%s\]\s*\.\s*SetIsOnWithoutNotify\s*\(([^;]+)\)\s*;" % idx,
-        r"Toggle_SetIsOnWithoutNotify(\1[\2], (\3));", text)
-    text = cs2cpp.code_sub(
-        r"(?<![\w.])(\w+)\s*\.\s*SetIsOnWithoutNotify\s*\(([^;]+)\)\s*;",
-        r"Toggle_SetIsOnWithoutNotify(\1, (\2));", text)
-    text = cs2cpp.code_sub(
-        r"(\w+)\s*\[%s\]\s*\.\s*isOn\s*=\s*([^;]+);" % idx,
-        r"Toggle_set_isOn(\1[\2], (\3));",
-        text)
-    text = cs2cpp.code_sub(
-        r"(?<![\w.])(\w+)\s*\.\s*isOn\s*=\s*([^;]+);",
-        r"Toggle_set_isOn(\1, (\2));",
-        text)
-    text = cs2cpp.code_sub(
-        r"(\w+)\s*\[%s\]\s*\.\s*isOn\b" % idx,
-        r"Toggle_get_isOn(\1[\2])",
-        text)
-    text = cs2cpp.code_sub(
-        r"(?<![\w.])(\w+)\s*\.\s*isOn\b",
-        r"Toggle_get_isOn(\1)",
-        text)
-    return text
-
-
 #: Emitted helpers that hand back a `Rect` — a receiver its properties read.
 _RECT_VALUE_CALLS = ("RectTransform_GetWorldRect", "RectTransform_get_rect",
                      "Rect_MinMaxRect", "Rect_make", "Camera_main_rect")
@@ -2830,123 +2790,6 @@ def _rect_receiver(text, scan, end):
     if k == j:
         return None
     return k, text[k:end]
-
-
-def _rewrite_recttransform_apis(text, cl, plan):
-    """Lower rectTransform.anchoredPosition / sizeDelta / localScale."""
-    if not plan.get("live_rt") or not plan.get("go_names"):
-        return text
-    idn = _c_ident(cl["name"])
-    this_go = "_engine_go_of_%s(i)" % idn
-    flags = re.DOTALL
-    # Receiver: rectTransform / transform / field / field[i] / a.b
-    _recv = (
-        r"((?:this\s*\.\s*)?rectTransform|(?:this\s*\.\s*)?transform|"
-        r"(?:[\w]+(?:\s*\.\s*[\w]+|\s*\[[^\]]+\])*))"
-    )
-
-    def _go_of(recv):
-        recv = (recv or "").strip()
-        if not recv or recv in ("rectTransform", "transform", "this"):
-            return this_go
-        if re.match(r"(?:this\s*\.\s*)?rectTransform\s*$", recv):
-            return this_go
-        if re.match(r"(?:this\s*\.\s*)?transform\s*$", recv):
-            return this_go
-        return recv
-
-    for prop, setter in (
-            ("anchoredPosition", "RectTransform_set_anchoredPosition_xy"),
-            ("sizeDelta", "RectTransform_set_sizeDelta_xy")):
-        def _repl_eq(m, setfn=setter):
-            go = _go_of(m.group(1))
-            args = _split_call_args(m.group(2))
-            if len(args) < 2:
-                return m.group(0)
-            return "%s(%s, (%s), (%s));" % (setfn, go, args[0], args[1])
-
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;"
-            % (_recv, prop),
-            _repl_eq, text, flags=flags)
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*Vector2\.zero\s*;" % (_recv, prop),
-            lambda m, setfn=setter: "%s(%s, 0.f, 0.f);" % (
-                setfn, _go_of(m.group(1))),
-            text)
-
-        def _repl_vec(m, setfn=setter):
-            go = _go_of(m.group(1))
-            rhs = m.group(2).strip()
-            return (
-                "%s(%s, Vector2_x(%s), Vector2_y(%s));"
-                % (setfn, go, rhs, rhs))
-
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*([^;]+);" % (_recv, prop),
-            _repl_vec, text)
-
-    def _repl_scale(m):
-        go = _go_of(m.group(1))
-        args = _split_call_args(m.group(2))
-        if len(args) < 2:
-            return m.group(0)
-        return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (
-            go, args[0], args[1])
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;"
-        % _recv,
-        _repl_scale, text, flags=flags)
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;"
-        % _recv,
-        _repl_scale, text, flags=flags)
-
-    def _repl_scale_one(m):
-        go = _go_of(m.group(1))
-        s = m.group(2).strip()
-        return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (go, s, s)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*Vector[23]\s*\.\s*one\s*\*\s*([^;]+);"
-        % _recv,
-        _repl_scale_one, text)
-
-    for prop, gx, gy in (
-            ("anchoredPosition",
-             "RectTransform_get_anchoredPosition_x",
-             "RectTransform_get_anchoredPosition_y"),
-            ("sizeDelta",
-             "RectTransform_get_sizeDelta_x",
-             "RectTransform_get_sizeDelta_y")):
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\b(?!\s*[=.])" % (_recv, prop),
-            lambda m, x=gx, y=gy: "Vector2_make(%s(%s), %s(%s))" % (
-                x, _go_of(m.group(1)), y, _go_of(m.group(1))),
-            text)
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*\.\s*x\b" % (_recv, prop),
-            lambda m, x=gx: "%s(%s)" % (x, _go_of(m.group(1))),
-            text)
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*\.\s*y\b" % (_recv, prop),
-            lambda m, y=gy: "%s(%s)" % (y, _go_of(m.group(1))),
-            text)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*\.\s*x\b" % _recv,
-        lambda m: "RectTransform_get_localScale_x(%s)" % _go_of(m.group(1)),
-        text)
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*\.\s*y\b" % _recv,
-        lambda m: "RectTransform_get_localScale_y(%s)" % _go_of(m.group(1)),
-        text)
-    # Remaining bare rectTransform → this GO (≡ GetComponent<RectTransform>).
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\b",
-        this_go, text)
-    return text
 
 
 def _emit_rect_struct(p, want_point_to_normalized=True):
@@ -3023,13 +2866,3 @@ def _emit_rect_struct(p, want_point_to_normalized=True):
         p("        Mathf_InverseLerp(r.y, r.y + r.height, p.y));")
         p("}")
     p("")
-
-
-_UNITY_API_RECT = [
-    _B("Rect.PointToNormalized", "Rect_PointToNormalized", namespaces=_UE),
-    _B("Rect.MinMaxRect", "Rect_MinMaxRect", namespaces=_UE),
-    _B("Camera.main.ScreenToWorldPoint", "Camera_main_ScreenToWorldPoint",
-       namespaces=_UE),
-    _B("Mouse.current.position.ReadValue", "Mouse_current_position",
-       namespaces=("UnityEngine.InputSystem",)),
-]

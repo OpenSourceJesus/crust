@@ -23,7 +23,6 @@ Scripts: `curve.Evaluate(t)` and `curve.length`, on a field.
 """
 import re
 
-import tools.cs2cpp as cs2cpp
 
 #: Unity's WrapMode values in m_PreInfinity / m_PostInfinity.
 WRAP_LOOP = 2
@@ -199,24 +198,3 @@ def emit_c(p, plan):
     p("         + (s3 - s2) * i1 * dt + (-2.f * s3 + 3.f * s2) * k[4 * (i + 1) + 1];")
     p("}")
     p("")
-
-
-def lower_api(text, cl, plan, c_ident):
-    """`curve.Evaluate(t)` / `curve.length` on an AnimationCurve field."""
-    idn = c_ident(cl["name"])
-    for f in cl.get("fields") or []:
-        if f.get("ty") not in ("AnimationCurve", "Curve"):
-            continue
-        # Unity's Evaluate, Godot's Sample: the same evaluation (a Godot
-        # Curve is read into the table in godot_pack._godot_curve).
-        meth = "Evaluate" if f["ty"] == "AnimationCurve" else "Sample"
-        recv = r"(?<![\w.])(?:this\s*\.\s*)?%s" % re.escape(f["name"])
-        handle = "(int)%s_get_%s(i)" % (idn, f["name"])
-        text = cs2cpp.code_sub(
-            recv + r"\s*\.\s*%s\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)" % meth,
-            lambda m, h=handle: "AnimationCurve_Evaluate(%s, (float)(%s))"
-            % (h, m.group(1).strip()), text)
-        text = cs2cpp.code_sub(recv + r"\s*\.\s*(?:length|PointCount)\b",
-                               lambda m, h=handle: "AnimationCurve_get_length(%s)" % h,
-                               text)
-    return text

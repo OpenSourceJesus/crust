@@ -21,7 +21,6 @@ isEmitting, isPaused, isStopped, particleCount.
 import math
 import re
 
-import tools.cs2cpp as cs2cpp
 import tools.unity.unity_pack_common as _cmn
 
 #: At most this many live particles a system (and maxNumParticles).
@@ -355,42 +354,3 @@ def emit_collect(p, plan):
     p("    }")
     p("}")
     p("")
-
-
-def lower_api(text, cl, plan, c_ident):
-    """ParticleSystem members on a field, local or GetComponent's."""
-    if not plan.get("particles"):
-        return text
-    idn = c_ident(cl["name"])
-    text = cs2cpp.code_sub(
-        r"(?<![\w.])(?:this\s*\.\s*)?(?:gameObject\s*\.\s*)?GetComponent\s*<\s*"
-        r"(?:UnityEngine\s*\.\s*)?ParticleSystem\s*>\s*\(\s*\)",
-        "GameObject_GetComponent_ParticleSystem(_engine_go_of_%s(i))" % idn, text)
-    recvs = {}
-    for f in cl.get("fields") or []:
-        if f.get("ty") == "ParticleSystem":
-            recvs[r"(?<![\w.])(?:this\s*\.\s*)?%s" % re.escape(f["name"])] = \
-                "(int)%s_get_%s(i)" % (idn, f["name"])
-    for n in set(re.findall(r"(?<![\w.<])(?:UnityEngine\s*\.\s*)?ParticleSystem\s+(\w+)"
-                            r"(?=\s*[=;,)])", cs2cpp._blank(text))):
-        recvs[r"(?<![\w.])%s" % re.escape(n)] = n
-    call = "GameObject_GetComponent_ParticleSystem(_engine_go_of_%s(i))" % idn
-    recvs[re.escape(call)] = call
-    text = cs2cpp.code_sub(r"(?<![\w.<])(?:UnityEngine\s*\.\s*)?ParticleSystem(?=\s+\w+\s*[=;])",
-                           "int", text)
-    for pat, rx in recvs.items():
-        text = cs2cpp.code_sub(pat + r"\s*(==|!=)\s*null\b",
-                               lambda m, rx=rx: "(%s %s)" % (
-                                   rx, "< 0" if m.group(1) == "==" else ">= 0"), text)
-        for meth in ("Play", "Stop", "Pause", "Clear"):
-            text = cs2cpp.code_sub(pat + r"\s*\.\s*%s\s*\([^()]*\)" % meth,
-                                   lambda m, rx=rx, meth=meth: "ParticleSystem_%s(%s)" % (
-                                       meth, rx), text)
-        text = cs2cpp.code_sub(pat + r"\s*\.\s*Emit\s*\(([^()]*)\)",
-                               lambda m, rx=rx: "ParticleSystem_Emit(%s, (int)(%s))" % (
-                                   rx, m.group(1).strip() or "1"), text)
-        for prop in ("isPlaying", "isEmitting", "isPaused", "isStopped", "particleCount"):
-            text = cs2cpp.code_sub(pat + r"\s*\.\s*%s\b" % prop,
-                                   lambda m, rx=rx, prop=prop: "ParticleSystem_get_%s(%s)" % (
-                                       prop, rx), text)
-    return text

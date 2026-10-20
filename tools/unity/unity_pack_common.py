@@ -14,25 +14,20 @@ import re
 import sys
 import math
 import copy
-import tools.cs2cpp as cs2cpp  # noqa: E402
 
-import tools.cs2cpp as cs2cpp  # noqa: E402
 
 __all__ = [
     'PackError',
     'COOST_STRING_CORE',
     'coost_include_block',
     'coost_incdirs',
-    'coost_string_core',
     'find_coost_root',
     'require_coost_root',
-    '_B',
     '_EVENTTRIGGER_SCRIPT_GUID',
     '_UE',
     '_UNITY_BUILTIN_GUID',
     '_authored_camera_view_size',
     '_mark_hierarchy_live',
-    '_c_ident',
     '_class_name_from_cs',
     '_fit_preserve_aspect',
     '_is_unity_builtin_guid',
@@ -49,7 +44,6 @@ __all__ = [
     '_read',
     '_rect_pivot_center',
     '_sdf_coverage',
-    '_split_call_args',
     '_ui_local_rect_wh',
     '_yaml_vec2',
     'player_display',
@@ -57,17 +51,10 @@ __all__ = [
 ]
 
 
-_split_call_args = cs2cpp.split_call_args
-
-
-_c_ident = cs2cpp.c_ident
-
-
 class PackError(Exception):
     def __init__(self, message):
         self.message = message
         Exception.__init__(self, message)
-
 
 
 # --------------------------------------------------------------------------
@@ -122,21 +109,6 @@ def coost_incdirs(root):
     """Include path for splicing coost: its headers, and its root for the
     sources (`#include "src/fastring.cc"`)."""
     return [os.path.join(root, "include"), root]
-
-
-def coost_string_core(root, extra=()):
-    """coost's string core as one self-contained C++ text, for engine.cpp.
-
-    Expanded here, on its own, rather than handing cpprust an include path
-    for the whole engine: cpprust evaluates every simple `#if` in a file it
-    splices headers into, and the engine's `#ifndef CRUST_NO_POSIX_MKDIR`
-    -- decided by the compiler, host or crust -- would be decided for the
-    host at lowering time, putting `<errno.h>` in front of crust's. It also
-    makes engine.cpp stand alone, whichever checkout it was packed from.
-    """
-    import tools.cpprust as cpprust
-    return cpprust._expand_headers(coost_include_block(extra), root,
-                                   coost_incdirs(root))
 
 
 def coost_include_block(extra=()):
@@ -595,19 +567,16 @@ def _class_name_from_cs(path):
         text = _read(path)
     except IOError:
         return None
-    scan = cs2cpp._blank(text)
+    scan = _CS_NOISE.sub(" ", text)
     stem = os.path.splitext(os.path.basename(path))[0]
-    first = None
-    for kind, name, _s, _b, _c in cs2cpp._find_types(scan):
-        if kind in ("class", "struct"):
-            if name == stem:
-                return name
-            if first is None:
-                first = name
-    return first
+    names = _CS_TYPE.findall(scan)
+    return stem if stem in names else (names[0] if names else None)
 
 
-_B = cs2cpp.Binding
+# ponytail: verbatim interpolated `@$"..."` is not blanked; a type name inside one could be taken.
+_CS_NOISE = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:[^"]|"")*"|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|^[ \t]*#[^\n]*',
+                       re.S | re.M)
+_CS_TYPE = re.compile(r"(?<!\w)(?:class|struct)\s+(\w+)[^;{]*\{")
 
 
 _UE = ("UnityEngine",)
